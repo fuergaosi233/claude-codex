@@ -314,8 +314,10 @@ class ClaudeSidecar:
             delta_type = obj_get(delta, "type", "")
             if delta_type == "text_delta":
                 emit({"type": "text_delta", "thread_id": thread_id, "turn_id": turn_id, "delta": obj_get(delta, "text", "")})
-            elif delta_type in ("thinking_delta", "signature_delta"):
-                emit({"type": "reasoning_delta", "thread_id": thread_id, "turn_id": turn_id, "delta": obj_get(delta, "thinking", "")})
+            elif delta_type == "thinking_delta":
+                thinking = obj_get(delta, "thinking", "")
+                if thinking:
+                    emit({"type": "reasoning_delta", "thread_id": thread_id, "turn_id": turn_id, "delta": thinking})
             # StructuredOutput streams as input_json_delta chunks and is emitted
             # once from the final ToolUseBlock carrying the parsed JSON input.
         elif event_type == "content_block_start":
@@ -341,7 +343,9 @@ class ClaudeSidecar:
                 return
             emit({"type": "text_delta", "thread_id": thread_id, "turn_id": turn_id, "delta": text})
         elif block_type == "thinking":
-            emit({"type": "reasoning_delta", "thread_id": thread_id, "turn_id": turn_id, "delta": obj_get(block, "thinking", "")})
+            thinking = obj_get(block, "thinking", "")
+            if thinking:
+                emit({"type": "reasoning_delta", "thread_id": thread_id, "turn_id": turn_id, "delta": thinking})
         elif block_type == "tool_use" or class_name(block) == "ToolUseBlock":
             tool_name = obj_get(block, "name", "")
             tool_input = obj_get(block, "input", {}) or {}

@@ -762,6 +762,7 @@ export class CodexClaudeAppServer {
             return
           }
           if (event.type === 'reasoning_delta') {
+            if (event.delta.length === 0) return
             const itemId = ensureReasoningItem()
             this.store.updateItem(turn.id, itemId, (item) => {
               if (item.type === 'reasoning') {
