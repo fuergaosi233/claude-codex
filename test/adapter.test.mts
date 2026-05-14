@@ -326,11 +326,12 @@ test('internal Codex title prompts are handled locally without Claude turn leaka
       additionalProperties: false,
     }
     const prompt = [
+      'You are a helpful assistant. You will be presented with a user prompt, and your job is to provide a short title for a task that will be created from that prompt.',
       'Generate a concise UI title (up to 36 characters) for this task.',
       'Fill the structured title field with plain text.',
       '',
       'User prompt:',
-      '帮我看看项目当前情况',
+      '看看当前项目情况呢?',
       '',
       'Show more',
       '11:17 PM',
@@ -346,18 +347,25 @@ test('internal Codex title prompts are handled locally without Claude turn leaka
         input: [{ type: 'text', text: prompt, text_elements: [] }],
       },
     }))
-    await reader.nextResponse(2)
+    const turnStart = await reader.nextResponse(2)
+    assert.equal(turnStart.result.turn.items.some((item: any) => item.type === 'userMessage'), false)
 
     let text = ''
+    let completedTurn: any = null
     for (let i = 0; i < 100; i += 1) {
       const message = await reader.next()
       if (message.method === 'item/agentMessage/delta') text += message.params.delta
-      if (message.method === 'turn/completed') break
+      if (message.method === 'turn/completed') {
+        completedTurn = message.params.turn
+        break
+      }
     }
-    assert.deepEqual(JSON.parse(text), { title: '处理看看项目当前情况' })
+    assert.deepEqual(JSON.parse(text), { title: '处理看看当前项目情况呢' })
+    assert.equal(completedTurn.items.some((item: any) => item.type === 'userMessage'), false)
     const logText = await readFile(debugLog, 'utf8')
     assert.match(logText, /turn\.internalTitle\.shortCircuit/)
     assert.doesNotMatch(logText, /model=haiku|output schema check/)
+    assert.doesNotMatch(logText, /helpful assistant|看看当前项目情况/)
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true })
@@ -628,6 +636,41 @@ test('review/start and thread/compact/start emit real turn items', async () => {
       if (message.method === 'turn/completed') break
     }
     assert.match(reviewText, /Claude Code adapter mock response|Claude warning/)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('Claude thinking maps to Codex reasoning summary and content deltas', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false } }))
+    const start = await reader.nextResponse(1)
+    const threadId = start.result.thread.id
+
+    proc.stdin.write(json({ id: 2, method: 'turn/start', params: { threadId, input: [{ type: 'text', text: 'thinking check', text_elements: [] }] } }))
+    await reader.nextResponse(2)
+
+    let sawSummary = false
+    let sawContent = false
+    let completedReasoning: any = null
+    for (let i = 0; i < 500; i += 1) {
+      const message = await reader.next()
+      if (message.method === 'item/reasoning/summaryTextDelta') sawSummary = true
+      if (message.method === 'item/reasoning/textDelta') sawContent = true
+      if (message.method === 'item/completed' && message.params.item.type === 'reasoning') completedReasoning = message.params.item
+      if (message.method === 'turn/completed') break
+    }
+    assert.equal(sawSummary, true)
+    assert.equal(sawContent, true)
+    assert.deepEqual(completedReasoning.summary, ['mock thinking'])
+    assert.deepEqual(completedReasoning.content, ['mock thinking'])
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true })

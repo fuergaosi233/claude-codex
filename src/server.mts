@@ -645,16 +645,16 @@ export class CodexClaudeAppServer {
     const turnId = newId()
     const input = Array.isArray(params.input) ? (params.input as UserInput[]) : []
     const prompt = textFromInput(input)
+    const internalStructuredTitle = maybeInternalStructuredTitle(params.outputSchema, prompt)
     if (typeof params.cwd === 'string' && params.cwd.length > 0) thread.cwd = params.cwd
-    if (typeof params.model === 'string' && params.model.length > 0) thread.model = params.model
-    if (typeof params.effort === 'string') thread.reasoningEffort = normalizeCodexReasoningEffort(params.effort)
+    if (!internalStructuredTitle && typeof params.model === 'string' && params.model.length > 0) thread.model = params.model
+    if (!internalStructuredTitle && typeof params.effort === 'string') thread.reasoningEffort = normalizeCodexReasoningEffort(params.effort)
     this.store.upsertThread(thread)
-    if (!thread.preview && prompt) {
+    if (!internalStructuredTitle && !thread.preview && prompt) {
       thread.preview = prompt.slice(0, 200)
       thread.updatedAt = nowSeconds()
       this.store.upsertThread(thread)
     }
-    const userItem: ThreadItem = { type: 'userMessage', id: newId(), content: input }
     const turn: TurnRecord = {
       id: turnId,
       threadId,
@@ -662,7 +662,7 @@ export class CodexClaudeAppServer {
       startedAt: nowSeconds(),
       completedAt: null,
       durationMs: null,
-      items: [userItem],
+      items: internalStructuredTitle ? [] : [{ type: 'userMessage', id: newId(), content: input }],
       diff: '',
       error: null,
     }
@@ -671,11 +671,10 @@ export class CodexClaudeAppServer {
     this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
     const publicTurn = this.toTurn(turn)
 
-    const internalStructuredTitle = maybeInternalStructuredTitle(params.outputSchema, prompt)
     setImmediate(() => {
       this.notify(peer, { method: 'turn/started', params: { threadId, turn: publicTurn } })
       if (internalStructuredTitle) {
-        debugLog('turn.internalTitle.shortCircuit', { threadId, turnId, title: internalStructuredTitle })
+        debugLog('turn.internalTitle.shortCircuit', { threadId, turnId })
         const itemId = newId()
         const text = JSON.stringify({ title: internalStructuredTitle })
         const item: ThreadItem = { type: 'agentMessage', id: itemId, text, phase: null, memoryCitation: null }
@@ -765,8 +764,18 @@ export class CodexClaudeAppServer {
           if (event.type === 'reasoning_delta') {
             const itemId = ensureReasoningItem()
             this.store.updateItem(turn.id, itemId, (item) => {
-              if (item.type === 'reasoning') return { ...item, content: [(item.content[0] ?? '') + event.delta] }
+              if (item.type === 'reasoning') {
+                return {
+                  ...item,
+                  summary: [(item.summary[0] ?? '') + event.delta],
+                  content: [(item.content[0] ?? '') + event.delta],
+                }
+              }
               return item
+            })
+            this.notify(peer, {
+              method: 'item/reasoning/summaryTextDelta',
+              params: { threadId: thread.id, turnId: turn.id, itemId, delta: event.delta, summaryIndex: 0 },
             })
             this.notify(peer, {
               method: 'item/reasoning/textDelta',
@@ -1654,6 +1663,30 @@ function summarizeRpcParams(method: string, params: unknown): unknown {
       stream: rec.stream,
       deltaBytes: typeof rec.deltaBase64 === 'string' ? Buffer.from(rec.deltaBase64, 'base64').byteLength : typeof rec.delta === 'string' ? rec.delta.length : 0,
       capReached: rec.capReached,
+    }
+  }
+  if (method === 'item/agentMessage/delta') {
+    return {
+      threadId: rec.threadId,
+      turnId: rec.turnId,
+      itemId: rec.itemId,
+      deltaChars: typeof rec.delta === 'string' ? rec.delta.length : 0,
+    }
+  }
+  if (method === 'item/started' || method === 'item/completed') {
+    const item = asRecord(rec.item)
+    return {
+      threadId: rec.threadId,
+      turnId: rec.turnId,
+      item: { id: item.id, type: item.type },
+    }
+  }
+  if (method === 'turn/started' || method === 'turn/completed') {
+    const turn = asRecord(rec.turn)
+    const items = Array.isArray(turn.items) ? turn.items.map((item) => ({ id: asRecord(item).id, type: asRecord(item).type })) : []
+    return {
+      threadId: rec.threadId,
+      turn: { id: turn.id, status: turn.status, items },
     }
   }
   return rec

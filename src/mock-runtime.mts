@@ -101,6 +101,13 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    if (/thinking check/i.test(context.prompt)) {
+      await handlers.onEvent({ type: 'reasoning_delta', delta: 'mock thinking' })
+      await handlers.onEvent({ type: 'text_delta', delta: 'done' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'thinking check' })
+      return
+    }
+
     const text = `Claude Code adapter mock response for: ${context.prompt || '(empty prompt)'}`
     for (const ch of text) {
       if (this.interrupted.has(context.threadId)) {
