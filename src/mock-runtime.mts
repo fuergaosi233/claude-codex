@@ -77,6 +77,24 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    if (/output schema check/i.test(context.prompt)) {
+      await handlers.onEvent({
+        type: 'text_delta',
+        delta: JSON.stringify({ model: context.model, outputFormat: context.outputFormat }),
+      })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'output schema check' })
+      return
+    }
+
+    if (/tool policy check/i.test(context.prompt)) {
+      await handlers.onEvent({
+        type: 'text_delta',
+        delta: `allowedTools=${context.allowedTools == null ? 'default' : context.allowedTools.join(',')}`,
+      })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'tool policy check' })
+      return
+    }
+
     const text = `Claude Code adapter mock response for: ${context.prompt || '(empty prompt)'}`
     for (const ch of text) {
       if (this.interrupted.has(context.threadId)) {

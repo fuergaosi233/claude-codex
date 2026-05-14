@@ -20,8 +20,13 @@ import { SessionStore } from './store.mjs'
 import { callMcpTool, readMcpConfig, readMcpResource } from './mcp.mjs'
 import { maybeCreateThreadWorktree } from './worktree.mjs'
 import {
+  claudeOutputFormat,
+  codexCliVersion,
+  defaultAllowedTools,
+  debugLog,
   claudeModelOptions,
   codexHome,
+  codexUserAgent,
   newId,
   nowMillis,
   nowSeconds,
@@ -54,6 +59,12 @@ export class CodexClaudeAppServer {
 
   async handle(peer: RpcPeer, message: WireMessage): Promise<void> {
     if ('method' in message && message.method) {
+      debugLog('rpc.request', {
+        peerId: peer.id,
+        id: 'id' in message ? message.id : null,
+        method: message.method,
+        params: summarizeRpcParams(message.method, message.params),
+      })
       if ('id' in message) {
         await this.handleRequest(peer, message as JsonRpcRequest)
       } else {
@@ -62,11 +73,13 @@ export class CodexClaudeAppServer {
       return
     }
     if ('id' in message) {
+      debugLog('rpc.responseFromClient', { peerId: peer.id, id: message.id, hasError: Boolean((message as JsonRpcResponse).error) })
       this.resolveServerRequest(message as JsonRpcResponse)
     }
   }
 
   closePeer(peer: RpcPeer): void {
+    debugLog('peer.close', { peerId: peer.id })
     for (const [threadId, activePeer] of this.activePeerByThread.entries()) {
       if (activePeer.id === peer.id) this.activePeerByThread.delete(threadId)
     }
@@ -86,8 +99,17 @@ export class CodexClaudeAppServer {
   private async handleRequest(peer: RpcPeer, request: JsonRpcRequest): Promise<void> {
     try {
       const result = await this.dispatch(peer, request.method, request.params ?? {})
+      debugLog('rpc.response', { peerId: peer.id, id: request.id, method: request.method, ok: true })
       this.sendResponse(peer, request.id, result)
     } catch (error) {
+      debugLog('rpc.response', {
+        peerId: peer.id,
+        id: request.id,
+        method: request.method,
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : null,
+      })
       this.sendResponse(peer, request.id, undefined, {
         code: -32000,
         message: error instanceof Error ? error.message : String(error),
@@ -98,8 +120,10 @@ export class CodexClaudeAppServer {
   private async dispatch(peer: RpcPeer, method: string, params: unknown): Promise<unknown> {
     switch (method) {
       case 'initialize':
+        const initParams = asRecord(params)
+        const clientInfo = asRecord(initParams.clientInfo)
         return {
-          userAgent: 'claude-codex-adapter/0.1.0',
+          userAgent: codexUserAgent(stringOr(clientInfo.name, 'codex-app'), stringOr(clientInfo.version, 'unknown')),
           codexHome: codexHome(),
           platformFamily: platformFamily(),
           platformOs: platformOs(),
@@ -146,8 +170,9 @@ export class CodexClaudeAppServer {
       case 'thread/shellCommand':
         return this.threadShellCommand(peer, asRecord(params))
       case 'thread/approveGuardianDeniedAction':
-      case 'thread/backgroundTerminals/clean':
         return {}
+      case 'thread/backgroundTerminals/clean':
+        return this.threadBackgroundTerminalsClean(asRecord(params))
       case 'thread/rollback':
         return this.threadRollback(asRecord(params))
       case 'thread/loaded/list':
@@ -510,11 +535,25 @@ export class CodexClaudeAppServer {
     const shell = process.env.SHELL || '/bin/sh'
     const cwd = thread?.cwd ?? process.cwd()
     const processId = newId()
+    debugLog('thread.shellCommand.start', { threadId, processId, cwd, command })
     const child = spawn(shell, ['-lc', command], { cwd, env: process.env, stdio: 'pipe' })
     this.commandProcesses.set(processId, child)
     child.stdout?.on('data', (chunk) => this.notify(peer, { method: 'command/exec/outputDelta', params: { processId, stream: 'stdout', deltaBase64: Buffer.from(chunk).toString('base64'), capReached: false } }))
     child.stderr?.on('data', (chunk) => this.notify(peer, { method: 'command/exec/outputDelta', params: { processId, stream: 'stderr', deltaBase64: Buffer.from(chunk).toString('base64'), capReached: false } }))
-    child.once('close', () => this.commandProcesses.delete(processId))
+    child.once('error', (error) => debugLog('thread.shellCommand.error', { threadId, processId, error: error.message }))
+    child.once('close', (code, signal) => {
+      debugLog('thread.shellCommand.close', { threadId, processId, code, signal })
+      this.commandProcesses.delete(processId)
+    })
+    return {}
+  }
+
+  private threadBackgroundTerminalsClean(params: Record<string, unknown>): unknown {
+    debugLog('thread.backgroundTerminals.clean', {
+      threadId: stringOr(params.threadId, ''),
+      activeCommandProcesses: this.commandProcesses.size,
+      activeProcessHandles: this.processHandles.size,
+    })
     return {}
   }
 
@@ -593,6 +632,7 @@ export class CodexClaudeAppServer {
     const itemIds = new Map<string, string>()
     let agentItemId: string | null = null
     let reasoningItemId: string | null = null
+    const commandOutputSeen = new Set<string>()
     const forkSession = thread.forkedFromId != null && thread.claudeSessionId != null && this.store.listTurns(thread.id).length <= 1
     const ensureAgentItem = (): string => {
       if (agentItemId) return agentItemId
@@ -617,17 +657,17 @@ export class CodexClaudeAppServer {
         turnId: turn.id,
         prompt,
         cwd: stringOr(params.cwd, thread.cwd),
-        model: resolveClaudeModel(stringOr(params.model, thread.model)),
+        model: resolveClaudeModel(stringOr(params.model, thread.model), params.outputSchema == null ? 'normal' : 'summary'),
         effort: resolveClaudeEffort(
           typeof params.effort === 'string' ? params.effort : thread.reasoningEffort ?? process.env.CLAUDE_CODEX_EFFORT ?? null,
         ),
         claudeSessionId: thread.claudeSessionId,
         forkSession,
         mcpServers: readMcpConfig().sdkValue,
-        allowedTools: stringListFromEnv('CLAUDE_CODEX_ALLOWED_TOOLS', ['Read', 'Glob', 'Grep']),
+        allowedTools: defaultAllowedTools(),
         addDirs: stringListFromEnv('CLAUDE_CODEX_ADD_DIRS', []),
         enableFileCheckpointing: process.env.CLAUDE_CODEX_ENABLE_FILE_CHECKPOINTING === '1',
-        outputFormat: params.outputSchema ?? null,
+        outputFormat: claudeOutputFormat(params.outputSchema),
       },
       {
         onEvent: async (event) => {
@@ -669,6 +709,7 @@ export class CodexClaudeAppServer {
           if (event.type === 'tool_output_delta') {
             const itemId = itemIds.get(event.toolUseId)
             if (!itemId) return
+            commandOutputSeen.add(itemId)
             this.store.updateItem(turn.id, itemId, (item) => {
               if (item.type === 'commandExecution') {
                 return { ...item, aggregatedOutput: `${item.aggregatedOutput ?? ''}${event.delta}` }
@@ -681,8 +722,16 @@ export class CodexClaudeAppServer {
           if (event.type === 'tool_result') {
             const itemId = itemIds.get(event.toolUseId)
             if (!itemId) return
+            const resultText = toolResultText(event.content)
             const updated = this.store.updateItem(turn.id, itemId, (item) => {
-              if (item.type === 'commandExecution') return { ...item, status: event.isError ? 'failed' : 'completed', exitCode: event.isError ? 1 : 0 }
+              if (item.type === 'commandExecution') {
+                return {
+                  ...item,
+                  status: event.isError ? 'failed' : 'completed',
+                  aggregatedOutput: item.aggregatedOutput ?? resultText,
+                  exitCode: event.isError ? 1 : 0,
+                }
+              }
               if (item.type === 'fileChange') return { ...item, status: event.isError ? 'failed' : 'completed' }
               if (item.type === 'mcpToolCall') {
                 return {
@@ -695,6 +744,9 @@ export class CodexClaudeAppServer {
               return item
             })
             const item = updated?.items.find((candidate) => candidate.id === itemId)
+            if (item?.type === 'commandExecution' && resultText && !commandOutputSeen.has(itemId)) {
+              this.notify(peer, { method: 'item/commandExecution/outputDelta', params: { threadId: thread.id, turnId: turn.id, itemId, delta: resultText } })
+            }
             if (item) this.notify(peer, { method: 'item/completed', params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() } })
             const diff = await gitDiff(thread.cwd)
             if (diff) {
@@ -705,6 +757,7 @@ export class CodexClaudeAppServer {
           }
           if (event.type === 'completed') {
             if (event.claudeSessionId) this.store.updateClaudeSessionId(thread.id, event.claudeSessionId)
+            if (!event.success) throw new Error(event.result ?? 'Claude turn failed')
           }
           if (event.type === 'error') {
             throw new Error(event.message)
@@ -740,6 +793,15 @@ export class CodexClaudeAppServer {
     if (finalDiff) {
       this.store.updateTurnDiff(turn.id, finalDiff)
       this.notify(peer, { method: 'turn/diff/updated', params: { threadId: thread.id, turnId: turn.id, diff: finalDiff } })
+    }
+    if (params.outputSchema != null && agentItemId == null) {
+      const text = fallbackStructuredText(params.outputSchema, prompt)
+      const itemId = ensureAgentItem()
+      this.store.updateItem(turn.id, itemId, (item) => {
+        if (item.type === 'agentMessage') return { ...item, text }
+        return item
+      })
+      this.notify(peer, { method: 'item/agentMessage/delta', params: { threadId: thread.id, turnId: turn.id, itemId, delta: text } })
     }
     const latestTurn = this.store.getTurn(turn.id)
     for (const completedItemId of [reasoningItemId, agentItemId]) {
@@ -986,11 +1048,7 @@ export class CodexClaudeAppServer {
 
   private async commandExec(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
     const processId = typeof params.processId === 'string' ? params.processId : newId()
-    const command = Array.isArray(params.command)
-      ? params.command.map(String)
-      : typeof params.command === 'string'
-        ? [params.command]
-        : []
+    const command = commandArray(params.command)
     if (command.length === 0) throw new Error('command/exec requires command')
     if ((params.streamStdoutStderr === true || params.streamStdin === true || params.tty === true) && typeof params.processId !== 'string') {
       throw new Error('command/exec streaming requires processId')
@@ -999,6 +1057,7 @@ export class CodexClaudeAppServer {
     const executable = command[0] as string
     const streamOutput = params.streamStdoutStderr === true || params.tty === true
     const cwd = stringOr(params.cwd, process.cwd())
+    debugLog('command.exec.start', { processId, cwd, command, streamOutput, streamStdin: params.streamStdin === true, tty: params.tty === true })
     const child = spawn(executable, command.slice(1), { cwd, env: commandEnv(params.env), stdio: 'pipe' })
     this.commandProcesses.set(processId, child)
 
@@ -1040,11 +1099,13 @@ export class CodexClaudeAppServer {
 
     return new Promise((resolve, reject) => {
       child.once('error', (error) => {
+        debugLog('command.exec.error', { processId, error: error.message, code: (error as NodeJS.ErrnoException).code })
         if (timeout) clearTimeout(timeout)
         this.commandProcesses.delete(processId)
         reject(error)
       })
-      child.once('close', (code) => {
+      child.once('close', (code, signal) => {
+        debugLog('command.exec.close', { processId, code, signal, stdoutBytes, stderrBytes })
         if (timeout) clearTimeout(timeout)
         this.commandProcesses.delete(processId)
         resolve({
@@ -1081,7 +1142,7 @@ export class CodexClaudeAppServer {
     const processHandle = stringOr(params.processHandle, '')
     if (!processHandle) throw new Error('process/spawn requires processHandle')
     if (this.processHandles.has(processHandle)) throw new Error(`process handle already active: ${processHandle}`)
-    const command = Array.isArray(params.command) ? params.command.map(String) : []
+    const command = commandArray(params.command)
     if (command.length === 0) throw new Error('process/spawn requires command')
     const cwd = stringOr(params.cwd, process.cwd())
     const streamOutput = params.streamStdoutStderr === true || params.tty === true
@@ -1092,6 +1153,8 @@ export class CodexClaudeAppServer {
     let stderrBytes = 0
     let stdoutCapReached = false
     let stderrCapReached = false
+    let exited = false
+    debugLog('process.spawn.start', { processHandle, cwd, command, streamOutput, streamStdin: params.streamStdin === true, tty: params.tty === true })
     const child = spawn(command[0] as string, command.slice(1), { cwd, env: commandEnv(params.env), stdio: 'pipe' })
     this.processHandles.set(processHandle, child)
 
@@ -1119,7 +1182,28 @@ export class CodexClaudeAppServer {
     })
     const timeoutMs = params.timeoutMs == null ? 60_000 : numberOr(params.timeoutMs, 60_000)
     const timeout = timeoutMs > 0 ? setTimeout(() => child.kill('SIGTERM'), timeoutMs) : null
-    child.once('close', (code) => {
+    child.once('error', (error) => {
+      debugLog('process.spawn.error', { processHandle, error: error.message, code: (error as NodeJS.ErrnoException).code })
+      if (exited) return
+      exited = true
+      if (timeout) clearTimeout(timeout)
+      this.processHandles.delete(processHandle)
+      setImmediate(() => this.notify(peer, {
+        method: 'process/exited',
+        params: {
+          processHandle,
+          exitCode: 1,
+          stdout: streamOutput ? '' : Buffer.concat(stdout).toString('utf8'),
+          stdoutCapReached,
+          stderr: error.message,
+          stderrCapReached: false,
+        },
+      }))
+    })
+    child.once('close', (code, signal) => {
+      if (exited) return
+      exited = true
+      debugLog('process.spawn.close', { processHandle, code, signal, stdoutBytes, stderrBytes, stdoutCapReached, stderrCapReached })
       if (timeout) clearTimeout(timeout)
       this.processHandles.delete(processHandle)
       this.notify(peer, {
@@ -1252,7 +1336,7 @@ export class CodexClaudeAppServer {
         updatedAt: now,
         modelProvider: thread?.modelProvider ?? 'claude-code',
         cwd: thread?.cwd ?? process.cwd(),
-        cliVersion: 'claude-codex-adapter/0.1.0',
+        cliVersion: codexCliVersion(),
         source: thread?.source ?? 'app_server',
         gitInfo: null,
       },
@@ -1363,7 +1447,7 @@ export class CodexClaudeAppServer {
       status: thread.status,
       path: null,
       cwd: thread.cwd,
-      cliVersion: 'claude-codex-adapter/0.1.0',
+      cliVersion: codexCliVersion(),
       source: thread.source,
       threadSource: null,
       agentNickname: null,
@@ -1395,6 +1479,7 @@ export class CodexClaudeAppServer {
   }
 
   private notify(peer: RpcPeer, notification: { method: string; params: unknown }): void {
+    debugLog('rpc.notify', { peerId: peer.id, method: notification.method, params: summarizeRpcParams(notification.method, notification.params) })
     peer.send({ jsonrpc: '2.0', method: notification.method, params: notification.params })
   }
 
@@ -1412,6 +1497,7 @@ export class CodexClaudeAppServer {
   private sendServerRequest(peer: RpcPeer, method: string, id: string, params: unknown): Promise<unknown> {
     const key = `${peer.id}:${id}`
     return new Promise((resolve, reject) => {
+      debugLog('rpc.serverRequest', { peerId: peer.id, id, method, params: summarizeRpcParams(method, params) })
       this.pendingServerRequests.set(key, { resolve, reject })
       peer.send({ jsonrpc: '2.0', id, method, params })
     })
@@ -1441,6 +1527,49 @@ function numberOr(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback
 }
 
+function commandArray(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map(String).filter((part) => part.length > 0)
+  if (typeof value === 'string' && value.trim()) return [process.env.SHELL || '/bin/sh', '-lc', value]
+  return []
+}
+
+function summarizeRpcParams(method: string, params: unknown): unknown {
+  const rec = asRecord(params)
+  if (method === 'turn/start') {
+    return {
+      threadId: rec.threadId,
+      cwd: rec.cwd,
+      model: rec.model,
+      effort: rec.effort,
+      hasOutputSchema: rec.outputSchema != null,
+      inputTypes: Array.isArray(rec.input) ? rec.input.map((item) => asRecord(item).type) : [],
+    }
+  }
+  if (method === 'process/spawn' || method === 'command/exec') {
+    return {
+      processHandle: rec.processHandle,
+      processId: rec.processId,
+      cwd: rec.cwd,
+      command: commandArray(rec.command),
+      streamStdoutStderr: rec.streamStdoutStderr,
+      streamStdin: rec.streamStdin,
+      tty: rec.tty,
+      timeoutMs: rec.timeoutMs,
+    }
+  }
+  if (method.includes('outputDelta')) {
+    return {
+      processHandle: rec.processHandle,
+      processId: rec.processId,
+      itemId: rec.itemId,
+      stream: rec.stream,
+      deltaBytes: typeof rec.deltaBase64 === 'string' ? Buffer.from(rec.deltaBase64, 'base64').byteLength : typeof rec.delta === 'string' ? rec.delta.length : 0,
+      capReached: rec.capReached,
+    }
+  }
+  return rec
+}
+
 function commandEnv(value: unknown): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env }
   if (!value || typeof value !== 'object' || Array.isArray(value)) return env
@@ -1459,6 +1588,65 @@ function stringListFromEnv(name: string, fallback: string[]): string[] {
     if (Array.isArray(parsed)) return parsed.map(String).filter(Boolean)
   } catch {}
   return raw.split(',').map((part) => part.trim()).filter(Boolean)
+}
+
+function toolResultText(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) {
+    return content
+      .map((entry) => {
+        if (typeof entry === 'string') return entry
+        if (entry && typeof entry === 'object') {
+          const record = entry as Record<string, unknown>
+          if (typeof record.text === 'string') return record.text
+          if (typeof record.content === 'string') return record.content
+        }
+        return ''
+      })
+      .filter(Boolean)
+      .join('\n')
+  }
+  if (content && typeof content === 'object') {
+    const record = content as Record<string, unknown>
+    if (typeof record.text === 'string') return record.text
+    if (typeof record.content === 'string') return record.content
+  }
+  return ''
+}
+
+function fallbackStructuredText(outputSchema: unknown, prompt: string): string {
+  return JSON.stringify(coerceStructuredValue(outputSchema, prompt), null, 0)
+}
+
+function coerceStructuredValue(schema: unknown, prompt: string): unknown {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return prompt
+  const record = schema as Record<string, unknown>
+  if (record.type === 'string') return prompt
+  if (record.type !== 'object') return prompt
+  const properties = record.properties && typeof record.properties === 'object' && !Array.isArray(record.properties)
+    ? (record.properties as Record<string, unknown>)
+    : {}
+  const required = Array.isArray(record.required) ? record.required.map(String) : Object.keys(properties)
+  const result: Record<string, unknown> = {}
+  for (const key of required) {
+    const property = properties[key]
+    const propertyType = property && typeof property === 'object' && !Array.isArray(property) ? (property as Record<string, unknown>).type : null
+    if (propertyType === 'string') result[key] = conciseStructuredString(prompt)
+    else if (propertyType === 'number' || propertyType === 'integer') result[key] = 0
+    else if (propertyType === 'boolean') result[key] = false
+    else if (propertyType === 'array') result[key] = []
+    else if (propertyType === 'object') result[key] = {}
+    else result[key] = null
+  }
+  return result
+}
+
+function conciseStructuredString(prompt: string): string {
+  const lines = prompt.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+  const source = lines.at(-1) ?? prompt.trim()
+  const colon = Math.max(source.lastIndexOf('：'), source.lastIndexOf(':'))
+  const value = colon >= 0 ? source.slice(colon + 1).trim() : source
+  return value.replace(/^[-*\d.、)\s]+/, '').slice(0, 80).trim()
 }
 
 function normalizeDecision(response: unknown): PermissionDecision['decision'] {

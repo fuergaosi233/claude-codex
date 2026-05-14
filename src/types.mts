@@ -139,7 +139,7 @@ export interface RuntimeTurnContext {
   claudeSessionId: string | null
   forkSession: boolean
   mcpServers: unknown | null
-  allowedTools: string[]
+  allowedTools: string[] | null
   addDirs: string[]
   enableFileCheckpointing: boolean
   outputFormat: unknown | null

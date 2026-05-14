@@ -169,6 +169,8 @@ test('model/list exposes Claude model aliases and Codex-safe reasoning efforts',
       ...process.env,
       CODEX_HOME: home,
       CLAUDE_CODEX_MOCK: '1',
+      CLAUDE_CODEX_MODELS: '',
+      CLAUDE_CODEX_MODEL_ALIASES: '',
       CLAUDE_CODEX_DEFAULT_MODEL: 'opus',
       CLAUDE_CODEX_DEFAULT_EFFORT: 'xhigh',
       NODE_NO_WARNINGS: '1',
@@ -208,6 +210,8 @@ test('Codex++ model and effort selections map into Claude runtime context', asyn
       ...process.env,
       CODEX_HOME: home,
       CLAUDE_CODEX_MOCK: '1',
+      CLAUDE_CODEX_MODELS: '',
+      CLAUDE_CODEX_MODEL_ALIASES: '',
       CLAUDE_CODEX_EFFORT_ALIASES: JSON.stringify({ xhigh: 'max' }),
       NODE_NO_WARNINGS: '1',
     },
@@ -235,6 +239,96 @@ test('Codex++ model and effort selections map into Claude runtime context', asyn
     const resume = await reader.nextResponse(3)
     assert.equal(resume.result.model, 'sonnet-1m')
     assert.equal(resume.result.reasoningEffort, 'xhigh')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('Codex app model ids and outputSchema map into Claude runtime context', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      CODEX_HOME: home,
+      CLAUDE_CODEX_MOCK: '1',
+      CLAUDE_CODEX_MODELS: '',
+      CLAUDE_CODEX_MODEL_ALIASES: '',
+      CLAUDE_CODEX_DEFAULT_MODEL: 'claude-opus-4-6',
+      CLAUDE_CODEX_SUMMARY_MODEL: 'haiku',
+      NODE_NO_WARNINGS: '1',
+    },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), model: 'gpt-5.4-mini', experimentalRawEvents: false, persistExtendedHistory: false } }))
+    const start = await reader.nextResponse(1)
+    const threadId = start.result.thread.id
+    assert.equal(start.result.model, 'gpt-5.4-mini')
+
+    const outputSchema = {
+      type: 'object',
+      properties: { title: { type: 'string' } },
+      required: ['title'],
+      additionalProperties: false,
+    }
+    proc.stdin.write(json({
+      id: 2,
+      method: 'turn/start',
+      params: {
+        threadId,
+        model: 'gpt-5.4-mini',
+        outputSchema,
+        input: [{ type: 'text', text: 'output schema check', text_elements: [] }],
+      },
+    }))
+    await reader.nextResponse(2)
+
+    let text = ''
+    for (let i = 0; i < 500; i += 1) {
+      const message = await reader.next()
+      if (message.method === 'item/agentMessage/delta') text += message.params.delta
+      if (message.method === 'turn/completed') break
+    }
+    assert.deepEqual(JSON.parse(text), {
+      model: 'haiku',
+      outputFormat: { type: 'json_schema', schema: outputSchema },
+    })
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('default runtime tool policy leaves Claude Code tools unrestricted unless env overrides', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      CODEX_HOME: home,
+      CLAUDE_CODEX_MOCK: '1',
+      CLAUDE_CODEX_ALLOWED_TOOLS: '',
+      NODE_NO_WARNINGS: '1',
+    },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false } }))
+    const start = await reader.nextResponse(1)
+    const threadId = start.result.thread.id
+
+    proc.stdin.write(json({ id: 2, method: 'turn/start', params: { threadId, input: [{ type: 'text', text: 'tool policy check', text_elements: [] }] } }))
+    await reader.nextResponse(2)
+
+    let text = ''
+    for (let i = 0; i < 500; i += 1) {
+      const message = await reader.next()
+      if (message.method === 'item/agentMessage/delta') text += message.params.delta
+      if (message.method === 'turn/completed') break
+    }
+    assert.equal(text, 'allowedTools=default')
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true })
@@ -385,6 +479,51 @@ test('remote utility methods use v2 response shapes', async () => {
     proc.stdin.write(json({ id: 4, method: 'command/exec', params: { command: [process.execPath, '-e', 'process.stdout.write("ok")'], cwd: process.cwd() } }))
     const command = await reader.nextResponse(4)
     assert.deepEqual(command.result, { exitCode: 0, stdout: 'ok', stderr: '' })
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('process/spawn supports shell strings, errors, and debug logs terminal lifecycle', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const debugLog = join(home, 'adapter-debug.jsonl')
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_DEBUG_LOG: debugLog, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'process/spawn', params: { processHandle: 'shell-process', command: 'printf shell-ok', cwd: process.cwd(), streamStdoutStderr: false } }))
+    await reader.nextResponse(1)
+    let exited: any = null
+    for (let i = 0; i < 100; i += 1) {
+      const message = await reader.next()
+      if (message.method === 'process/exited') {
+        exited = message.params
+        break
+      }
+    }
+    assert.equal(exited.exitCode, 0)
+    assert.equal(exited.stdout, 'shell-ok')
+
+    proc.stdin.write(json({ id: 2, method: 'process/spawn', params: { processHandle: 'missing-process', command: ['/definitely/missing/claude-codex-test'], cwd: process.cwd() } }))
+    await reader.nextResponse(2)
+    let errorExit: any = null
+    for (let i = 0; i < 100; i += 1) {
+      const message = await reader.next()
+      if (message.method === 'process/exited' && message.params.processHandle === 'missing-process') {
+        errorExit = message.params
+        break
+      }
+    }
+    assert.equal(errorExit.exitCode, 1)
+    assert.match(errorExit.stderr, /ENOENT|no such file/i)
+
+    const logText = await readFile(debugLog, 'utf8')
+    assert.match(logText, /"event":"process.spawn.start"/)
+    assert.match(logText, /"event":"process.spawn.close"/)
+    assert.match(logText, /"event":"process.spawn.error"/)
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true })
