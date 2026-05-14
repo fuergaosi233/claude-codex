@@ -12,6 +12,7 @@
     "test": "npm run build && node --test dist/test/*.mjs",
     "doctor": "node scripts/doctor.mjs",
     "smoke:real": "npm run build && node scripts/smoke-real-claude.mjs",
+    "probe:capabilities": "npm run build && node scripts/probe-capabilities.mjs",
     "acceptance:local-remote": "npm run build && node scripts/acceptance-local-remote.mjs",
     "acceptance:gui-ssh-localhost": "npm run build && node scripts/acceptance-gui-ssh-localhost.mjs",
     "probe:codex-cli-remote": "npm run build && node scripts/probe-codex-cli-remote.mjs",

@@ -593,6 +593,47 @@ test('process/spawn supports shell strings, errors, and debug logs terminal life
   }
 })
 
+test('review/start and thread/compact/start emit real turn items', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false } }))
+    const start = await reader.nextResponse(1)
+    const threadId = start.result.thread.id
+
+    proc.stdin.write(json({ id: 2, method: 'thread/compact/start', params: { threadId } }))
+    await reader.nextResponse(2)
+    let sawCompaction = false
+    for (let i = 0; i < 100; i += 1) {
+      const message = await reader.next()
+      if (message.method === 'item/completed' && message.params.item.type === 'contextCompaction') sawCompaction = true
+      if (message.method === 'turn/completed') break
+    }
+    assert.equal(sawCompaction, true)
+
+    proc.stdin.write(json({ id: 3, method: 'review/start', params: { threadId, delivery: 'inline', target: { type: 'custom', instructions: 'notice event' } } }))
+    const review = await reader.nextResponse(3)
+    assert.equal(review.result.reviewThreadId, threadId)
+    assert.equal(review.result.turn.status, 'inProgress')
+    assert.equal(review.result.turn.items.some((item: any) => item.type === 'enteredReviewMode'), true)
+
+    let reviewText = ''
+    for (let i = 0; i < 500; i += 1) {
+      const message = await reader.next()
+      if (message.method === 'item/agentMessage/delta') reviewText += message.params.delta
+      if (message.method === 'turn/completed') break
+    }
+    assert.match(reviewText, /Claude Code adapter mock response|Claude warning/)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
 test('approval requests round-trip through Codex server requests', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {

@@ -95,6 +95,12 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    if (/notice event/i.test(context.prompt)) {
+      await handlers.onEvent({ type: 'notice', level: 'warning', message: 'mock rate limit notice' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'notice event' })
+      return
+    }
+
     const text = `Claude Code adapter mock response for: ${context.prompt || '(empty prompt)'}`
     for (const ch of text) {
       if (this.interrupted.has(context.threadId)) {

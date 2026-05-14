@@ -193,7 +193,7 @@ export class CodexClaudeAppServer {
       case 'thread/realtime/listVoices':
         return { voices: { v1: ['alloy'], v2: ['alloy'], defaultV1: 'alloy', defaultV2: 'alloy' } }
       case 'review/start':
-        return this.reviewStart(asRecord(params))
+        return this.reviewStart(peer, asRecord(params))
       case 'config/read':
         return this.configRead()
       case 'configRequirements/read':
@@ -362,7 +362,7 @@ export class CodexClaudeAppServer {
   private threadResume(params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
-    if (!thread) throw new Error(`unknown thread: ${threadId}`)
+    if (!thread) throw new Error('unknown thread: ' + threadId)
     if (typeof params.cwd === 'string' && params.cwd.length > 0) thread.cwd = params.cwd
     if (typeof params.model === 'string' && params.model.length > 0) thread.model = params.model
     if (typeof params.effort === 'string') thread.reasoningEffort = normalizeCodexReasoningEffort(params.effort)
@@ -416,7 +416,7 @@ export class CodexClaudeAppServer {
   private threadRead(params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
-    if (!thread) throw new Error(`unknown thread: ${threadId}`)
+    if (!thread) throw new Error('unknown thread: ' + threadId)
     const turns = params.includeTurns === false ? [] : this.store.listTurns(threadId)
     return { thread: this.toThread(thread, turns) }
   }
@@ -557,21 +557,83 @@ export class CodexClaudeAppServer {
     return {}
   }
 
-  private reviewStart(params: Record<string, unknown>): unknown {
+  private reviewStart(peer: RpcPeer, params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
+    const thread = this.store.getThread(threadId)
+    if (!thread) throw new Error(`unknown thread: \${threadId}`)
+    this.activePeerByThread.set(threadId, peer)
+    const turnId = newId()
+    const review = reviewLabel(params.target)
+    const prompt = reviewPrompt(params.target)
+    const userItem: ThreadItem = { type: 'userMessage', id: turnId, content: [{ type: 'text', text: review, text_elements: [] }] }
+    const entered: ThreadItem = { type: 'enteredReviewMode', id: newId(), review }
     const turn: TurnRecord = {
-      id: newId(),
+      id: turnId,
       threadId,
-      status: 'completed',
+      status: 'inProgress',
       startedAt: nowSeconds(),
-      completedAt: nowSeconds(),
-      durationMs: 0,
-      items: [{ type: 'agentMessage', id: newId(), text: 'Review mode is not implemented by the Claude-backed adapter.', phase: null, memoryCitation: null }],
+      completedAt: null,
+      durationMs: null,
+      items: [userItem, entered],
       diff: '',
       error: null,
     }
     this.store.upsertTurn(turn)
-    return { turn: this.toTurn(turn), reviewThreadId: threadId }
+    this.activeTurnByThread.set(threadId, turnId)
+    this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
+    const publicTurn = this.toTurn(turn)
+    setImmediate(() => {
+      this.notify(peer, { method: 'turn/started', params: { threadId, turn: publicTurn } })
+      this.notify(peer, { method: 'item/started', params: { threadId, turnId, item: entered, startedAtMs: nowMillis() } })
+      void this.runRuntimeTurn(peer, thread, turn, prompt, { model: thread.model, effort: thread.reasoningEffort }).catch((error) => {
+        const completed = this.store.completeTurn(turnId, 'failed', { message: error.message }) ?? turn
+        this.notify(peer, { method: 'error', params: { threadId, turnId, willRetry: false, error: { message: error.message } } })
+        this.notify(peer, { method: 'turn/completed', params: { threadId, turn: this.toTurn(completed) } })
+        this.activeTurnByThread.delete(threadId)
+        this.setThreadStatus(peer, threadId, { type: 'idle' })
+      })
+    })
+    return { turn: publicTurn, reviewThreadId: threadId }
+  }
+
+  private threadCompactStart(peer: RpcPeer, params: Record<string, unknown>): unknown {
+    const threadId = stringOr(params.threadId, '')
+    const thread = this.store.getThread(threadId)
+    if (!thread) throw new Error(`unknown thread: \${threadId}`)
+    const turnId = newId()
+    const compactItem: ThreadItem = { type: 'contextCompaction', id: newId() }
+    const turn: TurnRecord = {
+      id: turnId,
+      threadId,
+      status: 'inProgress',
+      startedAt: nowSeconds(),
+      completedAt: null,
+      durationMs: null,
+      items: [compactItem],
+      diff: '',
+      error: null,
+    }
+    this.store.upsertTurn(turn)
+    this.activeTurnByThread.set(threadId, turnId)
+    this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
+    const publicTurn = this.toTurn(turn)
+    setImmediate(() => {
+      this.notify(peer, { method: 'turn/started', params: { threadId, turn: publicTurn } })
+      this.notify(peer, { method: 'item/started', params: { threadId, turnId, item: compactItem, startedAtMs: nowMillis() } })
+      const summaryText = compactSummary(thread, this.store.listTurns(threadId))
+      const agentItem: ThreadItem = { type: 'agentMessage', id: newId(), text: summaryText, phase: null, memoryCitation: null }
+      this.store.appendItem(turnId, agentItem)
+      this.notify(peer, { method: 'item/started', params: { threadId, turnId, item: agentItem, startedAtMs: nowMillis() } })
+      this.notify(peer, { method: 'item/agentMessage/delta', params: { threadId, turnId, itemId: agentItem.id, delta: summaryText } })
+      this.notify(peer, { method: 'item/completed', params: { threadId, turnId, item: compactItem, completedAtMs: nowMillis() } })
+      this.notify(peer, { method: 'item/completed', params: { threadId, turnId, item: agentItem, completedAtMs: nowMillis() } })
+      const completed = this.store.completeTurn(turnId, 'completed') ?? turn
+      this.activeTurnByThread.delete(threadId)
+      this.setThreadStatus(peer, threadId, { type: 'idle' })
+      this.notify(peer, { method: 'turn/completed', params: { threadId, turn: this.toTurn(completed) } })
+      this.notify(peer, { method: 'thread/compacted', params: { threadId } })
+    })
+    return {}
   }
 
   private async turnStart(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
@@ -1595,6 +1657,44 @@ function summarizeRpcParams(method: string, params: unknown): unknown {
     }
   }
   return rec
+}
+
+function reviewLabel(target: unknown): string {
+  const rec = asRecord(target)
+  const type = stringOr(rec.type, 'uncommittedChanges')
+  if (type === 'commit') return 'commit ' + stringOr(rec.sha, '') + (typeof rec.title === 'string' ? ': ' + rec.title : '')
+  if (type === 'baseBranch') return 'base branch ' + stringOr(rec.branch, 'main')
+  if (type === 'custom') return stringOr(rec.instructions, 'custom review')
+  return 'uncommitted changes'
+}
+
+function reviewPrompt(target: unknown): string {
+  const label = reviewLabel(target)
+  return [
+    'Review the code changes for: ' + label,
+    '',
+    'Prioritize correctness bugs, regressions, security issues, and missing tests.',
+    'Return findings first, ordered by severity, with file and line references when available.',
+    'If there are no actionable issues, say so clearly and mention residual risk.',
+  ].join('\n')
+}
+
+function compactSummary(thread: ThreadRecord, turns: TurnRecord[]): string {
+  const snippets = turns
+    .flatMap((turn) => turn.items)
+    .filter((item) => item.type === 'userMessage' || item.type === 'agentMessage')
+    .slice(-12)
+    .map((item) => {
+      if (item.type === 'userMessage') return 'User: ' + textFromInput(item.content).slice(0, 500)
+      if (item.type === 'agentMessage') return 'Assistant: ' + item.text.slice(0, 500)
+      return ''
+    })
+    .filter(Boolean)
+  return [
+    'Context compacted for thread ' + thread.id + '.',
+    '',
+    snippets.length > 0 ? snippets.join('\n') : 'No prior conversation content was available to summarize.',
+  ].join('\n')
 }
 
 function commandEnv(value: unknown): NodeJS.ProcessEnv {

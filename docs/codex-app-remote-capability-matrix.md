@@ -21,8 +21,8 @@ This adapter lets Codex App connect to a remote host through the normal Codex Re
 | Filesystem utility RPCs | Supported | fs/readFile, write, metadata, directory listing, remove, copy, watch, and unwatch use Codex v2-shaped responses. |
 | Command/process utility RPCs | Supported | command/exec and process/spawn are implemented for app utility flows. |
 | Steering/interrupt | Supported | turn/steer and turn/interrupt route to the active Claude SDK client. |
-| Review mode | Stub | review/start returns a completed placeholder; real Codex-style review orchestration is not implemented yet. |
-| Context compaction | Stub | thread/compact/start is a no-op today. |
+| Review mode | Supported with Claude text findings | review/start now creates an in-progress review turn, emits enteredReviewMode, and routes the review prompt through Claude. Native Codex guardian finding items are not implemented. |
+| Context compaction | Supported with local summary | thread/compact/start now emits contextCompaction started/completed items and a compacted summary message. Native persisted rollout compaction is not implemented. |
 | Realtime audio | Unsupported | Realtime voice/audio methods are compatibility stubs except listVoices. |
 | Plugins/marketplace/skills/hooks/apps | Compatibility stub | Empty schema-shaped responses avoid UI breakage but do not provide native Codex plugin behavior. |
 | Account/rate limits/auth | Compatibility stub | Codex account panels return static/null responses; Claude authentication remains managed by Claude Code. |
@@ -31,10 +31,7 @@ This adapter lets Codex App connect to a remote host through the normal Codex Re
 
 ## Good next targets
 
-1. Implement real review/start by launching a Claude review turn and mapping findings into Codex review items instead of returning a placeholder.
-2. Implement thread/compact/start by asking Claude Haiku/Sonnet for a structured conversation summary and emitting Codex compaction/context items.
-3. Improve structured output fallback beyond simple object schemas, especially arrays and nested objects.
-4. Map Claude hook/subagent/rate-limit events into richer Codex items or notifications instead of treating some events as compatibility no-ops.
-5. Add a real capability probe command that exercises normal chat, structured title generation, Bash approval, file edit approval, MCP, resume, and interrupt against a remote host.
-6. Flesh out plugin/skill/app surfaces only if Codex App starts relying on those panels for regular remote workflows.
-
+1. Parse Claude review text into first-class Codex review finding items if the App exposes a stable item shape for them.
+2. Persist compaction summaries in a dedicated compacted-history store instead of only emitting contextCompaction UI items.
+3. Expand the capability probe to run over SSH against a named host, not only the local app-server process.
+4. Flesh out plugin/skill/app surfaces only if Codex App starts relying on those panels for regular remote workflows.
