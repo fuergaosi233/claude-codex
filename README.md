@@ -99,9 +99,35 @@ ssh host '
 '
 ```
 
-The daemon normally keeps running after it owns the Unix socket. In Codex App
-this process is managed by the native remote connection flow; the probe kills
-its temporary daemon after verifying the socket exists.
+The daemon owns the Unix socket while a Codex client is connected. When the
+last client (`app-server proxy`) disconnects, the daemon shuts down after a
+short idle grace period so its Claude runtime sidecar is reclaimed instead of
+leaking. Codex App re-probes and restarts the daemon on the next remote
+connection. Tune or disable this with `CLAUDE_CODEX_IDLE_EXIT_MS` (default
+`15000`; set `0` to keep the daemon running indefinitely).
+
+## Using Codex App GUI
+
+1. Install the shim and exports on the remote host as described above
+   (`~/bin/codex`, `~/.zshenv` for the localhost-GUI flow), and build the
+   adapter (`npm install && npm run build && npm run install:python-sdk`).
+2. For the localhost-GUI flow, start the runtime daemon — either manually or as
+   the LaunchAgent shown below — so Codex App GUI can reach Claude Code without
+   a terminal process.
+3. Open Codex App and add a Remote connection to the host (or `localhost`).
+   Codex App runs its native SSH version probe and bootstrap; the shim routes
+   `codex app-server` to this adapter.
+4. Start a new thread and send a prompt. Claude Code runs the turn: agent text
+   streams into the conversation, `Bash` calls surface as Codex command
+   approvals, and `Edit`/`Write`/`MultiEdit` surface as Codex file-change
+   approvals with a live diff. Approve them in the Codex App UI as usual.
+5. Disconnecting the remote in Codex App closes the proxy; the adapter daemon
+   idles out and the runtime sidecar is reclaimed automatically.
+
+`npm run acceptance:gui-ssh-localhost` drives this exact path end-to-end
+(real `codex app-server` daemon + `proxy` over SSH, real Claude Code turn,
+approval bridge, and diff events) and is the closest automated check to the
+Codex App GUI Remote experience.
 
 ## Modes
 

@@ -121,7 +121,11 @@ try {
     }
 
     assert.equal(completed.status, 'completed')
+    assert.ok(text.length > 0, 'expected streamed agent message deltas')
     assert.match(text, new RegExp(expectedText, 'i'))
+    assert.ok(approvals.file > 0, 'expected at least one file-change approval bridged through Codex')
+    assert.ok(diff.length > 0, 'expected a turn/diff/updated event')
+    assert.match(diff, /claude-codex-gui-ssh-acceptance\.txt/)
     assert.equal((await readFile(targetFile, 'utf8')).trim(), expectedText)
 
     rpc.close()
@@ -136,6 +140,8 @@ try {
     console.log(`approvals: command=${approvals.command} file=${approvals.file}`)
     console.log(`diffUpdated: ${diff.length > 0}`)
     console.log(`created: ${targetFile}`)
+    console.log(`--- streamed agent message ---\n${text.trim()}`)
+    console.log(`--- turn diff ---\n${diff.trim()}`)
   } catch (error) {
     clearTimeout(timeout)
     cleanup()
@@ -153,6 +159,15 @@ try {
 function cleanup() {
   proxy?.kill()
   daemon?.kill()
+  // SSH does not reliably propagate signals to the remote `app-server --listen`
+  // process, so reclaim it deterministically via its pidfile.
+  try {
+    spawnSync(
+      'ssh',
+      [...sshBaseArgs, `pidfile=${shQuote(`${socketPath}.pid`)}; [ -f "$pidfile" ] && kill "$(cat "$pidfile")" 2>/dev/null; rm -f "$pidfile"`],
+      { encoding: 'utf8', timeout: 10_000 },
+    )
+  } catch {}
 }
 
 function remoteShell(command) {

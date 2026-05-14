@@ -69,6 +69,7 @@ export async function startWebSocketTransport(
   listenUrl: string,
   onMessage: MessageHandler,
   onClose: CloseHandler,
+  onConnect?: CloseHandler,
 ): Promise<RunningTransport> {
   const parsed = parseListenUrl(listenUrl)
   const server = http.createServer()
@@ -76,6 +77,7 @@ export async function startWebSocketTransport(
 
   wss.on('connection', (ws) => {
     const peer = new WebSocketPeer(ws)
+    onConnect?.(peer)
     ws.on('message', (data) => {
       try {
         const text = Buffer.isBuffer(data) ? data.toString('utf8') : String(data)

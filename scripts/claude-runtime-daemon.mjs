@@ -20,7 +20,14 @@ const server = net.createServer((socket) => {
   child.stderr.on('data', (chunk) => process.stderr.write(`[claude-runtime-daemon] ${chunk}`))
   socket.pipe(child.stdin)
   child.stdout.pipe(socket)
-  socket.on('close', () => child.kill())
+  socket.on('close', () => {
+    if (child.exitCode !== null || child.signalCode !== null) return
+    child.kill('SIGTERM')
+    const force = setTimeout(() => {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+    }, 3000)
+    force.unref()
+  })
   child.on('exit', () => socket.destroy())
 })
 

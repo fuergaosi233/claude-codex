@@ -11,6 +11,7 @@ import {
   startStdioTransport,
   startWebSocketTransport,
 } from './transports.mjs'
+import type { RpcPeer } from './types.mjs'
 import { defaultSocketPath, ensureParent } from './util.mjs'
 
 async function main(): Promise<void> {
@@ -33,28 +34,74 @@ async function main(): Promise<void> {
 
   const listen = getArg(args, '--listen') ?? 'stdio://'
   if (listen === 'off') return
-  if (listen.startsWith('unix://')) {
-    ensureSingleUnixDaemon(listen)
+  const isUnixDaemon = listen.startsWith('unix://')
+  let pidFile: string | null = null
+  if (isUnixDaemon) {
+    pidFile = ensureSingleUnixDaemon(listen)
   }
 
   const store = new SessionStore()
   const runtime = createRuntime()
   const server = new CodexClaudeAppServer(store, runtime)
+  let shuttingDown = false
   const shutdown = async () => {
+    if (shuttingDown) return
+    shuttingDown = true
     await server.stop()
+    if (pidFile) {
+      try {
+        unlinkSync(pidFile)
+      } catch {}
+    }
     process.exit(0)
   }
   process.once('SIGINT', () => void shutdown())
   process.once('SIGTERM', () => void shutdown())
 
   const onMessage = server.handle.bind(server)
-  const onClose = server.closePeer.bind(server)
+
+  // When the Codex client (app-server proxy) disconnects, a `unix://` daemon
+  // would otherwise linger forever and keep its Claude runtime sidecar alive.
+  // Exit once the last peer is gone so the runtime socket closes and the
+  // sidecar is reclaimed. Codex App re-probes and restarts the daemon on
+  // reconnect. Set CLAUDE_CODEX_IDLE_EXIT_MS=0 to keep the legacy persistent
+  // behavior.
+  const idleExitMs = Number(process.env.CLAUDE_CODEX_IDLE_EXIT_MS ?? 15000)
+  const idleExitEnabled = isUnixDaemon && Number.isFinite(idleExitMs) && idleExitMs > 0
+  let activePeers = 0
+  let everConnected = false
+  let idleTimer: NodeJS.Timeout | null = null
+  const cancelIdleExit = () => {
+    if (idleTimer) {
+      clearTimeout(idleTimer)
+      idleTimer = null
+    }
+  }
+  const armIdleExit = () => {
+    if (!idleExitEnabled || activePeers > 0 || !everConnected || idleTimer) return
+    idleTimer = setTimeout(() => {
+      process.stderr.write(`[claude-codex-adapter] no active peers for ${idleExitMs}ms, shutting down\n`)
+      void shutdown()
+    }, idleExitMs)
+    idleTimer.unref()
+  }
+  const onConnect = (_peer: RpcPeer) => {
+    everConnected = true
+    activePeers += 1
+    cancelIdleExit()
+  }
+  const onClose = (peer: RpcPeer) => {
+    activePeers = Math.max(0, activePeers - 1)
+    server.closePeer(peer)
+    armIdleExit()
+  }
+
   const normalized = normalizeListenUrl(listen)
   if (normalized === 'stdio://') {
     startStdioTransport(onMessage, onClose)
     return
   }
-  await startWebSocketTransport(normalized, onMessage, onClose)
+  await startWebSocketTransport(normalized, onMessage, onClose, onConnect)
 }
 
 function getArg(args: string[], name: string): string | null {
@@ -65,7 +112,7 @@ function getArg(args: string[], name: string): string | null {
   return inline ? inline.slice(prefix.length) : null
 }
 
-function ensureSingleUnixDaemon(listen: string): void {
+function ensureSingleUnixDaemon(listen: string): string {
   const socketPath = listen === 'unix://' ? defaultSocketPath() : listen.slice('unix://'.length)
   const pidFile = `${socketPath}.pid`
   ensureParent(socketPath)
@@ -83,6 +130,7 @@ function ensureSingleUnixDaemon(listen: string): void {
   try {
     chmodSync(dirname(socketPath), 0o700)
   } catch {}
+  return pidFile
 }
 
 function processIsAlive(pid: number): boolean {
