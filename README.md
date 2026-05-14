@@ -55,13 +55,14 @@ Claude Code runs in the logged-in GUI session. Put these lightweight exports in
 the shim:
 
 ```bash
+REPO="$HOME/path/to/claude-codex" # adjust to your checkout
 export PATH="$HOME/bin:$PATH"
-export CLAUDE_CODEX_ADAPTER="/Users/Holegots/Project/github/claude-codex/dist/src/adapter.mjs"
-export CLAUDE_CODEX_NODE="/Users/Holegots/.nvm/versions/node/v22.20.0/bin/node"
-export CLAUDE_CODEX_PYTHON="/Users/Holegots/Project/github/claude-codex/.venv/bin/python"
-export CLAUDE_CODEX_CLI="/Users/Holegots/.nvm/versions/node/v22.20.0/bin/claude"
-export CLAUDE_CODEX_RUNTIME_SOCKET="/Users/Holegots/Project/github/claude-codex/.claude-codex/runtime.sock"
-export CODEX_REAL="/opt/homebrew/bin/codex"
+export CLAUDE_CODEX_ADAPTER="$REPO/dist/src/adapter.mjs"
+export CLAUDE_CODEX_NODE="$(command -v node)"
+export CLAUDE_CODEX_PYTHON="$REPO/.venv/bin/python"
+export CLAUDE_CODEX_CLI="$(command -v claude)"
+export CLAUDE_CODEX_RUNTIME_SOCKET="$REPO/.claude-codex/runtime.sock"
+export CODEX_REAL="$(command -v codex)"
 ```
 
 Start the GUI-session Claude runtime daemon manually:
@@ -69,7 +70,7 @@ Start the GUI-session Claude runtime daemon manually:
 ```bash
 CLAUDE_CODEX_RUNTIME_SOCKET="$PWD/.claude-codex/runtime.sock" \
 CLAUDE_CODEX_PYTHON="$PWD/.venv/bin/python" \
-CLAUDE_CODEX_CLI="/Users/Holegots/.nvm/versions/node/v22.20.0/bin/claude" \
+CLAUDE_CODEX_CLI="$(command -v claude)" \
 node scripts/claude-runtime-daemon.mjs --socket "$PWD/.claude-codex/runtime.sock"
 ```
 
