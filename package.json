@@ -1,0 +1,32 @@
+{
+  "name": "claude-codex-adapter",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "claude-codex-adapter": "dist/src/adapter.mjs"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "install:python-sdk": "bash scripts/install-python-sdk.sh",
+    "test": "npm run build && node --test dist/test/*.mjs",
+    "doctor": "node scripts/doctor.mjs",
+    "smoke:real": "npm run build && node scripts/smoke-real-claude.mjs",
+    "acceptance:local-remote": "npm run build && node scripts/acceptance-local-remote.mjs",
+    "acceptance:gui-ssh-localhost": "npm run build && node scripts/acceptance-gui-ssh-localhost.mjs",
+    "probe:codex-cli-remote": "npm run build && node scripts/probe-codex-cli-remote.mjs",
+    "start": "node dist/src/adapter.mjs",
+    "generate:schema": "codex app-server generate-ts --experimental --out generated/codex-app-server"
+  },
+  "dependencies": {
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.0",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=22.5"
+  }
+}

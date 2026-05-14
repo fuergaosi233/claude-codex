@@ -1,0 +1,174 @@
+export type JsonRpcId = string | number | null
+
+export type JsonValue =
+  | null
+  | string
+  | number
+  | boolean
+  | JsonValue[]
+  | { [key: string]: JsonValue }
+
+export interface JsonRpcRequest {
+  jsonrpc?: '2.0'
+  id: JsonRpcId
+  method: string
+  params?: unknown
+}
+
+export interface JsonRpcNotification {
+  jsonrpc?: '2.0'
+  method: string
+  params?: unknown
+}
+
+export interface JsonRpcResponse {
+  jsonrpc: '2.0'
+  id: JsonRpcId
+  result?: unknown
+  error?: JsonRpcError
+}
+
+export interface JsonRpcError {
+  code: number
+  message: string
+  data?: unknown
+}
+
+export type WireMessage = JsonRpcRequest | JsonRpcNotification | JsonRpcResponse
+
+export interface RpcPeer {
+  id: string
+  send(message: WireMessage): void
+  close(): void
+}
+
+export interface ThreadRecord {
+  id: string
+  sessionId: string
+  forkedFromId: string | null
+  preview: string
+  name: string | null
+  archived: boolean
+  cwd: string
+  model: string
+  reasoningEffort: string | null
+  modelProvider: string
+  claudeSessionId: string | null
+  source: string
+  createdAt: number
+  updatedAt: number
+  status: ThreadStatus
+}
+
+export type ThreadStatus =
+  | { type: 'notLoaded' }
+  | { type: 'idle' }
+  | { type: 'systemError' }
+  | { type: 'active'; activeFlags: Array<'waitingOnApproval' | 'waitingOnUserInput'> }
+
+export type TurnStatus = 'completed' | 'interrupted' | 'failed' | 'inProgress'
+
+export interface TurnRecord {
+  id: string
+  threadId: string
+  status: TurnStatus
+  startedAt: number | null
+  completedAt: number | null
+  durationMs: number | null
+  items: ThreadItem[]
+  diff: string
+  error: unknown | null
+}
+
+export type UserInput =
+  | { type: 'text'; text: string; text_elements?: unknown[] }
+  | { type: 'image'; url: string }
+  | { type: 'localImage'; path: string }
+  | { type: 'skill'; name: string; path: string }
+  | { type: 'mention'; name: string; path: string }
+
+export type ThreadItem =
+  | { type: 'userMessage'; id: string; content: UserInput[] }
+  | { type: 'agentMessage'; id: string; text: string; phase: string | null; memoryCitation: null }
+  | { type: 'plan'; id: string; text: string }
+  | { type: 'reasoning'; id: string; summary: string[]; content: string[] }
+  | {
+      type: 'commandExecution'
+      id: string
+      command: string
+      cwd: string
+      processId: string | null
+      source: string
+      status: 'inProgress' | 'completed' | 'failed' | 'declined'
+      commandActions: unknown[]
+      aggregatedOutput: string | null
+      exitCode: number | null
+      durationMs: number | null
+    }
+  | {
+      type: 'fileChange'
+      id: string
+      changes: FileUpdateChange[]
+      status: 'inProgress' | 'completed' | 'failed' | 'declined'
+    }
+  | {
+      type: 'mcpToolCall'
+      id: string
+      server: string
+      tool: string
+      status: string
+      arguments: unknown
+      result: unknown | null
+      error: unknown | null
+      durationMs: number | null
+    }
+
+export interface FileUpdateChange {
+  path: string
+  kind: { type: 'add' } | { type: 'delete' } | { type: 'update'; move_path: string | null }
+  diff: string
+}
+
+export interface RuntimeTurnContext {
+  threadId: string
+  turnId: string
+  prompt: string
+  cwd: string
+  model: string | null
+  effort: string | null
+  claudeSessionId: string | null
+  forkSession: boolean
+  mcpServers: unknown | null
+  allowedTools: string[]
+  addDirs: string[]
+  enableFileCheckpointing: boolean
+  outputFormat: unknown | null
+}
+
+export type RuntimeEvent =
+  | { type: 'session'; claudeSessionId: string }
+  | { type: 'text_delta'; delta: string }
+  | { type: 'reasoning_delta'; delta: string }
+  | { type: 'tool_use'; toolUseId: string; toolName: string; input: Record<string, unknown> }
+  | { type: 'tool_output_delta'; toolUseId: string; delta: string }
+  | { type: 'tool_result'; toolUseId: string; content: unknown; isError?: boolean }
+  | { type: 'permission_request'; requestId: string; toolUseId: string; toolName: string; input: Record<string, unknown> }
+  | { type: 'completed'; claudeSessionId?: string | null; result?: string | null; success: boolean }
+  | { type: 'error'; message: string }
+
+export interface PermissionDecision {
+  decision: 'accept' | 'acceptForSession' | 'decline' | 'cancel'
+  updatedInput?: Record<string, unknown>
+}
+
+export interface RuntimeHandlers {
+  onEvent(event: RuntimeEvent): Promise<void> | void
+  onPermissionRequest(event: Extract<RuntimeEvent, { type: 'permission_request' }>): Promise<PermissionDecision>
+}
+
+export interface ClaudeRuntime {
+  runTurn(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void>
+  steer(threadId: string, prompt: string): Promise<void>
+  interrupt(threadId: string): Promise<void>
+  stop(): Promise<void>
+}

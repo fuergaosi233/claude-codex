@@ -1,0 +1,9 @@
+node_modules/
+dist/
+generated/
+.venv/
+.claude-codex/
+*.sqlite
+*.sqlite-*
+*.sock
+*.pid

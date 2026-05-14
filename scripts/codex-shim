@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ADAPTER="${CLAUDE_CODEX_ADAPTER:-/opt/claude-codex-adapter/dist/src/adapter.mjs}"
+NODE_BIN="${CLAUDE_CODEX_NODE:-node}"
+
+case "${1:-}" in
+  --version|-V|version)
+    if [ -n "${CODEX_REAL:-}" ] && [ -x "$CODEX_REAL" ]; then
+      exec "$CODEX_REAL" "$@"
+    fi
+    echo "${CODEX_SHIM_VERSION:-codex-cli 0.130.0}"
+    exit 0
+    ;;
+  app-server)
+    exec "$NODE_BIN" "$ADAPTER" "$@"
+    ;;
+esac
+
+if [ -n "${CODEX_REAL:-}" ] && [ -x "$CODEX_REAL" ]; then
+  exec "$CODEX_REAL" "$@"
+fi
+
+echo "codex shim supports --version and app-server; set CODEX_REAL for fallback" >&2
+exit 127
