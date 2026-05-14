@@ -146,6 +146,13 @@ export class ClaudeSdkSocketRuntime implements ClaudeRuntime {
           isError: Boolean(message.is_error),
         })
         break
+      case 'notice':
+        await pending.handlers.onEvent({
+          type: 'notice',
+          level: message.level === 'error' || message.level === 'warning' ? message.level : 'info',
+          message: String(message.message ?? ''),
+        })
+        break
       case 'completed':
         await pending.handlers.onEvent({
           type: 'completed',

@@ -32,9 +32,15 @@ def coerce_structured_output(schema: Any, raw_text: str) -> Any:
         return raw_text
     schema_type = schema.get("type")
     if schema_type == "string":
-        return raw_text
+        return concise_string_value(raw_text, "value")
+    if schema_type == "array":
+        item_schema = schema.get("items") if isinstance(schema.get("items"), dict) else {"type": "string"}
+        values = [line.strip().lstrip("-*0123456789.、) ") for line in raw_text.splitlines() if line.strip()]
+        if not values:
+            values = [raw_text.strip()] if raw_text.strip() else []
+        return [coerce_structured_output(item_schema, value) for value in values[:10]]
     if schema_type != "object":
-        return raw_text
+        return None
     properties = schema.get("properties")
     if not isinstance(properties, dict):
         return {}
@@ -47,20 +53,7 @@ def coerce_structured_output(schema: Any, raw_text: str) -> Any:
         if not isinstance(name, str) or not isinstance(prop, dict):
             continue
         prop_type = prop.get("type")
-        if prop_type == "string":
-            result[name] = concise_string_value(raw_text, name)
-        elif prop_type == "number":
-            result[name] = 0
-        elif prop_type == "integer":
-            result[name] = 0
-        elif prop_type == "boolean":
-            result[name] = False
-        elif prop_type == "array":
-            result[name] = []
-        elif prop_type == "object":
-            result[name] = {}
-        else:
-            result[name] = None
+        result[name] = coerce_structured_output(prop, raw_text)
     return result
 
 
@@ -329,6 +322,14 @@ class ClaudeSidecar:
             block = obj_get(event, "content_block", {})
             if obj_get(block, "name", "") != "StructuredOutput":
                 self.emit_content_block(thread_id, turn_id, block)
+        elif event_type in ("rate_limit_event", "hook_event", "subagent_event", "subagent_stop", "precompact", "postcompact"):
+            emit({
+                "type": "notice",
+                "thread_id": thread_id,
+                "turn_id": turn_id,
+                "level": "warning" if event_type == "rate_limit_event" else "info",
+                "message": f"{event_type}: {json.dumps(event, ensure_ascii=False, default=str)[:1000]}",
+            })
 
     def emit_content_block(self, thread_id: str, turn_id: str, block: Any) -> None:
         block_type = obj_get(block, "type", "")

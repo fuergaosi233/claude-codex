@@ -166,7 +166,7 @@ export class CodexClaudeAppServer {
       case 'thread/unarchive':
         return this.threadArchive(asRecord(params), false)
       case 'thread/compact/start':
-        return {}
+        return this.threadCompactStart(peer, asRecord(params))
       case 'thread/shellCommand':
         return this.threadShellCommand(peer, asRecord(params))
       case 'thread/approveGuardianDeniedAction':
@@ -609,8 +609,24 @@ export class CodexClaudeAppServer {
     this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
     const publicTurn = this.toTurn(turn)
 
+    const internalStructuredTitle = maybeInternalStructuredTitle(params.outputSchema, prompt)
     setImmediate(() => {
       this.notify(peer, { method: 'turn/started', params: { threadId, turn: publicTurn } })
+      if (internalStructuredTitle) {
+        debugLog('turn.internalTitle.shortCircuit', { threadId, turnId, title: internalStructuredTitle })
+        const itemId = newId()
+        const text = JSON.stringify({ title: internalStructuredTitle })
+        const item: ThreadItem = { type: 'agentMessage', id: itemId, text, phase: null, memoryCitation: null }
+        this.store.appendItem(turnId, item)
+        this.notify(peer, { method: 'item/started', params: { threadId, turnId, item, startedAtMs: nowMillis() } })
+        this.notify(peer, { method: 'item/agentMessage/delta', params: { threadId, turnId, itemId, delta: text } })
+        this.notify(peer, { method: 'item/completed', params: { threadId, turnId, item, completedAtMs: nowMillis() } })
+        const completed = this.store.completeTurn(turnId, 'completed') ?? turn
+        this.activeTurnByThread.delete(threadId)
+        this.setThreadStatus(peer, threadId, { type: 'idle' })
+        this.notify(peer, { method: 'turn/completed', params: { threadId, turn: this.toTurn(completed) } })
+        return
+      }
       void this.runRuntimeTurn(peer, thread, turn, prompt, params).catch((error) => {
       const completed = this.store.completeTurn(turnId, 'failed', { message: error.message }) ?? turn
       this.notify(peer, { method: 'error', params: { threadId, turnId, willRetry: false, error: { message: error.message } } })
@@ -753,6 +769,17 @@ export class CodexClaudeAppServer {
               this.store.updateTurnDiff(turn.id, diff)
               this.notify(peer, { method: 'turn/diff/updated', params: { threadId: thread.id, turnId: turn.id, diff } })
             }
+            return
+          }
+          if (event.type === 'notice') {
+            const itemId = ensureAgentItem()
+            const prefix = event.level === 'warning' ? '[Claude warning] ' : event.level === 'error' ? '[Claude error] ' : '[Claude event] '
+            const delta = prefix + event.message + '\n'
+            this.store.updateItem(turn.id, itemId, (item) => {
+              if (item.type === 'agentMessage') return { ...item, text: item.text + delta }
+              return item
+            })
+            this.notify(peer, { method: 'item/agentMessage/delta', params: { threadId: thread.id, turnId: turn.id, itemId, delta } })
             return
           }
           if (event.type === 'completed') {
@@ -1618,11 +1645,56 @@ function fallbackStructuredText(outputSchema: unknown, prompt: string): string {
   return JSON.stringify(coerceStructuredValue(outputSchema, prompt), null, 0)
 }
 
+function maybeInternalStructuredTitle(outputSchema: unknown, prompt: string): string | null {
+  if (!schemaHasStringField(outputSchema, 'title')) return null
+  if (!/structured title field|concise UI title|Generate a concise UI title|User prompt:/i.test(prompt)) return null
+  const explicit = prompt.match(/User prompt:\s*([\s\S]*?)(?:\n\s*(?:Show more|\d{1,2}:\d{2}\s*(?:AM|PM)?|$))/i)?.[1]?.trim()
+  const source = explicit && explicit.length > 0 ? explicit : prompt
+  return titleFromPrompt(source)
+}
+
+function schemaHasStringField(schema: unknown, fieldName: string): boolean {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return false
+  const record = schema as Record<string, unknown>
+  const properties = record.properties && typeof record.properties === 'object' && !Array.isArray(record.properties)
+    ? (record.properties as Record<string, unknown>)
+    : {}
+  const property = properties[fieldName]
+  return Boolean(property && typeof property === 'object' && !Array.isArray(property) && (property as Record<string, unknown>).type === 'string')
+}
+
+function titleFromPrompt(value: string): string {
+  const lines = value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+  let source = lines.find((line) => !/^show more$/i.test(line) && !/^\d{1,2}:\d{2}\s*(?:AM|PM)?$/i.test(line)) ?? value.trim()
+  source = source.replace(/^User:\s*/i, '').trim()
+  source = source.replace(/^["'\`“”]+|["'\`“”]+$/g, '').trim()
+  if (!source) return '生成任务标题'
+  const localeLooksChinese = /[\u3400-\u9fff]/.test(source)
+  let title = source
+  if (localeLooksChinese) {
+    title = source
+      .replace(/^帮我/, '')
+      .replace(/^请/, '')
+      .replace(/[。！？!?]+$/g, '')
+      .trim()
+    if (!/^(查看|修复|增加|更新|调研|定位|总结|实现|过滤)/.test(title)) title = '处理' + title
+  } else {
+    const words = source.replace(/[.?!]+$/g, '').split(/\s+/).filter(Boolean)
+    title = words.slice(0, 5).join(' ')
+  }
+  return title.slice(0, 36).trim()
+}
+
 function coerceStructuredValue(schema: unknown, prompt: string): unknown {
   if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return prompt
   const record = schema as Record<string, unknown>
-  if (record.type === 'string') return prompt
-  if (record.type !== 'object') return prompt
+  if (record.type === 'string') return conciseStructuredString(prompt)
+  if (record.type === 'array') {
+    const itemSchema = record.items && typeof record.items === 'object' && !Array.isArray(record.items) ? record.items : { type: 'string' }
+    const values = prompt.split(/\r?\n/).map((line) => line.trim().replace(/^[-*\d.、)\s]+/, '')).filter(Boolean)
+    return (values.length > 0 ? values : prompt.trim() ? [prompt.trim()] : []).slice(0, 10).map((value) => coerceStructuredValue(itemSchema, value))
+  }
+  if (record.type !== 'object') return null
   const properties = record.properties && typeof record.properties === 'object' && !Array.isArray(record.properties)
     ? (record.properties as Record<string, unknown>)
     : {}
@@ -1631,12 +1703,7 @@ function coerceStructuredValue(schema: unknown, prompt: string): unknown {
   for (const key of required) {
     const property = properties[key]
     const propertyType = property && typeof property === 'object' && !Array.isArray(property) ? (property as Record<string, unknown>).type : null
-    if (propertyType === 'string') result[key] = conciseStructuredString(prompt)
-    else if (propertyType === 'number' || propertyType === 'integer') result[key] = 0
-    else if (propertyType === 'boolean') result[key] = false
-    else if (propertyType === 'array') result[key] = []
-    else if (propertyType === 'object') result[key] = {}
-    else result[key] = null
+    result[key] = coerceStructuredValue(property, prompt)
   }
   return result
 }

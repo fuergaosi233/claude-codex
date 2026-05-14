@@ -92,6 +92,9 @@ export type ThreadItem =
   | { type: 'agentMessage'; id: string; text: string; phase: string | null; memoryCitation: null }
   | { type: 'plan'; id: string; text: string }
   | { type: 'reasoning'; id: string; summary: string[]; content: string[] }
+  | { type: 'enteredReviewMode'; id: string; review: string }
+  | { type: 'exitedReviewMode'; id: string; review: string }
+  | { type: 'contextCompaction'; id: string }
   | {
       type: 'commandExecution'
       id: string
@@ -153,6 +156,7 @@ export type RuntimeEvent =
   | { type: 'tool_output_delta'; toolUseId: string; delta: string }
   | { type: 'tool_result'; toolUseId: string; content: unknown; isError?: boolean }
   | { type: 'permission_request'; requestId: string; toolUseId: string; toolName: string; input: Record<string, unknown> }
+  | { type: 'notice'; level: 'info' | 'warning' | 'error'; message: string }
   | { type: 'completed'; claudeSessionId?: string | null; result?: string | null; success: boolean }
   | { type: 'error'; message: string }
 

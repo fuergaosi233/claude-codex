@@ -301,6 +301,69 @@ test('Codex app model ids and outputSchema map into Claude runtime context', asy
   }
 })
 
+test('internal Codex title prompts are handled locally without Claude turn leakage', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const debugLog = join(home, 'debug.jsonl')
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      CODEX_HOME: home,
+      CLAUDE_CODEX_MOCK: '1',
+      CLAUDE_CODEX_DEBUG_LOG: debugLog,
+      NODE_NO_WARNINGS: '1',
+    },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), model: 'sonnet', experimentalRawEvents: false, persistExtendedHistory: false } }))
+    const start = await reader.nextResponse(1)
+    const threadId = start.result.thread.id
+    const outputSchema = {
+      type: 'object',
+      properties: { title: { type: 'string' } },
+      required: ['title'],
+      additionalProperties: false,
+    }
+    const prompt = [
+      'Generate a concise UI title (up to 36 characters) for this task.',
+      'Fill the structured title field with plain text.',
+      '',
+      'User prompt:',
+      '帮我看看项目当前情况',
+      '',
+      'Show more',
+      '11:17 PM',
+    ].join('\n')
+    proc.stdin.write(json({
+      id: 2,
+      method: 'turn/start',
+      params: {
+        threadId,
+        model: 'gpt-5.4-mini',
+        effort: 'medium',
+        outputSchema,
+        input: [{ type: 'text', text: prompt, text_elements: [] }],
+      },
+    }))
+    await reader.nextResponse(2)
+
+    let text = ''
+    for (let i = 0; i < 100; i += 1) {
+      const message = await reader.next()
+      if (message.method === 'item/agentMessage/delta') text += message.params.delta
+      if (message.method === 'turn/completed') break
+    }
+    assert.deepEqual(JSON.parse(text), { title: '处理看看项目当前情况' })
+    const logText = await readFile(debugLog, 'utf8')
+    assert.match(logText, /turn\.internalTitle\.shortCircuit/)
+    assert.doesNotMatch(logText, /model=haiku|output schema check/)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
 test('default runtime tool policy leaves Claude Code tools unrestricted unless env overrides', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
