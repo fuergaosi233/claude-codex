@@ -302,7 +302,12 @@ test('Codex app model ids and outputSchema map into Claude runtime context', asy
   }
 })
 
-test('internal Codex title prompts are handled locally without Claude turn leakage', async () => {
+test('Codex title-generation turn runs through the runtime instead of a hardcoded local title', async () => {
+  // We used to short-circuit Codex App's title-gen turn with a regex-derived
+  // "处理X" string. That was forcing a hardcoded title regardless of what the
+  // model would have produced. Now the turn flows through runRuntimeTurn just
+  // like any other structured output turn — the model maps to the summary
+  // alias (haiku) and the user message is recorded.
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const debugLog = join(home, 'debug.jsonl')
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
@@ -317,7 +322,7 @@ test('internal Codex title prompts are handled locally without Claude turn leaka
   })
   const reader = new JsonLineReader(proc)
   try {
-    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), model: 'sonnet', experimentalRawEvents: false, persistExtendedHistory: false } }))
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), model: 'sonnet', ephemeral: true, experimentalRawEvents: false, persistExtendedHistory: false } }))
     const start = await reader.nextResponse(1)
     const threadId = start.result.thread.id
     const outputSchema = {
@@ -332,10 +337,7 @@ test('internal Codex title prompts are handled locally without Claude turn leaka
       'Fill the structured title field with plain text.',
       '',
       'User prompt:',
-      '看看当前项目情况呢?',
-      '',
-      'Show more',
-      '11:17 PM',
+      'output schema check',
     ].join('\n')
     proc.stdin.write(json({
       id: 2,
@@ -349,24 +351,23 @@ test('internal Codex title prompts are handled locally without Claude turn leaka
       },
     }))
     const turnStart = await reader.nextResponse(2)
-    assert.equal(turnStart.result.turn.items.some((item: any) => item.type === 'userMessage'), false)
+    // The user message IS recorded now (we no longer skip the items list).
+    assert.equal(turnStart.result.turn.items.some((item: any) => item.type === 'userMessage'), true)
 
     let text = ''
-    let completedTurn: any = null
-    for (let i = 0; i < 100; i += 1) {
+    for (let i = 0; i < 200; i += 1) {
       const message = await reader.next()
       if (message.method === 'item/agentMessage/delta') text += message.params.delta
-      if (message.method === 'turn/completed') {
-        completedTurn = message.params.turn
-        break
-      }
+      if (message.method === 'turn/completed') break
     }
-    assert.deepEqual(JSON.parse(text), { title: '处理看看当前项目情况呢' })
-    assert.equal(completedTurn.items.some((item: any) => item.type === 'userMessage'), false)
+    // The text is whatever the runtime produced (the mock echoes the resolved
+    // model + outputFormat). Importantly it must NOT be the old hardcoded
+    // "处理X" string the local short-circuit would have produced.
+    assert.doesNotMatch(text, /^\{"title":"处理/)
+    const parsed = JSON.parse(text)
+    assert.equal(parsed.model, 'haiku', 'gpt-5.4-mini should map to the summary model (haiku) when an outputSchema is set')
     const logText = await readFile(debugLog, 'utf8')
-    assert.match(logText, /turn\.internalTitle\.shortCircuit/)
-    assert.doesNotMatch(logText, /model=haiku|output schema check/)
-    assert.doesNotMatch(logText, /helpful assistant|看看当前项目情况/)
+    assert.doesNotMatch(logText, /turn\.internalTitle\.shortCircuit/, 'no local title short-circuit should fire')
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true })

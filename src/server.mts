@@ -683,16 +683,21 @@ export class CodexClaudeAppServer {
     const turnId = newId()
     const input = Array.isArray(params.input) ? (params.input as UserInput[]) : []
     const prompt = textFromInput(input)
-    const internalStructuredTitle = maybeInternalStructuredTitle(params.outputSchema, prompt)
     if (typeof params.cwd === 'string' && params.cwd.length > 0) thread.cwd = params.cwd
-    if (!internalStructuredTitle && typeof params.model === 'string' && params.model.length > 0) thread.model = params.model
-    if (!internalStructuredTitle && typeof params.effort === 'string') thread.reasoningEffort = normalizeCodexReasoningEffort(params.effort)
+    if (typeof params.model === 'string' && params.model.length > 0) thread.model = params.model
+    if (typeof params.effort === 'string') thread.reasoningEffort = normalizeCodexReasoningEffort(params.effort)
     this.store.upsertThread(thread)
-    if (!internalStructuredTitle && !thread.preview && prompt) {
+    if (!thread.preview && prompt) {
       thread.preview = prompt.slice(0, 200)
       thread.updatedAt = nowSeconds()
       this.store.upsertThread(thread)
     }
+    // Note: we used to short-circuit Codex App's title-generation turn with a
+    // local regex-derived title to avoid prompt leakage into the parent thread.
+    // That leakage no longer happens (title turns run on their own ephemeral
+    // thread, filtered from listings), so the short-circuit was just forcing a
+    // hardcoded "处理X" string instead of the real model output. Now every turn
+    // — including the structured title turn on Claude Haiku — runs end-to-end.
     const turn: TurnRecord = {
       id: turnId,
       threadId,
@@ -700,7 +705,7 @@ export class CodexClaudeAppServer {
       startedAt: nowSeconds(),
       completedAt: null,
       durationMs: null,
-      items: internalStructuredTitle ? [] : [{ type: 'userMessage', id: newId(), content: input }],
+      items: [{ type: 'userMessage', id: newId(), content: input }],
       diff: '',
       error: null,
     }
@@ -711,21 +716,6 @@ export class CodexClaudeAppServer {
 
     setImmediate(() => {
       this.notify(peer, { method: 'turn/started', params: { threadId, turn: publicTurn } })
-      if (internalStructuredTitle) {
-        debugLog('turn.internalTitle.shortCircuit', { threadId, turnId })
-        const itemId = newId()
-        const text = JSON.stringify({ title: internalStructuredTitle })
-        const item: ThreadItem = { type: 'agentMessage', id: itemId, text, phase: null, memoryCitation: null }
-        this.store.appendItem(turnId, item)
-        this.notify(peer, { method: 'item/started', params: { threadId, turnId, item, startedAtMs: nowMillis() } })
-        this.notify(peer, { method: 'item/agentMessage/delta', params: { threadId, turnId, itemId, delta: text } })
-        this.notify(peer, { method: 'item/completed', params: { threadId, turnId, item, completedAtMs: nowMillis() } })
-        const completed = this.store.completeTurn(turnId, 'completed') ?? turn
-        this.activeTurnByThread.delete(threadId)
-        this.setThreadStatus(peer, threadId, { type: 'idle' })
-        this.notify(peer, { method: 'turn/completed', params: { threadId, turn: this.toTurn(completed) } })
-        return
-      }
       void this.runRuntimeTurn(peer, thread, turn, prompt, params).catch((error) => {
       const completed = this.store.completeTurn(turnId, 'failed', { message: error.message }) ?? turn
       this.notify(peer, { method: 'error', params: { threadId, turnId, willRetry: false, error: { message: error.message } } })
@@ -2037,45 +2027,6 @@ function tokenBreakdownFromClaudeUsage(usage: Record<string, unknown>): TokenUsa
   }
 }
 
-function maybeInternalStructuredTitle(outputSchema: unknown, prompt: string): string | null {
-  if (!schemaHasStringField(outputSchema, 'title')) return null
-  if (!/structured title field|concise UI title|Generate a concise UI title|User prompt:/i.test(prompt)) return null
-  const explicit = prompt.match(/User prompt:\s*([\s\S]*?)(?:\n\s*(?:Show more|\d{1,2}:\d{2}\s*(?:AM|PM)?|$))/i)?.[1]?.trim()
-  const source = explicit && explicit.length > 0 ? explicit : prompt
-  return titleFromPrompt(source)
-}
-
-function schemaHasStringField(schema: unknown, fieldName: string): boolean {
-  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return false
-  const record = schema as Record<string, unknown>
-  const properties = record.properties && typeof record.properties === 'object' && !Array.isArray(record.properties)
-    ? (record.properties as Record<string, unknown>)
-    : {}
-  const property = properties[fieldName]
-  return Boolean(property && typeof property === 'object' && !Array.isArray(property) && (property as Record<string, unknown>).type === 'string')
-}
-
-function titleFromPrompt(value: string): string {
-  const lines = value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
-  let source = lines.find((line) => !/^show more$/i.test(line) && !/^\d{1,2}:\d{2}\s*(?:AM|PM)?$/i.test(line)) ?? value.trim()
-  source = source.replace(/^User:\s*/i, '').trim()
-  source = source.replace(/^["'\`“”]+|["'\`“”]+$/g, '').trim()
-  if (!source) return '生成任务标题'
-  const localeLooksChinese = /[\u3400-\u9fff]/.test(source)
-  let title = source
-  if (localeLooksChinese) {
-    title = source
-      .replace(/^帮我/, '')
-      .replace(/^请/, '')
-      .replace(/[。！？!?]+$/g, '')
-      .trim()
-    if (!/^(查看|修复|增加|更新|调研|定位|总结|实现|过滤)/.test(title)) title = '处理' + title
-  } else {
-    const words = source.replace(/[.?!]+$/g, '').split(/\s+/).filter(Boolean)
-    title = words.slice(0, 5).join(' ')
-  }
-  return title.slice(0, 36).trim()
-}
 
 function coerceStructuredValue(schema: unknown, prompt: string): unknown {
   if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return prompt
