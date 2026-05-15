@@ -680,20 +680,104 @@ export class CodexClaudeAppServer {
     setImmediate(() => {
       this.notify(peer, { method: 'turn/started', params: { threadId, turn: publicTurn } })
       this.notify(peer, { method: 'item/started', params: { threadId, turnId, item: compactItem, startedAtMs: nowMillis() } })
-      const summaryText = compactSummary(thread, this.store.listTurns(threadId))
-      const agentItem: ThreadItem = { type: 'agentMessage', id: newId(), text: summaryText, phase: null, memoryCitation: null }
+      const agentItem: ThreadItem = { type: 'agentMessage', id: newId(), text: '', phase: null, memoryCitation: null }
       this.store.appendItem(turnId, agentItem)
       this.notify(peer, { method: 'item/started', params: { threadId, turnId, item: agentItem, startedAtMs: nowMillis() } })
-      this.notify(peer, { method: 'item/agentMessage/delta', params: { threadId, turnId, itemId: agentItem.id, delta: summaryText } })
-      this.notify(peer, { method: 'item/completed', params: { threadId, turnId, item: compactItem, completedAtMs: nowMillis() } })
-      this.notify(peer, { method: 'item/completed', params: { threadId, turnId, item: agentItem, completedAtMs: nowMillis() } })
-      const completed = this.store.completeTurn(turnId, 'completed') ?? turn
-      this.activeTurnByThread.delete(threadId)
-      this.setThreadStatus(peer, threadId, { type: 'idle' })
-      this.notify(peer, { method: 'turn/completed', params: { threadId, turn: this.toTurn(completed) } })
-      this.notify(peer, { method: 'thread/compacted', params: { threadId } })
+
+      // Drive an actual Claude (summary model) turn to compact the thread
+      // instead of just stringifying the last 12 snippets locally — the
+      // local fallback still kicks in if the runtime errors.
+      void this.runCompactTurn(peer, thread, turnId, agentItem.id, compactItem)
+        .catch((error) => {
+          debugLog('thread.compact.fallback', { threadId, error: error?.message ?? String(error) })
+          const fallback = compactSummary(thread, this.store.listTurns(threadId))
+          this.store.updateItem(turnId, agentItem.id, (item) =>
+            item.type === 'agentMessage' ? { ...item, text: fallback } : item,
+          )
+          this.notify(peer, { method: 'item/agentMessage/delta', params: { threadId, turnId, itemId: agentItem.id, delta: fallback } })
+        })
+        .finally(() => {
+          this.notify(peer, { method: 'item/completed', params: { threadId, turnId, item: compactItem, completedAtMs: nowMillis() } })
+          const finalAgent = this.store.getTurn(turnId)?.items.find((i) => i.id === agentItem.id) ?? agentItem
+          this.notify(peer, { method: 'item/completed', params: { threadId, turnId, item: finalAgent, completedAtMs: nowMillis() } })
+          const completed = this.store.completeTurn(turnId, 'completed') ?? turn
+          this.activeTurnByThread.delete(threadId)
+          this.setThreadStatus(peer, threadId, { type: 'idle' })
+          this.notify(peer, { method: 'turn/completed', params: { threadId, turn: this.toTurn(completed) } })
+          this.notify(peer, { method: 'thread/compacted', params: { threadId } })
+        })
     })
     return {}
+  }
+
+  // Calls into the runtime with a structured "give me a 1-paragraph summary"
+  // prompt against the summary model alias (haiku). Streams the text into the
+  // placeholder agent message via item/agentMessage/delta. Errors propagate
+  // so the threadCompactStart fallback can substitute the local snippet.
+  private async runCompactTurn(
+    peer: RpcPeer,
+    thread: ThreadRecord,
+    turnId: string,
+    agentItemId: string,
+    compactItem: ThreadItem,
+  ): Promise<void> {
+    const turns = this.store.listTurns(thread.id)
+    const promptBody = compactSummary(thread, turns)
+    const compactPrompt = [
+      'You are summarizing a Codex / Claude Code conversation so the user can keep context after compaction.',
+      'Produce ONE concise paragraph (≤ 6 sentences) covering goals, decisions, files touched, and outstanding work.',
+      'Skip greetings; do not invent details that are not in the snippets below.',
+      '',
+      promptBody,
+    ].join('\n')
+
+    let collected = ''
+    await this.runtime.runTurn(
+      {
+        threadId: thread.id,
+        turnId,
+        prompt: compactPrompt,
+        cwd: thread.cwd,
+        model: resolveClaudeModel(thread.model, 'summary'),
+        effort: resolveClaudeEffort(thread.reasoningEffort ?? null),
+        claudeSessionId: null,
+        forkSession: false,
+        mcpServers: null,
+        allowedTools: ['Read', 'Glob', 'Grep'],
+        addDirs: [],
+        enableFileCheckpointing: false,
+        outputFormat: null,
+        approvalPolicy: 'never',
+        sandboxMode: 'read-only',
+        systemPromptAddendum: null,
+        planMode: false,
+        imageInputs: [],
+      },
+      {
+        onEvent: async (event) => {
+          if (event.type === 'text_delta' && event.delta) {
+            collected += event.delta
+            this.store.updateItem(turnId, agentItemId, (item) =>
+              item.type === 'agentMessage' ? { ...item, text: item.text + event.delta } : item,
+            )
+            this.notify(peer, { method: 'item/agentMessage/delta', params: { threadId: thread.id, turnId, itemId: agentItemId, delta: event.delta } })
+          }
+          if (event.type === 'error') throw new Error(event.message)
+          if (event.type === 'completed' && !event.success) {
+            throw new Error(event.result ?? 'compaction turn failed')
+          }
+        },
+        // Compaction never asks for approvals — it's read-only summarisation.
+        onPermissionRequest: async () => ({ decision: 'accept' }),
+      },
+    )
+
+    // If Claude produced nothing usable, surface the local fallback so the
+    // caller's catch path runs and the user still gets a summary.
+    if (!collected.trim()) {
+      void compactItem
+      throw new Error('compaction returned no content')
+    }
   }
 
   private async turnStart(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {

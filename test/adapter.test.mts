@@ -773,6 +773,48 @@ test('baseInstructions / developerInstructions / personality flow into the syste
   }
 })
 
+test('thread/compact/start drives Claude (summary model) instead of the local stringified summary', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const start = await reader.nextResponse(1)
+    const threadId = start.result.thread.id
+
+    // Need a turn or two of content for compactSummary to have snippets.
+    proc.stdin.write(json({ id: 2, method: 'turn/start', params: { threadId, input: [{ type: 'text', text: 'hello world', text_elements: [] }] } }))
+    await reader.nextResponse(2)
+    let firstTurnDone = false
+    for (let i = 0; i < 200 && !firstTurnDone; i += 1) {
+      const message = await reader.next()
+      if (message.method === 'turn/completed') firstTurnDone = true
+    }
+
+    proc.stdin.write(json({ id: 3, method: 'thread/compact/start', params: { threadId } }))
+    await reader.nextResponse(3)
+
+    let agentText = ''
+    let sawCompacted = false
+    let sawTurnCompleted = false
+    for (let i = 0; i < 300 && !(sawCompacted && sawTurnCompleted); i += 1) {
+      const message = await reader.next()
+      if (message.method === 'item/agentMessage/delta') agentText += String(message.params.delta ?? '')
+      if (message.method === 'thread/compacted') sawCompacted = true
+      if (message.method === 'turn/completed') sawTurnCompleted = true
+    }
+    assert.match(agentText, /MOCK_COMPACT_SUMMARY/, 'compact turn should stream the runtime-produced summary, not the local template')
+    assert.doesNotMatch(agentText, /Context compacted for thread/, 'local fallback should not have fired when the runtime succeeded')
+    assert.equal(sawCompacted, true, 'thread/compacted notification should still fire after compaction')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
 test('localImage user input becomes a multimodal Claude prompt + an imageView ThreadItem', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   // Tiny 1x1 PNG to avoid pulling a real image binary.

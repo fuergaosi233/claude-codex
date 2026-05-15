@@ -132,6 +132,14 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    if (/summarizing a Codex \/ Claude Code conversation/i.test(context.prompt)) {
+      // Compaction turn — produce a fixed marker so tests can prove the
+      // summary came from the runtime rather than the local fallback text.
+      await handlers.onEvent({ type: 'text_delta', delta: 'MOCK_COMPACT_SUMMARY: thread compacted by Claude.' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'compact' })
+      return
+    }
+
     if (/image input check/i.test(context.prompt)) {
       const summary = context.imageInputs.map((img) => `${img.kind}:${img.mediaType}:${img.data.length}`).join(',')
       await handlers.onEvent({
