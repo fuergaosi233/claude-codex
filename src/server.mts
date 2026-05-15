@@ -1212,6 +1212,22 @@ export class CodexClaudeAppServer {
             this.recordTokenUsage(peer, thread.id, turn.id, event.usage)
             return
           }
+          if (event.type === 'hook') {
+            // Render the hook event as a Codex hookPrompt item alongside the
+            // (still-emitted) notice line, so the user sees structured hook
+            // activity in the timeline instead of just a one-liner warning.
+            const fragments: Array<{ kind: 'text' | 'note'; text: string }> = [
+              { kind: 'text', text: `Hook · ${event.hookName}` },
+            ]
+            if (event.status) fragments.push({ kind: 'note', text: `status: ${event.status}` })
+            if (event.decision) fragments.push({ kind: 'note', text: `decision: ${event.decision}` })
+            if (event.message) fragments.push({ kind: 'text', text: event.message })
+            const hookItem: ThreadItem = { type: 'hookPrompt', id: newId(), fragments }
+            this.store.appendItem(turn.id, hookItem)
+            this.notify(peer, { method: 'item/started', params: { threadId: thread.id, turnId: turn.id, item: hookItem, startedAtMs: nowMillis() } })
+            this.notify(peer, { method: 'item/completed', params: { threadId: thread.id, turnId: turn.id, item: hookItem, completedAtMs: nowMillis() } })
+            return
+          }
           if (event.type === 'metrics') {
             // Track metrics on the runRuntimeTurn closure rather than in the
             // SQLite turns row (which doesn't have these columns). They get

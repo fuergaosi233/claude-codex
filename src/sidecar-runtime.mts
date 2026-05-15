@@ -170,6 +170,15 @@ export class ClaudeSdkSidecarRuntime implements ClaudeRuntime {
           costUsd: numberOrNull(message.total_cost_usd),
         })
         break
+      case 'hook':
+        await pending.handlers.onEvent({
+          type: 'hook',
+          hookName: String(message.hook_name ?? 'hook'),
+          status: stringOrNull(message.status),
+          decision: stringOrNull(message.decision),
+          message: stringOrNull(message.message),
+        })
+        break
       case 'completed':
         await pending.handlers.onEvent({
           type: 'completed',
@@ -211,4 +220,8 @@ function asRecord(value: unknown): Record<string, unknown> {
 
 function numberOrNull(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+function stringOrNull(value: unknown): string | null {
+  return typeof value === 'string' && value.length > 0 ? value : null
 }

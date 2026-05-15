@@ -94,6 +94,13 @@ def trim_title(value: str) -> str:
     return value[:80].strip()
 
 
+def _str_or_none(value: Any) -> Any:
+    if value is None:
+        return None
+    s = str(value).strip()
+    return s if s else None
+
+
 def summarize_runtime_event(event_type: str, event: Any) -> tuple[str, str]:
     """Turn a Claude runtime side-event into a (level, message) pair.
 
@@ -546,6 +553,19 @@ class ClaudeSidecar:
                 "level": level,
                 "message": message,
             })
+            # Hook events also get a structured emission so the server can
+            # render them as a Codex hookPrompt ThreadItem instead of just a
+            # flattened notice line.
+            if event_type == "hook_event" and isinstance(event, dict):
+                emit({
+                    "type": "hook",
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
+                    "hook_name": str(event.get("hook_name") or event.get("name") or "hook"),
+                    "status": _str_or_none(event.get("status") or event.get("event")),
+                    "decision": _str_or_none(event.get("decision")),
+                    "message": _str_or_none(event.get("message") or event.get("reason")),
+                })
 
     def emit_content_block(self, thread_id: str, turn_id: str, block: Any) -> None:
         # Claude Agent SDK 0.2.x ships its content blocks as bare @dataclass

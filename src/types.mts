@@ -147,6 +147,14 @@ export type ThreadItem =
   // render an inline preview. Path is either a real file path (localImage)
   // or a URL (image with http(s)/data:).
   | { type: 'imageView'; id: string; path: string }
+  // Codex hookPrompt — surfaces Claude Code hook activity (PreToolUse,
+  // PostToolUse, UserPromptSubmit, etc.) as a first-class timeline item
+  // instead of flattening it into a single notice line.
+  | {
+      type: 'hookPrompt'
+      id: string
+      fragments: Array<{ kind: 'text' | 'note'; text: string }>
+    }
   | {
       type: 'mcpToolCall'
       id: string
@@ -247,6 +255,7 @@ export type RuntimeEvent =
   | { type: 'notice'; level: 'info' | 'warning' | 'error'; message: string }
   | { type: 'usage'; usage: Record<string, unknown> }
   | { type: 'metrics'; durationMs: number | null; apiDurationMs: number | null; numTurns: number | null; costUsd: number | null }
+  | { type: 'hook'; hookName: string; status: string | null; decision: string | null; message: string | null }
   | { type: 'completed'; claudeSessionId?: string | null; result?: string | null; success: boolean }
   | { type: 'error'; message: string }
 

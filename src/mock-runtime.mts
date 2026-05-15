@@ -132,6 +132,19 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    if (/hook check/i.test(context.prompt)) {
+      await handlers.onEvent({
+        type: 'hook',
+        hookName: 'PreToolUse',
+        status: 'started',
+        decision: 'allow',
+        message: 'Bash about to run echo hi',
+      })
+      await handlers.onEvent({ type: 'text_delta', delta: 'hook check done' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'hook check' })
+      return
+    }
+
     if (/summarizing a Codex \/ Claude Code conversation/i.test(context.prompt)) {
       // Compaction turn — produce a fixed marker so tests can prove the
       // summary came from the runtime rather than the local fallback text.

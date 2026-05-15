@@ -773,6 +773,38 @@ test('baseInstructions / developerInstructions / personality flow into the syste
   }
 })
 
+test('Claude hook events are rendered as Codex hookPrompt ThreadItems', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const start = await reader.nextResponse(1)
+    const threadId = start.result.thread.id
+
+    proc.stdin.write(json({ id: 2, method: 'turn/start', params: { threadId, input: [{ type: 'text', text: 'hook check', text_elements: [] }] } }))
+    await reader.nextResponse(2)
+
+    let hookItem: any = null
+    for (let i = 0; i < 200; i += 1) {
+      const message = await reader.next()
+      if (message.method === 'item/started' && message.params.item.type === 'hookPrompt') hookItem = message.params.item
+      if (message.method === 'turn/completed') break
+    }
+    assert.ok(hookItem, 'hook event should produce a hookPrompt ThreadItem')
+    const fragmentTexts = (hookItem.fragments as Array<{ text: string }>).map((f) => f.text)
+    assert.ok(fragmentTexts.some((t) => /Hook · PreToolUse/.test(t)), 'fragments should include the hook name')
+    assert.ok(fragmentTexts.some((t) => /status: started/.test(t)), 'fragments should include the status')
+    assert.ok(fragmentTexts.some((t) => /decision: allow/.test(t)), 'fragments should include the decision')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
 test('thread/compact/start drives Claude (summary model) instead of the local stringified summary', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
