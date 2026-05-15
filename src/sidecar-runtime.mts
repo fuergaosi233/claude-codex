@@ -45,6 +45,7 @@ export class ClaudeSdkSidecarRuntime implements ClaudeRuntime {
         sandbox_mode: context.sandboxMode,
         system_prompt_addendum: context.systemPromptAddendum,
         plan_mode: context.planMode,
+        image_inputs: context.imageInputs.map((img) => ({ kind: img.kind, media_type: img.mediaType, data: img.data })),
       })
     })
   }

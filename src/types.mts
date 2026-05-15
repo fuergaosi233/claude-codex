@@ -143,6 +143,10 @@ export type ThreadItem =
       changes: FileUpdateChange[]
       status: 'inProgress' | 'completed' | 'failed' | 'declined'
     }
+  // User-uploaded image surfaced in the thread transcript so Codex App can
+  // render an inline preview. Path is either a real file path (localImage)
+  // or a URL (image with http(s)/data:).
+  | { type: 'imageView'; id: string; path: string }
   | {
       type: 'mcpToolCall'
       id: string
@@ -217,6 +221,19 @@ export interface RuntimeTurnContext {
   // a plan but does not execute tools. Set when the App requests `planMode`
   // on turn/start (or when CLAUDE_CODEX_PERMISSION_MODE=plan globally).
   planMode: boolean
+  // Multimodal input attached to the turn. localImage gets read + base64
+  // encoded; image (URL) is passed through as-is. Sidecar reshapes the
+  // Claude SDK query into a multimodal user message when this is non-empty.
+  imageInputs: ImageInput[]
+}
+
+export interface ImageInput {
+  kind: 'base64' | 'url'
+  mediaType: string
+  // Base64-encoded bytes when kind=base64; the URL string when kind=url.
+  data: string
+  // Display path/URL preserved for the imageView ThreadItem rendering.
+  displayPath: string
 }
 
 export type RuntimeEvent =

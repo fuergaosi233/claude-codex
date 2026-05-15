@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { homedir, platform, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
-import { appendFileSync, mkdirSync, renameSync, statSync, unlinkSync } from 'node:fs'
+import { appendFileSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync } from 'node:fs'
+import type { ImageInput } from './types.mjs'
 
 export function nowSeconds(): number {
   return Math.floor(Date.now() / 1000)
@@ -130,6 +131,81 @@ export function textFromInput(input: unknown): string {
     })
     .filter(Boolean)
     .join('\n')
+}
+
+// Split UserInput[] into the text prompt + a list of image inputs ready to
+// hand to Claude SDK as multimodal content blocks. localImage paths are read
+// + base64 encoded (capped at 10 MiB to avoid OOM); image URLs pass through
+// (data: URLs decode inline). Anything we can't read falls back to the same
+// `[image]` text representation textFromInput uses, so the user still sees
+// an indication in the prompt.
+export interface ImageExtractResult {
+  textPrompt: string
+  images: ImageInput[]
+}
+
+export function extractImageInputs(input: unknown): ImageExtractResult {
+  if (!Array.isArray(input)) return { textPrompt: '', images: [] }
+  const texts: string[] = []
+  const images: ImageInput[] = []
+  for (const raw of input) {
+    if (!raw || typeof raw !== 'object') continue
+    const item = raw as { type?: string; text?: string; path?: string; name?: string; url?: string }
+    if (item.type === 'text' && typeof item.text === 'string') texts.push(item.text)
+    else if (item.type === 'mention') texts.push(`@${item.path ?? item.name ?? ''}`)
+    else if (item.type === 'skill') texts.push(`/${item.name ?? 'skill'}`)
+    else if (item.type === 'localImage' && typeof item.path === 'string') {
+      const img = readLocalImage(item.path)
+      if (img) images.push(img)
+      else texts.push(`[local image unavailable: ${item.path}]`)
+    } else if (item.type === 'image' && typeof item.url === 'string') {
+      const img = parseImageUrl(item.url)
+      if (img) images.push(img)
+      else texts.push('[image]')
+    }
+  }
+  return { textPrompt: texts.filter(Boolean).join('\n'), images }
+}
+
+function readLocalImage(path: string): ImageInput | null {
+  try {
+    const stat = statSync(path)
+    if (stat.size > 10 * 1024 * 1024) return null
+    const buf = readFileSync(path)
+    return { kind: 'base64', mediaType: sniffImageMediaType(path), data: buf.toString('base64'), displayPath: path }
+  } catch {
+    return null
+  }
+}
+
+function parseImageUrl(url: string): ImageInput | null {
+  if (url.startsWith('data:')) {
+    const match = url.match(/^data:([^;,]+)(?:;([^,]+))?,(.*)$/)
+    if (!match) return null
+    const mediaType = match[1] || 'application/octet-stream'
+    const isBase64 = (match[2] ?? '').includes('base64')
+    const payload = match[3] ?? ''
+    return {
+      kind: 'base64',
+      mediaType,
+      data: isBase64 ? payload : Buffer.from(decodeURIComponent(payload), 'utf8').toString('base64'),
+      displayPath: url.slice(0, 64) + (url.length > 64 ? '...' : ''),
+    }
+  }
+  if (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('file://')) {
+    return { kind: 'url', mediaType: 'image/*', data: url, displayPath: url }
+  }
+  return null
+}
+
+function sniffImageMediaType(path: string): string {
+  const lower = path.toLowerCase()
+  if (lower.endsWith('.png')) return 'image/png'
+  if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg'
+  if (lower.endsWith('.webp')) return 'image/webp'
+  if (lower.endsWith('.gif')) return 'image/gif'
+  if (lower.endsWith('.bmp')) return 'image/bmp'
+  return 'image/png'
 }
 
 export function jsonClone<T>(value: T): T {

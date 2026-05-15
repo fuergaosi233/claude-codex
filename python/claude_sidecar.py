@@ -371,7 +371,7 @@ class ClaudeSidecar:
 
         try:
             await client.connect()
-            await client.query(message.get("prompt") or "")
+            await self._send_query(client, message)
             async for sdk_message in client.receive_response():
                 last_session_id = self.emit_sdk_message(thread_id, turn_id, sdk_message, last_session_id)
             self.flush_structured_output(thread_id, turn_id)
@@ -421,6 +421,51 @@ class ClaudeSidecar:
                 await client.disconnect()
             except Exception:
                 pass
+
+    async def _send_query(self, client: Any, message: Dict[str, Any]) -> None:
+        """Wrap the user prompt as Claude SDK input.
+
+        When the turn has no image attachments we hand the SDK a plain string
+        (the SDK serializes it with role=user and a string content, matching
+        Claude Code's default path). When images are present we yield a single
+        AsyncIterable message with multimodal content blocks instead, so the
+        image bytes / URLs reach Claude alongside the text instead of being
+        textified to "[image]".
+        """
+        prompt = message.get("prompt") or ""
+        images = message.get("image_inputs") or []
+        if not isinstance(images, list) or not images:
+            await client.query(prompt)
+            return
+        blocks: list[Dict[str, Any]] = []
+        if prompt:
+            blocks.append({"type": "text", "text": prompt})
+        for img in images:
+            if not isinstance(img, dict):
+                continue
+            kind = img.get("kind", "base64")
+            media_type = img.get("media_type") or "image/png"
+            data = img.get("data", "")
+            if kind == "url":
+                blocks.append({"type": "image", "source": {"type": "url", "url": data}})
+            else:
+                blocks.append({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": media_type, "data": data},
+                })
+        if not blocks:
+            await client.query(prompt)
+            return
+
+        async def _stream():
+            yield {
+                "type": "user",
+                "message": {"role": "user", "content": blocks},
+                "parent_tool_use_id": None,
+                "session_id": "default",
+            }
+
+        await client.query(_stream())
 
     def emit_sdk_message(self, thread_id: str, turn_id: str, message: Any, last_session_id: Any) -> Any:
         name = class_name(message)

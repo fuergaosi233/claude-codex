@@ -773,6 +773,52 @@ test('baseInstructions / developerInstructions / personality flow into the syste
   }
 })
 
+test('localImage user input becomes a multimodal Claude prompt + an imageView ThreadItem', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  // Tiny 1x1 PNG to avoid pulling a real image binary.
+  const png1x1 = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=', 'base64')
+  const imgPath = join(home, 'pixel.png')
+  const fs = await import('node:fs/promises')
+  await fs.writeFile(imgPath, png1x1)
+
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const start = await reader.nextResponse(1)
+    const threadId = start.result.thread.id
+
+    proc.stdin.write(json({ id: 2, method: 'turn/start', params: {
+      threadId,
+      input: [
+        { type: 'text', text: 'image input check', text_elements: [] },
+        { type: 'localImage', path: imgPath },
+      ],
+    } }))
+    const turnStart = await reader.nextResponse(2)
+    const items = turnStart.result.turn.items as any[]
+    const imageView = items.find((i) => i.type === 'imageView')
+    assert.ok(imageView, 'turn should include an imageView ThreadItem for the user-uploaded image')
+    assert.equal(imageView.path, imgPath)
+
+    let text = ''
+    for (let i = 0; i < 200; i += 1) {
+      const message = await reader.next()
+      if (message.method === 'item/agentMessage/delta') text += message.params.delta
+      if (message.method === 'turn/completed') break
+    }
+    // Mock echoes the parsed image inputs; assert kind=base64 + media type +
+    // a non-trivial payload landed in the runtime context.
+    assert.match(text, /^images=base64:image\/png:\d+/, 'runtime should receive base64 image input — got: ' + text)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
 test('Claude WebSearch tool maps to native Codex webSearch ThreadItem with action', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {

@@ -132,6 +132,16 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    if (/image input check/i.test(context.prompt)) {
+      const summary = context.imageInputs.map((img) => `${img.kind}:${img.mediaType}:${img.data.length}`).join(',')
+      await handlers.onEvent({
+        type: 'text_delta',
+        delta: `images=${summary || 'none'}`,
+      })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'image input check' })
+      return
+    }
+
     if (/web search check/i.test(context.prompt)) {
       const toolUseId = `ws-${Date.now()}`
       await handlers.onEvent({

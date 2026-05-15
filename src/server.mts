@@ -4,6 +4,7 @@ import { promisify } from 'node:util'
 import type {
   ClaudeRuntime,
   FileUpdateChange,
+  ImageInput,
   JsonRpcId,
   JsonRpcRequest,
   JsonRpcResponse,
@@ -29,6 +30,7 @@ import {
   claudeModelOptions,
   codexHome,
   codexUserAgent,
+  extractImageInputs,
   newId,
   nowMillis,
   nowSeconds,
@@ -702,7 +704,13 @@ export class CodexClaudeAppServer {
 
     const turnId = newId()
     const input = Array.isArray(params.input) ? (params.input as UserInput[]) : []
-    const prompt = textFromInput(input)
+    // extractImageInputs splits user input into the text prompt and any image
+    // attachments (localImage / image URL / data:). Sidecar repacks the
+    // images into a Claude SDK multimodal user message; here we also append
+    // an `imageView` ThreadItem per image so the App's transcript shows them
+    // inline next to the user message instead of losing them.
+    const { textPrompt, images } = extractImageInputs(input)
+    const prompt = textPrompt || textFromInput(input)
     if (typeof params.cwd === 'string' && params.cwd.length > 0) thread.cwd = params.cwd
     if (typeof params.model === 'string' && params.model.length > 0) thread.model = params.model
     if (typeof params.effort === 'string') thread.reasoningEffort = normalizeCodexReasoningEffort(params.effort)
@@ -711,6 +719,10 @@ export class CodexClaudeAppServer {
       thread.preview = prompt.slice(0, 200)
       thread.updatedAt = nowSeconds()
       this.store.upsertThread(thread)
+    }
+    const initialItems: ThreadItem[] = [{ type: 'userMessage', id: newId(), content: input }]
+    for (const img of images) {
+      initialItems.push({ type: 'imageView', id: newId(), path: img.displayPath })
     }
     // Note: we used to short-circuit Codex App's title-generation turn with a
     // local regex-derived title to avoid prompt leakage into the parent thread.
@@ -725,7 +737,7 @@ export class CodexClaudeAppServer {
       startedAt: nowSeconds(),
       completedAt: null,
       durationMs: null,
-      items: [{ type: 'userMessage', id: newId(), content: input }],
+      items: initialItems,
       diff: '',
       error: null,
     }
@@ -736,7 +748,9 @@ export class CodexClaudeAppServer {
 
     setImmediate(() => {
       this.notify(peer, { method: 'turn/started', params: { threadId, turn: publicTurn } })
-      void this.runRuntimeTurn(peer, thread, turn, prompt, params).catch((error) => {
+      // Carry parsed images through the params bag so runRuntimeTurn can hand
+      // them to the runtime context without re-parsing user input.
+      void this.runRuntimeTurn(peer, thread, turn, prompt, { ...params, _imageInputs: images }).catch((error) => {
       const completed = this.store.completeTurn(turnId, 'failed', { message: error.message }) ?? turn
       this.notify(peer, { method: 'error', params: { threadId, turnId, willRetry: false, error: { message: error.message } } })
       this.notify(peer, { method: 'turn/completed', params: { threadId, turn: this.toTurn(completed) } })
@@ -842,6 +856,7 @@ export class CodexClaudeAppServer {
         sandboxMode,
         systemPromptAddendum,
         planMode: params.planMode === true,
+        imageInputs: Array.isArray(params._imageInputs) ? (params._imageInputs as ImageInput[]) : [],
       },
       {
         onEvent: async (event) => {
