@@ -59,6 +59,8 @@ export class SessionStore {
     this.ensureColumn('threads', 'reasoning_effort', 'TEXT')
     this.ensureColumn('threads', 'approval_policy', 'TEXT')
     this.ensureColumn('threads', 'sandbox_mode', 'TEXT')
+    this.ensureColumn('threads', 'ephemeral', 'INTEGER NOT NULL DEFAULT 0')
+    this.ensureColumn('threads', 'thread_source', 'TEXT')
   }
 
   private ensureColumn(table: string, column: string, definition: string): void {
@@ -73,8 +75,8 @@ export class SessionStore {
         INSERT INTO threads (
           id, session_id, forked_from_id, preview, name, archived, cwd, model, reasoning_effort,
           model_provider, claude_session_id, source, created_at, updated_at, status_json,
-          approval_policy, sandbox_mode
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          approval_policy, sandbox_mode, ephemeral, thread_source
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           session_id=excluded.session_id,
           forked_from_id=excluded.forked_from_id,
@@ -90,7 +92,9 @@ export class SessionStore {
           updated_at=excluded.updated_at,
           status_json=excluded.status_json,
           approval_policy=excluded.approval_policy,
-          sandbox_mode=excluded.sandbox_mode
+          sandbox_mode=excluded.sandbox_mode,
+          ephemeral=excluded.ephemeral,
+          thread_source=excluded.thread_source
       `)
       .run(
         thread.id,
@@ -110,6 +114,8 @@ export class SessionStore {
         JSON.stringify(thread.status),
         thread.approvalPolicy,
         thread.sandboxMode,
+        thread.ephemeral ? 1 : 0,
+        thread.threadSource,
       )
   }
 
@@ -118,22 +124,32 @@ export class SessionStore {
     return row ? this.rowToThread(row) : null
   }
 
-  listThreads(options: { archived?: boolean | null; limit?: number | null; cursor?: string | null; cwd?: string | string[] | null } = {}): ThreadRecord[] {
+  listThreads(options: {
+    archived?: boolean | null
+    limit?: number | null
+    cursor?: string | null
+    cwd?: string | string[] | null
+    includeEphemeral?: boolean
+  } = {}): ThreadRecord[] {
     const limit = Math.max(1, Math.min(Number(options.limit ?? 50), 200))
     const archived = options.archived === true ? 1 : 0
     const cursor = options.cursor ? Number(options.cursor) : Number.MAX_SAFE_INTEGER
+    // Ephemeral threads (Codex App's internal title generators, subagent
+    // children, memory-consolidation runs) shouldn't appear in the user's
+    // session list. Callers can opt back in for diagnostic flows.
+    const ephemeralFilter = options.includeEphemeral ? '' : ' AND ephemeral = 0'
     const cwdList = Array.isArray(options.cwd) ? options.cwd : options.cwd ? [options.cwd] : []
     if (cwdList.length > 0) {
       const placeholders = cwdList.map(() => '?').join(',')
       const rows = this.db
         .prepare(
-          `SELECT * FROM threads WHERE archived = ? AND updated_at < ? AND cwd IN (${placeholders}) ORDER BY updated_at DESC LIMIT ?`,
+          `SELECT * FROM threads WHERE archived = ? AND updated_at < ? AND cwd IN (${placeholders})${ephemeralFilter} ORDER BY updated_at DESC LIMIT ?`,
         )
         .all(archived, cursor, ...cwdList, limit)
       return rows.map((row: unknown) => this.rowToThread(row))
     }
     const rows = this.db
-      .prepare('SELECT * FROM threads WHERE archived = ? AND updated_at < ? ORDER BY updated_at DESC LIMIT ?')
+      .prepare(`SELECT * FROM threads WHERE archived = ? AND updated_at < ?${ephemeralFilter} ORDER BY updated_at DESC LIMIT ?`)
       .all(archived, cursor, limit)
     return rows.map((row: unknown) => this.rowToThread(row))
   }
@@ -254,6 +270,8 @@ export class SessionStore {
       status: JSON.parse(String(row.status_json)),
       approvalPolicy: row.approval_policy == null ? null : String(row.approval_policy),
       sandboxMode: row.sandbox_mode == null ? null : String(row.sandbox_mode),
+      ephemeral: Number(row.ephemeral ?? 0) === 1,
+      threadSource: row.thread_source == null ? null : String(row.thread_source),
     }
   }
 

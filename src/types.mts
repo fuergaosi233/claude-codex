@@ -58,12 +58,18 @@ export interface ThreadRecord {
   createdAt: number
   updatedAt: number
   status: ThreadStatus
-  // Codex App-supplied policy. `approvalPolicy` is one of unless-trusted /
+  // Codex App-supplied policy. `approvalPolicy` is one of untrusted /
   // on-failure / on-request / never; `sandboxMode` is read-only /
   // workspace-write / danger-full-access. These map onto Claude Agent SDK
   // permission_mode and the can_use_tool callback.
   approvalPolicy: string | null
   sandboxMode: string | null
+  // Codex App marks transient title-generation / consolidation threads as
+  // ephemeral — these should not appear in the user-facing thread list.
+  ephemeral: boolean
+  // 'user' | 'subagent' | 'memory_consolidation' (Codex `ThreadSource`).
+  // Subagent threads spawned by the Task tool also carry this.
+  threadSource: string | null
 }
 
 export type ThreadStatus =
@@ -130,6 +136,21 @@ export type ThreadItem =
       result: unknown | null
       error: unknown | null
       durationMs: number | null
+    }
+  // Native Codex subagent representation. The Task tool spawns a child thread;
+  // Codex App displays it as one Agent item that can drill into the child
+  // thread by id (`receiverThreadIds`).
+  | {
+      type: 'collabAgentToolCall'
+      id: string
+      tool: 'spawnAgent' | 'sendInput' | 'resumeAgent' | 'wait' | 'closeAgent'
+      status: 'inProgress' | 'completed' | 'failed'
+      senderThreadId: string
+      receiverThreadIds: string[]
+      prompt: string | null
+      model: string | null
+      reasoningEffort: string | null
+      agentsStates: Record<string, { status: 'pendingInit' | 'running' | 'interrupted' | 'completed' | 'errored' | 'shutdown' | 'notFound'; message: string | null }>
     }
 
 export interface FileUpdateChange {

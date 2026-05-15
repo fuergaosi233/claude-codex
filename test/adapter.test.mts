@@ -759,7 +759,7 @@ test('Codex App approvalPolicy=never + sandbox=danger-full-access auto-accepts t
   }
 })
 
-test('Task subagent inner events are hidden; only the Agent item completes with the final result', async () => {
+test('Task subagent emits a collabAgentToolCall + ephemeral child thread; inner events are hidden', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -774,26 +774,73 @@ test('Task subagent inner events are hidden; only the Agent item completes with 
     proc.stdin.write(json({ id: 2, method: 'turn/start', params: { threadId, input: [{ type: 'text', text: 'subagent check', text_elements: [] }] } }))
     await reader.nextResponse(2)
 
-    let taskItemId: string | null = null
-    let taskCompleted = false
+    let collabItem: any = null
+    let collabCompleted: any = null
     let agentMessageText = ''
     let leakedInnerItems = 0
     for (let i = 0; i < 200; i += 1) {
       const message = await reader.next()
       if (message.method === 'item/started') {
         const item = message.params.item
-        if (item.type === 'mcpToolCall' && item.tool === 'Task') taskItemId = item.id
+        if (item.type === 'collabAgentToolCall') collabItem = item
         else if (item.type === 'commandExecution' || (item.type === 'mcpToolCall' && item.tool !== 'Task')) leakedInnerItems += 1
       }
-      if (message.method === 'item/completed' && message.params.item.id === taskItemId) taskCompleted = true
+      if (message.method === 'item/completed' && collabItem && message.params.item.id === collabItem.id) collabCompleted = message.params.item
       if (message.method === 'item/agentMessage/delta') agentMessageText += String(message.params.delta ?? '')
       if (message.method === 'turn/completed') break
     }
-    assert.ok(taskItemId, 'Task tool should appear as a single mcpToolCall item')
-    assert.equal(taskCompleted, true, 'Task item should complete on its matching tool_result')
-    assert.equal(leakedInnerItems, 0, 'inner Bash tool calls should be suppressed while subagent runs')
+    assert.ok(collabItem, 'Task should be rendered as a collabAgentToolCall (Codex native subagent)')
+    assert.equal(collabItem.tool, 'spawnAgent')
+    assert.equal(collabItem.senderThreadId, threadId)
+    assert.equal(collabItem.receiverThreadIds.length, 1, 'collabAgentToolCall should reference one ephemeral child thread')
+    const childThreadId = collabItem.receiverThreadIds[0]
+    assert.ok(collabCompleted, 'collabAgentToolCall should complete on the Task tool_result')
+    assert.equal(collabCompleted.status, 'completed')
+    assert.equal(collabCompleted.agentsStates[childThreadId].status, 'completed')
+    assert.equal(leakedInnerItems, 0, 'inner Bash tool calls should not appear at the parent level')
     assert.doesNotMatch(agentMessageText, /subagent thinking aloud/, 'subagent text should not bleed into the main agent message')
     assert.match(agentMessageText, /main agent summary/, 'main agent text after subagent should still appear')
+
+    // The ephemeral child thread exists but is hidden from the default list.
+    proc.stdin.write(json({ id: 3, method: 'thread/list', params: {} }))
+    const list = await reader.nextResponse(3)
+    const ids = (list.result.data as any[]).map((t) => t.id)
+    assert.ok(!ids.includes(childThreadId), 'subagent child thread should be ephemeral and excluded from thread/list')
+    assert.ok(ids.includes(threadId), 'parent user thread should remain visible')
+
+    proc.stdin.write(json({ id: 4, method: 'thread/list', params: { includeEphemeral: true } }))
+    const listAll = await reader.nextResponse(4)
+    const allIds = (listAll.result.data as any[]).map((t) => t.id)
+    assert.ok(allIds.includes(childThreadId), 'includeEphemeral=true should surface the subagent child thread')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('thread/start with ephemeral=true is hidden from thread/list and surfaces threadSource', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), ephemeral: true, threadSource: 'memory_consolidation', model: 'gpt-5.4-mini' } }))
+    const ephemeralStart = await reader.nextResponse(1)
+    const ephemeralId = ephemeralStart.result.thread.id
+    assert.equal(ephemeralStart.result.thread.ephemeral, true, 'envelope should reflect ephemeral=true')
+    assert.equal(ephemeralStart.result.thread.threadSource, 'memory_consolidation')
+
+    proc.stdin.write(json({ id: 2, method: 'thread/start', params: { cwd: process.cwd(), threadSource: 'user' } }))
+    const userStart = await reader.nextResponse(2)
+    const userId = userStart.result.thread.id
+
+    proc.stdin.write(json({ id: 3, method: 'thread/list', params: {} }))
+    const list = await reader.nextResponse(3)
+    const ids = (list.result.data as any[]).map((t) => t.id)
+    assert.ok(ids.includes(userId), 'normal user thread should appear')
+    assert.ok(!ids.includes(ephemeralId), 'ephemeral title/summary thread should be filtered out')
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true })

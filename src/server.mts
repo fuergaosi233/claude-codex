@@ -365,6 +365,8 @@ export class CodexClaudeAppServer {
       status: { type: 'idle' },
       approvalPolicy: normalizeApprovalPolicy(params.approvalPolicy),
       sandboxMode: normalizeSandboxMode(params.sandbox),
+      ephemeral: params.ephemeral === true,
+      threadSource: typeof params.threadSource === 'string' ? params.threadSource : null,
     }
     this.store.upsertThread(thread)
     this.activePeerByThread.set(id, peer)
@@ -381,6 +383,7 @@ export class CodexClaudeAppServer {
     if (typeof params.effort === 'string') thread.reasoningEffort = normalizeCodexReasoningEffort(params.effort)
     if (typeof params.approvalPolicy === 'string') thread.approvalPolicy = normalizeApprovalPolicy(params.approvalPolicy)
     if (typeof params.sandbox === 'string') thread.sandboxMode = normalizeSandboxMode(params.sandbox)
+    if (typeof params.threadSource === 'string') thread.threadSource = params.threadSource
     this.store.upsertThread(thread)
     return this.threadEnvelope(thread, params.excludeTurns === true ? [] : this.store.listTurns(thread.id))
   }
@@ -412,6 +415,8 @@ export class CodexClaudeAppServer {
       sandboxMode: typeof params.sandbox === 'string'
         ? normalizeSandboxMode(params.sandbox)
         : parent.sandboxMode,
+      ephemeral: parent.ephemeral,
+      threadSource: typeof params.threadSource === 'string' ? params.threadSource : parent.threadSource,
     }
     this.store.upsertThread(thread)
     this.activePeerByThread.set(id, peer)
@@ -425,6 +430,7 @@ export class CodexClaudeAppServer {
       limit: numberOr(params.limit, 50),
       cursor: typeof params.cursor === 'string' ? params.cursor : null,
       cwd: typeof params.cwd === 'string' || Array.isArray(params.cwd) ? (params.cwd as string | string[]) : null,
+      includeEphemeral: params.includeEphemeral === true,
     })
     const last = threads.at(-1)
     return {
@@ -742,10 +748,14 @@ export class CodexClaudeAppServer {
     let agentItemId: string | null = null
     let reasoningItemId: string | null = null
     const commandOutputSeen = new Set<string>()
-    // Mirror the sidecar's subagent suppression in case events arrive from a
-    // runtime that does not filter (mock-runtime, future SDK paths). While a
-    // Task tool_use is open we hide nested text/tool events from the Codex App
-    // so the user sees one Agent item complete with a final result.
+    // Codex's native subagent rendering is `collabAgentToolCall`, which points
+    // at a real child thread by id. When Claude's Task tool fires we spawn
+    // that ephemeral child thread, emit one collabAgentToolCall item in the
+    // parent, and (still) hide the subagent's inner events from the parent.
+    // The matching tool_result closes the item and writes the subagent's
+    // final result as a single agentMessage on the child thread so the user
+    // can drill in from the Agent item without seeing the leaked sub-actions.
+    const subagentContexts = new Map<string, { childThreadId: string; parentItemId: string; prompt: string }>()
     const activeSubagents = new Set<string>()
     const forkSession = thread.forkedFromId != null && thread.claudeSessionId != null && this.store.listTurns(thread.id).length <= 1
     const ensureAgentItem = (): string => {
@@ -767,12 +777,13 @@ export class CodexClaudeAppServer {
 
     // Allow per-turn override of policy (Codex App may attach updated values
     // when the user toggles Full access mid-conversation), then fall back to
-    // the thread-level setting captured at start/resume.
+    // the thread-level setting captured at start/resume. turn/start ships a
+    // sandboxPolicy struct (e.g. {type:"dangerFullAccess"}); thread/start uses
+    // the simpler sandbox string. Both are honoured.
     const approvalPolicy =
       (typeof params.approvalPolicy === 'string' ? normalizeApprovalPolicy(params.approvalPolicy) : null) ??
       thread.approvalPolicy
-    const sandboxMode =
-      (typeof params.sandbox === 'string' ? normalizeSandboxMode(params.sandbox) : null) ?? thread.sandboxMode
+    const sandboxMode = sandboxFromTurnParams(params) ?? thread.sandboxMode
 
     await this.runtime.runTurn(
       {
@@ -807,10 +818,102 @@ export class CodexClaudeAppServer {
             if (event.type === 'tool_result' && !activeSubagents.has(event.toolUseId) && !itemIds.has(event.toolUseId)) return
           }
           if (event.type === 'tool_use' && event.toolName === 'Task') {
+            // Spawn the ephemeral subagent thread and emit Codex's native
+            // collabAgentToolCall item; hide inner events afterwards.
+            const promptText = String(event.input.prompt ?? event.input.description ?? '')
+            const subType = typeof event.input.subagent_type === 'string' ? event.input.subagent_type : null
+            const childThreadId = newId()
+            const childThread: ThreadRecord = {
+              id: childThreadId,
+              sessionId: thread.sessionId,
+              forkedFromId: thread.id,
+              preview: promptText.slice(0, 200),
+              name: subType ? `Subagent · ${subType}` : 'Subagent',
+              archived: false,
+              cwd: thread.cwd,
+              model: thread.model,
+              reasoningEffort: thread.reasoningEffort,
+              modelProvider: thread.modelProvider,
+              claudeSessionId: null,
+              source: thread.source,
+              createdAt: nowSeconds(),
+              updatedAt: nowSeconds(),
+              status: { type: 'active', activeFlags: [] },
+              approvalPolicy: thread.approvalPolicy,
+              sandboxMode: thread.sandboxMode,
+              ephemeral: true,
+              threadSource: 'subagent',
+            }
+            this.store.upsertThread(childThread)
+
+            const collabItem: ThreadItem = {
+              type: 'collabAgentToolCall',
+              id: newId(),
+              tool: 'spawnAgent',
+              status: 'inProgress',
+              senderThreadId: thread.id,
+              receiverThreadIds: [childThreadId],
+              prompt: promptText || null,
+              model: subType ?? thread.model,
+              reasoningEffort: thread.reasoningEffort,
+              agentsStates: { [childThreadId]: { status: 'running', message: null } },
+            }
+            this.store.appendItem(turn.id, collabItem)
+            itemIds.set(event.toolUseId, collabItem.id)
+            subagentContexts.set(event.toolUseId, { childThreadId, parentItemId: collabItem.id, prompt: promptText })
             activeSubagents.add(event.toolUseId)
+            this.notify(peer, { method: 'item/started', params: { threadId: thread.id, turnId: turn.id, item: collabItem, startedAtMs: nowMillis() } })
+            return
           }
           if (event.type === 'tool_result' && activeSubagents.has(event.toolUseId)) {
+            const ctx = subagentContexts.get(event.toolUseId)
+            const itemId = itemIds.get(event.toolUseId)
             activeSubagents.delete(event.toolUseId)
+            subagentContexts.delete(event.toolUseId)
+            if (!ctx || !itemId) return
+            const resultText = toolResultText(event.content)
+            // Materialize a one-turn transcript on the child thread so the
+            // Codex App can drill in from the parent collabAgentToolCall.
+            const childTurn: TurnRecord = {
+              id: newId(),
+              threadId: ctx.childThreadId,
+              status: event.isError ? 'failed' : 'completed',
+              startedAt: nowSeconds(),
+              completedAt: nowSeconds(),
+              durationMs: 0,
+              items: [
+                { type: 'userMessage', id: newId(), content: [{ type: 'text', text: ctx.prompt, text_elements: [] }] },
+                { type: 'agentMessage', id: newId(), text: resultText, phase: null, memoryCitation: null },
+              ],
+              diff: '',
+              error: event.isError ? { message: 'subagent failed' } : null,
+            }
+            this.store.upsertTurn(childTurn)
+            const childThread = this.store.getThread(ctx.childThreadId)
+            if (childThread) {
+              childThread.status = { type: 'idle' }
+              childThread.updatedAt = nowSeconds()
+              this.store.upsertThread(childThread)
+            }
+            const newStatus: 'completed' | 'failed' = event.isError ? 'failed' : 'completed'
+            this.store.updateItem(turn.id, itemId, (item) => {
+              if (item.type === 'collabAgentToolCall') {
+                return {
+                  ...item,
+                  status: newStatus,
+                  agentsStates: {
+                    [ctx.childThreadId]: { status: event.isError ? 'errored' : 'completed', message: null },
+                  },
+                }
+              }
+              return item
+            })
+            const updated = this.store.getTurn(turn.id)
+            const completedItem = updated?.items.find((c) => c.id === itemId)
+            if (completedItem) {
+              this.notify(peer, { method: 'item/completed', params: { threadId: thread.id, turnId: turn.id, item: completedItem, completedAtMs: nowMillis() } })
+            }
+            return
           }
           if (event.type === 'text_delta') {
             const itemId = ensureAgentItem()
@@ -1631,7 +1734,7 @@ export class CodexClaudeAppServer {
       sessionId: thread.sessionId,
       forkedFromId: thread.forkedFromId,
       preview: thread.preview,
-      ephemeral: false,
+      ephemeral: thread.ephemeral,
       modelProvider: thread.modelProvider,
       createdAt: thread.createdAt,
       updatedAt: thread.updatedAt,
@@ -1640,7 +1743,7 @@ export class CodexClaudeAppServer {
       cwd: thread.cwd,
       cliVersion: codexCliVersion(),
       source: thread.source,
-      threadSource: null,
+      threadSource: thread.threadSource,
       agentNickname: null,
       agentRole: null,
       gitInfo: null,
@@ -1874,13 +1977,32 @@ function fallbackStructuredText(outputSchema: unknown, prompt: string): string {
 function normalizeApprovalPolicy(value: unknown): string | null {
   if (typeof value !== 'string') return null
   const v = value.trim()
-  return v === 'unless-trusted' || v === 'on-failure' || v === 'on-request' || v === 'never' ? v : null
+  // Codex AskForApproval enum: untrusted | on-failure | on-request | never.
+  // (We previously had "unless-trusted" which never appeared in the wire enum.)
+  if (v === 'untrusted' || v === 'on-failure' || v === 'on-request' || v === 'never') return v
+  // Some early App builds shipped the longer form; normalize forward.
+  if (v === 'unless-trusted') return 'untrusted'
+  return null
 }
 
 function normalizeSandboxMode(value: unknown): string | null {
   if (typeof value !== 'string') return null
   const v = value.trim()
   return v === 'read-only' || v === 'workspace-write' || v === 'danger-full-access' ? v : null
+}
+
+// turn/start uses `sandboxPolicy: SandboxPolicy` (a struct) instead of the
+// thread/start `sandbox: SandboxMode` string. Translate the struct's `type`
+// back to the internal canonical mode string the sidecar understands.
+function sandboxFromTurnParams(params: Record<string, unknown>): string | null {
+  if (typeof params.sandbox === 'string') return normalizeSandboxMode(params.sandbox)
+  const policy = params.sandboxPolicy
+  if (!policy || typeof policy !== 'object' || Array.isArray(policy)) return null
+  const type = (policy as Record<string, unknown>).type
+  if (type === 'dangerFullAccess') return 'danger-full-access'
+  if (type === 'readOnly') return 'read-only'
+  if (type === 'workspaceWrite' || type === 'externalSandbox') return 'workspace-write'
+  return null
 }
 
 // Codex App's thread envelope expects a sandbox object whose `type` matches the
