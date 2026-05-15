@@ -153,6 +153,29 @@ class PendingPermission:
     future: asyncio.Future
 
 
+READ_ONLY_TOOLS = ["Read", "Glob", "Grep", "WebSearch", "WebFetch", "TodoWrite", "Task"]
+
+
+def derive_permission_mode(approval_policy: Any, sandbox_mode: Any) -> str:
+    """Map Codex (approvalPolicy, sandbox) tier onto Claude SDK permission_mode.
+
+    Honour CLAUDE_CODEX_PERMISSION_MODE as a hard override so operators can
+    pin the runtime regardless of what the App requests.
+    """
+    override = os.environ.get("CLAUDE_CODEX_PERMISSION_MODE", "").strip()
+    if override in ("default", "acceptEdits", "bypassPermissions", "plan"):
+        return override
+    ap = (approval_policy or "").strip() if isinstance(approval_policy, str) else ""
+    sb = (sandbox_mode or "").strip() if isinstance(sandbox_mode, str) else ""
+    if ap == "never":
+        return "bypassPermissions"
+    if ap == "on-failure":
+        return "acceptEdits"
+    if sb == "danger-full-access":
+        return "bypassPermissions"
+    return "default"
+
+
 class ClaudeSidecar:
     def __init__(self) -> None:
         self.permission_futures: Dict[str, PendingPermission] = {}
@@ -160,6 +183,11 @@ class ClaudeSidecar:
         self.structured_outputs_emitted: set[str] = set()
         self.structured_output_schemas: Dict[str, Any] = {}
         self.structured_text_buffers: Dict[str, list[str]] = {}
+        # Tool-use ids of active Task (subagent) calls per thread. While a Task
+        # is in flight we hide its inner text/tool_use/tool_result events so
+        # Codex App renders one Agent item instead of a wall of leaked sub-tool
+        # calls. Cleared in the query() finally clause for safety.
+        self.active_subagent_ids: Dict[str, set] = {}
         self.queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
 
     async def run(self) -> None:
@@ -233,6 +261,8 @@ class ClaudeSidecar:
                 return {"behavior": "allow" if decision in ("accept", "acceptForSession") else "deny"}
 
         self.structured_outputs_emitted.discard(f"{thread_id}:{turn_id}")
+        # Reset any leaked subagent state from a previous turn on this thread.
+        self.active_subagent_ids.pop(thread_id, None)
         output_format = message.get("output_format")
         if isinstance(output_format, dict) and output_format.get("type") == "json_schema":
             self.structured_output_schemas[f"{thread_id}:{turn_id}"] = output_format.get("schema")
@@ -240,14 +270,29 @@ class ClaudeSidecar:
         else:
             self.structured_output_schemas.pop(f"{thread_id}:{turn_id}", None)
             self.structured_text_buffers.pop(f"{thread_id}:{turn_id}", None)
+
+        permission_mode = derive_permission_mode(
+            message.get("approval_policy"), message.get("sandbox_mode")
+        )
         kwargs: Dict[str, Any] = {
             "cwd": message.get("cwd") or os.getcwd(),
             "include_partial_messages": True,
-            "permission_mode": "default",
+            "permission_mode": permission_mode,
             "setting_sources": ["user", "project", "local"],
-            "can_use_tool": can_use_tool,
         }
-        if message.get("allowed_tools"):
+        # Only attach the can_use_tool callback when we actually want per-tool
+        # approval. In bypass mode the SDK should run tools immediately and not
+        # ping us for every Bash/Edit/Write — that round-trip is the whole
+        # reason "Full access" used to keep showing "Awaiting approval".
+        if permission_mode != "bypassPermissions":
+            kwargs["can_use_tool"] = can_use_tool
+
+        # When the App pinned read-only sandbox we must not let Claude use
+        # write/exec tools, even if the caller's allowed_tools list said so.
+        sandbox_mode = message.get("sandbox_mode")
+        if isinstance(sandbox_mode, str) and sandbox_mode == "read-only":
+            kwargs["allowed_tools"] = list(READ_ONLY_TOOLS)
+        elif message.get("allowed_tools"):
             kwargs["allowed_tools"] = message["allowed_tools"]
         if message.get("model"):
             kwargs["model"] = message["model"]
@@ -351,6 +396,7 @@ class ClaudeSidecar:
         finally:
             self.structured_output_schemas.pop(f"{thread_id}:{turn_id}", None)
             self.structured_text_buffers.pop(f"{thread_id}:{turn_id}", None)
+            self.active_subagent_ids.pop(thread_id, None)
             self.active_clients.pop(thread_id, None)
             try:
                 await client.disconnect()
@@ -388,7 +434,14 @@ class ClaudeSidecar:
 
     def emit_stream_event(self, thread_id: str, turn_id: str, event: Any) -> None:
         event_type = obj_get(event, "type", "")
+        in_subagent = bool(self.active_subagent_ids.get(thread_id))
         if event_type == "content_block_delta":
+            # While a Task subagent is in flight, all streaming text/thinking
+            # belongs to the subagent; we hide it so Codex App keeps showing one
+            # collapsed Agent item instead of bleeding partial sub-text into
+            # the main thread.
+            if in_subagent:
+                return
             delta = obj_get(event, "delta", {})
             delta_type = obj_get(delta, "type", "")
             if delta_type == "text_delta":
@@ -415,7 +468,13 @@ class ClaudeSidecar:
 
     def emit_content_block(self, thread_id: str, turn_id: str, block: Any) -> None:
         block_type = obj_get(block, "type", "")
+        active = self.active_subagent_ids.setdefault(thread_id, set())
+
         if block_type == "text" or class_name(block) == "TextBlock" or obj_get(block, "text", None) is not None:
+            # Inside a Task subagent the assistant text belongs to the sub-run;
+            # hide it from the main thread so Codex shows a single Agent item.
+            if active:
+                return
             text = obj_get(block, "text", "")
             key = f"{thread_id}:{turn_id}"
             if key in self.structured_output_schemas and key not in self.structured_outputs_emitted:
@@ -423,29 +482,51 @@ class ClaudeSidecar:
                 return
             emit({"type": "text_delta", "thread_id": thread_id, "turn_id": turn_id, "delta": text})
         elif block_type == "thinking":
+            if active:
+                return
             thinking = obj_get(block, "thinking", "")
             if thinking:
                 emit({"type": "reasoning_delta", "thread_id": thread_id, "turn_id": turn_id, "delta": thinking})
         elif block_type == "tool_use" or class_name(block) == "ToolUseBlock":
             tool_name = obj_get(block, "name", "")
             tool_input = obj_get(block, "input", {}) or {}
+            block_id = str(obj_get(block, "id", ""))
             if tool_name == "StructuredOutput":
                 self.emit_structured_output(thread_id, turn_id, tool_input)
+                return
+            if tool_name == "Task":
+                # Open the subagent context. Codex App still sees this Task as
+                # a single mcpToolCall item; the sub-events between here and
+                # the matching tool_result are intentionally suppressed.
+                if block_id:
+                    active.add(block_id)
+            elif active:
+                # Nested tool_use issued by the running Task subagent — drop it
+                # so it does not leak into the main thread as a parallel item.
                 return
             emit({
                 "type": "tool_use",
                 "thread_id": thread_id,
                 "turn_id": turn_id,
-                "tool_use_id": obj_get(block, "id", ""),
+                "tool_use_id": block_id,
                 "tool_name": tool_name,
                 "input": tool_input,
             })
         elif block_type == "tool_result":
+            tool_use_id = str(obj_get(block, "tool_use_id", ""))
+            if tool_use_id and tool_use_id in active:
+                # The Task subagent finished — close the context and let Codex
+                # render the final result on the original Agent item.
+                active.discard(tool_use_id)
+            elif active:
+                # Some other tool_result that was issued inside the subagent.
+                # Hide it; Codex would otherwise complete a non-existent item.
+                return
             emit({
                 "type": "tool_result",
                 "thread_id": thread_id,
                 "turn_id": turn_id,
-                "tool_use_id": obj_get(block, "tool_use_id", ""),
+                "tool_use_id": tool_use_id,
                 "content": obj_get(block, "content", ""),
                 "is_error": bool(obj_get(block, "is_error", False)),
             })

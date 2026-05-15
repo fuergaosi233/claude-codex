@@ -725,6 +725,81 @@ test('Claude token usage maps to thread/tokenUsage/updated notifications', async
   }
 })
 
+test('Codex App approvalPolicy=never + sandbox=danger-full-access auto-accepts tool calls', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), approvalPolicy: 'never', sandbox: 'danger-full-access', experimentalRawEvents: false, persistExtendedHistory: false } }))
+    const start = await reader.nextResponse(1)
+    const threadId = start.result.thread.id
+    // Envelope reflects the App's chosen policy/sandbox instead of the previous hardcoded `on-request` + workspaceWrite.
+    assert.equal(start.result.approvalPolicy, 'never')
+    assert.equal((start.result.sandbox as any).type, 'dangerFullAccess')
+
+    proc.stdin.write(json({ id: 2, method: 'turn/start', params: { threadId, input: [{ type: 'text', text: 'please run approval bash', text_elements: [] }] } }))
+    await reader.nextResponse(2)
+
+    let sawApprovalRequest = false
+    let sawCommandOutput = false
+    for (let i = 0; i < 200; i += 1) {
+      const message = await reader.next()
+      if (message.method === 'item/commandExecution/requestApproval') sawApprovalRequest = true
+      if (message.method === 'item/commandExecution/outputDelta' && /mock approval/.test(message.params.delta)) sawCommandOutput = true
+      if (message.method === 'turn/completed') break
+    }
+    assert.equal(sawApprovalRequest, false, 'expected no requestApproval round-trip when approvalPolicy=never')
+    assert.equal(sawCommandOutput, true, 'tool should still execute and stream output')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('Task subagent inner events are hidden; only the Agent item completes with the final result', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false } }))
+    const start = await reader.nextResponse(1)
+    const threadId = start.result.thread.id
+
+    proc.stdin.write(json({ id: 2, method: 'turn/start', params: { threadId, input: [{ type: 'text', text: 'subagent check', text_elements: [] }] } }))
+    await reader.nextResponse(2)
+
+    let taskItemId: string | null = null
+    let taskCompleted = false
+    let agentMessageText = ''
+    let leakedInnerItems = 0
+    for (let i = 0; i < 200; i += 1) {
+      const message = await reader.next()
+      if (message.method === 'item/started') {
+        const item = message.params.item
+        if (item.type === 'mcpToolCall' && item.tool === 'Task') taskItemId = item.id
+        else if (item.type === 'commandExecution' || (item.type === 'mcpToolCall' && item.tool !== 'Task')) leakedInnerItems += 1
+      }
+      if (message.method === 'item/completed' && message.params.item.id === taskItemId) taskCompleted = true
+      if (message.method === 'item/agentMessage/delta') agentMessageText += String(message.params.delta ?? '')
+      if (message.method === 'turn/completed') break
+    }
+    assert.ok(taskItemId, 'Task tool should appear as a single mcpToolCall item')
+    assert.equal(taskCompleted, true, 'Task item should complete on its matching tool_result')
+    assert.equal(leakedInnerItems, 0, 'inner Bash tool calls should be suppressed while subagent runs')
+    assert.doesNotMatch(agentMessageText, /subagent thinking aloud/, 'subagent text should not bleed into the main agent message')
+    assert.match(agentMessageText, /main agent summary/, 'main agent text after subagent should still appear')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
 test('defaultSocketPath stays within the platform sun_path limit', async () => {
   const util = await import(resolve('dist/src/util.mjs'))
   const prev = process.env.CODEX_HOME

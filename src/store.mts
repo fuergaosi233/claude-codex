@@ -57,6 +57,8 @@ export class SessionStore {
       CREATE INDEX IF NOT EXISTS idx_turns_thread ON turns(thread_id, started_at);
     `)
     this.ensureColumn('threads', 'reasoning_effort', 'TEXT')
+    this.ensureColumn('threads', 'approval_policy', 'TEXT')
+    this.ensureColumn('threads', 'sandbox_mode', 'TEXT')
   }
 
   private ensureColumn(table: string, column: string, definition: string): void {
@@ -70,8 +72,9 @@ export class SessionStore {
       .prepare(`
         INSERT INTO threads (
           id, session_id, forked_from_id, preview, name, archived, cwd, model, reasoning_effort,
-          model_provider, claude_session_id, source, created_at, updated_at, status_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          model_provider, claude_session_id, source, created_at, updated_at, status_json,
+          approval_policy, sandbox_mode
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           session_id=excluded.session_id,
           forked_from_id=excluded.forked_from_id,
@@ -85,7 +88,9 @@ export class SessionStore {
           claude_session_id=excluded.claude_session_id,
           source=excluded.source,
           updated_at=excluded.updated_at,
-          status_json=excluded.status_json
+          status_json=excluded.status_json,
+          approval_policy=excluded.approval_policy,
+          sandbox_mode=excluded.sandbox_mode
       `)
       .run(
         thread.id,
@@ -103,6 +108,8 @@ export class SessionStore {
         thread.createdAt,
         thread.updatedAt,
         JSON.stringify(thread.status),
+        thread.approvalPolicy,
+        thread.sandboxMode,
       )
   }
 
@@ -245,6 +252,8 @@ export class SessionStore {
       createdAt: Number(row.created_at),
       updatedAt: Number(row.updated_at),
       status: JSON.parse(String(row.status_json)),
+      approvalPolicy: row.approval_policy == null ? null : String(row.approval_policy),
+      sandboxMode: row.sandbox_mode == null ? null : String(row.sandbox_mode),
     }
   }
 

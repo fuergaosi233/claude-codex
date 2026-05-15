@@ -41,6 +41,8 @@ export class ClaudeSdkSidecarRuntime implements ClaudeRuntime {
         add_dirs: context.addDirs,
         enable_file_checkpointing: context.enableFileCheckpointing,
         output_format: context.outputFormat,
+        approval_policy: context.approvalPolicy,
+        sandbox_mode: context.sandboxMode,
       })
     })
   }

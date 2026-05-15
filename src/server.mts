@@ -363,6 +363,8 @@ export class CodexClaudeAppServer {
       createdAt: now,
       updatedAt: now,
       status: { type: 'idle' },
+      approvalPolicy: normalizeApprovalPolicy(params.approvalPolicy),
+      sandboxMode: normalizeSandboxMode(params.sandbox),
     }
     this.store.upsertThread(thread)
     this.activePeerByThread.set(id, peer)
@@ -377,6 +379,8 @@ export class CodexClaudeAppServer {
     if (typeof params.cwd === 'string' && params.cwd.length > 0) thread.cwd = params.cwd
     if (typeof params.model === 'string' && params.model.length > 0) thread.model = params.model
     if (typeof params.effort === 'string') thread.reasoningEffort = normalizeCodexReasoningEffort(params.effort)
+    if (typeof params.approvalPolicy === 'string') thread.approvalPolicy = normalizeApprovalPolicy(params.approvalPolicy)
+    if (typeof params.sandbox === 'string') thread.sandboxMode = normalizeSandboxMode(params.sandbox)
     this.store.upsertThread(thread)
     return this.threadEnvelope(thread, params.excludeTurns === true ? [] : this.store.listTurns(thread.id))
   }
@@ -402,6 +406,12 @@ export class CodexClaudeAppServer {
       createdAt: now,
       updatedAt: now,
       status: { type: 'idle' },
+      approvalPolicy: typeof params.approvalPolicy === 'string'
+        ? normalizeApprovalPolicy(params.approvalPolicy)
+        : parent.approvalPolicy,
+      sandboxMode: typeof params.sandbox === 'string'
+        ? normalizeSandboxMode(params.sandbox)
+        : parent.sandboxMode,
     }
     this.store.upsertThread(thread)
     this.activePeerByThread.set(id, peer)
@@ -732,6 +742,11 @@ export class CodexClaudeAppServer {
     let agentItemId: string | null = null
     let reasoningItemId: string | null = null
     const commandOutputSeen = new Set<string>()
+    // Mirror the sidecar's subagent suppression in case events arrive from a
+    // runtime that does not filter (mock-runtime, future SDK paths). While a
+    // Task tool_use is open we hide nested text/tool events from the Codex App
+    // so the user sees one Agent item complete with a final result.
+    const activeSubagents = new Set<string>()
     const forkSession = thread.forkedFromId != null && thread.claudeSessionId != null && this.store.listTurns(thread.id).length <= 1
     const ensureAgentItem = (): string => {
       if (agentItemId) return agentItemId
@@ -750,6 +765,15 @@ export class CodexClaudeAppServer {
       return reasoningItemId
     }
 
+    // Allow per-turn override of policy (Codex App may attach updated values
+    // when the user toggles Full access mid-conversation), then fall back to
+    // the thread-level setting captured at start/resume.
+    const approvalPolicy =
+      (typeof params.approvalPolicy === 'string' ? normalizeApprovalPolicy(params.approvalPolicy) : null) ??
+      thread.approvalPolicy
+    const sandboxMode =
+      (typeof params.sandbox === 'string' ? normalizeSandboxMode(params.sandbox) : null) ?? thread.sandboxMode
+
     await this.runtime.runTurn(
       {
         threadId: thread.id,
@@ -767,12 +791,26 @@ export class CodexClaudeAppServer {
         addDirs: stringListFromEnv('CLAUDE_CODEX_ADD_DIRS', []),
         enableFileCheckpointing: process.env.CLAUDE_CODEX_ENABLE_FILE_CHECKPOINTING === '1',
         outputFormat: claudeOutputFormat(params.outputSchema),
+        approvalPolicy,
+        sandboxMode,
       },
       {
         onEvent: async (event) => {
           if (event.type === 'session') {
             this.store.updateClaudeSessionId(thread.id, event.claudeSessionId)
             return
+          }
+          if (activeSubagents.size > 0) {
+            if (event.type === 'text_delta' || event.type === 'reasoning_delta') return
+            if (event.type === 'tool_use' && event.toolName !== 'Task') return
+            if (event.type === 'tool_output_delta' && !itemIds.has(event.toolUseId)) return
+            if (event.type === 'tool_result' && !activeSubagents.has(event.toolUseId) && !itemIds.has(event.toolUseId)) return
+          }
+          if (event.type === 'tool_use' && event.toolName === 'Task') {
+            activeSubagents.add(event.toolUseId)
+          }
+          if (event.type === 'tool_result' && activeSubagents.has(event.toolUseId)) {
+            activeSubagents.delete(event.toolUseId)
           }
           if (event.type === 'text_delta') {
             const itemId = ensureAgentItem()
@@ -946,6 +984,15 @@ export class CodexClaudeAppServer {
     itemId: string,
     event: Extract<RuntimeEvent, { type: 'permission_request' }>,
   ): Promise<PermissionDecision> {
+    // Defensive: if Codex App selected approvalPolicy=never (or "Full access"
+    // sandbox), auto-accept without bouncing the request to the user. The
+    // sidecar already drops can_use_tool in those modes, but in case some
+    // future SDK path still emits permission_request, this prevents the
+    // adapter from sitting on "Awaiting approval" forever.
+    const thread = this.store.getThread(threadId)
+    if (thread && (thread.approvalPolicy === 'never' || thread.sandboxMode === 'danger-full-access')) {
+      return { decision: 'accept' }
+    }
     const command = String(event.input.command ?? '')
     if (command && this.commandSessionAllow.get(threadId)?.has(command)) {
       return { decision: 'accept' }
@@ -1569,9 +1616,9 @@ export class CodexClaudeAppServer {
       serviceTier: null,
       cwd: thread.cwd,
       instructionSources: [],
-      approvalPolicy: 'on-request',
+      approvalPolicy: thread.approvalPolicy ?? 'on-request',
       approvalsReviewer: 'user',
-      sandbox: { type: 'workspaceWrite', writableRoots: [thread.cwd], networkAccess: true, excludeTmpdirEnvVar: false, excludeSlashTmp: false },
+      sandbox: sandboxEnvelope(thread.sandboxMode, thread.cwd),
       permissionProfile: null,
       activePermissionProfile: null,
       reasoningEffort: thread.reasoningEffort,
@@ -1822,6 +1869,28 @@ function toolResultText(content: unknown): string {
 
 function fallbackStructuredText(outputSchema: unknown, prompt: string): string {
   return JSON.stringify(coerceStructuredValue(outputSchema, prompt), null, 0)
+}
+
+function normalizeApprovalPolicy(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const v = value.trim()
+  return v === 'unless-trusted' || v === 'on-failure' || v === 'on-request' || v === 'never' ? v : null
+}
+
+function normalizeSandboxMode(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const v = value.trim()
+  return v === 'read-only' || v === 'workspace-write' || v === 'danger-full-access' ? v : null
+}
+
+// Codex App's thread envelope expects a sandbox object whose `type` matches the
+// chosen tier. Returning the right shape lets the App render the correct badge
+// (Read-only / Workspace / Full access) and stops it from over-prompting.
+function sandboxEnvelope(mode: string | null, cwd: string): unknown {
+  if (mode === 'read-only') return { type: 'readOnly' }
+  if (mode === 'danger-full-access') return { type: 'dangerFullAccess' }
+  // Default: workspace-write (or null/legacy).
+  return { type: 'workspaceWrite', writableRoots: [cwd], networkAccess: true, excludeTmpdirEnvVar: false, excludeSlashTmp: false }
 }
 
 function emptyTokenBreakdown(): TokenUsageBreakdown {

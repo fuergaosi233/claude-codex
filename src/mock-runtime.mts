@@ -18,13 +18,19 @@ export class MockRuntime implements ClaudeRuntime {
         toolName: 'Bash',
         input: { command: 'echo mock approval', description: 'mock approval command' },
       })
-      const decision = await handlers.onPermissionRequest({
-        type: 'permission_request',
-        requestId: `perm-${toolUseId}`,
-        toolUseId,
-        toolName: 'Bash',
-        input: { command: 'echo mock approval' },
-      })
+      // Mirror the real sidecar: when the Codex App pinned approvalPolicy=never
+      // or Full access, skip the permission round-trip and run the tool.
+      const autoApprove =
+        context.approvalPolicy === 'never' || context.sandboxMode === 'danger-full-access'
+      const decision = autoApprove
+        ? { decision: 'accept' as const }
+        : await handlers.onPermissionRequest({
+            type: 'permission_request',
+            requestId: `perm-${toolUseId}`,
+            toolUseId,
+            toolName: 'Bash',
+            input: { command: 'echo mock approval' },
+          })
       if (decision.decision === 'accept' || decision.decision === 'acceptForSession') {
         await handlers.onEvent({ type: 'tool_output_delta', toolUseId, delta: 'mock approval\n' })
         await handlers.onEvent({ type: 'tool_result', toolUseId, content: 'mock approval\n' })
@@ -105,6 +111,32 @@ export class MockRuntime implements ClaudeRuntime {
       await handlers.onEvent({ type: 'reasoning_delta', delta: 'mock thinking' })
       await handlers.onEvent({ type: 'text_delta', delta: 'done' })
       await handlers.onEvent({ type: 'completed', success: true, result: 'thinking check' })
+      return
+    }
+
+    if (/policy check/i.test(context.prompt)) {
+      await handlers.onEvent({
+        type: 'text_delta',
+        delta: `approvalPolicy=${context.approvalPolicy ?? 'null'} sandboxMode=${context.sandboxMode ?? 'null'}`,
+      })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'policy check' })
+      return
+    }
+
+    if (/subagent check/i.test(context.prompt)) {
+      // Drive the subagent suppression contract: a Task tool_use opens the
+      // subagent context, internal tool_use/text/tool_result are emitted but
+      // should be hidden by the runtime, then the matching tool_result on the
+      // Task closes it and is forwarded as the visible Agent item completion.
+      const taskId = `task-${Date.now()}`
+      const innerToolId = `inner-${Date.now()}`
+      await handlers.onEvent({ type: 'tool_use', toolUseId: taskId, toolName: 'Task', input: { description: 'mock subagent', prompt: 'investigate' } })
+      await handlers.onEvent({ type: 'text_delta', delta: 'subagent thinking aloud (should be hidden)' })
+      await handlers.onEvent({ type: 'tool_use', toolUseId: innerToolId, toolName: 'Bash', input: { command: 'echo inner', description: 'leaked inner call' } })
+      await handlers.onEvent({ type: 'tool_result', toolUseId: innerToolId, content: 'inner result' })
+      await handlers.onEvent({ type: 'tool_result', toolUseId: taskId, content: 'subagent final summary' })
+      await handlers.onEvent({ type: 'text_delta', delta: 'main agent summary' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'subagent check' })
       return
     }
 

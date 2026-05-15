@@ -58,6 +58,12 @@ export interface ThreadRecord {
   createdAt: number
   updatedAt: number
   status: ThreadStatus
+  // Codex App-supplied policy. `approvalPolicy` is one of unless-trusted /
+  // on-failure / on-request / never; `sandboxMode` is read-only /
+  // workspace-write / danger-full-access. These map onto Claude Agent SDK
+  // permission_mode and the can_use_tool callback.
+  approvalPolicy: string | null
+  sandboxMode: string | null
 }
 
 export type ThreadStatus =
@@ -146,6 +152,12 @@ export interface RuntimeTurnContext {
   addDirs: string[]
   enableFileCheckpointing: boolean
   outputFormat: unknown | null
+  // Honour the Codex App's selected policy (unless-trusted / on-failure /
+  // on-request / never) and sandbox tier (read-only / workspace-write /
+  // danger-full-access). When the App says "Full access" the runtime should
+  // skip per-tool approvals instead of asking for every Claude tool call.
+  approvalPolicy: string | null
+  sandboxMode: string | null
 }
 
 export type RuntimeEvent =
