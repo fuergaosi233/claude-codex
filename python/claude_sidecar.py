@@ -467,10 +467,16 @@ class ClaudeSidecar:
             })
 
     def emit_content_block(self, thread_id: str, turn_id: str, block: Any) -> None:
+        # Claude Agent SDK 0.2.x ships its content blocks as bare @dataclass
+        # instances (TextBlock / ThinkingBlock / ToolUseBlock / ToolResultBlock)
+        # with NO `type` field, so a `block.type == "tool_result"` check alone
+        # silently drops every tool_result and the matching item/started never
+        # gets a item/completed pair. Detect by class_name as well.
         block_type = obj_get(block, "type", "")
+        cname = class_name(block)
         active = self.active_subagent_ids.setdefault(thread_id, set())
 
-        if block_type == "text" or class_name(block) == "TextBlock" or obj_get(block, "text", None) is not None:
+        if block_type == "text" or cname == "TextBlock" or obj_get(block, "text", None) is not None:
             # Inside a Task subagent the assistant text belongs to the sub-run;
             # hide it from the main thread so Codex shows a single Agent item.
             if active:
@@ -481,13 +487,13 @@ class ClaudeSidecar:
                 self.structured_text_buffers.setdefault(key, []).append(str(text))
                 return
             emit({"type": "text_delta", "thread_id": thread_id, "turn_id": turn_id, "delta": text})
-        elif block_type == "thinking":
+        elif block_type == "thinking" or cname == "ThinkingBlock":
             if active:
                 return
             thinking = obj_get(block, "thinking", "")
             if thinking:
                 emit({"type": "reasoning_delta", "thread_id": thread_id, "turn_id": turn_id, "delta": thinking})
-        elif block_type == "tool_use" or class_name(block) == "ToolUseBlock":
+        elif block_type == "tool_use" or cname == "ToolUseBlock":
             tool_name = obj_get(block, "name", "")
             tool_input = obj_get(block, "input", {}) or {}
             block_id = str(obj_get(block, "id", ""))
@@ -512,7 +518,7 @@ class ClaudeSidecar:
                 "tool_name": tool_name,
                 "input": tool_input,
             })
-        elif block_type == "tool_result":
+        elif block_type == "tool_result" or cname == "ToolResultBlock":
             tool_use_id = str(obj_get(block, "tool_use_id", ""))
             if tool_use_id and tool_use_id in active:
                 # The Task subagent finished — close the context and let Codex
