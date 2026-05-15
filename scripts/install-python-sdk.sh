@@ -22,5 +22,15 @@ fi
 
 "$PYTHON" -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
-.venv/bin/python -m pip install claude-agent-sdk
-echo "Installed claude-agent-sdk into .venv"
+
+# Prefer the configured pip index (corporate mirrors, internal caches), but fall
+# back to public PyPI if it cannot serve claude-agent-sdk — without this, an
+# unreachable or restricted internal mirror silently leaves the venv empty.
+if ! .venv/bin/python -m pip install claude-agent-sdk; then
+  echo "default pip index could not provide claude-agent-sdk; retrying via https://pypi.org" >&2
+  .venv/bin/python -m pip install --index-url https://pypi.org/simple/ claude-agent-sdk
+fi
+
+# Hard-fail the script if the SDK is still not importable, so callers like
+# `npm run install:python-sdk` cannot pass while leaving the venv broken.
+.venv/bin/python -c "import claude_agent_sdk; print('Installed claude-agent-sdk', claude_agent_sdk.__version__, 'into .venv')"

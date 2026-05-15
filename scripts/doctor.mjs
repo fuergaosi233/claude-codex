@@ -5,9 +5,12 @@ import { resolve } from 'node:path'
 
 const checks = []
 
-check('node >= 22.5 with node:sqlite', () => {
+check('node >= 24 with stable node:sqlite', () => {
+  // node:sqlite ships flag-gated on Node 22 and stable on Node 24+. The adapter
+  // imports it without --experimental-sqlite, so anything older than 24 will
+  // crash at runtime even if it advertises a sqlite module.
   const major = Number(process.versions.node.split('.')[0])
-  if (major < 22) throw new Error(`Node ${process.versions.node} is too old`)
+  if (major < 24) throw new Error(`Node ${process.versions.node} is too old; install Node 24+`)
   requireModule('node:sqlite')
 })
 

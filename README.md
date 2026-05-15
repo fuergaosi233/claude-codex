@@ -17,10 +17,12 @@ npm run build
 python3 -m pip install claude-agent-sdk
 ```
 
-The adapter expects Node.js with `node:sqlite` support. Use Node 22.5+ on the
-remote host, or set `CLAUDE_CODEX_NODE` in the shim environment. The Python
-sidecar needs Python 3.10+ for `claude-agent-sdk`; set `CLAUDE_CODEX_PYTHON` if
-the remote host's `python3` is older.
+The adapter requires **Node.js 24+** for stable `node:sqlite`. Node 22 ships
+`node:sqlite` behind `--experimental-sqlite`, which the adapter does not pass,
+so it crashes at runtime on 22 even though it imports cleanly on 24. Set
+`CLAUDE_CODEX_NODE` in the shim environment to pin a specific node binary.
+The Python sidecar needs Python 3.10+ for `claude-agent-sdk`; set
+`CLAUDE_CODEX_PYTHON` if the remote host's `python3` is older.
 
 ## Remote shim
 
@@ -37,17 +39,73 @@ Then ensure the remote login shell exports:
 
 ```bash
 export PATH="$HOME/bin:$PATH"
-export ANTHROPIC_API_KEY="..."
+export ANTHROPIC_API_KEY="..."                    # or sign in with `claude /login`
 export CLAUDE_CODEX_ADAPTER="/opt/claude-codex-adapter/dist/src/adapter.mjs"
 export CLAUDE_CODEX_NODE="/absolute/path/to/node" # optional
 export CLAUDE_CODEX_PYTHON="/absolute/path/to/python3.11" # optional
 export CODEX_REAL="/usr/local/bin/codex.real"     # optional fallback
+
+# Optional: route Anthropic API traffic through a reverse proxy. Useful when the
+# remote host's egress IP is region-blocked from api.anthropic.com but you still
+# want the same `claude` CLI auth (claude.ai OAuth or ANTHROPIC_API_KEY).
+# export ANTHROPIC_BASE_URL="https://your-anthropic-reverse-proxy.example"
 ```
 
 Codex App Remote should continue to use its native SSH flow. The app probes
 `codex --version`, starts `codex app-server --listen unix://`, then connects via
 `codex app-server proxy`. The shim routes only those app-server calls to this
 adapter.
+
+### Bootstrapping a fresh remote host (macOS / Linux)
+
+A clean machine usually only needs four user-space tools. The pattern below
+works without `sudo` or Homebrew and is what the project's macOS deployments
+use:
+
+```bash
+# 1. Node 24 (stable node:sqlite). Pick your platform tarball from
+#    https://nodejs.org/dist/v24.11.0/ and extract under ~/.local.
+curl -fsSL https://nodejs.org/dist/v24.11.0/node-v24.11.0-darwin-arm64.tar.xz \
+  | tar -xJ -C ~/.local
+
+# 2. uv as a single-binary Python manager, then Python 3.11 itself.
+curl -LsSf https://astral.sh/uv/install.sh | sh
+~/.local/bin/uv python install 3.11
+
+# 3. Claude Code CLI, installed under a user prefix so no sudo is needed.
+mkdir -p ~/.local/npm-global
+~/.local/node-v24.11.0-darwin-arm64/bin/npm config set prefix ~/.local/npm-global
+~/.local/npm-global/bin/npm install -g @anthropic-ai/claude-code
+~/.local/npm-global/bin/claude /login   # interactive: claude.ai OAuth
+
+# 4. Adapter checkout, build, and Python sidecar SDK.
+git clone <this repo> ~/claude-codex
+cd ~/claude-codex
+npm install
+npm run build
+CLAUDE_CODEX_PYTHON="$(uv python find 3.11)" npm run install:python-sdk
+
+# Persist PATH + adapter pointers for non-interactive SSH:
+cat >>~/.zshenv <<'EOF'
+export PATH="$HOME/.local/npm-global/bin:$HOME/.local/node-v24.11.0-darwin-arm64/bin:$HOME/.local/bin:$PATH"
+export CLAUDE_CODEX_PYTHON="$HOME/claude-codex/.venv/bin/python"
+export CLAUDE_CODEX_ADAPTER="$HOME/claude-codex/dist/src/adapter.mjs"
+export CLAUDE_CODEX_NODE="$HOME/.local/node-v24.11.0-darwin-arm64/bin/node"
+# Uncomment if api.anthropic.com is blocked from this host:
+# export ANTHROPIC_BASE_URL="https://your-anthropic-reverse-proxy.example"
+EOF
+
+cp scripts/codex-shim ~/.local/bin/codex && chmod +x ~/.local/bin/codex
+
+npm run doctor   # 6 checks should all be ok
+npm run smoke:real   # round-trips an actual Claude turn
+```
+
+After this, Codex App's Remote connection to the host hits `~/.local/bin/codex`
+first and is routed into the adapter. Disconnecting reclaims the daemon so the
+sidecar exits.
+
+### Localhost GUI testing on macOS
 
 For localhost GUI testing on macOS, the adapter can be launched by SSH while
 Claude Code runs in the logged-in GUI session. Put these lightweight exports in

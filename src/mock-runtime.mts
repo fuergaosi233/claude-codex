@@ -108,6 +108,16 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    if (/usage check/i.test(context.prompt)) {
+      await handlers.onEvent({
+        type: 'usage',
+        usage: { input_tokens: 100, output_tokens: 40, cache_read_input_tokens: 10, cache_creation_input_tokens: 5 },
+      })
+      await handlers.onEvent({ type: 'text_delta', delta: 'usage done' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'usage check' })
+      return
+    }
+
     const text = `Claude Code adapter mock response for: ${context.prompt || '(empty prompt)'}`
     for (const ch of text) {
       if (this.interrupted.has(context.threadId)) {

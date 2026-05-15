@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { homedir, platform } from 'node:os'
+import { homedir, platform, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { appendFileSync, mkdirSync } from 'node:fs'
 
@@ -23,8 +23,18 @@ export function adapterHome(): string {
   return resolve(process.env.CLAUDE_CODEX_HOME || join(codexHome(), 'claude-codex-adapter'))
 }
 
+// Unix domain socket paths are bounded by sockaddr_un.sun_path — roughly 104
+// bytes on macOS and 108 on Linux. A deep CODEX_HOME (long usernames, nested
+// workspaces) silently blew past that and surfaced as a cryptic EINVAL on
+// connect. Fall back to a short, hashed path under the system temp dir.
+export function socketPathLimit(): number {
+  return platform() === 'darwin' ? 104 : 108
+}
+
 export function defaultSocketPath(): string {
-  return join(codexHome(), 'app-server-control', 'app-server-control.sock')
+  const preferred = join(codexHome(), 'app-server-control', 'app-server-control.sock')
+  if (preferred.length <= socketPathLimit()) return preferred
+  return join(tmpdir(), `ccx-${stableHash(preferred).slice(0, 16)}.sock`)
 }
 
 export function ensureParent(path: string): void {

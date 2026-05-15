@@ -157,8 +157,23 @@ export type RuntimeEvent =
   | { type: 'tool_result'; toolUseId: string; content: unknown; isError?: boolean }
   | { type: 'permission_request'; requestId: string; toolUseId: string; toolName: string; input: Record<string, unknown> }
   | { type: 'notice'; level: 'info' | 'warning' | 'error'; message: string }
+  | { type: 'usage'; usage: Record<string, unknown> }
   | { type: 'completed'; claudeSessionId?: string | null; result?: string | null; success: boolean }
   | { type: 'error'; message: string }
+
+export interface TokenUsageBreakdown {
+  totalTokens: number
+  inputTokens: number
+  cachedInputTokens: number
+  outputTokens: number
+  reasoningOutputTokens: number
+}
+
+export interface ThreadTokenUsage {
+  total: TokenUsageBreakdown
+  last: TokenUsageBreakdown
+  modelContextWindow: number | null
+}
 
 export interface PermissionDecision {
   decision: 'accept' | 'acceptForSession' | 'decline' | 'cancel'

@@ -12,6 +12,8 @@ import type {
   RuntimeEvent,
   ThreadItem,
   ThreadRecord,
+  ThreadTokenUsage,
+  TokenUsageBreakdown,
   TurnRecord,
   UserInput,
   WireMessage,
@@ -50,6 +52,7 @@ export class CodexClaudeAppServer {
   private fsWatchers = new Map<string, FSWatcher>()
   private goals = new Map<string, Record<string, unknown>>()
   private elicitationCounts = new Map<string, number>()
+  private tokenUsageByThread = new Map<string, TokenUsageBreakdown>()
   private stopped = false
 
   constructor(
@@ -160,6 +163,9 @@ export class CodexClaudeAppServer {
         return this.threadGoalClear(asRecord(params))
       case 'thread/metadata/update':
         return this.threadMetadataUpdate(asRecord(params))
+      // Intentional no-ops: Claude Code has no equivalent concept, so the
+      // adapter acknowledges the call without side effects rather than failing
+      // the RPC (which would break the Codex App connection).
       case 'thread/memoryMode/set':
       case 'memory/reset':
         return {}
@@ -185,13 +191,16 @@ export class CodexClaudeAppServer {
         return this.turnSteer(peer, asRecord(params))
       case 'turn/interrupt':
         return this.turnInterrupt(asRecord(params))
+      // Realtime voice is unsupported: Claude Code has no realtime audio
+      // channel. These ack so the App's capability probe does not error; a
+      // real session would need a separate audio backend.
       case 'thread/realtime/start':
       case 'thread/realtime/appendAudio':
       case 'thread/realtime/appendText':
       case 'thread/realtime/stop':
         return {}
       case 'thread/realtime/listVoices':
-        return { voices: { v1: ['alloy'], v2: ['alloy'], defaultV1: 'alloy', defaultV2: 'alloy' } }
+        return { voices: { v1: [], v2: [], defaultV1: null, defaultV2: null } }
       case 'review/start':
         return this.reviewStart(peer, asRecord(params))
       case 'config/read':
@@ -318,6 +327,8 @@ export class CodexClaudeAppServer {
         return { authMethod: null, authToken: null, requiresOpenaiAuth: false }
       case 'fuzzyFileSearch':
         return this.fuzzyFileSearch(asRecord(params))
+      // Stateful fuzzy-search sessions are not implemented; the one-shot
+      // `fuzzyFileSearch` above already covers the App's file picker needs.
       case 'fuzzyFileSearch/sessionStart':
       case 'fuzzyFileSearch/sessionUpdate':
       case 'fuzzyFileSearch/sessionStop':
@@ -457,7 +468,18 @@ export class CodexClaudeAppServer {
       if (!thread) throw new Error(`unknown thread: ${threadId}`)
       return { thread: this.toThread(thread, this.store.listTurns(threadId)) }
     }
+    this.clearThreadState(threadId)
     return {}
+  }
+
+  // Drops per-thread in-memory state (session-scoped command approvals, token
+  // usage tallies, goals, elicitation counts) so an archived thread does not
+  // leak entries for the lifetime of the process.
+  private clearThreadState(threadId: string): void {
+    this.commandSessionAllow.delete(threadId)
+    this.tokenUsageByThread.delete(threadId)
+    this.goals.delete(threadId)
+    this.elicitationCounts.delete(threadId)
   }
 
   private threadUnsubscribe(peer: RpcPeer, params: Record<string, unknown>): unknown {
@@ -560,7 +582,7 @@ export class CodexClaudeAppServer {
   private reviewStart(peer: RpcPeer, params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
-    if (!thread) throw new Error(`unknown thread: \${threadId}`)
+    if (!thread) throw new Error(`unknown thread: ${threadId}`)
     this.activePeerByThread.set(threadId, peer)
     const turnId = newId()
     const review = reviewLabel(params.target)
@@ -599,7 +621,7 @@ export class CodexClaudeAppServer {
   private threadCompactStart(peer: RpcPeer, params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
-    if (!thread) throw new Error(`unknown thread: \${threadId}`)
+    if (!thread) throw new Error(`unknown thread: ${threadId}`)
     const turnId = newId()
     const compactItem: ThreadItem = { type: 'contextCompaction', id: newId() }
     const turn: TurnRecord = {
@@ -854,6 +876,10 @@ export class CodexClaudeAppServer {
             this.notify(peer, { method: 'item/agentMessage/delta', params: { threadId: thread.id, turnId: turn.id, itemId, delta } })
             return
           }
+          if (event.type === 'usage') {
+            this.recordTokenUsage(peer, thread.id, turn.id, event.usage)
+            return
+          }
           if (event.type === 'completed') {
             if (event.claudeSessionId) this.store.updateClaudeSessionId(thread.id, event.claudeSessionId)
             if (!event.success) throw new Error(event.result ?? 'Claude turn failed')
@@ -1065,6 +1091,25 @@ export class CodexClaudeAppServer {
       rateLimitReachedType: null,
     }
     return { rateLimits, rateLimitsByLimitId: { 'claude-code': rateLimits } }
+  }
+
+  // Accumulates Claude Agent SDK token usage per thread and pushes a
+  // `thread/tokenUsage/updated` notification so the Codex App can render real
+  // consumption instead of leaving the meter blank.
+  private recordTokenUsage(peer: RpcPeer, threadId: string, turnId: string, usage: Record<string, unknown>): void {
+    const last = tokenBreakdownFromClaudeUsage(usage)
+    if (last.totalTokens === 0) return
+    const prior = this.tokenUsageByThread.get(threadId) ?? emptyTokenBreakdown()
+    const total: TokenUsageBreakdown = {
+      totalTokens: prior.totalTokens + last.totalTokens,
+      inputTokens: prior.inputTokens + last.inputTokens,
+      cachedInputTokens: prior.cachedInputTokens + last.cachedInputTokens,
+      outputTokens: prior.outputTokens + last.outputTokens,
+      reasoningOutputTokens: prior.reasoningOutputTokens + last.reasoningOutputTokens,
+    }
+    this.tokenUsageByThread.set(threadId, total)
+    const tokenUsage: ThreadTokenUsage = { total, last, modelContextWindow: null }
+    this.notify(peer, { method: 'thread/tokenUsage/updated', params: { threadId, turnId, tokenUsage } })
   }
 
   private async fsReadFile(params: Record<string, unknown>): Promise<unknown> {
@@ -1779,6 +1824,28 @@ function fallbackStructuredText(outputSchema: unknown, prompt: string): string {
   return JSON.stringify(coerceStructuredValue(outputSchema, prompt), null, 0)
 }
 
+function emptyTokenBreakdown(): TokenUsageBreakdown {
+  return { totalTokens: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0 }
+}
+
+// Maps the raw Anthropic usage block carried on the Claude Agent SDK
+// ResultMessage onto the Codex `TokenUsageBreakdown` shape. Cache-creation
+// tokens count as input; Claude does not separate reasoning output tokens.
+function tokenBreakdownFromClaudeUsage(usage: Record<string, unknown>): TokenUsageBreakdown {
+  const num = (value: unknown): number => (typeof value === 'number' && Number.isFinite(value) ? value : 0)
+  const cacheRead = num(usage.cache_read_input_tokens)
+  const cacheCreation = num(usage.cache_creation_input_tokens)
+  const inputTokens = num(usage.input_tokens) + cacheCreation
+  const outputTokens = num(usage.output_tokens)
+  return {
+    inputTokens,
+    cachedInputTokens: cacheRead,
+    outputTokens,
+    reasoningOutputTokens: 0,
+    totalTokens: inputTokens + cacheRead + outputTokens,
+  }
+}
+
 function maybeInternalStructuredTitle(outputSchema: unknown, prompt: string): string | null {
   if (!schemaHasStringField(outputSchema, 'title')) return null
   if (!/structured title field|concise UI title|Generate a concise UI title|User prompt:/i.test(prompt)) return null
@@ -1888,12 +1955,25 @@ function simpleDiff(path: string, oldText: string, newText: string): string {
   ].join('\n')
 }
 
+// `git diff` failing is expected outside a repo, so we still return '' to keep
+// turns working — but the reason is written to the debug log instead of being
+// dropped silently, and a genuine git error is flagged as such.
+function isNotAGitRepo(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return /not a git repository/i.test(message)
+}
+
 async function gitDiff(cwd: string): Promise<string> {
   let trackedDiff = ''
   try {
     const { stdout } = await execFileAsync('git', ['diff', '--no-ext-diff', '--'], { cwd, timeout: 10_000, maxBuffer: 5 * 1024 * 1024 })
     trackedDiff = stdout
-  } catch {
+  } catch (error) {
+    debugLog('git.diff.failed', {
+      cwd,
+      reason: isNotAGitRepo(error) ? 'notAGitRepository' : 'error',
+      error: error instanceof Error ? error.message : String(error),
+    })
     return ''
   }
   const untrackedDiff = await gitUntrackedDiff(cwd)
@@ -1916,7 +1996,12 @@ async function gitUntrackedDiff(cwd: string): Promise<string> {
       diffs.push(addedFileDiff(path, bytes.toString('utf8')))
     }
     return diffs.join('\n')
-  } catch {
+  } catch (error) {
+    debugLog('git.untrackedDiff.failed', {
+      cwd,
+      reason: isNotAGitRepo(error) ? 'notAGitRepository' : 'error',
+      error: error instanceof Error ? error.message : String(error),
+    })
     return ''
   }
 }
@@ -1939,11 +2024,13 @@ async function listFiles(root: string): Promise<string[]> {
   try {
     const { stdout } = await execFileAsync('rg', ['--files'], { cwd: root, timeout: 10_000, maxBuffer: 5 * 1024 * 1024 })
     return stdout.split('\n').filter(Boolean)
-  } catch {
+  } catch (rgError) {
+    debugLog('listFiles.rgFailed', { root, error: rgError instanceof Error ? rgError.message : String(rgError) })
     try {
       const { stdout } = await execFileAsync('find', ['.', '-type', 'f'], { cwd: root, timeout: 10_000, maxBuffer: 5 * 1024 * 1024 })
       return stdout.split('\n').filter(Boolean).map((path) => path.replace(/^\.\//, ''))
-    } catch {
+    } catch (findError) {
+      debugLog('listFiles.findFailed', { root, error: findError instanceof Error ? findError.message : String(findError) })
       return []
     }
   }

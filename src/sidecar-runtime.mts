@@ -153,6 +153,9 @@ export class ClaudeSdkSidecarRuntime implements ClaudeRuntime {
           message: String(message.message ?? ''),
         })
         break
+      case 'usage':
+        await pending.handlers.onEvent({ type: 'usage', usage: asRecord(message.usage) })
+        break
       case 'completed':
         await pending.handlers.onEvent({
           type: 'completed',

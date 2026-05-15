@@ -94,6 +94,60 @@ def trim_title(value: str) -> str:
     return value[:80].strip()
 
 
+def summarize_runtime_event(event_type: str, event: Any) -> tuple[str, str]:
+    """Turn a Claude runtime side-event into a (level, message) pair.
+
+    Pulls the meaningful fields out of rate-limit / hook / subagent / compaction
+    events instead of dumping truncated raw JSON, so the Codex App shows a clean,
+    actionable line.
+    """
+    if not isinstance(event, dict):
+        return "info", f"{event_type}: {str(event)[:300]}"
+
+    if event_type == "rate_limit_event":
+        retry = event.get("retry_after") or event.get("retryAfter") or event.get("reset_at")
+        scope = event.get("scope") or event.get("limit_type") or event.get("type")
+        detail = event.get("message") or event.get("error")
+        parts = ["Claude rate limit reached"]
+        if scope:
+            parts.append(f"scope={scope}")
+        if retry:
+            parts.append(f"retry_after={retry}")
+        if detail:
+            parts.append(str(detail))
+        return "warning", " · ".join(parts)
+
+    if event_type in ("hook_event",):
+        name = event.get("hook_name") or event.get("name") or "hook"
+        status = event.get("status") or event.get("decision") or event.get("event")
+        detail = event.get("message") or event.get("reason")
+        msg = f"Claude hook '{name}'"
+        if status:
+            msg += f" {status}"
+        if detail:
+            msg += f": {detail}"
+        return "info", msg
+
+    if event_type in ("subagent_event", "subagent_stop"):
+        name = event.get("subagent") or event.get("name") or event.get("agent") or "subagent"
+        status = "stopped" if event_type == "subagent_stop" else (event.get("status") or event.get("event") or "update")
+        detail = event.get("message") or event.get("result")
+        msg = f"Claude subagent '{name}' {status}"
+        if detail:
+            msg += f": {str(detail)[:300]}"
+        return "info", msg
+
+    if event_type in ("precompact", "postcompact"):
+        phase = "before" if event_type == "precompact" else "after"
+        trigger = event.get("trigger") or event.get("reason")
+        msg = f"Claude context compaction ({phase})"
+        if trigger:
+            msg += f": {trigger}"
+        return "info", msg
+
+    return "info", f"{event_type}: {json.dumps(event, ensure_ascii=False, default=str)[:600]}"
+
+
 @dataclass
 class PendingPermission:
     future: asyncio.Future
@@ -214,33 +268,38 @@ class ClaudeSidecar:
         if message.get("output_format") is not None:
             kwargs["output_format"] = message["output_format"]
 
-        try:
-            options = ClaudeAgentOptions(**kwargs)
-        except TypeError:
-            # Older SDKs may not accept every option. Keep the safe core.
-            safe = {
-                "cwd": kwargs["cwd"],
-                "permission_mode": kwargs["permission_mode"],
-                "setting_sources": kwargs["setting_sources"],
-                "can_use_tool": can_use_tool,
-            }
-            if "allowed_tools" in kwargs:
-                safe["allowed_tools"] = kwargs["allowed_tools"]
-            if "model" in kwargs:
-                safe["model"] = kwargs["model"]
-            if "cli_path" in kwargs:
-                safe["cli_path"] = kwargs["cli_path"]
-            if "resume" in kwargs:
-                safe["resume"] = kwargs["resume"]
-            if "fork_session" in kwargs:
-                safe["fork_session"] = kwargs["fork_session"]
-            if "mcp_servers" in kwargs:
-                safe["mcp_servers"] = kwargs["mcp_servers"]
-            if "add_dirs" in kwargs:
-                safe["add_dirs"] = kwargs["add_dirs"]
-            if "output_format" in kwargs:
-                safe["output_format"] = kwargs["output_format"]
-            options = ClaudeAgentOptions(**safe)
+        # Older SDKs may not accept every option. Drop unsupported options one
+        # at a time (least essential first) instead of collapsing to a bare
+        # core set, so streaming/session options survive whenever possible.
+        droppable_in_priority = [
+            "effort",
+            "enable_file_checkpointing",
+            "output_format",
+            "add_dirs",
+            "fork_session",
+            "mcp_servers",
+            "setting_sources",
+            "include_partial_messages",
+            "allowed_tools",
+            "resume",
+        ]
+        attempt = dict(kwargs)
+        while True:
+            try:
+                options = ClaudeAgentOptions(**attempt)
+                break
+            except TypeError:
+                dropped = next((k for k in droppable_in_priority if k in attempt), None)
+                if dropped is None:
+                    raise
+                del attempt[dropped]
+                emit({
+                    "type": "notice",
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
+                    "level": "info",
+                    "message": f"claude-agent-sdk does not support option '{dropped}'; continuing without it.",
+                })
 
         client = ClaudeSDKClient(options=options)
         self.active_clients[thread_id] = client
@@ -263,11 +322,27 @@ class ClaudeSidecar:
             emit({"type": "completed", "thread_id": thread_id, "turn_id": turn_id, "success": False, "result": "interrupted"})
         except Exception as exc:
             if "Unknown message type: rate_limit_event" in str(exc):
+                # The installed claude-agent-sdk is too old to parse Claude
+                # Code's rate_limit_event frame. Content received before the
+                # frame is still valid, so flush what we have and surface a
+                # visible warning instead of silently reporting success.
+                emit({
+                    "type": "notice",
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
+                    "level": "warning",
+                    "message": (
+                        "claude-agent-sdk could not parse a rate_limit_event from Claude Code; "
+                        "the response above may be truncated. Upgrade claude-agent-sdk to resolve this."
+                    ),
+                })
+                self.flush_structured_output(thread_id, turn_id)
                 emit({
                     "type": "completed",
                     "thread_id": thread_id,
                     "turn_id": turn_id,
                     "success": True,
+                    "result": "rate_limit_event (sdk parse gap)",
                     "claude_session_id": last_session_id,
                 })
                 return
@@ -302,6 +377,10 @@ class ClaudeSidecar:
         structured_output = obj_get(message, "structured_output", None)
         if structured_output is not None:
             self.emit_structured_output(thread_id, turn_id, structured_output)
+        if name.lower().startswith("result"):
+            usage = obj_get(message, "usage", None)
+            if isinstance(usage, dict) and usage:
+                emit({"type": "usage", "thread_id": thread_id, "turn_id": turn_id, "usage": usage})
         if result and name.lower().startswith("result"):
             self.flush_structured_output(thread_id, turn_id)
             emit({"type": "completed", "thread_id": thread_id, "turn_id": turn_id, "success": not bool(obj_get(message, "is_error", False)), "result": result, "claude_session_id": last_session_id})
@@ -325,12 +404,13 @@ class ClaudeSidecar:
             if obj_get(block, "name", "") != "StructuredOutput":
                 self.emit_content_block(thread_id, turn_id, block)
         elif event_type in ("rate_limit_event", "hook_event", "subagent_event", "subagent_stop", "precompact", "postcompact"):
+            level, message = summarize_runtime_event(event_type, event)
             emit({
                 "type": "notice",
                 "thread_id": thread_id,
                 "turn_id": turn_id,
-                "level": "warning" if event_type == "rate_limit_event" else "info",
-                "message": f"{event_type}: {json.dumps(event, ensure_ascii=False, default=str)[:1000]}",
+                "level": level,
+                "message": message,
             })
 
     def emit_content_block(self, thread_id: str, turn_id: str, block: Any) -> None:

@@ -14,7 +14,9 @@ This adapter lets Codex App connect to a remote host through the normal Codex Re
 | Reasoning effort | Best effort | Codex efforts are normalized and can be mapped through CLAUDE_CODEX_EFFORT_ALIASES. Older Claude SDKs may ignore unsupported effort options. |
 | Claude Code tools | Supported | The adapter no longer restricts tools by default. Set CLAUDE_CODEX_ALLOWED_TOOLS to explicitly restrict the tool list. |
 | Bash approval | Supported | Claude SDK can_use_tool requests become Codex item/commandExecution/requestApproval server requests. |
-| Bash output | Supported | Streaming command output is forwarded, and final tool results backfill output when the SDK does not stream deltas. |
+| Bash output | Supported | Final tool results are forwarded as command output. The Claude Agent SDK does not expose incremental tool-output streaming, so output appears when the command completes rather than line by line. |
+| Token usage | Supported | Claude Agent SDK ResultMessage usage is mapped to a TokenUsageBreakdown and pushed as thread/tokenUsage/updated notifications (cumulative total plus last turn). |
+| Claude side events | Supported | rate_limit / hook / subagent / compaction stream events are summarized into structured, human-readable notice lines with the right severity instead of truncated raw JSON. |
 | File edit approval | Supported | Edit, Write, and MultiEdit become Codex fileChange items with approval and diff updates. |
 | Generic Claude tools | Supported | Non-command/file tools become mcpToolCall items under the claude-code pseudo server. |
 | MCP config/status/tools | Supported | The adapter reads Claude MCP config, reports server status, can call stdio/HTTP tools directly, and passes MCP servers into Claude SDK turns. |
@@ -23,11 +25,18 @@ This adapter lets Codex App connect to a remote host through the normal Codex Re
 | Steering/interrupt | Supported | turn/steer and turn/interrupt route to the active Claude SDK client. |
 | Review mode | Supported with Claude text findings | review/start now creates an in-progress review turn, emits enteredReviewMode, and routes the review prompt through Claude. Native Codex guardian finding items are not implemented. |
 | Context compaction | Supported with local summary | thread/compact/start now emits contextCompaction started/completed items and a compacted summary message. Native persisted rollout compaction is not implemented. |
-| Realtime audio | Unsupported | Realtime voice/audio methods are compatibility stubs except listVoices. |
-| Plugins/marketplace/skills/hooks/apps | Compatibility stub | Empty schema-shaped responses avoid UI breakage but do not provide native Codex plugin behavior. |
-| Account/rate limits/auth | Compatibility stub | Codex account panels return static/null responses; Claude authentication remains managed by Claude Code. |
+| SDK option compatibility | Supported | When an older Claude Agent SDK rejects an option, the sidecar drops it one at a time (least essential first) and emits an info notice instead of collapsing to a bare option set. |
+| Realtime audio | Unsupported | Claude Code has no realtime audio channel. Realtime methods ack the call so the App's capability probe does not error, and listVoices returns an empty voice list rather than fabricated voices. |
+| Plugins/marketplace/skills/hooks/apps | Not applicable | Claude Code has no Codex plugin marketplace; methods return empty schema-shaped responses so the App's panels render without breaking. |
+| Account/rate limits/auth | Not applicable | Claude Code manages its own authentication, so Codex account/OpenAI-auth panels intentionally report null/empty rather than fabricated state. |
 | External agent import | Stub | externalAgentConfig/detect and import return empty results. |
 | Windows sandbox | Unsupported | The target deployment is Linux; Windows sandbox methods return not configured. |
+
+## Robustness notes
+
+- Unix socket paths are validated against the platform sun_path limit (~104 on macOS, ~108 on Linux); a deep CODEX_HOME falls back to a short hashed path under the system temp dir.
+- git diff / file listing failures are written to the debug log (distinguishing "not a git repository" from real errors) instead of being swallowed silently.
+- Per-thread in-memory state (session command approvals, token usage, goals, elicitation counts) is released when a thread is archived.
 
 ## Good next targets
 

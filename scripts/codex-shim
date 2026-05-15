@@ -3,13 +3,16 @@ set -euo pipefail
 
 ADAPTER="${CLAUDE_CODEX_ADAPTER:-/opt/claude-codex-adapter/dist/src/adapter.mjs}"
 NODE_BIN="${CLAUDE_CODEX_NODE:-node}"
+# Keep the reported version in sync with codexCompatVersion() in src/util.mts —
+# both default to 0.130.0 and honour CLAUDE_CODEX_COMPAT_VERSION.
+COMPAT_VERSION="${CLAUDE_CODEX_COMPAT_VERSION:-${CODEX_SHIM_COMPAT_VERSION:-0.130.0}}"
 
 case "${1:-}" in
   --version|-V|version)
     if [ -n "${CODEX_REAL:-}" ] && [ -x "$CODEX_REAL" ]; then
       exec "$CODEX_REAL" "$@"
     fi
-    echo "${CODEX_SHIM_VERSION:-codex-cli 0.130.0}"
+    echo "${CODEX_SHIM_VERSION:-codex-cli ${COMPAT_VERSION}}"
     exit 0
     ;;
   app-server)

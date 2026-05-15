@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import http from 'node:http'
@@ -408,7 +409,9 @@ test('default runtime tool policy leaves Claude Code tools unrestricted unless e
 
 test('unix websocket app-server accepts initialize', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
-  const sock = join(home, 'app-server-control', 'app-server-control.sock')
+  // Keep the socket path short — a mkdtemp dir nested under macOS tmpdir blows
+  // past the ~104-byte sockaddr_un limit, which surfaced as a bind EINVAL.
+  const sock = join(tmpdir(), `ccx-test-${randomUUID().slice(0, 8)}.sock`)
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', `unix://${sock}`], {
     stdio: ['ignore', 'ignore', 'pipe'],
     env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
@@ -433,7 +436,9 @@ test('unix websocket app-server accepts initialize', async () => {
 
 test('app-server proxy forwards websocket handshake bytes to unix daemon', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
-  const sock = join(home, 'app-server-control', 'app-server-control.sock')
+  // Keep the socket path short — a mkdtemp dir nested under macOS tmpdir blows
+  // past the ~104-byte sockaddr_un limit, which surfaced as a bind EINVAL.
+  const sock = join(tmpdir(), `ccx-test-${randomUUID().slice(0, 8)}.sock`)
   const daemon = spawn(process.execPath, [adapter, 'app-server', '--listen', `unix://${sock}`], {
     stdio: ['ignore', 'ignore', 'pipe'],
     env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
@@ -467,7 +472,9 @@ test('app-server proxy forwards websocket handshake bytes to unix daemon', async
 
 test('app-server proxy carries websocket JSON-RPC traffic over stdio', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
-  const sock = join(home, 'app-server-control', 'app-server-control.sock')
+  // Keep the socket path short — a mkdtemp dir nested under macOS tmpdir blows
+  // past the ~104-byte sockaddr_un limit, which surfaced as a bind EINVAL.
+  const sock = join(tmpdir(), `ccx-test-${randomUUID().slice(0, 8)}.sock`)
   const daemon = spawn(process.execPath, [adapter, 'app-server', '--listen', `unix://${sock}`], {
     stdio: ['ignore', 'ignore', 'pipe'],
     env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
@@ -498,7 +505,9 @@ test('app-server proxy carries websocket JSON-RPC traffic over stdio', async () 
 
 test('remote shim launches daemon and proxy with Codex-compatible commands', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
-  const sock = join(home, 'app-server-control', 'app-server-control.sock')
+  // Keep the socket path short — a mkdtemp dir nested under macOS tmpdir blows
+  // past the ~104-byte sockaddr_un limit, which surfaced as a bind EINVAL.
+  const sock = join(tmpdir(), `ccx-test-${randomUUID().slice(0, 8)}.sock`)
   const daemon = spawn(shim, ['app-server', '--listen', `unix://${sock}`], {
     stdio: ['ignore', 'ignore', 'pipe'],
     env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_ADAPTER: adapter, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
@@ -674,6 +683,61 @@ test('Claude thinking maps to Codex reasoning summary and content deltas', async
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('Claude token usage maps to thread/tokenUsage/updated notifications', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false } }))
+    const start = await reader.nextResponse(1)
+    const threadId = start.result.thread.id
+
+    proc.stdin.write(json({ id: 2, method: 'turn/start', params: { threadId, input: [{ type: 'text', text: 'usage check', text_elements: [] }] } }))
+    await reader.nextResponse(2)
+
+    let tokenUsage: any = null
+    for (let i = 0; i < 500; i += 1) {
+      const message = await reader.next()
+      if (message.method === 'thread/tokenUsage/updated') tokenUsage = message.params
+      if (message.method === 'turn/completed') break
+    }
+    assert.ok(tokenUsage, 'expected a thread/tokenUsage/updated notification')
+    assert.equal(tokenUsage.threadId, threadId)
+    // input_tokens 100 + cache_creation 5 = 105 input; cache_read 10; output 40.
+    assert.deepEqual(tokenUsage.tokenUsage.last, {
+      inputTokens: 105,
+      cachedInputTokens: 10,
+      outputTokens: 40,
+      reasoningOutputTokens: 0,
+      totalTokens: 155,
+    })
+    assert.deepEqual(tokenUsage.tokenUsage.total, tokenUsage.tokenUsage.last)
+    assert.equal(tokenUsage.tokenUsage.modelContextWindow, null)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('defaultSocketPath stays within the platform sun_path limit', async () => {
+  const util = await import(resolve('dist/src/util.mjs'))
+  const prev = process.env.CODEX_HOME
+  process.env.CODEX_HOME = '/' + 'very-long-codex-home-segment'.repeat(8)
+  try {
+    const socketPath = util.defaultSocketPath()
+    assert.ok(
+      socketPath.length <= util.socketPathLimit(),
+      `socket path ${socketPath.length} exceeds limit ${util.socketPathLimit()}`,
+    )
+  } finally {
+    if (prev == null) delete process.env.CODEX_HOME
+    else process.env.CODEX_HOME = prev
   }
 })
 
