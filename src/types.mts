@@ -70,6 +70,11 @@ export interface ThreadRecord {
   // 'user' | 'subagent' | 'memory_consolidation' (Codex `ThreadSource`).
   // Subagent threads spawned by the Task tool also carry this.
   threadSource: string | null
+  // Codex's native subagent identity. `agentRole` mirrors the Codex
+  // "agent_role" (mapped from Claude's Task `subagent_type`); `agentNickname`
+  // is the unique handle the App displays for this subagent instance.
+  agentRole: string | null
+  agentNickname: string | null
 }
 
 export type ThreadStatus =

@@ -61,6 +61,8 @@ export class SessionStore {
     this.ensureColumn('threads', 'sandbox_mode', 'TEXT')
     this.ensureColumn('threads', 'ephemeral', 'INTEGER NOT NULL DEFAULT 0')
     this.ensureColumn('threads', 'thread_source', 'TEXT')
+    this.ensureColumn('threads', 'agent_role', 'TEXT')
+    this.ensureColumn('threads', 'agent_nickname', 'TEXT')
   }
 
   private ensureColumn(table: string, column: string, definition: string): void {
@@ -75,8 +77,8 @@ export class SessionStore {
         INSERT INTO threads (
           id, session_id, forked_from_id, preview, name, archived, cwd, model, reasoning_effort,
           model_provider, claude_session_id, source, created_at, updated_at, status_json,
-          approval_policy, sandbox_mode, ephemeral, thread_source
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          approval_policy, sandbox_mode, ephemeral, thread_source, agent_role, agent_nickname
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           session_id=excluded.session_id,
           forked_from_id=excluded.forked_from_id,
@@ -94,7 +96,9 @@ export class SessionStore {
           approval_policy=excluded.approval_policy,
           sandbox_mode=excluded.sandbox_mode,
           ephemeral=excluded.ephemeral,
-          thread_source=excluded.thread_source
+          thread_source=excluded.thread_source,
+          agent_role=excluded.agent_role,
+          agent_nickname=excluded.agent_nickname
       `)
       .run(
         thread.id,
@@ -116,6 +120,8 @@ export class SessionStore {
         thread.sandboxMode,
         thread.ephemeral ? 1 : 0,
         thread.threadSource,
+        thread.agentRole,
+        thread.agentNickname,
       )
   }
 
@@ -272,6 +278,8 @@ export class SessionStore {
       sandboxMode: row.sandbox_mode == null ? null : String(row.sandbox_mode),
       ephemeral: Number(row.ephemeral ?? 0) === 1,
       threadSource: row.thread_source == null ? null : String(row.thread_source),
+      agentRole: row.agent_role == null ? null : String(row.agent_role),
+      agentNickname: row.agent_nickname == null ? null : String(row.agent_nickname),
     }
   }
 

@@ -367,6 +367,8 @@ export class CodexClaudeAppServer {
       sandboxMode: normalizeSandboxMode(params.sandbox),
       ephemeral: params.ephemeral === true,
       threadSource: typeof params.threadSource === 'string' ? params.threadSource : null,
+      agentRole: typeof params.agentRole === 'string' ? params.agentRole : null,
+      agentNickname: typeof params.agentNickname === 'string' ? params.agentNickname : null,
     }
     this.store.upsertThread(thread)
     this.activePeerByThread.set(id, peer)
@@ -417,6 +419,8 @@ export class CodexClaudeAppServer {
         : parent.sandboxMode,
       ephemeral: parent.ephemeral,
       threadSource: typeof params.threadSource === 'string' ? params.threadSource : parent.threadSource,
+      agentRole: typeof params.agentRole === 'string' ? params.agentRole : parent.agentRole,
+      agentNickname: typeof params.agentNickname === 'string' ? params.agentNickname : parent.agentNickname,
     }
     this.store.upsertThread(thread)
     this.activePeerByThread.set(id, peer)
@@ -812,18 +816,29 @@ export class CodexClaudeAppServer {
             // Spawn the ephemeral subagent thread, then mirror Codex's native
             // 3-stage timeline: `spawnAgent` (begin+end), `wait` (begin only,
             // closes when the Task tool_result lands), and later `closeAgent`.
+            //
+            // Concept alignment: Claude's `subagent_type` (e.g. "general-
+            // purpose") is the same idea as Codex's `agentRole`; we also
+            // generate an `agentNickname` matching the `agent-{12hex}` shape
+            // Claude itself uses internally so the App's subagent UI shows a
+            // distinct, repeatable handle. The collabAgentToolCall.model
+            // field carries the actual SDK model the subagent runs on, NOT
+            // the subagent_type — that distinction was wrong before.
             const promptText = String(event.input.prompt ?? event.input.description ?? '')
             const subType = typeof event.input.subagent_type === 'string' ? event.input.subagent_type : null
+            const subagentModel = typeof event.input.model === 'string' ? event.input.model : thread.model
             const childThreadId = newId()
+            const agentNickname = `agent-${childThreadId.replace(/-/g, '').slice(0, 12)}`
+            const agentRole = subType ?? 'general-purpose'
             const childThread: ThreadRecord = {
               id: childThreadId,
               sessionId: thread.sessionId,
               forkedFromId: thread.id,
               preview: promptText.slice(0, 200),
-              name: subType ? `Subagent · ${subType}` : 'Subagent',
+              name: null,
               archived: false,
               cwd: thread.cwd,
-              model: thread.model,
+              model: subagentModel,
               reasoningEffort: thread.reasoningEffort,
               modelProvider: thread.modelProvider,
               claudeSessionId: null,
@@ -835,6 +850,8 @@ export class CodexClaudeAppServer {
               sandboxMode: thread.sandboxMode,
               ephemeral: true,
               threadSource: 'subagent',
+              agentRole,
+              agentNickname,
             }
             this.store.upsertThread(childThread)
 
@@ -844,7 +861,7 @@ export class CodexClaudeAppServer {
             const spawnBegin: ThreadItem = {
               type: 'collabAgentToolCall', id: spawnId, tool: 'spawnAgent',
               status: 'inProgress', senderThreadId: thread.id, receiverThreadIds: [],
-              prompt: promptText || null, model: subType ?? thread.model,
+              prompt: promptText || null, model: subagentModel,
               reasoningEffort: thread.reasoningEffort, agentsStates: {},
             }
             this.store.appendItem(turn.id, spawnBegin)
@@ -852,7 +869,7 @@ export class CodexClaudeAppServer {
             const spawnEnd: ThreadItem = {
               type: 'collabAgentToolCall', id: spawnId, tool: 'spawnAgent',
               status: 'completed', senderThreadId: thread.id, receiverThreadIds: [childThreadId],
-              prompt: promptText || null, model: subType ?? thread.model,
+              prompt: promptText || null, model: subagentModel,
               reasoningEffort: thread.reasoningEffort,
               agentsStates: { [childThreadId]: { status: 'running', message: null } },
             }
@@ -1768,8 +1785,8 @@ export class CodexClaudeAppServer {
       cliVersion: codexCliVersion(),
       source: thread.source,
       threadSource: thread.threadSource,
-      agentNickname: null,
-      agentRole: null,
+      agentNickname: thread.agentNickname,
+      agentRole: thread.agentRole,
       gitInfo: null,
       name: thread.name,
       turns: turns.map((turn) => this.toTurn(turn)),

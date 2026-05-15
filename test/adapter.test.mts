@@ -820,6 +820,24 @@ test('Task subagent emits Codex native spawnAgent → wait → closeAgent timeli
     assert.equal(collabByTool.wait.started.receiverThreadIds[0], childThreadId)
     assert.equal(collabByTool.wait.completed.agentsStates[childThreadId].status, 'completed')
     assert.equal(collabByTool.closeAgent.completed.agentsStates[childThreadId].status, 'completed')
+    // collabAgentToolCall.model carries the SDK model the subagent runs on,
+    // NOT Claude's subagent_type — the App's "Agent · model" badge depends
+    // on this. The mock runs without a subagent_type so the parent's model
+    // (default 'sonnet') flows through unchanged.
+    assert.equal(spawnEnd.model, 'sonnet', 'collabAgentToolCall.model should be the parent thread model when no Task input.model is set')
+
+    // Codex App reads agentRole/agentNickname off the child thread to render
+    // its native subagent identity. The mock has no subagent_type so we fall
+    // back to "general-purpose"; agentNickname mirrors Claude's `agent-{hex}`
+    // shape so the App can show a stable handle for this subagent instance.
+    proc.stdin.write(json({ id: 5, method: 'thread/read', params: { threadId: childThreadId } }))
+    const childRead = await reader.nextResponse(5)
+    const childThread = childRead.result.thread
+    assert.equal(childThread.threadSource, 'subagent')
+    assert.equal(childThread.ephemeral, true)
+    assert.equal(childThread.agentRole, 'general-purpose')
+    assert.match(childThread.agentNickname, /^agent-[0-9a-f]{12}$/)
+    assert.equal(childThread.forkedFromId, threadId, 'subagent thread should be forked from the parent user thread')
 
     assert.equal(leakedInnerItems, 0, 'inner Bash tool calls should not appear at the parent level')
     assert.doesNotMatch(agentMessageText, /subagent thinking aloud/, 'subagent text should not bleed into the main agent message')
