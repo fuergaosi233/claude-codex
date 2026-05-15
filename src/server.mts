@@ -738,14 +738,15 @@ export class CodexClaudeAppServer {
     let agentItemId: string | null = null
     let reasoningItemId: string | null = null
     const commandOutputSeen = new Set<string>()
-    // Codex's native subagent rendering is `collabAgentToolCall`, which points
-    // at a real child thread by id. When Claude's Task tool fires we spawn
-    // that ephemeral child thread, emit one collabAgentToolCall item in the
-    // parent, and (still) hide the subagent's inner events from the parent.
-    // The matching tool_result closes the item and writes the subagent's
-    // final result as a single agentMessage on the child thread so the user
-    // can drill in from the Agent item without seeing the leaked sub-actions.
-    const subagentContexts = new Map<string, { childThreadId: string; parentItemId: string; prompt: string }>()
+    // Codex's native subagent rendering is a sequence of three
+    // collabAgentToolCall lifecycle pairs in the parent timeline:
+    //   spawnAgent (begin → end)  – "spawning the agent"
+    //   wait        (begin → end)  – the agent is working (covers runtime)
+    //   closeAgent (begin → end)  – the agent finished
+    // Together they tell Codex App which child thread to navigate into and
+    // give the user a live "agent is running" indicator instead of a single
+    // collapsed item that goes silent for the duration of the subagent.
+    const subagentContexts = new Map<string, { childThreadId: string; waitItemId: string; prompt: string; subType: string | null }>()
     const activeSubagents = new Set<string>()
     const forkSession = thread.forkedFromId != null && thread.claudeSessionId != null && this.store.listTurns(thread.id).length <= 1
     const ensureAgentItem = (): string => {
@@ -808,8 +809,9 @@ export class CodexClaudeAppServer {
             if (event.type === 'tool_result' && !activeSubagents.has(event.toolUseId) && !itemIds.has(event.toolUseId)) return
           }
           if (event.type === 'tool_use' && event.toolName === 'Task') {
-            // Spawn the ephemeral subagent thread and emit Codex's native
-            // collabAgentToolCall item; hide inner events afterwards.
+            // Spawn the ephemeral subagent thread, then mirror Codex's native
+            // 3-stage timeline: `spawnAgent` (begin+end), `wait` (begin only,
+            // closes when the Task tool_result lands), and later `closeAgent`.
             const promptText = String(event.input.prompt ?? event.input.description ?? '')
             const subType = typeof event.input.subagent_type === 'string' ? event.input.subagent_type : null
             const childThreadId = newId()
@@ -836,32 +838,53 @@ export class CodexClaudeAppServer {
             }
             this.store.upsertThread(childThread)
 
-            const collabItem: ThreadItem = {
-              type: 'collabAgentToolCall',
-              id: newId(),
-              tool: 'spawnAgent',
-              status: 'inProgress',
-              senderThreadId: thread.id,
-              receiverThreadIds: [childThreadId],
-              prompt: promptText || null,
-              model: subType ?? thread.model,
+            // Stage 1 — spawnAgent (begin + end emitted together; the agent is
+            // already created so there's no real latency here).
+            const spawnId = newId()
+            const spawnBegin: ThreadItem = {
+              type: 'collabAgentToolCall', id: spawnId, tool: 'spawnAgent',
+              status: 'inProgress', senderThreadId: thread.id, receiverThreadIds: [],
+              prompt: promptText || null, model: subType ?? thread.model,
+              reasoningEffort: thread.reasoningEffort, agentsStates: {},
+            }
+            this.store.appendItem(turn.id, spawnBegin)
+            this.notify(peer, { method: 'item/started', params: { threadId: thread.id, turnId: turn.id, item: spawnBegin, startedAtMs: nowMillis() } })
+            const spawnEnd: ThreadItem = {
+              type: 'collabAgentToolCall', id: spawnId, tool: 'spawnAgent',
+              status: 'completed', senderThreadId: thread.id, receiverThreadIds: [childThreadId],
+              prompt: promptText || null, model: subType ?? thread.model,
               reasoningEffort: thread.reasoningEffort,
               agentsStates: { [childThreadId]: { status: 'running', message: null } },
             }
-            this.store.appendItem(turn.id, collabItem)
-            itemIds.set(event.toolUseId, collabItem.id)
-            subagentContexts.set(event.toolUseId, { childThreadId, parentItemId: collabItem.id, prompt: promptText })
+            this.store.updateItem(turn.id, spawnId, () => spawnEnd)
+            this.notify(peer, { method: 'item/completed', params: { threadId: thread.id, turnId: turn.id, item: spawnEnd, completedAtMs: nowMillis() } })
+
+            // Stage 2 — wait (begin only; this is the long phase that gives
+            // Codex App its "agent is working" indicator while the subagent
+            // runs. It closes when the Task tool_result arrives.)
+            const waitId = newId()
+            const waitBegin: ThreadItem = {
+              type: 'collabAgentToolCall', id: waitId, tool: 'wait',
+              status: 'inProgress', senderThreadId: thread.id, receiverThreadIds: [childThreadId],
+              prompt: null, model: null, reasoningEffort: null, agentsStates: {},
+            }
+            this.store.appendItem(turn.id, waitBegin)
+            this.notify(peer, { method: 'item/started', params: { threadId: thread.id, turnId: turn.id, item: waitBegin, startedAtMs: nowMillis() } })
+
+            itemIds.set(event.toolUseId, waitId)
+            subagentContexts.set(event.toolUseId, { childThreadId, waitItemId: waitId, prompt: promptText, subType })
             activeSubagents.add(event.toolUseId)
-            this.notify(peer, { method: 'item/started', params: { threadId: thread.id, turnId: turn.id, item: collabItem, startedAtMs: nowMillis() } })
             return
           }
           if (event.type === 'tool_result' && activeSubagents.has(event.toolUseId)) {
             const ctx = subagentContexts.get(event.toolUseId)
-            const itemId = itemIds.get(event.toolUseId)
             activeSubagents.delete(event.toolUseId)
             subagentContexts.delete(event.toolUseId)
-            if (!ctx || !itemId) return
+            if (!ctx) return
             const resultText = toolResultText(event.content)
+            const collabStatus: 'completed' | 'failed' = event.isError ? 'failed' : 'completed'
+            const agentStatus: 'completed' | 'errored' = event.isError ? 'errored' : 'completed'
+
             // Materialize a one-turn transcript on the child thread so the
             // Codex App can drill in from the parent collabAgentToolCall.
             const childTurn: TurnRecord = {
@@ -885,24 +908,35 @@ export class CodexClaudeAppServer {
               childThread.updatedAt = nowSeconds()
               this.store.upsertThread(childThread)
             }
-            const newStatus: 'completed' | 'failed' = event.isError ? 'failed' : 'completed'
-            this.store.updateItem(turn.id, itemId, (item) => {
-              if (item.type === 'collabAgentToolCall') {
-                return {
-                  ...item,
-                  status: newStatus,
-                  agentsStates: {
-                    [ctx.childThreadId]: { status: event.isError ? 'errored' : 'completed', message: null },
-                  },
-                }
-              }
-              return item
-            })
-            const updated = this.store.getTurn(turn.id)
-            const completedItem = updated?.items.find((c) => c.id === itemId)
-            if (completedItem) {
-              this.notify(peer, { method: 'item/completed', params: { threadId: thread.id, turnId: turn.id, item: completedItem, completedAtMs: nowMillis() } })
+
+            // Stage 2 close — wait (end). Re-emits the same waitItemId.
+            const waitEnd: ThreadItem = {
+              type: 'collabAgentToolCall', id: ctx.waitItemId, tool: 'wait',
+              status: collabStatus, senderThreadId: thread.id, receiverThreadIds: [ctx.childThreadId],
+              prompt: null, model: null, reasoningEffort: null,
+              agentsStates: { [ctx.childThreadId]: { status: agentStatus, message: null } },
             }
+            this.store.updateItem(turn.id, ctx.waitItemId, () => waitEnd)
+            this.notify(peer, { method: 'item/completed', params: { threadId: thread.id, turnId: turn.id, item: waitEnd, completedAtMs: nowMillis() } })
+
+            // Stage 3 — closeAgent (begin + end emitted together; the SDK has
+            // already torn down the subagent by the time we get the result).
+            const closeId = newId()
+            const closeBegin: ThreadItem = {
+              type: 'collabAgentToolCall', id: closeId, tool: 'closeAgent',
+              status: 'inProgress', senderThreadId: thread.id, receiverThreadIds: [ctx.childThreadId],
+              prompt: null, model: null, reasoningEffort: null, agentsStates: {},
+            }
+            this.store.appendItem(turn.id, closeBegin)
+            this.notify(peer, { method: 'item/started', params: { threadId: thread.id, turnId: turn.id, item: closeBegin, startedAtMs: nowMillis() } })
+            const closeEnd: ThreadItem = {
+              type: 'collabAgentToolCall', id: closeId, tool: 'closeAgent',
+              status: collabStatus, senderThreadId: thread.id, receiverThreadIds: [ctx.childThreadId],
+              prompt: null, model: null, reasoningEffort: null,
+              agentsStates: { [ctx.childThreadId]: { status: agentStatus, message: null } },
+            }
+            this.store.updateItem(turn.id, closeId, () => closeEnd)
+            this.notify(peer, { method: 'item/completed', params: { threadId: thread.id, turnId: turn.id, item: closeEnd, completedAtMs: nowMillis() } })
             return
           }
           if (event.type === 'text_delta') {

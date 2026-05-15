@@ -760,7 +760,7 @@ test('Codex App approvalPolicy=never + sandbox=danger-full-access auto-accepts t
   }
 })
 
-test('Task subagent emits a collabAgentToolCall + ephemeral child thread; inner events are hidden', async () => {
+test('Task subagent emits Codex native spawnAgent → wait → closeAgent timeline with hidden inner events', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -775,38 +775,61 @@ test('Task subagent emits a collabAgentToolCall + ephemeral child thread; inner 
     proc.stdin.write(json({ id: 2, method: 'turn/start', params: { threadId, input: [{ type: 'text', text: 'subagent check', text_elements: [] }] } }))
     await reader.nextResponse(2)
 
-    let collabItem: any = null
-    let collabCompleted: any = null
+    type Lifecycle = { started?: any; completed?: any }
+    const collabByTool: Record<string, Lifecycle> = {}
     let agentMessageText = ''
     let leakedInnerItems = 0
-    for (let i = 0; i < 200; i += 1) {
+    for (let i = 0; i < 300; i += 1) {
       const message = await reader.next()
       if (message.method === 'item/started') {
         const item = message.params.item
-        if (item.type === 'collabAgentToolCall') collabItem = item
-        else if (item.type === 'commandExecution' || (item.type === 'mcpToolCall' && item.tool !== 'Task')) leakedInnerItems += 1
+        if (item.type === 'collabAgentToolCall') {
+          collabByTool[item.tool] = collabByTool[item.tool] ?? {}
+          collabByTool[item.tool].started = item
+        } else if (item.type === 'commandExecution' || (item.type === 'mcpToolCall' && item.tool !== 'Task')) {
+          leakedInnerItems += 1
+        }
       }
-      if (message.method === 'item/completed' && collabItem && message.params.item.id === collabItem.id) collabCompleted = message.params.item
+      if (message.method === 'item/completed') {
+        const item = message.params.item
+        if (item.type === 'collabAgentToolCall') {
+          collabByTool[item.tool] = collabByTool[item.tool] ?? {}
+          collabByTool[item.tool].completed = item
+        }
+      }
       if (message.method === 'item/agentMessage/delta') agentMessageText += String(message.params.delta ?? '')
       if (message.method === 'turn/completed') break
     }
-    assert.ok(collabItem, 'Task should be rendered as a collabAgentToolCall (Codex native subagent)')
-    assert.equal(collabItem.tool, 'spawnAgent')
-    assert.equal(collabItem.senderThreadId, threadId)
-    assert.equal(collabItem.receiverThreadIds.length, 1, 'collabAgentToolCall should reference one ephemeral child thread')
-    const childThreadId = collabItem.receiverThreadIds[0]
-    assert.ok(collabCompleted, 'collabAgentToolCall should complete on the Task tool_result')
-    assert.equal(collabCompleted.status, 'completed')
-    assert.equal(collabCompleted.agentsStates[childThreadId].status, 'completed')
+
+    // All three native lifecycle pairs must appear, each with a started AND
+    // a completed for the same id, so Codex App can render the timeline.
+    for (const tool of ['spawnAgent', 'wait', 'closeAgent']) {
+      const lc = collabByTool[tool]
+      assert.ok(lc?.started, `expected item/started for ${tool}`)
+      assert.ok(lc?.completed, `expected item/completed for ${tool}`)
+      assert.equal(lc.started.id, lc.completed.id, `${tool} begin/end must share a single item id`)
+      assert.equal(lc.completed.status, 'completed', `${tool} should complete with status=completed`)
+    }
+    const spawnEnd = collabByTool.spawnAgent.completed
+    assert.equal(spawnEnd.senderThreadId, threadId)
+    assert.equal(spawnEnd.receiverThreadIds.length, 1, 'spawnAgent end should reference exactly one child thread')
+    const childThreadId = spawnEnd.receiverThreadIds[0]
+    // After spawnAgent ends the subagent is now running; only wait/closeAgent
+    // ends report the agent as completed.
+    assert.equal(spawnEnd.agentsStates[childThreadId].status, 'running')
+    assert.equal(collabByTool.wait.started.receiverThreadIds[0], childThreadId)
+    assert.equal(collabByTool.wait.completed.agentsStates[childThreadId].status, 'completed')
+    assert.equal(collabByTool.closeAgent.completed.agentsStates[childThreadId].status, 'completed')
+
     assert.equal(leakedInnerItems, 0, 'inner Bash tool calls should not appear at the parent level')
     assert.doesNotMatch(agentMessageText, /subagent thinking aloud/, 'subagent text should not bleed into the main agent message')
     assert.match(agentMessageText, /main agent summary/, 'main agent text after subagent should still appear')
 
-    // The ephemeral child thread exists but is hidden from the default list.
+    // Ephemeral child thread is hidden from the default list, exposed with includeEphemeral.
     proc.stdin.write(json({ id: 3, method: 'thread/list', params: {} }))
     const list = await reader.nextResponse(3)
     const ids = (list.result.data as any[]).map((t) => t.id)
-    assert.ok(!ids.includes(childThreadId), 'subagent child thread should be ephemeral and excluded from thread/list')
+    assert.ok(!ids.includes(childThreadId), 'subagent child thread should be hidden from thread/list')
     assert.ok(ids.includes(threadId), 'parent user thread should remain visible')
 
     proc.stdin.write(json({ id: 4, method: 'thread/list', params: { includeEphemeral: true } }))
