@@ -132,6 +132,17 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    if (/plan mode check/i.test(context.prompt)) {
+      // plan mode should never reach the per-tool approval path; mirror that
+      // here by emitting a tool_use *without* invoking onPermissionRequest.
+      await handlers.onEvent({
+        type: 'text_delta',
+        delta: `planMode=${context.planMode}`,
+      })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'plan mode check' })
+      return
+    }
+
     if (/subagent check/i.test(context.prompt)) {
       // Drive the subagent suppression contract: a Task tool_use opens the
       // subagent context, internal tool_use/text/tool_result are emitted but

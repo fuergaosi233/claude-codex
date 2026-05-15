@@ -44,6 +44,7 @@ export class ClaudeSdkSidecarRuntime implements ClaudeRuntime {
         approval_policy: context.approvalPolicy,
         sandbox_mode: context.sandboxMode,
         system_prompt_addendum: context.systemPromptAddendum,
+        plan_mode: context.planMode,
       })
     })
   }

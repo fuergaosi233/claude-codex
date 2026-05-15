@@ -199,6 +199,10 @@ export interface RuntimeTurnContext {
   // Pre-assembled system prompt addendum (baseInstructions + developerInstructions
   // + personality cue). Sidecar appends it to Claude's default system prompt.
   systemPromptAddendum: string | null
+  // Drive Claude SDK permission_mode='plan' for this turn — Claude generates
+  // a plan but does not execute tools. Set when the App requests `planMode`
+  // on turn/start (or when CLAUDE_CODEX_PERMISSION_MODE=plan globally).
+  planMode: boolean
 }
 
 export type RuntimeEvent =

@@ -156,15 +156,19 @@ class PendingPermission:
 READ_ONLY_TOOLS = ["Read", "Glob", "Grep", "WebSearch", "WebFetch", "TodoWrite", "Task"]
 
 
-def derive_permission_mode(approval_policy: Any, sandbox_mode: Any) -> str:
-    """Map Codex (approvalPolicy, sandbox) tier onto Claude SDK permission_mode.
+def derive_permission_mode(approval_policy: Any, sandbox_mode: Any, plan_mode: bool = False) -> str:
+    """Map Codex (approvalPolicy, sandbox, planMode) onto Claude SDK permission_mode.
 
-    Honour CLAUDE_CODEX_PERMISSION_MODE as a hard override so operators can
-    pin the runtime regardless of what the App requests.
+    Precedence:
+      1. CLAUDE_CODEX_PERMISSION_MODE env (operator pin)
+      2. plan_mode=True from Codex App turn/start
+      3. approvalPolicy / sandbox tier
     """
     override = os.environ.get("CLAUDE_CODEX_PERMISSION_MODE", "").strip()
     if override in ("default", "acceptEdits", "bypassPermissions", "plan"):
         return override
+    if plan_mode:
+        return "plan"
     ap = (approval_policy or "").strip() if isinstance(approval_policy, str) else ""
     sb = (sandbox_mode or "").strip() if isinstance(sandbox_mode, str) else ""
     if ap == "never":
@@ -272,7 +276,9 @@ class ClaudeSidecar:
             self.structured_text_buffers.pop(f"{thread_id}:{turn_id}", None)
 
         permission_mode = derive_permission_mode(
-            message.get("approval_policy"), message.get("sandbox_mode")
+            message.get("approval_policy"),
+            message.get("sandbox_mode"),
+            bool(message.get("plan_mode")),
         )
         kwargs: Dict[str, Any] = {
             "cwd": message.get("cwd") or os.getcwd(),

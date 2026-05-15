@@ -834,6 +834,7 @@ export class CodexClaudeAppServer {
         approvalPolicy,
         sandboxMode,
         systemPromptAddendum,
+        planMode: params.planMode === true,
       },
       {
         onEvent: async (event) => {
