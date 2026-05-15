@@ -280,6 +280,18 @@ class ClaudeSidecar:
             "permission_mode": permission_mode,
             "setting_sources": ["user", "project", "local"],
         }
+        # Per-thread instruction surface from Codex App (project / developer /
+        # personality). claude-agent-sdk 0.2.x lets us preserve Claude Code's
+        # default system prompt and tack our addendum on via the preset
+        # "append" field, so the user's settings actually take effect without
+        # clobbering the runtime's built-in tools/behavior text.
+        addendum = message.get("system_prompt_addendum")
+        if isinstance(addendum, str) and addendum.strip():
+            kwargs["system_prompt"] = {
+                "type": "preset",
+                "preset": "claude_code",
+                "append": addendum.strip(),
+            }
         # Only attach the can_use_tool callback when we actually want per-tool
         # approval. In bypass mode the SDK should run tools immediately and not
         # ping us for every Bash/Edit/Write — that round-trip is the whole
@@ -323,6 +335,7 @@ class ClaudeSidecar:
             "add_dirs",
             "fork_session",
             "mcp_servers",
+            "system_prompt",
             "setting_sources",
             "include_partial_messages",
             "allowed_tools",

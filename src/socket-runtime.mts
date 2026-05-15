@@ -42,6 +42,7 @@ export class ClaudeSdkSocketRuntime implements ClaudeRuntime {
         output_format: context.outputFormat,
         approval_policy: context.approvalPolicy,
         sandbox_mode: context.sandboxMode,
+        system_prompt_addendum: context.systemPromptAddendum,
       })
     })
   }

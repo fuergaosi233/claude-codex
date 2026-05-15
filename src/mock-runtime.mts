@@ -123,6 +123,15 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    if (/system prompt check/i.test(context.prompt)) {
+      await handlers.onEvent({
+        type: 'text_delta',
+        delta: `systemPromptAddendum=${JSON.stringify(context.systemPromptAddendum ?? null)}`,
+      })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'system prompt check' })
+      return
+    }
+
     if (/subagent check/i.test(context.prompt)) {
       // Drive the subagent suppression contract: a Task tool_use opens the
       // subagent context, internal tool_use/text/tool_result are emitted but

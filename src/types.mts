@@ -75,6 +75,13 @@ export interface ThreadRecord {
   // is the unique handle the App displays for this subagent instance.
   agentRole: string | null
   agentNickname: string | null
+  // Codex App's per-thread instruction surface (settings panel: project
+  // instructions / developer instructions / personality). We thread these
+  // through to Claude as a system_prompt addendum so the user's configured
+  // tone and constraints actually take effect.
+  baseInstructions: string | null
+  developerInstructions: string | null
+  personality: string | null
 }
 
 export type ThreadStatus =
@@ -184,6 +191,9 @@ export interface RuntimeTurnContext {
   // skip per-tool approvals instead of asking for every Claude tool call.
   approvalPolicy: string | null
   sandboxMode: string | null
+  // Pre-assembled system prompt addendum (baseInstructions + developerInstructions
+  // + personality cue). Sidecar appends it to Claude's default system prompt.
+  systemPromptAddendum: string | null
 }
 
 export type RuntimeEvent =

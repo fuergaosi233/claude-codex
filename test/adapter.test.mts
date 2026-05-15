@@ -726,6 +726,44 @@ test('Claude token usage maps to thread/tokenUsage/updated notifications', async
   }
 })
 
+test('baseInstructions / developerInstructions / personality flow into the system prompt addendum', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: {
+      cwd: process.cwd(),
+      baseInstructions: 'Always write SQL in lowercase.',
+      developerInstructions: 'Avoid SELECT *.',
+      personality: 'pragmatic',
+    } }))
+    const start = await reader.nextResponse(1)
+    const threadId = start.result.thread.id
+
+    proc.stdin.write(json({ id: 2, method: 'turn/start', params: { threadId, input: [{ type: 'text', text: 'system prompt check', text_elements: [] }] } }))
+    await reader.nextResponse(2)
+
+    let text = ''
+    for (let i = 0; i < 200; i += 1) {
+      const message = await reader.next()
+      if (message.method === 'item/agentMessage/delta') text += message.params.delta
+      if (message.method === 'turn/completed') break
+    }
+    const addendumLine = text.replace(/^systemPromptAddendum=/, '')
+    const addendum = JSON.parse(addendumLine)
+    assert.ok(typeof addendum === 'string', 'systemPromptAddendum should be a non-null string')
+    assert.match(addendum, /Always write SQL in lowercase\./)
+    assert.match(addendum, /Avoid SELECT \*/)
+    assert.match(addendum, /Personality: pragmatic/)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
 test('Codex App approvalPolicy=never + sandbox=danger-full-access auto-accepts tool calls', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {

@@ -369,6 +369,9 @@ export class CodexClaudeAppServer {
       threadSource: typeof params.threadSource === 'string' ? params.threadSource : null,
       agentRole: typeof params.agentRole === 'string' ? params.agentRole : null,
       agentNickname: typeof params.agentNickname === 'string' ? params.agentNickname : null,
+      baseInstructions: typeof params.baseInstructions === 'string' ? params.baseInstructions : null,
+      developerInstructions: typeof params.developerInstructions === 'string' ? params.developerInstructions : null,
+      personality: normalizePersonality(params.personality),
     }
     this.store.upsertThread(thread)
     this.activePeerByThread.set(id, peer)
@@ -386,6 +389,9 @@ export class CodexClaudeAppServer {
     if (typeof params.approvalPolicy === 'string') thread.approvalPolicy = normalizeApprovalPolicy(params.approvalPolicy)
     if (typeof params.sandbox === 'string') thread.sandboxMode = normalizeSandboxMode(params.sandbox)
     if (typeof params.threadSource === 'string') thread.threadSource = params.threadSource
+    if (typeof params.baseInstructions === 'string') thread.baseInstructions = params.baseInstructions
+    if (typeof params.developerInstructions === 'string') thread.developerInstructions = params.developerInstructions
+    if (typeof params.personality === 'string') thread.personality = normalizePersonality(params.personality)
     this.store.upsertThread(thread)
     return this.threadEnvelope(thread, params.excludeTurns === true ? [] : this.store.listTurns(thread.id))
   }
@@ -421,6 +427,9 @@ export class CodexClaudeAppServer {
       threadSource: typeof params.threadSource === 'string' ? params.threadSource : parent.threadSource,
       agentRole: typeof params.agentRole === 'string' ? params.agentRole : parent.agentRole,
       agentNickname: typeof params.agentNickname === 'string' ? params.agentNickname : parent.agentNickname,
+      baseInstructions: typeof params.baseInstructions === 'string' ? params.baseInstructions : parent.baseInstructions,
+      developerInstructions: typeof params.developerInstructions === 'string' ? params.developerInstructions : parent.developerInstructions,
+      personality: typeof params.personality === 'string' ? normalizePersonality(params.personality) : parent.personality,
     }
     this.store.upsertThread(thread)
     this.activePeerByThread.set(id, peer)
@@ -779,6 +788,22 @@ export class CodexClaudeAppServer {
       (typeof params.approvalPolicy === 'string' ? normalizeApprovalPolicy(params.approvalPolicy) : null) ??
       thread.approvalPolicy
     const sandboxMode = sandboxFromTurnParams(params) ?? thread.sandboxMode
+    // Per-turn instruction overrides: Codex App may resend its instruction
+    // panel state when the user toggles personality mid-thread. Falls back to
+    // whatever was captured at thread/start.
+    const baseInstructions =
+      (typeof params.baseInstructions === 'string' ? params.baseInstructions : null) ?? thread.baseInstructions
+    const developerInstructions =
+      (typeof params.developerInstructions === 'string' ? params.developerInstructions : null) ??
+      thread.developerInstructions
+    const personality =
+      (typeof params.personality === 'string' ? normalizePersonality(params.personality) : null) ??
+      thread.personality
+    const systemPromptAddendum = buildSystemPromptAddendum({
+      baseInstructions,
+      developerInstructions,
+      personality,
+    })
 
     await this.runtime.runTurn(
       {
@@ -799,6 +824,7 @@ export class CodexClaudeAppServer {
         outputFormat: claudeOutputFormat(params.outputSchema),
         approvalPolicy,
         sandboxMode,
+        systemPromptAddendum,
       },
       {
         onEvent: async (event) => {
@@ -852,6 +878,11 @@ export class CodexClaudeAppServer {
               threadSource: 'subagent',
               agentRole,
               agentNickname,
+              // Subagent inherits parent's instruction surface so the same
+              // project/developer guidance applies to the child run.
+              baseInstructions: thread.baseInstructions,
+              developerInstructions: thread.developerInstructions,
+              personality: thread.personality,
             }
             this.store.upsertThread(childThread)
 
@@ -2044,6 +2075,50 @@ function sandboxFromTurnParams(params: Record<string, unknown>): string | null {
   if (type === 'readOnly') return 'read-only'
   if (type === 'workspaceWrite' || type === 'externalSandbox') return 'workspace-write'
   return null
+}
+
+function normalizePersonality(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const v = value.trim()
+  if (v === 'none' || v === 'friendly' || v === 'pragmatic' || v === 'cynic' || v === 'robot' || v === 'nerd') return v
+  return null
+}
+
+// Assemble the per-thread system prompt addendum from Codex App's instruction
+// surface. Sidecar concatenates this onto Claude's default system prompt so
+// the user's project / developer / personality settings actually take effect.
+function buildSystemPromptAddendum(input: {
+  baseInstructions: string | null
+  developerInstructions: string | null
+  personality: string | null
+}): string | null {
+  const sections: string[] = []
+  const base = (input.baseInstructions ?? '').trim()
+  if (base) sections.push(`# Project instructions\n${base}`)
+  const dev = (input.developerInstructions ?? '').trim()
+  if (dev) sections.push(`# Developer instructions\n${dev}`)
+  const cue = personalityPromptCue(input.personality)
+  if (cue) sections.push(cue)
+  return sections.length > 0 ? sections.join('\n\n') : null
+}
+
+function personalityPromptCue(personality: string | null): string | null {
+  switch (personality) {
+    case 'friendly':
+      return 'Personality: friendly. Communicate in a warm, encouraging tone; default to plain language and short paragraphs.'
+    case 'pragmatic':
+      return 'Personality: pragmatic. Be concise and direct; lead with the answer, skip pleasantries, prefer concrete code or commands.'
+    case 'cynic':
+      return 'Personality: cynic. Be terse and wry; surface trade-offs and risks plainly; avoid hype.'
+    case 'robot':
+      return 'Personality: robot. Reply in clipped, structured prose; prefer bullet points and exact field names; minimise filler.'
+    case 'nerd':
+      return 'Personality: nerd. Get into mechanism and detail; explain underlying assumptions and edge cases when relevant.'
+    case 'none':
+    case null:
+    default:
+      return null
+  }
 }
 
 // Codex App's thread envelope expects a sandbox object whose `type` matches the

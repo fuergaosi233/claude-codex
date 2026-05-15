@@ -63,6 +63,9 @@ export class SessionStore {
     this.ensureColumn('threads', 'thread_source', 'TEXT')
     this.ensureColumn('threads', 'agent_role', 'TEXT')
     this.ensureColumn('threads', 'agent_nickname', 'TEXT')
+    this.ensureColumn('threads', 'base_instructions', 'TEXT')
+    this.ensureColumn('threads', 'developer_instructions', 'TEXT')
+    this.ensureColumn('threads', 'personality', 'TEXT')
   }
 
   private ensureColumn(table: string, column: string, definition: string): void {
@@ -77,8 +80,9 @@ export class SessionStore {
         INSERT INTO threads (
           id, session_id, forked_from_id, preview, name, archived, cwd, model, reasoning_effort,
           model_provider, claude_session_id, source, created_at, updated_at, status_json,
-          approval_policy, sandbox_mode, ephemeral, thread_source, agent_role, agent_nickname
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          approval_policy, sandbox_mode, ephemeral, thread_source, agent_role, agent_nickname,
+          base_instructions, developer_instructions, personality
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           session_id=excluded.session_id,
           forked_from_id=excluded.forked_from_id,
@@ -98,7 +102,10 @@ export class SessionStore {
           ephemeral=excluded.ephemeral,
           thread_source=excluded.thread_source,
           agent_role=excluded.agent_role,
-          agent_nickname=excluded.agent_nickname
+          agent_nickname=excluded.agent_nickname,
+          base_instructions=excluded.base_instructions,
+          developer_instructions=excluded.developer_instructions,
+          personality=excluded.personality
       `)
       .run(
         thread.id,
@@ -122,6 +129,9 @@ export class SessionStore {
         thread.threadSource,
         thread.agentRole,
         thread.agentNickname,
+        thread.baseInstructions,
+        thread.developerInstructions,
+        thread.personality,
       )
   }
 
@@ -280,6 +290,9 @@ export class SessionStore {
       threadSource: row.thread_source == null ? null : String(row.thread_source),
       agentRole: row.agent_role == null ? null : String(row.agent_role),
       agentNickname: row.agent_nickname == null ? null : String(row.agent_nickname),
+      baseInstructions: row.base_instructions == null ? null : String(row.base_instructions),
+      developerInstructions: row.developer_instructions == null ? null : String(row.developer_instructions),
+      personality: row.personality == null ? null : String(row.personality),
     }
   }
 
