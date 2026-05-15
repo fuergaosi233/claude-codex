@@ -889,6 +889,38 @@ test('thread/start with ephemeral=true is hidden from thread/list and surfaces t
   }
 })
 
+test('debug.jsonl rotates once it crosses CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES', async () => {
+  const util = await import(resolve('dist/src/util.mjs'))
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-rotate-'))
+  const logPath = join(home, 'debug.jsonl')
+  const prevPath = process.env.CLAUDE_CODEX_DEBUG_LOG
+  const prevMax = process.env.CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES
+  const prevKeep = process.env.CLAUDE_CODEX_DEBUG_LOG_KEEP
+  process.env.CLAUDE_CODEX_DEBUG_LOG = logPath
+  process.env.CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES = '512'
+  process.env.CLAUDE_CODEX_DEBUG_LOG_KEEP = '2'
+  try {
+    // Each line is ~150 bytes; write enough to cross 512 bytes twice.
+    for (let i = 0; i < 30; i += 1) util.debugLog('test.rotate', { i, payload: 'x'.repeat(120) })
+    const fs = await import('node:fs/promises')
+    const entries = await fs.readdir(home)
+    assert.ok(entries.includes('debug.jsonl'), 'active log should exist')
+    assert.ok(entries.includes('debug.jsonl.1'), 'rotation should have produced a .1 slot')
+    // KEEP=2 means at most .1 + .2; .3 must never appear.
+    assert.ok(!entries.includes('debug.jsonl.3'), 'rotation should respect CLAUDE_CODEX_DEBUG_LOG_KEEP')
+    const activeSize = (await fs.stat(logPath)).size
+    assert.ok(activeSize < 512 * 4, 'active log should have been freshly started after rotation')
+  } finally {
+    if (prevPath == null) delete process.env.CLAUDE_CODEX_DEBUG_LOG
+    else process.env.CLAUDE_CODEX_DEBUG_LOG = prevPath
+    if (prevMax == null) delete process.env.CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES
+    else process.env.CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES = prevMax
+    if (prevKeep == null) delete process.env.CLAUDE_CODEX_DEBUG_LOG_KEEP
+    else process.env.CLAUDE_CODEX_DEBUG_LOG_KEEP = prevKeep
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
 test('defaultSocketPath stays within the platform sun_path limit', async () => {
   const util = await import(resolve('dist/src/util.mjs'))
   const prev = process.env.CODEX_HOME

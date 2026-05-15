@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { homedir, platform, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
-import { appendFileSync, mkdirSync } from 'node:fs'
+import { appendFileSync, mkdirSync, renameSync, statSync, unlinkSync } from 'node:fs'
 
 export function nowSeconds(): number {
   return Math.floor(Date.now() / 1000)
@@ -46,8 +46,43 @@ export function debugLog(event: string, data: Record<string, unknown> = {}): voi
   const path = resolve(process.env.CLAUDE_CODEX_DEBUG_LOG || join(adapterHome(), 'debug.jsonl'))
   try {
     ensureParent(path)
+    rotateLogIfNeeded(path)
     appendFileSync(path, JSON.stringify({ ts: new Date().toISOString(), pid: process.pid, event, ...(redact(data) as Record<string, unknown>) }) + '\n')
   } catch {}
+}
+
+// Long-running adapter daemons would otherwise grow debug.jsonl until the disk
+// fills. Bound it with a simple `.1`/`.2`/... rotation: when the active log
+// passes `maxBytes`, push it down one slot and start fresh. Bound by `keep`,
+// dropping anything older. Sized envs override; failures swallow because the
+// debug log is best-effort and must never break the main flow.
+export function rotateLogIfNeeded(path: string): void {
+  const maxBytes = numericEnv('CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES', 50 * 1024 * 1024)
+  if (maxBytes <= 0) return
+  const keep = Math.max(1, numericEnv('CLAUDE_CODEX_DEBUG_LOG_KEEP', 3))
+  let size = 0
+  try {
+    size = statSync(path).size
+  } catch {
+    return // file does not exist yet — nothing to rotate
+  }
+  if (size < maxBytes) return
+  // Drop the oldest slot if it would push us past `keep`.
+  const oldest = `${path}.${keep}`
+  try { unlinkSync(oldest) } catch {}
+  // Shift `.k-1` → `.k`, `.k-2` → `.k-1`, …, `.1` → `.2`.
+  for (let i = keep - 1; i >= 1; i -= 1) {
+    try { renameSync(`${path}.${i}`, `${path}.${i + 1}`) } catch {}
+  }
+  // Move the active log to `.1`. The next appendFileSync recreates it.
+  try { renameSync(path, `${path}.1`) } catch {}
+}
+
+function numericEnv(name: string, fallback: number): number {
+  const raw = process.env[name]
+  if (!raw) return fallback
+  const parsed = Number(raw)
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback
 }
 
 export function platformFamily(): string {
