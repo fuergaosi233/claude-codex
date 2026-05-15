@@ -210,7 +210,14 @@ export class CodexClaudeAppServer {
       case 'model/list':
         return this.modelList()
       case 'modelProvider/capabilities/read':
-        return { namespaceTools: true, imageGeneration: false, webSearch: false }
+        return {
+          namespaceTools: true,
+          imageGeneration: false,
+          // Claude Code SDK ships a WebSearch tool. Default to advertising it
+          // so Codex App shows the search affordance; CLAUDE_CODEX_WEBSEARCH=0
+          // turns it off for environments where the tool is rate-limited.
+          webSearch: process.env.CLAUDE_CODEX_WEBSEARCH !== '0',
+        }
       case 'experimentalFeature/list':
         return { data: [], nextCursor: null }
       case 'experimentalFeature/enablement/set':
@@ -1074,6 +1081,9 @@ export class CodexClaudeAppServer {
                   error: event.isError ? event.content : null,
                 }
               }
+              if (item.type === 'webSearch') {
+                return { ...item, action: parseWebSearchAction(item.query, resultText) }
+              }
               return item
             })
             const item = updated?.items.find((candidate) => candidate.id === itemId)
@@ -1795,6 +1805,18 @@ export class CodexClaudeAppServer {
         status: 'inProgress',
       }
     }
+    if (event.toolName === 'WebSearch') {
+      // Codex App has a dedicated `webSearch` ThreadItem with a structured
+      // action — emit it instead of a generic mcpToolCall so the App can show
+      // the search badge (and follow-up open-page links) natively. Action is
+      // populated when the tool_result arrives (see tool_result handler).
+      return {
+        type: 'webSearch',
+        id,
+        query: String(event.input.query ?? ''),
+        action: { type: 'search' },
+      }
+    }
     return {
       type: 'mcpToolCall',
       id,
@@ -2161,6 +2183,20 @@ function sandboxEnvelope(mode: string | null, cwd: string): unknown {
 
 function emptyTokenBreakdown(): TokenUsageBreakdown {
   return { totalTokens: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0 }
+}
+
+// Best-effort: when the WebSearch tool returns a result, sniff whether the
+// first result was an explicit page open vs a result list. Codex App's
+// `webSearch` ThreadItem renders the action badge accordingly.
+function parseWebSearchAction(query: string, resultText: string):
+  | { type: 'search' }
+  | { type: 'openPage'; url: string }
+  | { type: 'findInPage'; pattern: string; url: string }
+  | { type: 'other' } {
+  if (!resultText) return { type: 'search' }
+  const urlMatch = resultText.match(/https?:\/\/[^\s)\]"'<]+/)
+  if (urlMatch && query) return { type: 'openPage', url: urlMatch[0] }
+  return { type: 'search' }
 }
 
 // Maps the raw Anthropic usage block carried on the Claude Agent SDK

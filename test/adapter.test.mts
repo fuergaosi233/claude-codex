@@ -773,6 +773,58 @@ test('baseInstructions / developerInstructions / personality flow into the syste
   }
 })
 
+test('Claude WebSearch tool maps to native Codex webSearch ThreadItem with action', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const start = await reader.nextResponse(1)
+    const threadId = start.result.thread.id
+
+    proc.stdin.write(json({ id: 2, method: 'turn/start', params: { threadId, input: [{ type: 'text', text: 'web search check', text_elements: [] }] } }))
+    await reader.nextResponse(2)
+
+    let webSearchItem: any = null
+    let completedWebSearch: any = null
+    for (let i = 0; i < 200; i += 1) {
+      const message = await reader.next()
+      if (message.method === 'item/started' && message.params.item.type === 'webSearch') webSearchItem = message.params.item
+      if (message.method === 'item/completed' && webSearchItem && message.params.item.id === webSearchItem.id) completedWebSearch = message.params.item
+      if (message.method === 'turn/completed') break
+    }
+    assert.ok(webSearchItem, 'WebSearch tool_use should emit a native webSearch ThreadItem')
+    assert.equal(webSearchItem.query, 'mock query')
+    assert.deepEqual(webSearchItem.action, { type: 'search' })
+    assert.ok(completedWebSearch, 'webSearch item should complete')
+    assert.equal(completedWebSearch.action.type, 'openPage', 'tool_result with a URL should upgrade action to openPage')
+    assert.equal(completedWebSearch.action.url, 'https://example.com/article')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('modelProvider/capabilities/read advertises webSearch=true unless CLAUDE_CODEX_WEBSEARCH=0', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'modelProvider/capabilities/read', params: {} }))
+    const cap = await reader.nextResponse(1)
+    assert.equal(cap.result.webSearch, true)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
 test('turn/start planMode=true flows into Claude SDK permission_mode plan', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {

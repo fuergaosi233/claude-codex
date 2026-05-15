@@ -154,6 +154,20 @@ export type ThreadItem =
       error: unknown | null
       durationMs: number | null
     }
+  // Native Codex Web Search rendering. Claude SDK's WebSearch tool input is
+  // {query: string}; we map it to Codex's `webSearch` ThreadItem so the App
+  // gets the dedicated search badge / link UI instead of a generic mcpToolCall.
+  | {
+      type: 'webSearch'
+      id: string
+      query: string
+      action:
+        | { type: 'search' }
+        | { type: 'openPage'; url: string }
+        | { type: 'findInPage'; pattern: string; url: string }
+        | { type: 'other' }
+        | null
+    }
   // Native Codex subagent representation. The Task tool spawns a child thread;
   // Codex App displays it as one Agent item that can drill into the child
   // thread by id (`receiverThreadIds`).

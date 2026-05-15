@@ -132,6 +132,23 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    if (/web search check/i.test(context.prompt)) {
+      const toolUseId = `ws-${Date.now()}`
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId,
+        toolName: 'WebSearch',
+        input: { query: 'mock query' },
+      })
+      await handlers.onEvent({
+        type: 'tool_result',
+        toolUseId,
+        content: 'Top result: https://example.com/article — overview.',
+      })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'web search check' })
+      return
+    }
+
     if (/plan mode check/i.test(context.prompt)) {
       // plan mode should never reach the per-tool approval path; mirror that
       // here by emitting a tool_use *without* invoking onPermissionRequest.
