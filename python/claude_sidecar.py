@@ -440,6 +440,23 @@ class ClaudeSidecar:
             usage = obj_get(message, "usage", None)
             if isinstance(usage, dict) and usage:
                 emit({"type": "usage", "thread_id": thread_id, "turn_id": turn_id, "usage": usage})
+            # ResultMessage also carries the timing + cost view that Codex
+            # App's status bar consumes; emit them so the bars stop reading
+            # blank.
+            duration_ms = obj_get(message, "duration_ms", None)
+            api_duration_ms = obj_get(message, "duration_api_ms", None)
+            num_turns = obj_get(message, "num_turns", None)
+            cost_usd = obj_get(message, "total_cost_usd", None)
+            if any(v is not None for v in (duration_ms, api_duration_ms, num_turns, cost_usd)):
+                emit({
+                    "type": "metrics",
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
+                    "duration_ms": duration_ms,
+                    "duration_api_ms": api_duration_ms,
+                    "num_turns": num_turns,
+                    "total_cost_usd": cost_usd,
+                })
         if result and name.lower().startswith("result"):
             self.flush_structured_output(thread_id, turn_id)
             emit({"type": "completed", "thread_id": thread_id, "turn_id": turn_id, "success": not bool(obj_get(message, "is_error", False)), "result": result, "claude_session_id": last_session_id})

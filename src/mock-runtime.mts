@@ -154,6 +154,13 @@ export class MockRuntime implements ClaudeRuntime {
         type: 'usage',
         usage: { input_tokens: 100, output_tokens: 40, cache_read_input_tokens: 10, cache_creation_input_tokens: 5 },
       })
+      await handlers.onEvent({
+        type: 'metrics',
+        durationMs: 1234,
+        apiDurationMs: 987,
+        numTurns: 3,
+        costUsd: 0.0042,
+      })
       await handlers.onEvent({ type: 'text_delta', delta: 'usage done' })
       await handlers.onEvent({ type: 'completed', success: true, result: 'usage check' })
       return

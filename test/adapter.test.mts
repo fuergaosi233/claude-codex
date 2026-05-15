@@ -703,13 +703,22 @@ test('Claude token usage maps to thread/tokenUsage/updated notifications', async
     await reader.nextResponse(2)
 
     let tokenUsage: any = null
+    let completedTurn: any = null
     for (let i = 0; i < 500; i += 1) {
       const message = await reader.next()
       if (message.method === 'thread/tokenUsage/updated') tokenUsage = message.params
-      if (message.method === 'turn/completed') break
+      if (message.method === 'turn/completed') {
+        completedTurn = message.params.turn
+        break
+      }
     }
     assert.ok(tokenUsage, 'expected a thread/tokenUsage/updated notification')
     assert.equal(tokenUsage.threadId, threadId)
+    // Metrics from ResultMessage flow through into turn/completed.
+    assert.ok(completedTurn, 'turn/completed must arrive')
+    assert.equal(completedTurn.apiDurationMs, 987)
+    assert.equal(completedTurn.numTurns, 3)
+    assert.equal(completedTurn.costUsd, 0.0042)
     // input_tokens 100 + cache_creation 5 = 105 input; cache_read 10; output 40.
     assert.deepEqual(tokenUsage.tokenUsage.last, {
       inputTokens: 105,

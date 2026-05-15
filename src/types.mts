@@ -102,6 +102,11 @@ export interface TurnRecord {
   items: ThreadItem[]
   diff: string
   error: unknown | null
+  // Claude Agent SDK ResultMessage metrics. Surface them in turn/completed
+  // so Codex App's status bar can show real timing + cost instead of blanks.
+  apiDurationMs?: number | null
+  numTurns?: number | null
+  costUsd?: number | null
 }
 
 export type UserInput =
@@ -206,6 +211,7 @@ export type RuntimeEvent =
   | { type: 'permission_request'; requestId: string; toolUseId: string; toolName: string; input: Record<string, unknown> }
   | { type: 'notice'; level: 'info' | 'warning' | 'error'; message: string }
   | { type: 'usage'; usage: Record<string, unknown> }
+  | { type: 'metrics'; durationMs: number | null; apiDurationMs: number | null; numTurns: number | null; costUsd: number | null }
   | { type: 'completed'; claudeSessionId?: string | null; result?: string | null; success: boolean }
   | { type: 'error'; message: string }
 

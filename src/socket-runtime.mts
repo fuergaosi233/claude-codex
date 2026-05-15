@@ -159,6 +159,15 @@ export class ClaudeSdkSocketRuntime implements ClaudeRuntime {
       case 'usage':
         await pending.handlers.onEvent({ type: 'usage', usage: asRecord(message.usage) })
         break
+      case 'metrics':
+        await pending.handlers.onEvent({
+          type: 'metrics',
+          durationMs: numberOrNull(message.duration_ms),
+          apiDurationMs: numberOrNull(message.duration_api_ms),
+          numTurns: numberOrNull(message.num_turns),
+          costUsd: numberOrNull(message.total_cost_usd),
+        })
+        break
       case 'completed':
         await pending.handlers.onEvent({
           type: 'completed',
@@ -196,4 +205,8 @@ export class ClaudeSdkSocketRuntime implements ClaudeRuntime {
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {}
+}
+
+function numberOrNull(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
 }

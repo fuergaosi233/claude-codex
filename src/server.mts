@@ -761,6 +761,15 @@ export class CodexClaudeAppServer {
     // collapsed item that goes silent for the duration of the subagent.
     const subagentContexts = new Map<string, { childThreadId: string; waitItemId: string; prompt: string; subType: string | null }>()
     const activeSubagents = new Set<string>()
+    // Mutable holder rather than `let collectedMetrics`: TS's control-flow
+    // analysis doesn't see writes from inside the onEvent callback, so a bare
+    // `let` would still be inferred as `null` outside the closure.
+    const collectedMetrics: { apiDurationMs: number | null; numTurns: number | null; costUsd: number | null; set: boolean } = {
+      apiDurationMs: null,
+      numTurns: null,
+      costUsd: null,
+      set: false,
+    }
     const forkSession = thread.forkedFromId != null && thread.claudeSessionId != null && this.store.listTurns(thread.id).length <= 1
     const ensureAgentItem = (): string => {
       if (agentItemId) return agentItemId
@@ -1093,6 +1102,16 @@ export class CodexClaudeAppServer {
             this.recordTokenUsage(peer, thread.id, turn.id, event.usage)
             return
           }
+          if (event.type === 'metrics') {
+            // Track metrics on the runRuntimeTurn closure rather than in the
+            // SQLite turns row (which doesn't have these columns). They get
+            // merged into the final TurnRecord shipped via turn/completed.
+            collectedMetrics.apiDurationMs = event.apiDurationMs
+            collectedMetrics.numTurns = event.numTurns
+            collectedMetrics.costUsd = event.costUsd
+            collectedMetrics.set = true
+            return
+          }
           if (event.type === 'completed') {
             if (event.claudeSessionId) this.store.updateClaudeSessionId(thread.id, event.claudeSessionId)
             if (!event.success) throw new Error(event.result ?? 'Claude turn failed')
@@ -1146,7 +1165,12 @@ export class CodexClaudeAppServer {
       const item = latestTurn?.items.find((candidate) => candidate.id === completedItemId)
       if (item) this.notify(peer, { method: 'item/completed', params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() } })
     }
-    const completed = this.store.completeTurn(turn.id, 'completed') ?? turn
+    const completed: TurnRecord = this.store.completeTurn(turn.id, 'completed') ?? turn
+    if (collectedMetrics.set) {
+      completed.apiDurationMs = collectedMetrics.apiDurationMs
+      completed.numTurns = collectedMetrics.numTurns
+      completed.costUsd = collectedMetrics.costUsd
+    }
     this.activeTurnByThread.delete(thread.id)
     this.setThreadStatus(peer, thread.id, { type: 'idle' })
     this.notify(peer, { method: 'turn/completed', params: { threadId: thread.id, turn: this.toTurn(completed) } })
@@ -1834,6 +1858,9 @@ export class CodexClaudeAppServer {
       startedAt: turn.startedAt,
       completedAt: turn.completedAt,
       durationMs: turn.durationMs,
+      apiDurationMs: turn.apiDurationMs ?? null,
+      numTurns: turn.numTurns ?? null,
+      costUsd: turn.costUsd ?? null,
     }
   }
 
