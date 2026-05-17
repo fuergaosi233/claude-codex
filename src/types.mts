@@ -153,7 +153,12 @@ export type ThreadItem =
   | {
       type: 'hookPrompt'
       id: string
-      fragments: Array<{ kind: 'text' | 'note'; text: string }>
+      // Codex protocol HookPromptFragment = { text, hookRunId }. We previously
+      // emitted {kind, text} (a misread of an older schema) — that would crash
+      // the App's ts-rs deserializer with "missing field `hookRunId`". Each
+      // fragment now carries the structured hookRunId so App can group related
+      // fragments under one hook execution.
+      fragments: Array<{ text: string; hookRunId: string }>
     }
   | {
       type: 'mcpToolCall'
@@ -162,8 +167,18 @@ export type ThreadItem =
       tool: string
       status: string
       arguments: unknown
-      result: unknown | null
-      error: unknown | null
+      // Codex v2 McpToolCallResult shape — must have all three fields present
+      // (structuredContent / _meta default to null). Raw content array is the
+      // Anthropic tool-result block array.
+      result:
+        | {
+            content: unknown[]
+            structuredContent: unknown | null
+            _meta: unknown | null
+          }
+        | null
+      // Codex v2 McpToolCallError shape — { message: string } and nothing else.
+      error: { message: string } | null
       durationMs: number | null
     }
   // Native Codex Web Search rendering. Claude SDK's WebSearch tool input is
@@ -173,10 +188,12 @@ export type ThreadItem =
       type: 'webSearch'
       id: string
       query: string
+      // Codex v2 WebSearchAction. Each variant's inner fields are Option<...>
+      // with no serde default, so we MUST always emit them (allowed to be null).
       action:
-        | { type: 'search' }
-        | { type: 'openPage'; url: string }
-        | { type: 'findInPage'; pattern: string; url: string }
+        | { type: 'search'; query: string | null; queries: string[] | null }
+        | { type: 'openPage'; url: string | null }
+        | { type: 'findInPage'; pattern: string | null; url: string | null }
         | { type: 'other' }
         | null
     }

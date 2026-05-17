@@ -989,7 +989,9 @@ test('Claude WebSearch tool maps to native Codex webSearch ThreadItem with actio
     }
     assert.ok(webSearchItem, 'WebSearch tool_use should emit a native webSearch ThreadItem')
     assert.equal(webSearchItem.query, 'mock query')
-    assert.deepEqual(webSearchItem.action, { type: 'search' })
+    // Protocol-correct action shape: 'search' variant has required query/queries
+    // (Option<...> with no serde default) — bare {type:'search'} would crash App.
+    assert.deepEqual(webSearchItem.action, { type: 'search', query: 'mock query', queries: null })
     assert.ok(completedWebSearch, 'webSearch item should complete')
     assert.equal(completedWebSearch.action.type, 'openPage', 'tool_result with a URL should upgrade action to openPage')
     assert.equal(completedWebSearch.action.url, 'https://example.com/article')
@@ -1457,7 +1459,14 @@ test('generic Claude tools complete as Codex mcpToolCall items', async () => {
     }
     assert.equal(completedTool?.tool, 'Read')
     assert.equal(completedTool?.status, 'completed')
-    assert.deepEqual(completedTool?.result, { text: 'mock read result' })
+    // Result must be wrapped in Codex v2 McpToolCallResult shape — {content[], structuredContent, _meta}.
+    // The mock runtime returns {text:'mock read result'} as the raw content, which we wrap as:
+    //   content: [{type:'text', text:'<json>'}], structuredContent: <object>, _meta: null.
+    assert.deepEqual(completedTool?.result, {
+      content: [{ type: 'text', text: JSON.stringify({ text: 'mock read result' }) }],
+      structuredContent: { text: 'mock read result' },
+      _meta: null,
+    })
     assert.equal(sawIdle, true)
   } finally {
     proc.kill()

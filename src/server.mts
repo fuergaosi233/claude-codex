@@ -257,6 +257,20 @@ export class CodexClaudeAppServer {
         return { effectiveEnabled: asRecord(params).enabled === true }
       case 'plugin/share/list':
         return { data: [] }
+      // Stub the three RPC methods Codex App may call but our dispatcher
+      // previously threw "method not implemented" on. Stubs return the
+      // schema-correct empty shape so the App's call sites don't surface an
+      // RPC error toast.
+      case 'plugin/share/checkout':
+        // PluginShareCheckoutResponse — App polls after a share/save; nothing to checkout.
+        return {}
+      case 'environment/add':
+        // EnvironmentAddResponse — adds a workspace environment; we have no concept of one.
+        return {}
+      case 'attestation/generate':
+        // AttestationGenerateResponse — returns a signed blob; clients with
+        // requestAttestation:true expect a string. Empty string is permissive.
+        return { attestation: '' }
       case 'app/list':
         return { data: [], nextCursor: null }
       case 'mcpServer/oauth/login':
@@ -823,7 +837,15 @@ export class CodexClaudeAppServer {
     }
     const initialItems: ThreadItem[] = [{ type: 'userMessage', id: newId(), content: input }]
     for (const img of images) {
-      initialItems.push({ type: 'imageView', id: newId(), path: img.displayPath })
+      // Codex v2 imageView.path is AbsolutePathBuf — Rust's custom Deserialize
+      // rejects anything that isn't an absolute filesystem path (URLs, data:
+      // URIs, relative paths). For non-local images we'd otherwise crash the
+      // App on persist/reload. Only emit imageView for kind:'base64' inputs
+      // that came from a real local file path (the displayPath in that case
+      // is the original absolute path captured by extractImageInputs).
+      if (img.kind === 'base64' && img.displayPath.startsWith('/')) {
+        initialItems.push({ type: 'imageView', id: newId(), path: img.displayPath })
+      }
     }
     // Note: we used to short-circuit Codex App's title-generation turn with a
     // local regex-derived title to avoid prompt leakage into the parent thread.
@@ -1046,11 +1068,16 @@ export class CodexClaudeAppServer {
             // Stage 1 — spawnAgent (begin + end emitted together; the agent is
             // already created so there's no real latency here).
             const spawnId = newId()
+            // Codex v2 collabAgentToolCall.reasoningEffort is `ReasoningEffort | null`
+            // (strict enum: none|minimal|low|medium|high|xhigh). Same Oops trap as
+            // threadSource — an empty string from a sloppy resume crashes the App.
+            // Normalize here once and reuse for every stage of the lifecycle.
+            const collabEffort = normalizeReasoningEffortEnum(thread.reasoningEffort)
             const spawnBegin: ThreadItem = {
               type: 'collabAgentToolCall', id: spawnId, tool: 'spawnAgent',
               status: 'inProgress', senderThreadId: thread.id, receiverThreadIds: [],
               prompt: promptText || null, model: subagentModel,
-              reasoningEffort: thread.reasoningEffort, agentsStates: {},
+              reasoningEffort: collabEffort, agentsStates: {},
             }
             this.store.appendItem(turn.id, spawnBegin)
             this.notify(peer, { method: 'item/started', params: { threadId: thread.id, turnId: turn.id, item: spawnBegin, startedAtMs: nowMillis() } })
@@ -1058,7 +1085,7 @@ export class CodexClaudeAppServer {
               type: 'collabAgentToolCall', id: spawnId, tool: 'spawnAgent',
               status: 'completed', senderThreadId: thread.id, receiverThreadIds: [childThreadId],
               prompt: promptText || null, model: subagentModel,
-              reasoningEffort: thread.reasoningEffort,
+              reasoningEffort: collabEffort,
               agentsStates: { [childThreadId]: { status: 'running', message: null } },
             }
             this.store.updateItem(turn.id, spawnId, () => spawnEnd)
@@ -1268,11 +1295,15 @@ export class CodexClaudeAppServer {
               }
               if (item.type === 'fileChange') return { ...item, status: event.isError ? 'failed' : 'completed' }
               if (item.type === 'mcpToolCall') {
+                // Protocol-correct shape: McpToolCallResult = {content[], structuredContent, _meta};
+                // McpToolCallError = {message}. We previously shipped raw event.content for both
+                // which crashed App's ts-rs deserializer for any tool that returned anything richer
+                // than a primitive. Always wrap into the strict shape.
                 return {
                   ...item,
                   status: event.isError ? 'failed' : 'completed',
-                  result: event.isError ? null : event.content,
-                  error: event.isError ? event.content : null,
+                  result: event.isError ? null : wrapMcpToolResult(event.content),
+                  error: event.isError ? wrapMcpToolError(event.content) : null,
                   durationMs,
                 }
               }
@@ -1312,12 +1343,16 @@ export class CodexClaudeAppServer {
             // Render the hook event as a Codex hookPrompt item alongside the
             // (still-emitted) notice line, so the user sees structured hook
             // activity in the timeline instead of just a one-liner warning.
-            const fragments: Array<{ kind: 'text' | 'note'; text: string }> = [
-              { kind: 'text', text: `Hook · ${event.hookName}` },
+            // All fragments of the same hook run share one hookRunId so App
+            // groups them under a single execution; the format matches
+            // Codex's own hookprompt items (one synthetic run id per emit).
+            const hookRunId = newId()
+            const fragments: Array<{ text: string; hookRunId: string }> = [
+              { text: `Hook · ${event.hookName}`, hookRunId },
             ]
-            if (event.status) fragments.push({ kind: 'note', text: `status: ${event.status}` })
-            if (event.decision) fragments.push({ kind: 'note', text: `decision: ${event.decision}` })
-            if (event.message) fragments.push({ kind: 'text', text: event.message })
+            if (event.status) fragments.push({ text: `status: ${event.status}`, hookRunId })
+            if (event.decision) fragments.push({ text: `decision: ${event.decision}`, hookRunId })
+            if (event.message) fragments.push({ text: event.message, hookRunId })
             const hookItem: ThreadItem = { type: 'hookPrompt', id: newId(), fragments }
             this.store.appendItem(turn.id, hookItem)
             this.notify(peer, { method: 'item/started', params: { threadId: thread.id, turnId: turn.id, item: hookItem, startedAtMs: nowMillis() } })
@@ -2024,13 +2059,17 @@ export class CodexClaudeAppServer {
     if (event.toolName === 'WebSearch') {
       // Codex App has a dedicated `webSearch` ThreadItem with a structured
       // action — emit it instead of a generic mcpToolCall so the App can show
-      // the search badge (and follow-up open-page links) natively. Action is
-      // populated when the tool_result arrives (see tool_result handler).
+      // the search badge (and follow-up open-page links) natively. The action
+      // is finalized when the tool_result arrives (see tool_result handler).
+      // The 'search' variant's `query` / `queries` are required (Option fields
+      // with no serde default), so always populate both even on the initial
+      // inProgress emit.
+      const q = String(event.input.query ?? '')
       return {
         type: 'webSearch',
         id,
-        query: String(event.input.query ?? ''),
-        action: { type: 'search' },
+        query: q,
+        action: { type: 'search', query: q || null, queries: null },
       }
     }
     return {
@@ -2366,6 +2405,19 @@ function normalizePersonality(value: unknown): string | null {
   return null
 }
 
+// Codex v2 ReasoningEffort enum (top-level, used by collabAgentToolCall and
+// elsewhere). No serde(other) fallback — anything outside this set crashes
+// the App's deserializer (same trap as threadSource = ""). Pass any value
+// through here before emitting it on the wire.
+function normalizeReasoningEffortEnum(
+  value: string | null | undefined,
+): 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | null {
+  if (typeof value !== 'string') return null
+  const v = value.trim()
+  if (v === 'none' || v === 'minimal' || v === 'low' || v === 'medium' || v === 'high' || v === 'xhigh') return v
+  return null
+}
+
 // Codex App's settings sheet writes the persistent reasoning-effort default
 // under `params.config.model_reasoning_effort` (the same shape as the Codex
 // CLI's `config.toml`). turn/start's top-level `effort` is only set when the
@@ -2477,6 +2529,38 @@ interface SubagentTrailer {
   usage: { totalTokens: number; toolUses: number; durationMs: number } | null
 }
 
+// Codex v2 McpToolCallResult requires {content[], structuredContent, _meta}.
+// Claude SDK tool_result.content is one of: a string, an array of Anthropic
+// content blocks ({type:'text'|'image', ...}), or a structured JsonValue.
+// Wrap into the protocol shape — if content is already an array, use it; if
+// it's a primitive/object, materialize as a single text block so the App
+// renders something useful instead of an empty result.
+function wrapMcpToolResult(content: unknown): { content: unknown[]; structuredContent: unknown | null; _meta: unknown | null } {
+  if (content == null) return { content: [], structuredContent: null, _meta: null }
+  if (Array.isArray(content)) return { content, structuredContent: null, _meta: null }
+  const text = typeof content === 'string' ? content : JSON.stringify(content)
+  return { content: [{ type: 'text', text }], structuredContent: typeof content === 'object' ? content : null, _meta: null }
+}
+
+// Codex v2 McpToolCallError requires { message: string } — and nothing else.
+// Coerce any tool_result body the SDK gave us into that single-field shape.
+function wrapMcpToolError(content: unknown): { message: string } {
+  if (content == null) return { message: 'tool call failed' }
+  if (typeof content === 'string') return { message: content }
+  if (Array.isArray(content)) {
+    // Concatenate any text blocks; fall back to a JSON dump.
+    const text = content
+      .map((b) => (b && typeof b === 'object' && (b as any).type === 'text' ? String((b as any).text ?? '') : ''))
+      .filter(Boolean)
+      .join('\n')
+    return { message: text || JSON.stringify(content) }
+  }
+  if (typeof content === 'object' && content && typeof (content as any).message === 'string') {
+    return { message: (content as any).message }
+  }
+  return { message: JSON.stringify(content) }
+}
+
 function parseSubagentTrailer(text: string): SubagentTrailer {
   if (!text) return { cleanText: '', agentId: null, usage: null }
   let cleanText = text
@@ -2526,14 +2610,18 @@ function parseExitCodeFromResult(content: unknown): number | null {
 // first result was an explicit page open vs a result list. Codex App's
 // `webSearch` ThreadItem renders the action badge accordingly.
 function parseWebSearchAction(query: string, resultText: string):
-  | { type: 'search' }
-  | { type: 'openPage'; url: string }
-  | { type: 'findInPage'; pattern: string; url: string }
+  | { type: 'search'; query: string | null; queries: string[] | null }
+  | { type: 'openPage'; url: string | null }
+  | { type: 'findInPage'; pattern: string | null; url: string | null }
   | { type: 'other' } {
-  if (!resultText) return { type: 'search' }
+  // Codex v2 WebSearchAction variants are tagged but the inner fields are NOT
+  // optional in Rust — they're `Option<...>` with NO `#[serde(default)]`, so
+  // App rejects an item that ships a bare {type:'search'} (missing required
+  // fields). Always populate every field of the chosen variant, even if null.
+  if (!resultText) return { type: 'search', query: query || null, queries: null }
   const urlMatch = resultText.match(/https?:\/\/[^\s)\]"'<]+/)
   if (urlMatch && query) return { type: 'openPage', url: urlMatch[0] }
-  return { type: 'search' }
+  return { type: 'search', query: query || null, queries: null }
 }
 
 // Maps the raw Anthropic usage block carried on the Claude Agent SDK
