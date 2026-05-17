@@ -194,6 +194,7 @@ class ClaudeSidecar:
         self.structured_outputs_emitted: set[str] = set()
         self.structured_output_schemas: Dict[str, Any] = {}
         self.structured_text_buffers: Dict[str, list[str]] = {}
+        self.streamed_text_turns: set[str] = set()
         # Tool-use ids of active Task (subagent) calls per thread. While a Task
         # is in flight we hide its inner text/tool_use/tool_result events so
         # Codex App renders one Agent item instead of a wall of leaked sub-tool
@@ -272,6 +273,7 @@ class ClaudeSidecar:
                 return {"behavior": "allow" if decision in ("accept", "acceptForSession") else "deny"}
 
         self.structured_outputs_emitted.discard(f"{thread_id}:{turn_id}")
+        self.streamed_text_turns.discard(f"{thread_id}:{turn_id}")
         # Reset any leaked subagent state from a previous turn on this thread.
         self.active_subagent_ids.pop(thread_id, None)
         output_format = message.get("output_format")
@@ -422,6 +424,7 @@ class ClaudeSidecar:
         finally:
             self.structured_output_schemas.pop(f"{thread_id}:{turn_id}", None)
             self.structured_text_buffers.pop(f"{thread_id}:{turn_id}", None)
+            self.streamed_text_turns.discard(f"{thread_id}:{turn_id}")
             self.active_subagent_ids.pop(thread_id, None)
             self.active_clients.pop(thread_id, None)
             try:
@@ -488,8 +491,9 @@ class ClaudeSidecar:
 
         content = obj_get(obj_get(message, "message", message), "content", None)
         if isinstance(content, list):
+            skip_streamed_text = f"{thread_id}:{turn_id}" in self.streamed_text_turns
             for block in content:
-                self.emit_content_block(thread_id, turn_id, block)
+                self.emit_content_block(thread_id, turn_id, block, skip_text_blocks=skip_streamed_text)
         result = obj_get(message, "result", None)
         structured_output = obj_get(message, "structured_output", None)
         if structured_output is not None:
@@ -523,6 +527,7 @@ class ClaudeSidecar:
     def emit_stream_event(self, thread_id: str, turn_id: str, event: Any) -> None:
         event_type = obj_get(event, "type", "")
         in_subagent = bool(self.active_subagent_ids.get(thread_id))
+        key = f"{thread_id}:{turn_id}"
         if event_type == "content_block_delta":
             # While a Task subagent is in flight, all streaming text/thinking
             # belongs to the subagent; we hide it so Codex App keeps showing one
@@ -533,16 +538,26 @@ class ClaudeSidecar:
             delta = obj_get(event, "delta", {})
             delta_type = obj_get(delta, "type", "")
             if delta_type == "text_delta":
-                emit({"type": "text_delta", "thread_id": thread_id, "turn_id": turn_id, "delta": obj_get(delta, "text", "")})
+                text = obj_get(delta, "text", "")
+                if key in self.structured_output_schemas and key not in self.structured_outputs_emitted:
+                    self.structured_text_buffers.setdefault(key, []).append(str(text))
+                else:
+                    emit({"type": "text_delta", "thread_id": thread_id, "turn_id": turn_id, "delta": text})
+                if text:
+                    self.streamed_text_turns.add(key)
             elif delta_type == "thinking_delta":
                 thinking = obj_get(delta, "thinking", "")
                 if thinking:
                     emit({"type": "reasoning_delta", "thread_id": thread_id, "turn_id": turn_id, "delta": thinking})
+                    self.streamed_text_turns.add(key)
             # StructuredOutput streams as input_json_delta chunks and is emitted
             # once from the final ToolUseBlock carrying the parsed JSON input.
         elif event_type == "content_block_start":
             block = obj_get(event, "content_block", {})
-            if obj_get(block, "name", "") != "StructuredOutput":
+            block_type = obj_get(block, "type", "")
+            cname = class_name(block)
+            is_text_start = block_type in ("text", "thinking") or cname in ("TextBlock", "ThinkingBlock")
+            if obj_get(block, "name", "") != "StructuredOutput" and not is_text_start:
                 self.emit_content_block(thread_id, turn_id, block)
         elif event_type in ("rate_limit_event", "hook_event", "subagent_event", "subagent_stop", "precompact", "postcompact"):
             level, message = summarize_runtime_event(event_type, event)
@@ -567,7 +582,7 @@ class ClaudeSidecar:
                     "message": _str_or_none(event.get("message") or event.get("reason")),
                 })
 
-    def emit_content_block(self, thread_id: str, turn_id: str, block: Any) -> None:
+    def emit_content_block(self, thread_id: str, turn_id: str, block: Any, skip_text_blocks: bool = False) -> None:
         # Claude Agent SDK 0.2.x ships its content blocks as bare @dataclass
         # instances (TextBlock / ThinkingBlock / ToolUseBlock / ToolResultBlock)
         # with NO `type` field, so a `block.type == "tool_result"` check alone
@@ -582,6 +597,8 @@ class ClaudeSidecar:
             # hide it from the main thread so Codex shows a single Agent item.
             if active:
                 return
+            if skip_text_blocks:
+                return
             text = obj_get(block, "text", "")
             key = f"{thread_id}:{turn_id}"
             if key in self.structured_output_schemas and key not in self.structured_outputs_emitted:
@@ -590,6 +607,8 @@ class ClaudeSidecar:
             emit({"type": "text_delta", "thread_id": thread_id, "turn_id": turn_id, "delta": text})
         elif block_type == "thinking" or cname == "ThinkingBlock":
             if active:
+                return
+            if skip_text_blocks:
                 return
             thinking = obj_get(block, "thinking", "")
             if thinking:

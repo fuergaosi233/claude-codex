@@ -31,7 +31,7 @@ This adapter lets Codex App connect to a remote host through the normal Codex Re
 | Command/process utility RPCs | Supported | command/exec and process/spawn are implemented for app utility flows. |
 | Steering/interrupt | Supported | turn/steer and turn/interrupt route to the active Claude SDK client. |
 | Review mode | Supported with Claude text findings | review/start now creates an in-progress review turn, emits enteredReviewMode, and routes the review prompt through Claude. Native Codex guardian finding items are not implemented. |
-| Context compaction | Supported with local summary | thread/compact/start now emits contextCompaction started/completed items and a compacted summary message. Native persisted rollout compaction is not implemented. |
+| Context compaction | Supported with Claude summary turn | thread/compact/start routes the summary prompt through the configured runtime, emits contextCompaction started/completed items, and returns a compacted summary message. Native persisted rollout compaction is not implemented. |
 | SDK option compatibility | Supported | When an older Claude Agent SDK rejects an option, the sidecar drops it one at a time (least essential first) and emits an info notice instead of collapsing to a bare option set. |
 | Realtime audio | Unsupported | Claude Code has no realtime audio channel. Realtime methods ack the call so the App's capability probe does not error, and listVoices returns an empty voice list rather than fabricated voices. |
 | Plugins/marketplace/skills/hooks/apps | Not applicable | Claude Code has no Codex plugin marketplace; methods return empty schema-shaped responses so the App's panels render without breaking. |

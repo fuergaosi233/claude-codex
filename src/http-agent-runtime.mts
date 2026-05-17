@@ -120,7 +120,7 @@ export class HttpAgentRuntime implements ClaudeRuntime {
         if (abort.signal.aborted) throw new Error('interrupted')
         const status = await this.fetchStatus(baseUrl, abort.signal)
         if (status === 'stable') break
-        if (this.options.kind !== 'agentapi') await this.pollMessages(baseUrl, tracker, handlers, abort.signal)
+        await this.pollMessages(baseUrl, tracker, handlers, abort.signal)
         await sleep(this.options.pollIntervalMs)
       }
 
@@ -441,9 +441,11 @@ export function sanitizeAgentapiTerminalContent(content: string): string {
 }
 
 function isAgentapiStatusLine(trimmed: string): boolean {
-  const text = trimmed.replace(/^[✻✢✶✳✽✼✺✹✸*•+\-.]\s*/, '')
-  if (/^(Fluttering|Baked|Worked|Working|Thinking|Pondering|Musing|Deciphering|Crunching|Churning|Running|Reading|Searching|Exploring|Editing|Waiting)\b/i.test(text)) {
-    return /\.\.\.|for \d+s\b/i.test(text)
+  const hasStatusMarker = /^[✻✢✶✳✽✼✺✹✸*•·+\-.]\s*/.test(trimmed)
+  const text = trimmed.replace(/^[✻✢✶✳✽✼✺✹✸*•·+\-.]\s*/, '')
+  if (hasStatusMarker && /(\.\.\.|…|for \d+s\b|[↑↓]\s*\d+\s+tokens|thinking\b)/i.test(text)) return true
+  if (/^(Fluttering|Baked|Brewed|Cooked|Crunched|Churned|Sauteed|Sautéed|Worked|Working|Thinking|Pondering|Musing|Deciphering|Processing|Sublimating|Caramelizing|Slithering|Crunching|Churning|Running|Reading|Searching|Exploring|Editing|Waiting)\b/i.test(text)) {
+    return /(\.\.\.|…|for \d+s\b)/i.test(text)
   }
   return false
 }

@@ -744,6 +744,65 @@ test('unix daemon keeps active turns alive across peer reconnect', async () => {
   }
 })
 
+test('unix daemon recovers stale in-progress turns after process restart', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const sock = join(tmpdir(), `ccx-test-${randomUUID().slice(0, 8)}.sock`)
+  let proc = spawn(process.execPath, [adapter, 'app-server', '--listen', `unix://${sock}`], {
+    stdio: ['ignore', 'ignore', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  try {
+    await waitForStderr(proc, /listening on/)
+    const ws1 = new WebSocket('ws://localhost/', {
+      createConnection: (() => net.createConnection(sock)) as typeof net.createConnection,
+    })
+    const reader1 = new WebSocketJsonReader(ws1)
+    await once(ws1, 'open')
+    ws1.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'thread/start', params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false } }))
+    const start = await reader1.nextResponse(1)
+    const threadId = start.result.thread.id
+    ws1.send(JSON.stringify({
+      jsonrpc: '2.0',
+      id: 2,
+      method: 'turn/start',
+      params: { threadId, input: [{ type: 'text', text: `stale restart check ${'x'.repeat(20_000)}`, text_elements: [] }] },
+    }))
+    const turnStart = await reader1.nextResponse(2)
+    const turnId = turnStart.result.turn.id
+
+    proc.kill('SIGKILL')
+    await Promise.race([
+      once(proc, 'exit'),
+      delay(2000).then(() => {
+        throw new Error('timed out waiting for killed daemon to exit')
+      }),
+    ])
+    ws1.terminate()
+
+    proc = spawn(process.execPath, [adapter, 'app-server', '--listen', `unix://${sock}`], {
+      stdio: ['ignore', 'ignore', 'pipe'],
+      env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+    })
+    await waitForStderr(proc, /listening on/)
+
+    const ws2 = new WebSocket('ws://localhost/', {
+      createConnection: (() => net.createConnection(sock)) as typeof net.createConnection,
+    })
+    const reader2 = new WebSocketJsonReader(ws2)
+    await once(ws2, 'open')
+    ws2.send(JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'thread/read', params: { threadId, includeTurns: true } }))
+    const read = await reader2.nextResponse(3)
+    assert.equal(read.result.thread.status.type, 'idle')
+    const recoveredTurn = read.result.thread.turns.find((turn: any) => turn.id === turnId)
+    assert.equal(recoveredTurn.status, 'interrupted')
+    assert.match(recoveredTurn.error.message, /server restarted before completing turn/)
+    ws2.close()
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
 test('app-server proxy forwards websocket handshake bytes to unix daemon', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   // Keep the socket path short — a mkdtemp dir nested under macOS tmpdir blows

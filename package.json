@@ -15,6 +15,7 @@
     "probe:capabilities": "npm run build && node scripts/probe-capabilities.mjs",
     "acceptance:local-remote": "npm run build && node scripts/acceptance-local-remote.mjs",
     "acceptance:gui-ssh-localhost": "npm run build && node scripts/acceptance-gui-ssh-localhost.mjs",
+    "acceptance:ssh-runtime-matrix": "npm run build && node scripts/acceptance-ssh-runtime-matrix.mjs",
     "probe:codex-cli-remote": "npm run build && node scripts/probe-codex-cli-remote.mjs",
     "start": "node dist/src/adapter.mjs",
     "generate:schema": "codex app-server generate-ts --experimental --out generated/codex-app-server"

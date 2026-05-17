@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import http from 'node:http'
 import { once } from 'node:events'
-import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -18,6 +18,8 @@ test('runtime config keeps legacy defaults and accepts explicit backends', () =>
   assert.equal(resolveRuntimeConfig({ CLAUDE_CODEX_RUNTIME_TYPE: 'claude-p' }).type, 'claude-p')
   assert.equal(resolveRuntimeConfig({ CLAUDE_CODEX_HTTP_MANAGE_BRIDGE: '1' }).http.manageBridge, true)
   assert.equal(resolveRuntimeConfig({ CLAUDE_CODEX_MODE_COMMAND: '/tmp/mode' }).http.modeCommand, '/tmp/mode')
+  assert.equal(resolveRuntimeConfig({}).claudeP.stopTimeoutRetries, 1)
+  assert.equal(resolveRuntimeConfig({ CLAUDE_CODEX_CLAUDE_P_STOP_TIMEOUT_RETRIES: '0' }).claudeP.stopTimeoutRetries, 0)
 })
 
 test('HTTP agent runtime streams agentapi-compatible message updates', async () => {
@@ -302,6 +304,205 @@ test('claude-p runtime runs each turn in its own cwd', async () => {
   }
 })
 
+test('claude-p runtime timeout terminates spawned process tree', async () => {
+  const tmp = await mkdtemp(join(tmpdir(), 'claude-codex-claude-p-timeout-test-'))
+  const command = join(tmp, 'hanging-claude-p.mjs')
+  const childPidFile = join(tmp, 'child.pid')
+  await writeFile(
+    command,
+    [
+      '#!/usr/bin/env node',
+      'import { spawn } from "node:child_process";',
+      'import { writeFileSync } from "node:fs";',
+      `const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', detached: process.platform !== 'win32' });`,
+      `writeFileSync(${JSON.stringify(childPidFile)}, String(child.pid));`,
+      'setInterval(() => {}, 1000);',
+    ].join('\n'),
+  )
+  await chmod(command, 0o755)
+  const runtime = new ClaudePTranscriptRuntime({
+    command,
+    extraArgs: [],
+    timeoutMs: 1_000,
+    skipPermissions: false,
+    resume: false,
+  })
+  try {
+    await assert.rejects(
+      runtime.runTurn(
+        {
+          threadId: 'thread-timeout',
+          turnId: 'turn-timeout',
+          prompt: 'prompt',
+          cwd: tmp,
+          runtimeType: null,
+          model: null,
+          effort: null,
+          claudeSessionId: null,
+          forkSession: false,
+          mcpServers: null,
+          allowedTools: null,
+          addDirs: [],
+          enableFileCheckpointing: false,
+          outputFormat: null,
+          approvalPolicy: null,
+          sandboxMode: null,
+          systemPromptAddendum: null,
+          planMode: false,
+          imageInputs: [],
+        },
+        {
+          onEvent: async () => {},
+          onPermissionRequest: async () => ({ decision: 'accept' }),
+        },
+      ),
+      /timed out/,
+    )
+
+    const childPid = Number(await readFile(childPidFile, 'utf8'))
+    await new Promise((resolve) => setTimeout(resolve, 600))
+    assert.equal(processIsAlive(childPid), false)
+  } finally {
+    await rm(tmp, { recursive: true, force: true })
+  }
+})
+
+test('claude-p runtime retries an empty StopTimeout once', async () => {
+  const tmp = await mkdtemp(join(tmpdir(), 'claude-codex-claude-p-retry-test-'))
+  const command = join(tmp, 'flaky-claude-p.mjs')
+  const countFile = join(tmp, 'count.txt')
+  await writeFile(
+    command,
+    [
+      '#!/usr/bin/env node',
+      'import { existsSync, readFileSync, writeFileSync } from "node:fs";',
+      `const countFile = ${JSON.stringify(countFile)};`,
+      'const count = existsSync(countFile) ? Number(readFileSync(countFile, "utf8")) : 0;',
+      'writeFileSync(countFile, String(count + 1));',
+      'if (count === 0) { console.error("claude-p: StopTimeout"); process.exit(2); }',
+      'console.log(JSON.stringify({ result: "retry-ok", session_id: "session", is_error: false }));',
+    ].join('\n'),
+  )
+  await chmod(command, 0o755)
+  const runtime = new ClaudePTranscriptRuntime({
+    command,
+    extraArgs: [],
+    timeoutMs: 2_000,
+    skipPermissions: false,
+    resume: false,
+    stopTimeoutRetries: 1,
+  })
+  const events: string[] = []
+  try {
+    await runtime.runTurn(
+      {
+        threadId: 'thread-retry',
+        turnId: 'turn-retry',
+        prompt: 'prompt',
+        cwd: tmp,
+        runtimeType: null,
+        model: null,
+        effort: null,
+        claudeSessionId: null,
+        forkSession: false,
+        mcpServers: null,
+        allowedTools: null,
+        addDirs: [],
+        enableFileCheckpointing: false,
+        outputFormat: null,
+        approvalPolicy: null,
+        sandboxMode: null,
+        systemPromptAddendum: null,
+        planMode: false,
+        imageInputs: [],
+      },
+      {
+        onEvent: async (event) => {
+          if (event.type === 'notice') events.push(event.message)
+          if (event.type === 'text_delta') events.push(event.delta)
+        },
+        onPermissionRequest: async () => ({ decision: 'accept' }),
+      },
+    )
+
+    assert.deepEqual(events, [
+      'claude-p did not emit its Stop hook before timing out; retrying attempt 2/2.',
+      'retry-ok',
+    ])
+    assert.equal(await readFile(countFile, 'utf8'), '2')
+  } finally {
+    await rm(tmp, { recursive: true, force: true })
+  }
+})
+
+test('claude-p runtime retries a process timeout once', async () => {
+  const tmp = await mkdtemp(join(tmpdir(), 'claude-codex-claude-p-timeout-retry-test-'))
+  const command = join(tmp, 'timeout-then-ok-claude-p.mjs')
+  const countFile = join(tmp, 'count.txt')
+  await writeFile(
+    command,
+    [
+      '#!/usr/bin/env node',
+      'import { existsSync, readFileSync, writeFileSync } from "node:fs";',
+      `const countFile = ${JSON.stringify(countFile)};`,
+      'const count = existsSync(countFile) ? Number(readFileSync(countFile, "utf8")) : 0;',
+      'writeFileSync(countFile, String(count + 1));',
+      'if (count === 0) setInterval(() => {}, 1000);',
+      'else console.log(JSON.stringify({ result: "timeout-retry-ok", session_id: "session", is_error: false }));',
+    ].join('\n'),
+  )
+  await chmod(command, 0o755)
+  const runtime = new ClaudePTranscriptRuntime({
+    command,
+    extraArgs: [],
+    timeoutMs: 500,
+    skipPermissions: false,
+    resume: false,
+    stopTimeoutRetries: 1,
+  })
+  const events: string[] = []
+  try {
+    await runtime.runTurn(
+      {
+        threadId: 'thread-timeout-retry',
+        turnId: 'turn-timeout-retry',
+        prompt: 'prompt',
+        cwd: tmp,
+        runtimeType: null,
+        model: null,
+        effort: null,
+        claudeSessionId: null,
+        forkSession: false,
+        mcpServers: null,
+        allowedTools: null,
+        addDirs: [],
+        enableFileCheckpointing: false,
+        outputFormat: null,
+        approvalPolicy: null,
+        sandboxMode: null,
+        systemPromptAddendum: null,
+        planMode: false,
+        imageInputs: [],
+      },
+      {
+        onEvent: async (event) => {
+          if (event.type === 'notice') events.push(event.message)
+          if (event.type === 'text_delta') events.push(event.delta)
+        },
+        onPermissionRequest: async () => ({ decision: 'accept' }),
+      },
+    )
+
+    assert.deepEqual(events, [
+      'claude-p process timed out; retrying attempt 2/2.',
+      'timeout-retry-ok',
+    ])
+    assert.equal(await readFile(countFile, 'utf8'), '2')
+  } finally {
+    await rm(tmp, { recursive: true, force: true })
+  }
+})
+
 test('HTTP agent runtime keeps recoverable SSE fallback out of the conversation', async () => {
   let status: 'running' | 'stable' = 'stable'
   let messages: Array<{ id: number; role: 'agent'; content: string; time: string }> = []
@@ -392,6 +593,90 @@ test('HTTP agent runtime keeps recoverable SSE fallback out of the conversation'
   assert.deepEqual(notices, [])
 })
 
+test('agentapi runtime polls running terminal output before final status-only screen', async () => {
+  let status: 'running' | 'stable' = 'stable'
+  let messages: Array<{ id: number; role: 'agent'; content: string; time: string }> = []
+  const server = http.createServer((req, res) => {
+    if (req.method === 'GET' && req.url === '/messages') {
+      res.setHeader('content-type', 'application/json')
+      res.end(JSON.stringify({ messages }))
+      return
+    }
+    if (req.method === 'GET' && req.url === '/status') {
+      res.setHeader('content-type', 'application/json')
+      res.end(JSON.stringify({ status }))
+      return
+    }
+    if (req.method === 'POST' && req.url === '/message') {
+      req.resume()
+      status = 'running'
+      setTimeout(() => {
+        messages = [{ id: 1, role: 'agent', content: 'TOKEN_FROM_RUNNING_SCREEN', time: new Date().toISOString() }]
+      }, 20)
+      setTimeout(() => {
+        messages = [{ id: 1, role: 'agent', content: '✻ Cooked for 1s', time: new Date().toISOString() }]
+        status = 'stable'
+      }, 80)
+      res.setHeader('content-type', 'application/json')
+      res.end(JSON.stringify({ ok: true }))
+      return
+    }
+    res.statusCode = 404
+    res.end()
+  })
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  const address = server.address()
+  assert.ok(address && typeof address === 'object')
+
+  const runtime = new HttpAgentRuntime({
+    kind: 'agentapi',
+    baseUrl: `http://127.0.0.1:${address.port}`,
+    useSse: false,
+    pollIntervalMs: 20,
+    timeoutMs: 2_000,
+    sendInterruptRaw: false,
+    manageBridge: false,
+    modeCommand: 'claude-codex-mode',
+  })
+  const deltas: string[] = []
+  try {
+    await runtime.runTurn(
+      {
+        threadId: 'thread',
+        turnId: 'turn',
+        prompt: 'hello',
+        cwd: process.cwd(),
+        runtimeType: null,
+        model: null,
+        effort: null,
+        claudeSessionId: null,
+        forkSession: false,
+        mcpServers: null,
+        allowedTools: null,
+        addDirs: [],
+        enableFileCheckpointing: false,
+        outputFormat: null,
+        approvalPolicy: null,
+        sandboxMode: null,
+        systemPromptAddendum: null,
+        planMode: false,
+        imageInputs: [],
+      },
+      {
+        onEvent: (event) => {
+          if (event.type === 'text_delta') deltas.push(event.delta)
+        },
+        onPermissionRequest: async () => ({ decision: 'accept' }),
+      },
+    )
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  }
+
+  assert.equal(deltas.join(''), 'TOKEN_FROM_RUNNING_SCREEN')
+})
+
 test('HTTP agent runtime detects Claude Code trust prompt in agentapi screen output', () => {
   assert.equal(
     hasAgentapiTrustPrompt({
@@ -422,4 +707,19 @@ test('agentapi terminal sanitizer removes Claude Code TUI status artifacts', () 
     sanitizeAgentapiTerminalContent('* Fluttering...\n└ Tip: Run /install-github-app to tag @claude right from your Github issues\nand PRs'),
     '',
   )
+  assert.equal(sanitizeAgentapiTerminalContent('✻ Cooked for 1s'), '')
+  assert.equal(sanitizeAgentapiTerminalContent('✻ Crunched for 3s'), '')
+  assert.equal(sanitizeAgentapiTerminalContent('✻ Churned for 1s'), '')
+  assert.equal(sanitizeAgentapiTerminalContent('✶ Processing…'), '')
+  assert.equal(sanitizeAgentapiTerminalContent('* Caramelizing… (3s · ↓ 201 tokens · thinking)'), '')
+  assert.equal(sanitizeAgentapiTerminalContent('· Slithering…'), '')
 })
+
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}

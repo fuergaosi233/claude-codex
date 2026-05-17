@@ -55,7 +55,7 @@ if (runtimeType === 'codex') check('real Codex passthrough', () => {
 
 if (runtimeType === 'agent-sdk-sidecar' || runtimeType === 'agent-sdk-socket') check('Claude auth surface for real smoke', () => {
   if (process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_CODE_USE_BEDROCK || process.env.CLAUDE_CODE_USE_VERTEX) return
-  run('claude', ['--version'])
+  run(resolveClaudeCommand(), ['--version'])
 })
 
 for (const item of checks) {
@@ -129,4 +129,8 @@ function resolvePythonCommand() {
     if (result.status === 0) return candidate
   }
   return process.env.CLAUDE_CODEX_PYTHON || 'python3'
+}
+
+function resolveClaudeCommand() {
+  return process.env.CLAUDE_CODEX_CLI || 'claude'
 }

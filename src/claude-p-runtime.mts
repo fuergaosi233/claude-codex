@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from 'node:child_process'
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -10,6 +10,7 @@ export interface ClaudePRuntimeOptions {
   timeoutMs: number
   skipPermissions: boolean
   resume: boolean
+  stopTimeoutRetries?: number
 }
 
 const READ_ONLY_TOOLS = ['Read', 'Glob', 'Grep', 'WebSearch', 'WebFetch', 'TodoWrite', 'Task']
@@ -34,7 +35,7 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
       }
 
       const args = this.argsForContext(context, inputFile)
-      const result = await this.runProcess(context.threadId, args, context.cwd)
+      const result = await this.runProcessWithRetry(context.threadId, args, context.cwd, handlers)
       const parsed = parseClaudePJson(result.stdout)
       const text = parsed?.result ?? result.stdout.trim()
       const sessionId = parsed?.sessionId ? `claude-p:${parsed.sessionId}` : context.claudeSessionId ?? `claude-p:${context.threadId}`
@@ -64,14 +65,14 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
   async interrupt(threadId: string): Promise<void> {
     const child = this.active.get(threadId)
     if (!child) return
-    child.kill('SIGINT')
+    terminateProcessTree(child, 'SIGINT')
     setTimeout(() => {
-      if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM')
+      if (child.exitCode === null && child.signalCode === null) terminateProcessTree(child, 'SIGTERM')
     }, 1500).unref()
   }
 
   async stop(): Promise<void> {
-    for (const child of this.active.values()) child.kill('SIGTERM')
+    for (const child of this.active.values()) terminateProcessTree(child, 'SIGTERM')
     this.active.clear()
   }
 
@@ -98,6 +99,7 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
       cwd,
       env: { ...process.env },
       stdio: ['ignore', 'pipe', 'pipe'],
+      detached: process.platform !== 'win32',
     })
     this.active.set(threadId, child)
     let stdout = ''
@@ -112,22 +114,123 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
     })
 
     return new Promise((resolve, reject) => {
+      let timedOut = false
+      let killTimer: NodeJS.Timeout | null = null
       const timeout = setTimeout(() => {
-        child.kill('SIGTERM')
-        this.active.delete(threadId)
-        reject(new Error(`claude-p timed out after ${this.options.timeoutMs}ms`))
+        timedOut = true
+        terminateProcessTree(child, 'SIGTERM')
+        killTimer = setTimeout(() => {
+          if (child.exitCode === null && child.signalCode === null) terminateProcessTree(child, 'SIGKILL')
+        }, 1500).unref()
       }, this.options.timeoutMs)
       child.once('error', (error) => {
         clearTimeout(timeout)
+        if (killTimer) clearTimeout(killTimer)
         this.active.delete(threadId)
         reject(error)
       })
       child.once('close', (code) => {
         clearTimeout(timeout)
+        if (killTimer) clearTimeout(killTimer)
         this.active.delete(threadId)
+        if (timedOut) {
+          reject(new Error(`claude-p timed out after ${this.options.timeoutMs}ms`))
+          return
+        }
         resolve({ stdout, stderr, exitCode: code ?? 1 })
       })
     })
+  }
+
+  private async runProcessWithRetry(
+    threadId: string,
+    args: string[],
+    cwd: string,
+    handlers: RuntimeHandlers,
+  ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+    const attempts = 1 + Math.max(0, this.options.stopTimeoutRetries ?? 0)
+    let last: { stdout: string; stderr: string; exitCode: number } | null = null
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      let result: { stdout: string; stderr: string; exitCode: number }
+      try {
+        result = await this.runProcess(threadId, args, cwd)
+      } catch (error) {
+        if (isClaudePTimeoutError(error) && attempt < attempts) {
+          await handlers.onEvent({
+            type: 'notice',
+            level: 'warning',
+            message: `claude-p process timed out; retrying attempt ${attempt + 1}/${attempts}.`,
+          })
+          continue
+        }
+        throw error
+      }
+      if (!isClaudePStopTimeout(result) || attempt >= attempts) return result
+      last = result
+      await handlers.onEvent({
+        type: 'notice',
+        level: 'warning',
+        message: `claude-p did not emit its Stop hook before timing out; retrying attempt ${attempt + 1}/${attempts}.`,
+      })
+    }
+    return last ?? { stdout: '', stderr: 'claude-p retry exhausted', exitCode: 2 }
+  }
+}
+
+function isClaudePStopTimeout(result: { stdout: string; stderr: string; exitCode: number }): boolean {
+  return result.stdout.trim() === '' && /(?:^|\b)StopTimeout(?:\b|$)/i.test(result.stderr)
+}
+
+function isClaudePTimeoutError(error: unknown): boolean {
+  return error instanceof Error && /^claude-p timed out after \d+ms$/.test(error.message)
+}
+
+function terminateProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
+  if (child.exitCode !== null || child.signalCode !== null) return
+  const childPids = child.pid ? descendantPids(child.pid) : []
+  for (const pid of childPids.reverse()) {
+    killPid(pid, signal)
+  }
+  if (process.platform !== 'win32' && child.pid) {
+    try {
+      process.kill(-child.pid, signal)
+    } catch {}
+  }
+  killPid(child.pid, signal)
+}
+
+function killPid(pid: number | undefined, signal: NodeJS.Signals): void {
+  if (!pid) return
+  try {
+    process.kill(pid, signal)
+  } catch {}
+}
+
+function descendantPids(rootPid: number): number[] {
+  if (process.platform === 'win32') return []
+  try {
+    const output = execFileSync('ps', ['-eo', 'pid=,ppid='], { encoding: 'utf8', timeout: 1000 })
+    const children = new Map<number, number[]>()
+    for (const line of output.split(/\r?\n/)) {
+      const parts = line.trim().split(/\s+/)
+      if (parts.length < 2) continue
+      const pid = Number(parts[0])
+      const ppid = Number(parts[1])
+      if (!Number.isFinite(pid) || !Number.isFinite(ppid)) continue
+      const siblings = children.get(ppid) ?? []
+      siblings.push(pid)
+      children.set(ppid, siblings)
+    }
+    const result: number[] = []
+    const stack = [...(children.get(rootPid) ?? [])]
+    while (stack.length > 0) {
+      const pid = stack.pop()!
+      result.push(pid)
+      stack.push(...(children.get(pid) ?? []))
+    }
+    return result
+  } catch {
+    return []
   }
 }
 

@@ -41,6 +41,12 @@ async function main(): Promise<void> {
   }
 
   const store = new SessionStore()
+  if (isUnixDaemon) {
+    const recovered = store.recoverStaleInProgressTurns()
+    if (recovered > 0) {
+      process.stderr.write(`[claude-codex-adapter] recovered ${recovered} stale in-progress turn(s)\n`)
+    }
+  }
   const runtime = createRuntime()
   const server = new CodexClaudeAppServer(store, runtime)
   let shuttingDown = false

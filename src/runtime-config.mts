@@ -24,6 +24,7 @@ export interface RuntimeConfig {
     timeoutMs: number
     skipPermissions: boolean
     resume: boolean
+    stopTimeoutRetries: number
   }
 }
 
@@ -58,6 +59,7 @@ export function resolveRuntimeConfig(env: NodeJS.ProcessEnv = process.env): Runt
       timeoutMs: numericEnv(env.CLAUDE_CODEX_CLAUDE_P_TIMEOUT_MS, 5 * 60_000, 1_000, 24 * 60 * 60_000),
       skipPermissions: envFlag(env.CLAUDE_CODEX_CLAUDE_P_SKIP_PERMISSIONS, false),
       resume: envFlag(env.CLAUDE_CODEX_CLAUDE_P_RESUME, false),
+      stopTimeoutRetries: numericEnv(env.CLAUDE_CODEX_CLAUDE_P_STOP_TIMEOUT_RETRIES, 1, 0, 5),
     },
   }
 }
