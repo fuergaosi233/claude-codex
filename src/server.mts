@@ -954,11 +954,11 @@ export class CodexClaudeAppServer {
           }
           if (activeSubagents.size > 0) {
             if (event.type === 'text_delta' || event.type === 'reasoning_delta') return
-            if (event.type === 'tool_use' && event.toolName !== 'Task') return
+            if (event.type === 'tool_use' && !isSubagentToolName(event.toolName)) return
             if (event.type === 'tool_output_delta' && !itemIds.has(event.toolUseId)) return
             if (event.type === 'tool_result' && !activeSubagents.has(event.toolUseId) && !itemIds.has(event.toolUseId)) return
           }
-          if (event.type === 'tool_use' && event.toolName === 'Task') {
+          if (event.type === 'tool_use' && isSubagentToolName(event.toolName)) {
             // Spawn the ephemeral subagent thread, then mirror Codex's native
             // 3-stage timeline: `spawnAgent` (begin+end), `wait` (begin only,
             // closes when the Task tool_result lands), and later `closeAgent`.
@@ -2234,6 +2234,18 @@ function toolResultText(content: unknown): string {
 
 function fallbackStructuredText(outputSchema: unknown, prompt: string): string {
   return JSON.stringify(coerceStructuredValue(outputSchema, prompt), null, 0)
+}
+
+// claude-agent-sdk has shipped the subagent-spawning tool under both `Task`
+// (older) and `Agent` (current 0.2.x) names; accept both plus a few common
+// variants so the native collabAgentToolCall path triggers regardless of
+// which name the model emits. Without this, an `Agent` tool_use falls
+// through to the generic mcpToolCall branch and its inner Bash calls leak
+// into the parent thread as a flat list (the bug seen on mac-mini).
+function isSubagentToolName(name: string | null | undefined): boolean {
+  if (typeof name !== 'string') return false
+  const n = name.trim().toLowerCase()
+  return n === 'task' || n === 'agent' || n === 'subagent' || n === 'spawn_agent' || n === 'spawnagent'
 }
 
 function normalizeApprovalPolicy(value: unknown): string | null {

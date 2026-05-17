@@ -160,7 +160,17 @@ class PendingPermission:
     future: asyncio.Future
 
 
-READ_ONLY_TOOLS = ["Read", "Glob", "Grep", "WebSearch", "WebFetch", "TodoWrite", "Task"]
+READ_ONLY_TOOLS = ["Read", "Glob", "Grep", "WebSearch", "WebFetch", "TodoWrite", "Task", "Agent"]
+
+# Subagent-spawning tool names. claude-agent-sdk has shipped this under both
+# `Task` (older) and `Agent` (current 0.2.x) names; some forks use lowercase
+# `subagent`. Detection has to match all of them or the sub-tool calls leak
+# into the parent thread as a flat list of commands instead of nesting under
+# one Codex collabAgentToolCall item.
+def is_subagent_tool(name: Any) -> bool:
+    if not isinstance(name, str): return False
+    n = name.strip().lower()
+    return n in ("task", "agent", "subagent", "spawn_agent", "spawnagent")
 
 
 def derive_permission_mode(approval_policy: Any, sandbox_mode: Any, plan_mode: bool = False) -> str:
@@ -204,6 +214,15 @@ class ClaudeSidecar:
         # Codex App renders one Agent item instead of a wall of leaked sub-tool
         # calls. Cleared in the query() finally clause for safety.
         self.active_subagent_ids: Dict[str, set] = {}
+        # Per-turn flags marking that we already streamed text_delta /
+        # reasoning_delta from `content_block_delta` events. claude-agent-sdk
+        # 0.2.x also re-delivers the same blocks as complete `TextBlock` /
+        # `ThinkingBlock` instances inside the final AssistantMessage's
+        # content list; without these guards emit_content_block would re-emit
+        # the entire text on top of the streamed pieces, producing the
+        # duplicated paragraphs the user saw ("好的, ..." twice in a row).
+        self.streamed_text_turns: set[str] = set()
+        self.streamed_thinking_turns: set[str] = set()
         self.queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
 
     async def run(self) -> None:
@@ -436,6 +455,8 @@ class ClaudeSidecar:
             self.active_subagent_ids.pop(thread_id, None)
             self.active_clients.pop(thread_id, None)
             self.completed_turns.discard(f"{thread_id}:{turn_id}")
+            self.streamed_text_turns.discard(f"{thread_id}:{turn_id}")
+            self.streamed_thinking_turns.discard(f"{thread_id}:{turn_id}")
             try:
                 await client.disconnect()
             except Exception:
@@ -546,10 +567,13 @@ class ClaudeSidecar:
             delta = obj_get(event, "delta", {})
             delta_type = obj_get(delta, "type", "")
             if delta_type == "text_delta":
-                emit({"type": "text_delta", "thread_id": thread_id, "turn_id": turn_id, "delta": obj_get(delta, "text", "")})
+                text = obj_get(delta, "text", "")
+                self.streamed_text_turns.add(f"{thread_id}:{turn_id}")
+                emit({"type": "text_delta", "thread_id": thread_id, "turn_id": turn_id, "delta": text})
             elif delta_type == "thinking_delta":
                 thinking = obj_get(delta, "thinking", "")
                 if thinking:
+                    self.streamed_thinking_turns.add(f"{thread_id}:{turn_id}")
                     emit({"type": "reasoning_delta", "thread_id": thread_id, "turn_id": turn_id, "delta": thinking})
             # StructuredOutput streams as input_json_delta chunks and is emitted
             # once from the final ToolUseBlock carrying the parsed JSON input.
@@ -617,9 +641,19 @@ class ClaudeSidecar:
             if key in self.structured_output_schemas and key not in self.structured_outputs_emitted:
                 self.structured_text_buffers.setdefault(key, []).append(str(text))
                 return
+            # If content_block_delta already streamed text_delta for this
+            # turn, the AssistantMessage will re-deliver the whole text via
+            # this TextBlock. Without the skip we'd double-emit and the user
+            # sees every paragraph repeated. Structured-output path above
+            # already returned, so this guard is safe.
+            if key in self.streamed_text_turns:
+                return
             emit({"type": "text_delta", "thread_id": thread_id, "turn_id": turn_id, "delta": text})
         elif block_type == "thinking" or cname == "ThinkingBlock":
             if active:
+                return
+            key = f"{thread_id}:{turn_id}"
+            if key in self.streamed_thinking_turns:
                 return
             thinking = obj_get(block, "thinking", "")
             if thinking:
@@ -631,7 +665,7 @@ class ClaudeSidecar:
             if tool_name == "StructuredOutput":
                 self.emit_structured_output(thread_id, turn_id, tool_input)
                 return
-            if tool_name == "Task":
+            if is_subagent_tool(tool_name):
                 # Open the subagent context. Codex App still sees this Task as
                 # a single mcpToolCall item; the sub-events between here and
                 # the matching tool_result are intentionally suppressed.

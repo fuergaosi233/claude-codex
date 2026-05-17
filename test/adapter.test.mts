@@ -158,7 +158,7 @@ test('stdio initialize -> thread/start -> turn/start streams mock response', asy
     assert.equal(sawAgentCompleted, true)
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -199,7 +199,7 @@ test('model/list exposes Claude model aliases and Codex-safe reasoning efforts',
     )
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -242,7 +242,7 @@ test('Codex++ model and effort selections map into Claude runtime context', asyn
     assert.equal(resume.result.reasoningEffort, 'xhigh')
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -298,7 +298,7 @@ test('Codex app model ids and outputSchema map into Claude runtime context', asy
     })
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -370,7 +370,7 @@ test('Codex title-generation turn runs through the runtime instead of a hardcode
     assert.doesNotMatch(logText, /turn\.internalTitle\.shortCircuit/, 'no local title short-circuit should fire')
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -404,7 +404,7 @@ test('default runtime tool policy leaves Claude Code tools unrestricted unless e
     assert.equal(text, 'allowedTools=default')
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -431,7 +431,7 @@ test('unix websocket app-server accepts initialize', async () => {
     ws.close()
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -467,7 +467,7 @@ test('app-server proxy forwards websocket handshake bytes to unix daemon', async
   } finally {
     proxy.kill()
     daemon.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -500,7 +500,7 @@ test('app-server proxy carries websocket JSON-RPC traffic over stdio', async () 
   } finally {
     proxy.kill()
     daemon.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -532,7 +532,7 @@ test('remote shim launches daemon and proxy with Codex-compatible commands', asy
   } finally {
     proxy.kill()
     daemon.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -562,7 +562,7 @@ test('remote utility methods use v2 response shapes', async () => {
     assert.deepEqual(command.result, { exitCode: 0, stdout: 'ok', stderr: '' })
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -607,7 +607,7 @@ test('process/spawn supports shell strings, errors, and debug logs terminal life
     assert.match(logText, /"event":"process.spawn.error"/)
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -648,7 +648,7 @@ test('review/start and thread/compact/start emit real turn items', async () => {
     assert.match(reviewText, /Claude Code adapter mock response|Claude warning/)
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -683,7 +683,7 @@ test('Claude thinking maps to Codex reasoning summary and content deltas', async
     assert.deepEqual(completedReasoning.content, ['mock thinking'])
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -731,7 +731,7 @@ test('Claude token usage maps to thread/tokenUsage/updated notifications', async
     assert.equal(tokenUsage.tokenUsage.modelContextWindow, null)
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -769,7 +769,7 @@ test('baseInstructions / developerInstructions / personality flow into the syste
     assert.match(addendum, /Personality: pragmatic/)
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -840,7 +840,7 @@ test('sidecar-runtime: turn/completed still fires when Claude returns a failed R
     assert.equal(sawError, true, 'an error notification should also be sent so the App can surface the failure')
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -872,7 +872,7 @@ test('Claude hook events are rendered as Codex hookPrompt ThreadItems', async ()
     assert.ok(fragmentTexts.some((t) => /decision: allow/.test(t)), 'fragments should include the decision')
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -914,7 +914,7 @@ test('thread/compact/start drives Claude (summary model) instead of the local st
     assert.equal(sawCompacted, true, 'thread/compacted notification should still fire after compaction')
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -960,7 +960,7 @@ test('localImage user input becomes a multimodal Claude prompt + an imageView Th
     assert.match(text, /^images=base64:image\/png:\d+/, 'runtime should receive base64 image input — got: ' + text)
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -995,7 +995,7 @@ test('Claude WebSearch tool maps to native Codex webSearch ThreadItem with actio
     assert.equal(completedWebSearch.action.url, 'https://example.com/article')
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -1012,7 +1012,7 @@ test('modelProvider/capabilities/read advertises webSearch=true unless CLAUDE_CO
     assert.equal(cap.result.webSearch, true)
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -1040,7 +1040,7 @@ test('turn/start planMode=true flows into Claude SDK permission_mode plan', asyn
     assert.match(text, /planMode=true/, 'context.planMode should arrive at the runtime when turn/start.planMode=true')
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -1074,7 +1074,7 @@ test('Codex App approvalPolicy=never + sandbox=danger-full-access auto-accepts t
     assert.equal(sawCommandOutput, true, 'tool should still execute and stream output')
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -1174,7 +1174,7 @@ test('Task subagent emits Codex native spawnAgent → wait → closeAgent timeli
     assert.ok(allIds.includes(childThreadId), 'includeEphemeral=true should surface the subagent child thread')
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -1203,7 +1203,7 @@ test('thread/start with ephemeral=true is hidden from thread/list and surfaces t
     assert.ok(!ids.includes(ephemeralId), 'ephemeral title/summary thread should be filtered out')
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -1235,7 +1235,7 @@ test('debug.jsonl rotates once it crosses CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES', asy
     else process.env.CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES = prevMax
     if (prevKeep == null) delete process.env.CLAUDE_CODEX_DEBUG_LOG_KEEP
     else process.env.CLAUDE_CODEX_DEBUG_LOG_KEEP = prevKeep
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -1298,7 +1298,7 @@ test('approval requests round-trip through Codex server requests', async () => {
     assert.equal(sawOutput, true)
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -1331,7 +1331,7 @@ test('generic Claude tools complete as Codex mcpToolCall items', async () => {
     assert.equal(sawIdle, true)
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -1370,7 +1370,7 @@ test('turn/steer appends user input to an active Claude turn', async () => {
     assert.equal(items.result.data.some((item: any) => item.type === 'userMessage' && item.content?.[0]?.text === 'steered input'), true)
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -1405,7 +1405,7 @@ test('compatibility-only UI methods return schema-shaped responses', async () =>
     assert.deepEqual((await reader.nextResponse(7)).result, { authPolicy: 'ON_USE', appsNeedingAuth: [] })
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -1455,7 +1455,7 @@ test('file change approval emits patch and git diff updates', async () => {
     assert.match(diff, /changed by mock runtime/)
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -1481,7 +1481,7 @@ test('gitDiffToRemote includes untracked files for Codex diff review', async () 
     assert.match(response.result.diff, /\+new content/)
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -1519,7 +1519,7 @@ test('thread resume, fork, and interrupt lifecycle methods are stable', async ()
     assert.deepEqual(interrupt.result, {})
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -1544,7 +1544,7 @@ test('mcp status list reflects configured Claude SDK MCP servers', async () => {
     assert.equal(response.result.data[0].config.command, 'node')
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -1574,7 +1574,7 @@ test('direct MCP stdio resource and tool calls work', async () => {
     assert.equal(resource.result.contents[0].text, 'resource-ok')
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -1619,7 +1619,7 @@ test('direct MCP HTTP tool calls work', async () => {
   } finally {
     proc.kill()
     httpServer.close()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -1654,7 +1654,7 @@ test('optional auto worktree binds new threads to isolated git worktrees', async
     assert.notEqual(response.result.cwd, repo)
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
