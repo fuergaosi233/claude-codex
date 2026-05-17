@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import http from 'node:http'
 import net from 'node:net'
 import { tmpdir } from 'node:os'
@@ -183,6 +183,9 @@ test('model/list exposes Claude model aliases and Codex-safe reasoning efforts',
     const config = await reader.nextResponse(1)
     assert.equal(config.result.config.model, 'opus')
     assert.equal(config.result.config.model_reasoning_effort, 'xhigh')
+    assert.equal(config.result.config.model_provider, 'claude-code')
+    assert.equal(config.result.config.model_providers['claude-code'].name, 'Claude Code')
+    assert.equal(config.result.config.model_providers['claude-code'].requires_openai_auth, false)
 
     proc.stdin.write(json({ id: 2, method: 'model/list', params: {} }))
     const models = await reader.nextResponse(2)
@@ -194,6 +197,8 @@ test('model/list exposes Claude model aliases and Codex-safe reasoning efforts',
     assert.equal(ids.some((id: string) => id.startsWith('runtime-')), false)
     const opus = models.result.data.find((model: any) => model.id === 'opus')
     assert.equal(opus.isDefault, true)
+    assert.equal('serviceTiers' in opus, false)
+    assert.equal(models.result.data.filter((model: any) => model.isDefault === true).length, 1)
     assert.deepEqual(
       opus.supportedReasoningEfforts.map((entry: any) => entry.reasoningEffort),
       ['low', 'medium', 'high', 'xhigh'],
@@ -214,6 +219,22 @@ test('model/list exposes Claude model aliases and Codex-safe reasoning efforts',
     const updatedConfig = await reader.nextResponse(4)
     assert.equal(updatedConfig.result.config.model, 'haiku')
     assert.equal(updatedConfig.result.config.model_reasoning_effort, 'low')
+
+    proc.stdin.write(json({
+      id: 5,
+      method: 'config/batchWrite',
+      params: {
+        edits: [
+          { keyPath: 'model', value: 'runtime-agent-http', mergeStrategy: 'upsert' },
+          { keyPath: 'model_reasoning_effort', value: 'medium', mergeStrategy: 'upsert' },
+        ],
+      },
+    }))
+    await reader.nextResponse(5)
+    proc.stdin.write(json({ id: 6, method: 'config/read', params: {} }))
+    const repairedConfig = await reader.nextResponse(6)
+    assert.equal(repairedConfig.result.config.model, 'haiku')
+    assert.equal(repairedConfig.result.config.model_reasoning_effort, 'medium')
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true })
@@ -275,6 +296,46 @@ test('config writes persist across adapter restarts', async () => {
     } finally {
       second.kill()
       await once(second, 'exit')
+    }
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('invalid persisted model selections are repaired to a selectable model', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  try {
+    const adapterConfigDir = join(home, 'claude-codex-adapter')
+    await mkdir(adapterConfigDir, { recursive: true })
+    await writeFile(
+      join(adapterConfigDir, 'config.json'),
+      JSON.stringify({ model: 'runtime-agent-sdk-sidecar', model_reasoning_effort: 'high' }, null, 2) + '\n',
+    )
+
+    const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        CODEX_HOME: home,
+        CLAUDE_CODEX_MOCK: '1',
+        CLAUDE_CODEX_DEFAULT_MODEL: 'opus',
+        NODE_NO_WARNINGS: '1',
+      },
+    })
+    const reader = new JsonLineReader(proc)
+    try {
+      proc.stdin.write(json({ id: 1, method: 'config/read', params: {} }))
+      const config = await reader.nextResponse(1)
+      assert.equal(config.result.config.model, 'opus')
+      assert.equal(config.result.config.model_reasoning_effort, 'high')
+
+      proc.stdin.write(json({ id: 2, method: 'model/list', params: {} }))
+      const models = await reader.nextResponse(2)
+      assert.equal(models.result.data.some((model: any) => model.id.startsWith('runtime-')), false)
+      assert.deepEqual(models.result.data.filter((model: any) => model.isDefault === true).map((model: any) => model.id), ['opus'])
+    } finally {
+      proc.kill()
+      await once(proc, 'exit')
     }
   } finally {
     await rm(home, { recursive: true, force: true })

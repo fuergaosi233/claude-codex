@@ -58,7 +58,7 @@ export class CodexClaudeAppServer {
   private goals = new Map<string, Record<string, unknown>>()
   private elicitationCounts = new Map<string, number>()
   private tokenUsageByThread = new Map<string, TokenUsageBreakdown>()
-  private configModel = process.env.CLAUDE_CODEX_DEFAULT_MODEL ?? 'sonnet'
+  private configModel = defaultSelectableModelId()
   private configReasoningEffort = normalizeCodexReasoningEffort(process.env.CLAUDE_CODEX_DEFAULT_EFFORT) ?? 'medium'
   private readonly configPath = join(adapterHome(), 'config.json')
   private idleCheckHandler: (() => void) | null = null
@@ -1453,14 +1453,40 @@ export class CodexClaudeAppServer {
         service_tier: null,
         analytics: null,
         apps: null,
+        model_providers: {
+          'claude-code': {
+            name: 'Claude Code',
+            base_url: null,
+            env_key: null,
+            env_key_instructions: null,
+            experimental_bearer_token: null,
+            auth: null,
+            aws: null,
+            wire_api: 'responses',
+            query_params: null,
+            http_headers: null,
+            env_http_headers: null,
+            request_max_retries: null,
+            stream_max_retries: null,
+            stream_idle_timeout_ms: null,
+            websocket_connect_timeout_ms: null,
+            requires_openai_auth: false,
+            supports_websockets: false,
+          },
+        },
       },
-      origins: {},
+      origins: {
+        model_provider: configLayerMetadata(),
+        'model_providers.claude-code': configLayerMetadata(),
+      },
       layers: null,
     }
   }
 
   private modelList(): unknown {
     const defaultModel = this.configModel
+    const options = claudeModelOptions()
+    const hasConfiguredDefault = options.some((option) => option.id === defaultModel)
     const reasoningEfforts = [
       { reasoningEffort: 'low', description: 'Fast Claude Code runtime response' },
       { reasoningEffort: 'medium', description: 'Balanced Claude Code runtime response' },
@@ -1468,7 +1494,7 @@ export class CodexClaudeAppServer {
       { reasoningEffort: 'xhigh', description: 'Maximum Codex UI reasoning level for Claude Code' },
     ]
     return {
-      data: claudeModelOptions().map((option) => ({
+      data: options.map((option) => ({
         id: option.id,
         model: option.id,
         upgrade: null,
@@ -1482,8 +1508,7 @@ export class CodexClaudeAppServer {
         inputModalities: ['text', 'image'],
         supportsPersonality: false,
         additionalSpeedTiers: [],
-        serviceTiers: [],
-        isDefault: option.isDefault === true || option.id === defaultModel,
+        isDefault: hasConfiguredDefault ? option.id === defaultModel : option.isDefault === true,
       })),
       nextCursor: null,
     }
@@ -1841,7 +1866,7 @@ export class CodexClaudeAppServer {
   private configWriteResponse(params: Record<string, unknown>): unknown {
     for (const edit of configEdits(params)) {
       if (edit.keyPath === 'model' && typeof edit.value === 'string' && edit.value.length > 0) {
-        this.configModel = edit.value
+        this.configModel = normalizeSelectableModelId(edit.value, this.configModel)
       }
       if (edit.keyPath === 'model_reasoning_effort' && typeof edit.value === 'string') {
         this.configReasoningEffort = normalizeCodexReasoningEffort(edit.value) ?? this.configReasoningEffort
@@ -2129,10 +2154,16 @@ export class CodexClaudeAppServer {
   private loadPersistedConfig(): void {
     try {
       const parsed = JSON.parse(readFileSync(this.configPath, 'utf8')) as Record<string, unknown>
-      if (typeof parsed.model === 'string' && parsed.model.length > 0) this.configModel = parsed.model
+      let shouldRepair = false
+      if (typeof parsed.model === 'string' && parsed.model.length > 0) {
+        const normalized = normalizeSelectableModelId(parsed.model, this.configModel)
+        shouldRepair = normalized !== parsed.model
+        this.configModel = normalized
+      }
       if (typeof parsed.model_reasoning_effort === 'string') {
         this.configReasoningEffort = normalizeCodexReasoningEffort(parsed.model_reasoning_effort) ?? this.configReasoningEffort
       }
+      if (shouldRepair) this.persistConfig()
     } catch {}
   }
 
@@ -2165,6 +2196,30 @@ function configEdits(params: Record<string, unknown>): Array<{ keyPath: string; 
   }
   const keyPath = String(params.keyPath ?? params.key ?? '')
   return keyPath ? [{ keyPath, value: params.value }] : []
+}
+
+function configLayerMetadata(): unknown {
+  return {
+    name: { type: 'user', file: `${codexHome()}/config.toml` },
+    version: `claude-codex-${nowSeconds()}`,
+  }
+}
+
+function defaultSelectableModelId(): string {
+  const options = claudeModelOptions()
+  const defaultModel = process.env.CLAUDE_CODEX_DEFAULT_MODEL
+  if (defaultModel && options.some((option) => option.id === defaultModel)) return defaultModel
+  return options.find((option) => option.isDefault === true)?.id ?? options[0]?.id ?? 'sonnet'
+}
+
+function normalizeSelectableModelId(value: string, fallback: string): string {
+  const options = claudeModelOptions()
+  const ids = new Set(options.map((option) => option.id))
+  if (ids.has(value)) return value
+  if (ids.has(fallback)) return fallback
+  const defaultModel = defaultSelectableModelId()
+  debugLog('config.model.repaired', { requestedModel: value, repairedModel: defaultModel })
+  return defaultModel
 }
 
 function modelFromParams(params: Record<string, unknown>, fallback: string | null): string {
