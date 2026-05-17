@@ -179,20 +179,46 @@ export class ClaudeSdkSidecarRuntime implements ClaudeRuntime {
           message: stringOrNull(message.message),
         })
         break
-      case 'completed':
-        await pending.handlers.onEvent({
-          type: 'completed',
-          success: Boolean(message.success),
-          result: message.result == null ? null : String(message.result),
-          claudeSessionId: message.claude_session_id == null ? null : String(message.claude_session_id),
-        })
+      case 'completed': {
+        // Pull the turn out of the registry FIRST so a thrown onEvent doesn't
+        // strand the entry. Server's onEvent throws on success=false to make
+        // runTurn() reject — if we leave delete+resolve/reject after `await
+        // onEvent`, the throw unwinds handleMessage before pending is settled
+        // and the outer runRuntimeTurn hangs forever (so no turn/completed
+        // ever reaches the App). Always settle the promise.
         this.turns.delete(turnId)
-        pending.resolve()
+        const success = Boolean(message.success)
+        const result = message.result == null ? null : String(message.result)
+        let onEventError: unknown = null
+        try {
+          await pending.handlers.onEvent({
+            type: 'completed',
+            success,
+            result,
+            claudeSessionId: message.claude_session_id == null ? null : String(message.claude_session_id),
+          })
+        } catch (error) {
+          onEventError = error
+        }
+        if (success && onEventError == null) {
+          pending.resolve()
+        } else {
+          const reason = onEventError instanceof Error
+            ? onEventError
+            : new Error(String(onEventError ?? result ?? 'Claude turn failed'))
+          pending.reject(reason)
+        }
         break
+      }
       case 'error': {
-        const error = new Error(String(message.message ?? 'Claude sidecar error'))
-        await pending.handlers.onEvent({ type: 'error', message: error.message })
         this.turns.delete(turnId)
+        const error = new Error(String(message.message ?? 'Claude sidecar error'))
+        try {
+          await pending.handlers.onEvent({ type: 'error', message: error.message })
+        } catch {
+          // Server's onEvent throws to escalate — that's the whole point; we
+          // already have the error to reject with.
+        }
         pending.reject(error)
         break
       }

@@ -194,6 +194,11 @@ class ClaudeSidecar:
         self.structured_outputs_emitted: set[str] = set()
         self.structured_output_schemas: Dict[str, Any] = {}
         self.structured_text_buffers: Dict[str, list[str]] = {}
+        # Track which turns already emitted a `completed` event from a
+        # ResultMessage so the post-loop "default success" emit doesn't
+        # double-publish (a second completed would lose the failure signal
+        # and re-mark the turn as success on the Node side).
+        self.completed_turns: set[str] = set()
         # Tool-use ids of active Task (subagent) calls per thread. While a Task
         # is in flight we hide its inner text/tool_use/tool_result events so
         # Codex App renders one Agent item instead of a wall of leaked sub-tool
@@ -382,13 +387,19 @@ class ClaudeSidecar:
             async for sdk_message in client.receive_response():
                 last_session_id = self.emit_sdk_message(thread_id, turn_id, sdk_message, last_session_id)
             self.flush_structured_output(thread_id, turn_id)
-            emit({
-                "type": "completed",
-                "thread_id": thread_id,
-                "turn_id": turn_id,
-                "success": True,
-                "claude_session_id": last_session_id,
-            })
+            # Only emit the default success-completed if a ResultMessage during
+            # the loop didn't already publish one. A failed ResultMessage
+            # (is_error=True) would otherwise be overwritten here as success,
+            # leaving Codex App with a confused "turn completed ok" after an
+            # error like "Not logged in" was streamed.
+            if f"{thread_id}:{turn_id}" not in self.completed_turns:
+                emit({
+                    "type": "completed",
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
+                    "success": True,
+                    "claude_session_id": last_session_id,
+                })
         except asyncio.CancelledError:
             emit({"type": "completed", "thread_id": thread_id, "turn_id": turn_id, "success": False, "result": "interrupted"})
         except Exception as exc:
@@ -424,6 +435,7 @@ class ClaudeSidecar:
             self.structured_text_buffers.pop(f"{thread_id}:{turn_id}", None)
             self.active_subagent_ids.pop(thread_id, None)
             self.active_clients.pop(thread_id, None)
+            self.completed_turns.discard(f"{thread_id}:{turn_id}")
             try:
                 await client.disconnect()
             except Exception:
@@ -518,6 +530,7 @@ class ClaudeSidecar:
         if result and name.lower().startswith("result"):
             self.flush_structured_output(thread_id, turn_id)
             emit({"type": "completed", "thread_id": thread_id, "turn_id": turn_id, "success": not bool(obj_get(message, "is_error", False)), "result": result, "claude_session_id": last_session_id})
+            self.completed_turns.add(f"{thread_id}:{turn_id}")
         return last_session_id
 
     def emit_stream_event(self, thread_id: str, turn_id: str, event: Any) -> None:

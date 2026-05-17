@@ -773,6 +773,77 @@ test('baseInstructions / developerInstructions / personality flow into the syste
   }
 })
 
+test('sidecar-runtime: turn/completed still fires when Claude returns a failed ResultMessage (regression: auth-failed hang)', async () => {
+  // Reproduces the production hang where "Not logged in · Please run /login"
+  // streamed in as text + a ResultMessage(is_error=True). The bug: server's
+  // onEvent threw on success=false to make runTurn() reject, but the
+  // sidecar-runtime's `await onEvent` lost the throw — handleMessage exited
+  // without calling pending.resolve/reject, so runTurn() hung forever and
+  // turn/completed never reached the App. This test points the adapter at a
+  // fake sidecar python that emits exactly that sequence and asserts the
+  // outer turn/completed (failed) STILL fires.
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const fixture = join(home, 'fake_sidecar.py')
+  const fs = await import('node:fs/promises')
+  await fs.writeFile(fixture, [
+    '#!/usr/bin/env python3',
+    'import sys, json',
+    'for line in sys.stdin:',
+    '    line = line.strip()',
+    '    if not line: continue',
+    '    msg = json.loads(line)',
+    '    if msg.get("type") != "query": continue',
+    '    tid, uid = msg["thread_id"], msg["turn_id"]',
+    '    print(json.dumps({"type":"text_delta","thread_id":tid,"turn_id":uid,"delta":"Not logged in"}), flush=True)',
+    '    print(json.dumps({"type":"completed","thread_id":tid,"turn_id":uid,"success":False,"result":"Not logged in"}), flush=True)',
+    '    # Intentionally do NOT emit a second success=True completed — this',
+    '    # matches the fixed Python sidecar which now guards against double-',
+    '    # emitting after a ResultMessage already published completed.',
+    '',
+  ].join('\n'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      CODEX_HOME: home,
+      // Crucial: NOT mock, so ClaudeSdkSidecarRuntime is used and we exercise
+      // the actual handleMessage path that contained the bug.
+      CLAUDE_CODEX_MOCK: '0',
+      CLAUDE_CODEX_SIDECAR: fixture,
+      CLAUDE_CODEX_PYTHON: 'python3',
+      NODE_NO_WARNINGS: '1',
+    },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const start = await reader.nextResponse(1)
+    const threadId = start.result.thread.id
+
+    proc.stdin.write(json({ id: 2, method: 'turn/start', params: { threadId, input: [{ type: 'text', text: 'ping', text_elements: [] }] } }))
+    await reader.nextResponse(2)
+
+    const deadline = Date.now() + 5000
+    let completedTurn: any = null
+    let sawError = false
+    while (Date.now() < deadline) {
+      const message = await Promise.race([
+        reader.next(),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), deadline - Date.now() + 50)),
+      ])
+      if (!message) break
+      if (message.method === 'error') sawError = true
+      if (message.method === 'turn/completed') { completedTurn = message.params.turn; break }
+    }
+    assert.ok(completedTurn, 'turn/completed must arrive even when the Claude turn errored mid-stream')
+    assert.equal(completedTurn.status, 'failed', 'completed turn should report status=failed when Claude returned success=false')
+    assert.equal(sawError, true, 'an error notification should also be sent so the App can surface the failure')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
 test('Claude hook events are rendered as Codex hookPrompt ThreadItems', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {

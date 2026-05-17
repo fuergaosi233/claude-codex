@@ -179,20 +179,43 @@ export class ClaudeSdkSocketRuntime implements ClaudeRuntime {
           message: stringOrNull(message.message),
         })
         break
-      case 'completed':
-        await pending.handlers.onEvent({
-          type: 'completed',
-          success: Boolean(message.success),
-          result: message.result == null ? null : String(message.result),
-          claudeSessionId: message.claude_session_id == null ? null : String(message.claude_session_id),
-        })
+      case 'completed': {
+        // Always settle the pending promise even if server.onEvent throws —
+        // see ClaudeSdkSidecarRuntime.handleMessage for the same fix; same
+        // bug shape here (a thrown onEvent would otherwise leak the pending
+        // entry and hang runTurn() so turn/completed never reaches the App).
         this.turns.delete(turnId)
-        pending.resolve()
+        const success = Boolean(message.success)
+        const result = message.result == null ? null : String(message.result)
+        let onEventError: unknown = null
+        try {
+          await pending.handlers.onEvent({
+            type: 'completed',
+            success,
+            result,
+            claudeSessionId: message.claude_session_id == null ? null : String(message.claude_session_id),
+          })
+        } catch (error) {
+          onEventError = error
+        }
+        if (success && onEventError == null) {
+          pending.resolve()
+        } else {
+          const reason = onEventError instanceof Error
+            ? onEventError
+            : new Error(String(onEventError ?? result ?? 'Claude turn failed'))
+          pending.reject(reason)
+        }
         break
+      }
       case 'error': {
-        const error = new Error(String(message.message ?? 'Claude runtime socket error'))
-        await pending.handlers.onEvent({ type: 'error', message: error.message })
         this.turns.delete(turnId)
+        const error = new Error(String(message.message ?? 'Claude runtime socket error'))
+        try {
+          await pending.handlers.onEvent({ type: 'error', message: error.message })
+        } catch {
+          // Server's onEvent throws to escalate — that is intentional.
+        }
         pending.reject(error)
         break
       }
