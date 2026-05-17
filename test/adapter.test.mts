@@ -191,14 +191,92 @@ test('model/list exposes Claude model aliases and Codex-safe reasoning efforts',
     assert.equal(ids.includes('opus'), true)
     assert.equal(ids.includes('sonnet-1m'), true)
     assert.equal(ids.includes('opus-plan'), true)
+    assert.equal(ids.some((id: string) => id.startsWith('runtime-')), false)
     const opus = models.result.data.find((model: any) => model.id === 'opus')
     assert.equal(opus.isDefault, true)
     assert.deepEqual(
       opus.supportedReasoningEfforts.map((entry: any) => entry.reasoningEffort),
       ['low', 'medium', 'high', 'xhigh'],
     )
+
+    proc.stdin.write(json({
+      id: 3,
+      method: 'config/batchWrite',
+      params: {
+        edits: [
+          { keyPath: 'model', value: 'haiku', mergeStrategy: 'upsert' },
+          { keyPath: 'model_reasoning_effort', value: 'low', mergeStrategy: 'upsert' },
+        ],
+      },
+    }))
+    await reader.nextResponse(3)
+    proc.stdin.write(json({ id: 4, method: 'config/read', params: {} }))
+    const updatedConfig = await reader.nextResponse(4)
+    assert.equal(updatedConfig.result.config.model, 'haiku')
+    assert.equal(updatedConfig.result.config.model_reasoning_effort, 'low')
   } finally {
     proc.kill()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('config writes persist across adapter restarts', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  try {
+    const first = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        CODEX_HOME: home,
+        CLAUDE_CODEX_MOCK: '1',
+        CLAUDE_CODEX_DEFAULT_MODEL: 'opus',
+        CLAUDE_CODEX_DEFAULT_EFFORT: 'high',
+        NODE_NO_WARNINGS: '1',
+      },
+    })
+    const firstReader = new JsonLineReader(first)
+    first.stdin.write(json({
+      id: 1,
+      method: 'config/batchWrite',
+      params: {
+        edits: [
+          { keyPath: 'model', value: 'haiku', mergeStrategy: 'upsert' },
+          { keyPath: 'model_reasoning_effort', value: 'low', mergeStrategy: 'upsert' },
+        ],
+      },
+    }))
+    await firstReader.nextResponse(1)
+    first.kill()
+    await once(first, 'exit')
+
+    const second = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        CODEX_HOME: home,
+        CLAUDE_CODEX_MOCK: '1',
+        CLAUDE_CODEX_DEFAULT_MODEL: 'opus',
+        CLAUDE_CODEX_DEFAULT_EFFORT: 'high',
+        NODE_NO_WARNINGS: '1',
+      },
+    })
+    const secondReader = new JsonLineReader(second)
+    try {
+      second.stdin.write(json({ id: 2, method: 'config/read', params: {} }))
+      const config = await secondReader.nextResponse(2)
+      assert.equal(config.result.config.model, 'haiku')
+      assert.equal(config.result.config.model_reasoning_effort, 'low')
+
+      second.stdin.write(json({ id: 3, method: 'model/list', params: {} }))
+      const models = await secondReader.nextResponse(3)
+      const haiku = models.result.data.find((model: any) => model.id === 'haiku')
+      assert.equal(haiku.isDefault, true)
+      assert.equal(haiku.defaultReasoningEffort, 'low')
+    } finally {
+      second.kill()
+      await once(second, 'exit')
+    }
+  } finally {
     await rm(home, { recursive: true, force: true })
   }
 })
@@ -240,6 +318,60 @@ test('Codex++ model and effort selections map into Claude runtime context', asyn
     const resume = await reader.nextResponse(3)
     assert.equal(resume.result.model, 'sonnet-1m')
     assert.equal(resume.result.reasoningEffort, 'xhigh')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('Codex app config payload model and effort map into Claude runtime context', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      CODEX_HOME: home,
+      CLAUDE_CODEX_MOCK: '1',
+      CLAUDE_CODEX_MODELS: '',
+      CLAUDE_CODEX_MODEL_ALIASES: '',
+      NODE_NO_WARNINGS: '1',
+    },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({
+      id: 1,
+      method: 'thread/start',
+      params: {
+        cwd: process.cwd(),
+        config: { model: 'opus', model_reasoning_effort: 'high' },
+        experimentalRawEvents: false,
+        persistExtendedHistory: false,
+      },
+    }))
+    const start = await reader.nextResponse(1)
+    const threadId = start.result.thread.id
+    assert.equal(start.result.model, 'opus')
+    assert.equal(start.result.reasoningEffort, 'high')
+
+    proc.stdin.write(json({
+      id: 2,
+      method: 'turn/start',
+      params: {
+        threadId,
+        config: { model: 'haiku', model_reasoning_effort: 'xhigh' },
+        input: [{ type: 'text', text: 'model effort check', text_elements: [] }],
+      },
+    }))
+    await reader.nextResponse(2)
+
+    let text = ''
+    for (let i = 0; i < 500; i += 1) {
+      const message = await reader.next()
+      if (message.method === 'item/agentMessage/delta') text += message.params.delta
+      if (message.method === 'turn/completed') break
+    }
+    assert.equal(text, 'model=haiku effort=xhigh')
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true })
@@ -374,6 +506,60 @@ test('Codex title-generation turn runs through the runtime instead of a hardcode
   }
 })
 
+test('stateful HTTP bridge runtimes keep Codex title-generation turns local', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const debugLog = join(home, 'debug.jsonl')
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      CODEX_HOME: home,
+      CLAUDE_CODEX_RUNTIME_TYPE: 'agent-http',
+      CLAUDE_CODEX_HTTP_BASE_URL: 'http://127.0.0.1:9',
+      CLAUDE_CODEX_HTTP_MANAGE_BRIDGE: '1',
+      CLAUDE_CODEX_DEBUG_LOG: debugLog,
+      NODE_NO_WARNINGS: '1',
+    },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), model: 'sonnet', ephemeral: true, experimentalRawEvents: false, persistExtendedHistory: false } }))
+    const start = await reader.nextResponse(1)
+    const threadId = start.result.thread.id
+    const outputSchema = {
+      type: 'object',
+      properties: { title: { type: 'string' } },
+      required: ['title'],
+      additionalProperties: false,
+    }
+    proc.stdin.write(json({
+      id: 2,
+      method: 'turn/start',
+      params: {
+        threadId,
+        model: 'gpt-5.4-mini',
+        outputSchema,
+        input: [{ type: 'text', text: 'User prompt:\nhi', text_elements: [] }],
+      },
+    }))
+    await reader.nextResponse(2)
+
+    let text = ''
+    for (let i = 0; i < 200; i += 1) {
+      const message = await reader.next()
+      if (message.method === 'item/agentMessage/delta') text += message.params.delta
+      if (message.method === 'turn/completed') break
+    }
+    assert.deepEqual(JSON.parse(text), { title: 'hi' })
+    const logText = await readFile(debugLog, 'utf8')
+    assert.match(logText, /"selectedType":"local-structured-summary"/)
+    assert.doesNotMatch(logText, /"http\.bridge\.ensure\.start"/)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
 test('default runtime tool policy leaves Claude Code tools unrestricted unless env overrides', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
@@ -429,6 +615,68 @@ test('unix websocket app-server accepts initialize', async () => {
     assert.equal(response.id, 1)
     assert.equal(response.result.codexHome, home)
     ws.close()
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('unix daemon keeps active turns alive across peer reconnect', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const sock = join(tmpdir(), `ccx-test-${randomUUID().slice(0, 8)}.sock`)
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', `unix://${sock}`], {
+    stdio: ['ignore', 'ignore', 'pipe'],
+    env: {
+      ...process.env,
+      CODEX_HOME: home,
+      CLAUDE_CODEX_MOCK: '1',
+      CLAUDE_CODEX_IDLE_EXIT_MS: '40',
+      NODE_NO_WARNINGS: '1',
+    },
+  })
+  try {
+    await waitForStderr(proc, /listening on/)
+    const ws1 = new WebSocket('ws://localhost/', {
+      createConnection: (() => net.createConnection(sock)) as typeof net.createConnection,
+    })
+    const reader1 = new WebSocketJsonReader(ws1)
+    await once(ws1, 'open')
+    ws1.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'thread/start', params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false } }))
+    const start = await reader1.nextResponse(1)
+    const threadId = start.result.thread.id
+    const slowPrompt = `active reconnect check ${'x'.repeat(400)}`
+    ws1.send(JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'turn/start', params: { threadId, input: [{ type: 'text', text: slowPrompt, text_elements: [] }] } }))
+    await reader1.nextResponse(2)
+
+    ws1.close()
+    await once(ws1, 'close')
+    await delay(120)
+    assert.equal(proc.exitCode, null)
+
+    const ws2 = new WebSocket('ws://localhost/', {
+      createConnection: (() => net.createConnection(sock)) as typeof net.createConnection,
+    })
+    const reader2 = new WebSocketJsonReader(ws2)
+    await once(ws2, 'open')
+    ws2.send(JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'thread/resume', params: { threadId } }))
+    await reader2.nextResponse(3)
+
+    let text = ''
+    let completed = false
+    for (let i = 0; i < 1000; i += 1) {
+      const message = await reader2.next()
+      if (message.method === 'item/agentMessage/delta') text += message.params.delta
+      if (message.method === 'turn/completed') {
+        completed = true
+        break
+      }
+    }
+    assert.equal(completed, true)
+    assert.match(text, /reconnect check/)
+
+    ws2.close()
+    await once(ws2, 'close')
+    assert.equal(await waitForExit(proc, 2000), 0)
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true })
@@ -1452,6 +1700,93 @@ test('thread resume, fork, and interrupt lifecycle methods are stable', async ()
   }
 })
 
+test('turn interrupt completes requested in-progress turn after reconnect', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  try {
+    execFileSync(process.execPath, ['--no-warnings', '--input-type=module', '-e', `
+      import assert from 'node:assert/strict'
+      import { randomUUID } from 'node:crypto'
+      import { join } from 'node:path'
+      import { CodexClaudeAppServer } from './dist/src/server.mjs'
+      import { SessionStore } from './dist/src/store.mjs'
+
+      process.env.CLAUDE_CODEX_HOME = ${JSON.stringify(home)}
+      const store = new SessionStore(join(${JSON.stringify(home)}, 'state.sqlite'))
+      const threadId = randomUUID()
+      const turnId = randomUUID()
+      const now = Math.floor(Date.now() / 1000)
+      store.upsertThread({
+        id: threadId,
+        sessionId: randomUUID(),
+        forkedFromId: null,
+        preview: 'interrupt me',
+        name: null,
+        archived: false,
+        cwd: process.cwd(),
+        model: 'opus',
+        reasoningEffort: 'medium',
+        modelProvider: 'claude-code',
+        claudeSessionId: null,
+        source: 'user',
+        createdAt: now,
+        updatedAt: now,
+        status: { type: 'active', activeFlags: [] },
+        approvalPolicy: null,
+        sandboxMode: null,
+        ephemeral: false,
+        threadSource: 'user',
+        agentRole: null,
+        agentNickname: null,
+        baseInstructions: null,
+        developerInstructions: null,
+        personality: null,
+      })
+      store.upsertTurn({
+        id: turnId,
+        threadId,
+        status: 'inProgress',
+        startedAt: now,
+        completedAt: null,
+        durationMs: null,
+        items: [],
+        diff: '',
+        error: null,
+      })
+      const interrupted = []
+      const server = new CodexClaudeAppServer(store, {
+        async runTurn() {},
+        async steer() {},
+        async interrupt(id) {
+          interrupted.push(id)
+        },
+        async stop() {},
+      })
+      const messages = []
+      const peer = {
+        id: 'peer',
+        send(message) {
+          messages.push(message)
+        },
+        close() {},
+      }
+      await server.handle(peer, { id: 1, method: 'turn/interrupt', params: { threadId, turnId } })
+      assert.deepEqual(interrupted, [threadId])
+      assert.equal(store.getTurn(turnId)?.status, 'interrupted')
+      assert.equal(store.getThread(threadId)?.status.type, 'idle')
+      const completed = messages.find((message) => 'method' in message && message.method === 'turn/completed')
+      assert.equal(completed?.params.turn.id, turnId)
+      assert.equal(completed?.params.turn.status, 'interrupted')
+      const status = messages.find((message) => 'method' in message && message.method === 'thread/status/changed')
+      assert.deepEqual(status?.params.status, { type: 'idle' })
+      const response = messages.find((message) => 'id' in message && message.id === 1)
+      assert.deepEqual(response?.result, {})
+      await server.stop()
+    `], { cwd: resolve('.'), stdio: 'pipe' })
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
 test('mcp status list reflects configured Claude SDK MCP servers', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
@@ -1626,6 +1961,33 @@ class JsonLineReader {
   }
 }
 
+class WebSocketJsonReader {
+  private queue: any[] = []
+  private waiters: Array<(value: any) => void> = []
+
+  constructor(ws: WebSocket) {
+    ws.on('message', (data) => {
+      const message = JSON.parse(Buffer.isBuffer(data) ? data.toString('utf8') : String(data))
+      const waiter = this.waiters.shift()
+      if (waiter) waiter(message)
+      else this.queue.push(message)
+    })
+  }
+
+  next(): Promise<any> {
+    const existing = this.queue.shift()
+    if (existing) return Promise.resolve(existing)
+    return new Promise((resolve) => this.waiters.push(resolve))
+  }
+
+  async nextResponse(id: number): Promise<any> {
+    for (;;) {
+      const msg = await this.next()
+      if (msg.id === id && msg.method == null) return msg
+    }
+  }
+}
+
 class TextCollector {
   private text = ''
   private waiters: Array<() => void> = []
@@ -1675,19 +2037,45 @@ function json(message: Record<string, unknown>): string {
   return `${JSON.stringify({ jsonrpc: '2.0', ...message })}\n`
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function waitForExit(proc: ChildProcess, timeoutMs: number): Promise<number | null> {
+  if (proc.exitCode !== null) return proc.exitCode
+  return await Promise.race([
+    once(proc, 'exit').then(([code]) => code as number | null),
+    delay(timeoutMs).then(() => null),
+  ])
+}
+
 async function waitForStderr(proc: ChildProcess, pattern: RegExp): Promise<void> {
   if (!proc.stderr) throw new Error('test process has no stderr')
   proc.stderr.setEncoding('utf8')
   let acc = ''
-  const timeout = setTimeout(() => {
-    proc.kill()
-  }, 5000)
-  try {
-    for await (const chunk of proc.stderr) {
-      acc += String(chunk)
-      if (pattern.test(acc)) return
+  await new Promise<void>((resolve, reject) => {
+    const cleanup = () => {
+      clearTimeout(timeout)
+      proc.stderr?.off('data', onData)
+      proc.off('exit', onExit)
     }
-  } finally {
-    clearTimeout(timeout)
-  }
+    const onData = (chunk: string) => {
+      acc += String(chunk)
+      if (pattern.test(acc)) {
+        cleanup()
+        resolve()
+      }
+    }
+    const onExit = () => {
+      cleanup()
+      reject(new Error(`process exited before stderr matched ${pattern}; saw: ${acc}`))
+    }
+    const timeout = setTimeout(() => {
+      cleanup()
+      proc.kill()
+      reject(new Error(`timed out waiting for stderr ${pattern}; saw: ${acc}`))
+    }, 5000)
+    proc.stderr?.on('data', onData)
+    proc.once('exit', onExit)
+  })
 }

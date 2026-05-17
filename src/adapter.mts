@@ -78,13 +78,14 @@ async function main(): Promise<void> {
     }
   }
   const armIdleExit = () => {
-    if (!idleExitEnabled || activePeers > 0 || !everConnected || idleTimer) return
+    if (!idleExitEnabled || activePeers > 0 || !everConnected || idleTimer || server.hasActiveTurns()) return
     idleTimer = setTimeout(() => {
       process.stderr.write(`[claude-codex-adapter] no active peers for ${idleExitMs}ms, shutting down\n`)
       void shutdown()
     }, idleExitMs)
     idleTimer.unref()
   }
+  server.setIdleCheckHandler(armIdleExit)
   const onConnect = (_peer: RpcPeer) => {
     everConnected = true
     activePeers += 1

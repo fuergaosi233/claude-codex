@@ -1,0 +1,1017 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_DIR="${CLAUDE_CODEX_STATE_DIR:-$HOME/.claude-codex}"
+ENV_FILE="${CLAUDE_CODEX_RUNTIME_ENV:-$STATE_DIR/runtime.env}"
+ADAPTER_DEBUG_LOG="${CLAUDE_CODEX_DEBUG_LOG:-${CODEX_HOME:-$HOME/.codex}/claude-codex-adapter/debug.jsonl}"
+AGENT_HTTP_LOG="$STATE_DIR/agent-http.log"
+AGENTAPI_LOG="$STATE_DIR/agentapi.log"
+BRIDGE_LOCK="$STATE_DIR/bridge.lock"
+BRIDGE_POOL_DIR="$STATE_DIR/bridges"
+BRIDGE_PORT_START="${CLAUDE_CODEX_BRIDGE_PORT_START:-3284}"
+BRIDGE_PORT_END="${CLAUDE_CODEX_BRIDGE_PORT_END:-3384}"
+
+mkdir -p "$STATE_DIR" "$BRIDGE_POOL_DIR"
+
+if [ -f "$ENV_FILE" ]; then
+  # shellcheck source=/dev/null
+  source "$ENV_FILE"
+fi
+
+export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.local/node-v24.11.0-linux-x64/bin:$HOME/.bun/bin:$PATH"
+
+usage() {
+  cat <<'EOF'
+usage:
+  claude-codex-mode list
+  claude-codex-mode show
+  claude-codex-mode set <mode> [model] [cwd]
+  claude-codex-mode ensure-bridge <agent-http|agentapi> [model] <cwd>
+  claude-codex-mode model [model]
+  claude-codex-mode trust
+  claude-codex-mode status|read
+  claude-codex-mode stop-bridges [agent-http|agentapi]
+  claude-codex-mode prune-bridges
+  claude-codex-mode last-turn
+  claude-codex-mode last-user-turn
+  claude-codex-mode logs [adapter|agent-http|agentapi] [lines]
+  claude-codex-mode tail [adapter|agent-http|agentapi]
+
+aliases:
+  sdk -> agent-sdk-sidecar
+  channels -> agent-http
+  claudep -> claude-p
+
+Changing mode rewrites ~/.claude-codex/runtime.env, prepares the matching
+bridge daemon when needed, and stops the current app-server so Codex App can
+reconnect into the new route.
+
+For agent-http/agentapi, model selection is a bridge startup setting. Use
+`claude-codex-mode model opus` or `claude-codex-mode set agent-http opus` to
+restart the bridge with `claude --model opus`.
+
+When Codex App sends a turn, the adapter calls `ensure-bridge` so HTTP bridge
+sessions are pooled by mode + cwd + model instead of sharing one global port.
+
+agentapi runs Claude Code inside a PTY. If Claude Code opens its workspace trust
+prompt, run `claude-codex-mode trust` to accept it after reviewing the path.
+EOF
+}
+
+mode_description() {
+  case "$1" in
+    codex) printf '%s\n' "native Codex passthrough" ;;
+    agent-sdk-sidecar) printf '%s\n' "Claude Agent SDK sidecar (default adapter path)" ;;
+    agent-http) printf '%s\n' "Claude Code Channels via agent-http HTTP bridge" ;;
+    agentapi) printf '%s\n' "Claude Code TUI via agentapi HTTP bridge" ;;
+    claude-p) printf '%s\n' "claude-p one-shot PTY/transcript wrapper" ;;
+    *) printf '%s\n' "" ;;
+  esac
+}
+
+list_modes() {
+  local current
+  current="$(current_mode)"
+  local mode
+  for mode in codex agent-sdk-sidecar agent-http agentapi claude-p; do
+    if [ "$mode" = "$current" ]; then
+      printf '* %-18s %s\n' "$mode" "$(mode_description "$mode")"
+    else
+      printf '  %-18s %s\n' "$mode" "$(mode_description "$mode")"
+    fi
+  done
+}
+
+normalize_mode() {
+  case "${1:-}" in
+    codex|agent-sdk-sidecar|agent-http|agentapi|claude-p) printf '%s\n' "$1" ;;
+    sdk) printf '%s\n' "agent-sdk-sidecar" ;;
+    channels) printf '%s\n' "agent-http" ;;
+    claudep|claude_p) printf '%s\n' "claude-p" ;;
+    *) return 1 ;;
+  esac
+}
+
+current_mode() {
+  printf '%s\n' "${CLAUDE_CODEX_RUNTIME_TYPE:-agent-sdk-sidecar}"
+}
+
+current_model() {
+  printf '%s\n' "${CLAUDE_CODEX_DEFAULT_MODEL:-${CLAUDE_CODEX_BRIDGE_MODEL:-sonnet}}"
+}
+
+current_bridge_model() {
+  printf '%s\n' "${CLAUDE_CODEX_BRIDGE_MODEL:-${CLAUDE_CODEX_DEFAULT_MODEL:-}}"
+}
+
+current_bridge_cwd() {
+  printf '%s\n' "${CLAUDE_CODEX_BRIDGE_CWD:-}"
+}
+
+rewrite_env_value() {
+  local key="$1"
+  local value="$2"
+  python3 - "$ENV_FILE" "$key" "$value" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+key = sys.argv[2]
+value = sys.argv[3]
+lines = path.read_text().splitlines() if path.exists() else []
+out = []
+seen = False
+prefixes = (f"export {key}=", f"{key}=")
+for line in lines:
+    if line.startswith(prefixes):
+        out.append(f'export {key}="{value}"')
+        seen = True
+    else:
+        out.append(line)
+if not seen:
+    out.append(f'export {key}="{value}"')
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text("\n".join(out) + "\n")
+PY
+}
+
+rewrite_mode() {
+  rewrite_env_value CLAUDE_CODEX_RUNTIME_TYPE "$1"
+}
+
+rewrite_model() {
+  rewrite_env_value CLAUDE_CODEX_DEFAULT_MODEL "$1"
+  rewrite_env_value CLAUDE_CODEX_BRIDGE_MODEL "$1"
+}
+
+rewrite_bridge_cwd() {
+  rewrite_env_value CLAUDE_CODEX_BRIDGE_CWD "$1"
+}
+
+rewrite_http_manage_bridge() {
+  rewrite_env_value CLAUDE_CODEX_HTTP_MANAGE_BRIDGE "$1"
+}
+
+acquire_bridge_lock() {
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>"$BRIDGE_LOCK"
+    flock 9
+  fi
+}
+
+bridge_hash() {
+  local mode="$1"
+  local cwd="$2"
+  local model="$3"
+  printf '%s' "$mode|$cwd|$model" | sha256_hex | awk '{print substr($1, 1, 16)}'
+}
+
+sha256_hex() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum
+  else
+    shasum -a 256
+  fi
+}
+
+bridge_dir_for() {
+  local mode="$1"
+  local cwd="$2"
+  local model="$3"
+  printf '%s/%s/%s\n' "$BRIDGE_POOL_DIR" "$mode" "$(bridge_hash "$mode" "$cwd" "$model")"
+}
+
+meta_value() {
+  local file="$1"
+  local key="$2"
+  sed -n "s/^${key}=//p" "$file" 2>/dev/null | tail -1
+}
+
+bridge_pid_alive() {
+  local dir="$1"
+  pidfile_alive "$dir/pid"
+}
+
+bridge_base_url() {
+  local dir="$1"
+  local base
+  base="$(meta_value "$dir/meta" base_url)"
+  if [ -n "$base" ]; then
+    printf '%s\n' "$base"
+    return 0
+  fi
+  local port
+  port="$(meta_value "$dir/meta" port)"
+  if [ -n "$port" ]; then
+    printf 'http://127.0.0.1:%s\n' "$port"
+  fi
+}
+
+bridge_matches() {
+  local dir="$1"
+  local mode="$2"
+  local cwd="$3"
+  local model="$4"
+  [ -f "$dir/meta" ] || return 1
+  [ "$(meta_value "$dir/meta" mode)" = "$mode" ] || return 1
+  [ "$(meta_value "$dir/meta" cwd)" = "$cwd" ] || return 1
+  [ "$(meta_value "$dir/meta" model)" = "$model" ] || return 1
+}
+
+bridge_ready() {
+  local dir="$1"
+  local base
+  base="$(bridge_base_url "$dir")"
+  [ -n "$base" ] || return 1
+  bridge_pid_alive "$dir" && http_ok "$base"
+}
+
+write_pool_meta() {
+  local dir="$1"
+  local mode="$2"
+  local cwd="$3"
+  local model="$4"
+  local port="$5"
+  local base="$6"
+  local log="$7"
+  mkdir -p "$dir"
+  {
+    printf 'mode=%s\n' "$mode"
+    printf 'cwd=%s\n' "$cwd"
+    printf 'model=%s\n' "$model"
+    printf 'port=%s\n' "$port"
+    printf 'base_url=%s\n' "$base"
+    printf 'log=%s\n' "$log"
+    printf 'updated_at=%s\n' "$(date -Is)"
+  } > "$dir/meta"
+}
+
+print_bridge_ready() {
+  local name="$1"
+  local dir="$2"
+  local base="$3"
+  local key
+  key="$(basename "$dir")"
+  echo "$name ready at $base"
+  echo "CLAUDE_CODEX_BRIDGE_URL=$base"
+  echo "CLAUDE_CODEX_BRIDGE_KEY=$key"
+  echo "CLAUDE_CODEX_BRIDGE_LOG=$dir/log"
+}
+
+port_available() {
+  local port="$1"
+  python3 - "$port" <<'PY'
+import socket
+import sys
+
+sock = socket.socket()
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    sock.bind(("127.0.0.1", int(sys.argv[1])))
+except OSError:
+    sys.exit(1)
+finally:
+    sock.close()
+PY
+}
+
+active_bridge_uses_port() {
+  local port="$1"
+  local meta dir
+  while IFS= read -r meta; do
+    dir="$(dirname "$meta")"
+    if bridge_pid_alive "$dir" && [ "$(meta_value "$meta" port)" = "$port" ]; then
+      return 0
+    fi
+  done < <(find "$BRIDGE_POOL_DIR" -mindepth 3 -maxdepth 3 -name meta 2>/dev/null || true)
+  return 1
+}
+
+allocate_port() {
+  local dir="$1"
+  local existing
+  existing="$(meta_value "$dir/meta" port)"
+  if [ -n "$existing" ] && ! active_bridge_uses_port "$existing" && port_available "$existing"; then
+    printf '%s\n' "$existing"
+    return 0
+  fi
+  local port
+  for port in $(seq "$BRIDGE_PORT_START" "$BRIDGE_PORT_END"); do
+    if ! active_bridge_uses_port "$port" && port_available "$port"; then
+      printf '%s\n' "$port"
+      return 0
+    fi
+  done
+  echo "no free bridge port in range $BRIDGE_PORT_START-$BRIDGE_PORT_END" >&2
+  return 1
+}
+
+stop_bridge_dir() {
+  local dir="$1"
+  [ -d "$dir" ] || return 0
+  stop_pidfile "$dir/pid"
+}
+
+pool_dirs() {
+  local mode="${1:-}"
+  if [ -n "$mode" ]; then
+    find "$BRIDGE_POOL_DIR/$mode" -mindepth 1 -maxdepth 1 -type d 2>/dev/null || true
+  else
+    find "$BRIDGE_POOL_DIR" -mindepth 2 -maxdepth 2 -type d 2>/dev/null || true
+  fi
+}
+
+stop_bridge_pool() {
+  local mode="${1:-}"
+  local dir
+  while IFS= read -r dir; do
+    stop_bridge_dir "$dir"
+  done < <(pool_dirs "$mode")
+}
+
+prune_bridge_pool() {
+  local dir
+  while IFS= read -r dir; do
+    if ! bridge_pid_alive "$dir"; then
+      rm -rf "$dir"
+    fi
+  done < <(pool_dirs)
+}
+
+latest_bridge_log() {
+  local mode="$1"
+  local dir newest=""
+  while IFS= read -r dir; do
+    [ -f "$dir/log" ] || continue
+    newest="$dir/log"
+  done < <(for dir in $(pool_dirs "$mode"); do [ -d "$dir" ] && printf '%s\n' "$dir"; done | sort_by_mtime)
+  printf '%s\n' "$newest"
+}
+
+sort_by_mtime() {
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    printf '%s\t%s\n' "$(mtime_seconds "$path")" "$path"
+  done | sort -rn | cut -f2-
+}
+
+mtime_seconds() {
+  local path="$1"
+  stat -c %Y "$path" 2>/dev/null || stat -f %m "$path" 2>/dev/null || printf '0\n'
+}
+
+stop_pidfile() {
+  local file="$1"
+  if [ ! -f "$file" ]; then return 0; fi
+  local pid
+  pid="$(cat "$file" 2>/dev/null || true)"
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    for _ in $(seq 1 30); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    kill -TERM "$pid" 2>/dev/null || true
+  fi
+  rm -f "$file"
+}
+
+stop_adapter() {
+  local pid stopped=0
+  while read -r pid; do
+    if [ -n "$pid" ] && [ "$pid" != "$$" ] && [ "$pid" != "${PPID:-}" ]; then
+      kill "$pid" 2>/dev/null || true
+      stopped=1
+    fi
+  done < <(app_server_pids)
+  if [ "$stopped" = "1" ]; then
+    for _ in $(seq 1 30); do
+      if ! app_server_pids | grep -q .; then
+        break
+      fi
+      sleep 0.1
+    done
+    while read -r pid; do
+      [ -n "$pid" ] || continue
+      kill -TERM "$pid" 2>/dev/null || true
+    done < <(app_server_pids)
+    echo "app-server stopped; Codex App Remote will start the new route on reconnect."
+  else
+    echo "app-server not running; Codex App Remote will start the new route on reconnect."
+  fi
+}
+
+app_server_pids() {
+  app_server_processes | awk '{print $1}'
+}
+
+app_server_processes() {
+  ps -eo pid=,args= | awk -v self="$$" -v parent="${PPID:-}" '
+    $1 != self && $1 != parent && ($0 ~ /\/dist\/src\/adapter\.mjs app-server/ || $0 ~ /(^|[[:space:]])([^[:space:]]*\/)?codex app-server (--listen|proxy)([[:space:]]|$)/) {
+      found = 1
+      print
+    }
+    END {
+      exit found ? 0 : 1
+    }
+  '
+}
+
+http_ok() {
+  local base="$1"
+  curl -fsS --max-time 1 "$base/status" >/dev/null 2>&1 || curl -fsS --max-time 1 "$base/health" >/dev/null 2>&1
+}
+
+pidfile_alive() {
+  local file="$1"
+  [ -f "$file" ] || return 1
+  local pid
+  pid="$(cat "$file" 2>/dev/null || true)"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+configured_bridge_cwd_or_pwd() {
+  local cwd
+  cwd="$(current_bridge_cwd)"
+  if [ -n "$cwd" ]; then
+    printf '%s\n' "$cwd"
+  else
+    pwd
+  fi
+}
+
+wait_http() {
+  local base="$1"
+  local name="$2"
+  local log="$3"
+  local pidfile="${4:-}"
+  for _ in $(seq 1 40); do
+    if [ -n "$pidfile" ] && [ -f "$pidfile" ]; then
+      local pid
+      pid="$(cat "$pidfile" 2>/dev/null || true)"
+      if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+        echo "$name exited before becoming ready; read log with: claude-codex-mode logs $name" >&2
+        tail -n 40 "$log" 2>/dev/null || true
+        return 1
+      fi
+    fi
+    if http_ok "$base"; then
+      echo "$name ready at $base"
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "$name did not become ready at $base; read log with: claude-codex-mode logs $name" >&2
+  tail -n 20 "$log" 2>/dev/null || true
+  return 1
+}
+
+agentapi_base_url() {
+  printf '%s\n' "${CLAUDE_CODEX_AGENTAPI_URL:-${CLAUDE_CODEX_HTTP_BASE_URL:-http://127.0.0.1:3284}}"
+}
+
+agentapi_trust_pending() {
+  local base="${1:-$(agentapi_base_url)}"
+  curl -fsS --max-time 2 "$base/messages" 2>/dev/null | grep -Eq 'Quick safety check|Yes, I trust this folder|Claude Code.*able to read, edit, and execute'
+}
+
+print_agentapi_trust_hint() {
+  local base="${1:-$(agentapi_base_url)}"
+  if agentapi_trust_pending "$base"; then
+    cat <<EOF
+agentapi is waiting at Claude Code's workspace trust prompt.
+Review the workspace path in the agentapi screen, then run:
+  claude-codex-mode trust
+EOF
+  fi
+}
+
+wait_agentapi_initial_screen() {
+  local base="${1:-$(agentapi_base_url)}"
+  for _ in $(seq 1 32); do
+    if agentapi_trust_pending "$base"; then
+      print_agentapi_trust_hint "$base"
+      return 0
+    fi
+    if curl -fsS --max-time 2 "$base/messages" 2>/dev/null | grep -Eq 'Welcome back|What would you like to work on|Run /init|Claude Code v'; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  print_agentapi_trust_hint "$base"
+}
+
+trust_agentapi() {
+  local base="${1:-}"
+  if [ -z "$base" ]; then
+    local dir found=0
+    while IFS= read -r dir; do
+      bridge_ready "$dir" || continue
+      base="$(bridge_base_url "$dir")"
+      if agentapi_trust_pending "$base"; then
+        found=1
+        trust_agentapi "$base"
+      fi
+    done < <(pool_dirs agentapi)
+    if [ "$found" = "1" ]; then
+      return 0
+    fi
+    base="$(agentapi_base_url)"
+  fi
+  if ! http_ok "$base"; then
+    echo "agentapi is not ready at $base" >&2
+    return 1
+  fi
+  if ! agentapi_trust_pending "$base"; then
+    echo "No Claude Code trust prompt detected at $base."
+    return 0
+  fi
+  curl -fsS -X POST "$base/message" \
+    -H "Content-Type: application/json" \
+    -d '{"content":"\r","type":"raw"}' >/dev/null
+  sleep 1
+  if agentapi_trust_pending "$base"; then
+    echo "Trust prompt still appears to be pending. Open $base/chat and confirm it manually." >&2
+    return 1
+  fi
+  echo "Claude Code trust prompt accepted."
+}
+
+start_agent_http() {
+  local force="${1:-}"
+  local bridge_cwd="${2:-}"
+  local bridge_model="${3:-}"
+  if [ -z "$bridge_cwd" ]; then
+    bridge_cwd="$(configured_bridge_cwd_or_pwd)"
+  fi
+  if [ -z "$bridge_model" ]; then
+    bridge_model="$(current_bridge_model)"
+  fi
+  if [ ! -d "$bridge_cwd" ]; then
+    echo "bridge cwd not found: $bridge_cwd" >&2
+    return 1
+  fi
+
+  local state_dir port base log pidfile mcp_config
+  state_dir="$(bridge_dir_for agent-http "$bridge_cwd" "$bridge_model")"
+  log="$state_dir/log"
+  pidfile="$state_dir/pid"
+  mcp_config="$state_dir/mcp.json"
+  if [ "$force" != "force" ] && bridge_ready "$state_dir" && bridge_matches "$state_dir" agent-http "$bridge_cwd" "$bridge_model"; then
+    base="$(bridge_base_url "$state_dir")"
+    print_bridge_ready "agent-http" "$state_dir" "$base"
+    return 0
+  fi
+  stop_bridge_dir "$state_dir"
+  port="$(allocate_port "$state_dir")"
+  base="http://127.0.0.1:$port"
+  mkdir -p "$state_dir"
+  local dir="${CLAUDE_CODEX_AGENT_HTTP_DIR:-$HOME/agent-http}"
+  local claude="${CLAUDE_CODEX_CLI:-claude}"
+  if [ ! -d "$dir" ]; then
+    echo "agent-http checkout not found: $dir" >&2
+    return 1
+  fi
+  if [ ! -f "$dir/http.ts" ]; then
+    echo "agent-http server not found: $dir/http.ts" >&2
+    return 1
+  fi
+  python3 - "$mcp_config" "$dir/http.ts" "$port" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+http_ts = pathlib.Path(sys.argv[2])
+port = sys.argv[3]
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(json.dumps({
+    "mcpServers": {
+        "http-router": {
+            "command": "bun",
+            "args": [str(http_ts), "--port", port],
+        }
+    }
+}) + "\n")
+PY
+  local claude_args=("$claude")
+  if [ -n "$bridge_model" ]; then
+    claude_args+=(--model "$bridge_model")
+  fi
+  claude_args+=(--mcp-config "$mcp_config" --strict-mcp-config)
+  claude_args+=(--dangerously-load-development-channels server:http-router)
+  : > "$log"
+  nohup python3 - "$bridge_cwd" "$log" "${claude_args[@]}" 9>&- >>"$log" 2>&1 <<'PY' &
+import os
+import pty
+import re
+import select
+import signal
+import sys
+import time
+
+workdir = sys.argv[1]
+log_path = sys.argv[2]
+cmd = sys.argv[3:]
+
+os.chdir(workdir)
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvpe(cmd[0], cmd, os.environ)
+
+def forward(sig, _frame):
+    try:
+        os.kill(pid, sig)
+    except ProcessLookupError:
+        pass
+
+for sig in (signal.SIGTERM, signal.SIGINT):
+    signal.signal(sig, forward)
+
+buf = b""
+sent_trust = False
+sent_dev_channels = False
+with open(log_path, "ab", buffering=0) as log:
+    while True:
+        readable, _, _ = select.select([fd], [], [], 0.5)
+        if fd in readable:
+            try:
+                data = os.read(fd, 4096)
+            except OSError:
+                break
+            if not data:
+                break
+            log.write(data)
+            buf = (buf + data)[-6000:]
+            text = buf.decode("utf-8", "ignore").lower()
+            plain = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+            if not sent_trust and "quick" in plain and "trust" in plain and "enter" in plain:
+                time.sleep(0.2)
+                os.write(fd, b"\r")
+                sent_trust = True
+            if not sent_dev_channels and "development" in plain and "channels" in plain and "enter" in plain:
+                time.sleep(0.2)
+                os.write(fd, b"\r")
+                sent_dev_channels = True
+        try:
+            done, status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            break
+        if done:
+            if os.WIFEXITED(status):
+                sys.exit(os.WEXITSTATUS(status))
+            if os.WIFSIGNALED(status):
+                sys.exit(128 + os.WTERMSIG(status))
+            sys.exit(1)
+PY
+  echo $! > "$pidfile"
+  wait_http "$base" "agent-http" "$log" "$pidfile"
+  write_pool_meta "$state_dir" agent-http "$bridge_cwd" "$bridge_model" "$port" "$base" "$log"
+  print_bridge_ready "agent-http" "$state_dir" "$base"
+}
+
+start_agentapi() {
+  local force="${1:-}"
+  local bridge_cwd="${2:-}"
+  local bridge_model="${3:-}"
+  if [ -z "$bridge_cwd" ]; then
+    bridge_cwd="$(configured_bridge_cwd_or_pwd)"
+  fi
+  if [ -z "$bridge_model" ]; then
+    bridge_model="$(current_bridge_model)"
+  fi
+  if [ ! -d "$bridge_cwd" ]; then
+    echo "bridge cwd not found: $bridge_cwd" >&2
+    return 1
+  fi
+
+  local state_dir port base log pidfile
+  state_dir="$(bridge_dir_for agentapi "$bridge_cwd" "$bridge_model")"
+  log="$state_dir/log"
+  pidfile="$state_dir/pid"
+  if [ "$force" != "force" ] && bridge_ready "$state_dir" && bridge_matches "$state_dir" agentapi "$bridge_cwd" "$bridge_model"; then
+    base="$(bridge_base_url "$state_dir")"
+    print_bridge_ready "agentapi" "$state_dir" "$base"
+    return 0
+  fi
+  stop_bridge_dir "$state_dir"
+  port="$(allocate_port "$state_dir")"
+  base="http://127.0.0.1:$port"
+  mkdir -p "$state_dir"
+  local agentapi_bin="${CLAUDE_CODEX_AGENTAPI_COMMAND:-agentapi}"
+  local claude="${CLAUDE_CODEX_CLI:-claude}"
+  local claude_args=("$claude")
+  if [ -n "$bridge_model" ]; then
+    claude_args+=(--model "$bridge_model")
+  fi
+  : > "$log"
+  (
+    cd "$bridge_cwd"
+    nohup "$agentapi_bin" server --type=claude --port "$port" -- "${claude_args[@]}" 9>&- >"$log" 2>&1 &
+    echo $! > "$pidfile"
+  )
+  wait_http "$base" "agentapi" "$log" "$pidfile"
+  write_pool_meta "$state_dir" agentapi "$bridge_cwd" "$bridge_model" "$port" "$base" "$log"
+  wait_agentapi_initial_screen "$base"
+  print_bridge_ready "agentapi" "$state_dir" "$base"
+}
+
+prepare_mode() {
+  local force="${2:-}"
+  case "$1" in
+    agent-http)
+      start_agent_http "$force"
+      ;;
+    agentapi)
+      start_agentapi "$force"
+      ;;
+    codex|agent-sdk-sidecar|claude-p)
+      :
+      ;;
+  esac
+}
+
+show() {
+  grep -E '^(export )?CLAUDE_CODEX_RUNTIME_TYPE=' "$ENV_FILE" 2>/dev/null || echo "export CLAUDE_CODEX_RUNTIME_TYPE=\"$(current_mode)\""
+  grep -E '^(export )?CLAUDE_CODEX_DEFAULT_MODEL=' "$ENV_FILE" 2>/dev/null || echo "export CLAUDE_CODEX_DEFAULT_MODEL=\"$(current_model)\""
+  grep -E '^(export )?CLAUDE_CODEX_BRIDGE_MODEL=' "$ENV_FILE" 2>/dev/null || true
+  grep -E '^(export )?CLAUDE_CODEX_BRIDGE_CWD=' "$ENV_FILE" 2>/dev/null || true
+  grep -E '^(export )?CLAUDE_CODEX_HTTP_MANAGE_BRIDGE=' "$ENV_FILE" 2>/dev/null || true
+}
+
+last_json_line() {
+  local pattern="$1"
+  local file="$2"
+  grep "$pattern" "$file" 2>/dev/null | tail -1 || true
+}
+
+last_runtime_turn() {
+  local purpose="${1:-}"
+  if [ -n "$purpose" ]; then
+    grep '"runtime.turn.select"' "$ADAPTER_DEBUG_LOG" 2>/dev/null | grep "\"purpose\":\"$purpose\"" | tail -1 || true
+    return 0
+  fi
+  last_json_line '"runtime.turn.select"' "$ADAPTER_DEBUG_LOG"
+}
+
+status() {
+  echo "mode: $(current_mode)"
+  echo "model: $(current_model)"
+  local bridge_model
+  bridge_model="$(current_bridge_model)"
+  if [ -n "$bridge_model" ]; then
+    echo "bridge model: $bridge_model"
+  fi
+  local bridge_cwd
+  bridge_cwd="$(current_bridge_cwd)"
+  if [ -n "$bridge_cwd" ]; then
+    echo "bridge cwd: $bridge_cwd"
+  fi
+  echo "env: $ENV_FILE"
+  echo
+  echo "app-server:"
+  app_server_processes || echo "  not running"
+  echo
+  echo "bridges:"
+  local http_base="${CLAUDE_CODEX_AGENT_HTTP_URL:-${CLAUDE_CODEX_HTTP_BASE_URL:-http://127.0.0.1:3284}}"
+  local agentapi_base="${CLAUDE_CODEX_AGENTAPI_URL:-${CLAUDE_CODEX_HTTP_BASE_URL:-http://127.0.0.1:3284}}"
+  local saw_bridge=0
+  local dir meta mode base pid cwd model port trust=0
+  while IFS= read -r dir; do
+    meta="$dir/meta"
+    [ -f "$meta" ] || continue
+    mode="$(meta_value "$meta" mode)"
+    base="$(bridge_base_url "$dir")"
+    pid="$(cat "$dir/pid" 2>/dev/null || true)"
+    cwd="$(meta_value "$meta" cwd)"
+    model="$(meta_value "$meta" model)"
+    port="$(meta_value "$meta" port)"
+    if bridge_ready "$dir"; then
+      saw_bridge=1
+      printf '  %s %-16s port=%s model=%s cwd=%s pid=%s\n' "$(basename "$dir")" "$mode" "$port" "${model:-default}" "$cwd" "$pid"
+      if [ "$mode" = "agentapi" ] && agentapi_trust_pending "$base"; then
+        trust=1
+        echo "    trust prompt pending; run: claude-codex-mode trust $base"
+      fi
+    fi
+  done < <(pool_dirs)
+  if [ "$saw_bridge" = "0" ]; then
+    echo "  no pooled bridges running"
+  fi
+  if http_ok "$http_base" && [ "$saw_bridge" = "0" ]; then
+    echo "  legacy/default HTTP endpoint ready at $http_base"
+  fi
+  : "$agentapi_base" "$trust"
+  echo
+  echo "last runtime.create:"
+  last_json_line '"runtime.create"' "$ADAPTER_DEBUG_LOG"
+  echo
+  echo "last runtime.turn.select:"
+  last_runtime_turn
+  echo
+  echo "last user runtime.turn.select:"
+  last_runtime_turn normal
+  echo
+  echo "logs:"
+  echo "  adapter:    $ADAPTER_DEBUG_LOG"
+  echo "  agent-http: $AGENT_HTTP_LOG"
+  echo "  agentapi:   $AGENTAPI_LOG"
+  : "$agentapi_base"
+}
+
+logs() {
+  local which="${1:-adapter}"
+  local lines="${2:-80}"
+  case "$which" in
+    adapter) tail -n "$lines" "$ADAPTER_DEBUG_LOG" ;;
+    agent-http|agentapi)
+      local log
+      log="$(latest_bridge_log "$which")"
+      if [ -n "$log" ]; then
+        tail -n "$lines" "$log"
+      else
+        tail -n "$lines" "$([ "$which" = agent-http ] && printf '%s' "$AGENT_HTTP_LOG" || printf '%s' "$AGENTAPI_LOG")"
+      fi
+      ;;
+    *) echo "unknown log: $which" >&2; return 2 ;;
+  esac
+}
+
+tail_log() {
+  local which="${1:-adapter}"
+  case "$which" in
+    adapter) tail -f "$ADAPTER_DEBUG_LOG" ;;
+    agent-http|agentapi)
+      local log
+      log="$(latest_bridge_log "$which")"
+      if [ -n "$log" ]; then
+        tail -f "$log"
+      else
+        tail -f "$([ "$which" = agent-http ] && printf '%s' "$AGENT_HTTP_LOG" || printf '%s' "$AGENTAPI_LOG")"
+      fi
+      ;;
+    *) echo "unknown log: $which" >&2; return 2 ;;
+  esac
+}
+
+set_mode() {
+  acquire_bridge_lock
+  local raw="${1:-}"
+  local model="${2:-}"
+  local cwd="${3:-}"
+  local mode
+  if ! mode="$(normalize_mode "$raw")"; then
+    echo "unknown mode: ${raw:-<empty>}" >&2
+    echo >&2
+    usage >&2
+    return 2
+  fi
+  rewrite_mode "$mode"
+  case "$mode" in
+    agent-http|agentapi) rewrite_http_manage_bridge "1" ;;
+    *) rewrite_http_manage_bridge "0" ;;
+  esac
+  if [ -n "$model" ]; then
+    rewrite_model "$model"
+  fi
+  if [ -n "$cwd" ]; then
+    if [ ! -d "$cwd" ]; then
+      echo "cwd not found: $cwd" >&2
+      return 1
+    fi
+    rewrite_bridge_cwd "$cwd"
+  fi
+  # Re-source so status and bridge helpers see freshly-written values.
+  # shellcheck source=/dev/null
+  source "$ENV_FILE"
+  if [ -n "$model" ]; then
+    prepare_mode "$mode" force
+  else
+    prepare_mode "$mode"
+  fi
+  stop_adapter
+  echo "CLAUDE_CODEX_RUNTIME_TYPE=$mode"
+  if [ -n "$model" ]; then
+    echo "CLAUDE_CODEX_DEFAULT_MODEL=$model"
+    echo "CLAUDE_CODEX_BRIDGE_MODEL=$model"
+  fi
+  if [ -n "$cwd" ]; then
+    echo "CLAUDE_CODEX_BRIDGE_CWD=$cwd"
+  fi
+  echo "Reconnect Codex App Remote to use this mode."
+}
+
+ensure_bridge() {
+  acquire_bridge_lock
+  local raw="${1:-}"
+  local model="${2:-}"
+  local cwd="${3:-}"
+  local mode
+  if ! mode="$(normalize_mode "$raw")"; then
+    echo "unknown bridge mode: ${raw:-<empty>}" >&2
+    return 2
+  fi
+  case "$mode" in
+    agent-http|agentapi) ;;
+    *) echo "ensure-bridge only supports agent-http or agentapi" >&2; return 2 ;;
+  esac
+  if [ -z "$cwd" ] || [ ! -d "$cwd" ]; then
+    echo "cwd not found: ${cwd:-<empty>}" >&2
+    return 1
+  fi
+  case "$mode" in
+    agent-http) start_agent_http "" "$cwd" "$model" ;;
+    agentapi) start_agentapi "" "$cwd" "$model" ;;
+  esac
+}
+
+set_model() {
+  acquire_bridge_lock
+  local model="${1:-}"
+  if [ -z "$model" ]; then
+    echo "model: $(current_model)"
+    local bridge_model
+    bridge_model="$(current_bridge_model)"
+    if [ -n "$bridge_model" ]; then echo "bridge model: $bridge_model"; fi
+    return 0
+  fi
+  rewrite_model "$model"
+  # Re-source so prepare_mode sees the new model.
+  # shellcheck source=/dev/null
+  source "$ENV_FILE"
+  case "$(current_mode)" in
+    agent-http)
+      start_agent_http force
+      ;;
+    agentapi)
+      start_agentapi force
+      ;;
+  esac
+  stop_adapter
+  echo "CLAUDE_CODEX_DEFAULT_MODEL=$model"
+  echo "CLAUDE_CODEX_BRIDGE_MODEL=$model"
+  echo "Reconnect Codex App Remote to use this model."
+}
+
+cmd="${1:-show}"
+case "$cmd" in
+  -h|--help|help)
+    usage
+    ;;
+  list|modes)
+    list_modes
+    ;;
+  show|current)
+    show
+    ;;
+  set)
+    shift || true
+    set_mode "${1:-}" "${2:-}" "${3:-}"
+    ;;
+  ensure-bridge)
+    shift || true
+    ensure_bridge "${1:-}" "${2:-}" "${3:-}"
+    ;;
+  model)
+    shift || true
+    set_model "${1:-}"
+    ;;
+  trust)
+    shift || true
+    trust_agentapi "${1:-}"
+    ;;
+  stop-bridges|stop-bridge)
+    shift || true
+    acquire_bridge_lock
+    stop_bridge_pool "${1:-}"
+    ;;
+  prune-bridges|prune)
+    acquire_bridge_lock
+    prune_bridge_pool
+    ;;
+  status|read)
+    status
+    ;;
+  last-turn|last)
+    last_runtime_turn
+    ;;
+  last-user-turn|last-normal-turn)
+    last_runtime_turn normal
+    ;;
+  logs|log)
+    shift || true
+    logs "$@"
+    ;;
+  tail)
+    shift || true
+    tail_log "$@"
+    ;;
+  *)
+    if mode="$(normalize_mode "$cmd")"; then
+      set_mode "$mode"
+    else
+      usage >&2
+      exit 2
+    fi
+    ;;
+esac

@@ -160,9 +160,12 @@ ssh host '
 The daemon owns the Unix socket while a Codex client is connected. When the
 last client (`app-server proxy`) disconnects, the daemon shuts down after a
 short idle grace period so its Claude runtime sidecar is reclaimed instead of
-leaking. Codex App re-probes and restarts the daemon on the next remote
-connection. Tune or disable this with `CLAUDE_CODEX_IDLE_EXIT_MS` (default
-`15000`; set `0` to keep the daemon running indefinitely).
+leaking. If a turn is still active, idle shutdown is deferred until that turn
+completes; reconnecting/resuming the thread during that window reattaches
+notifications to the new client peer. Codex App re-probes and restarts the
+daemon on the next remote connection. Tune or disable this with
+`CLAUDE_CODEX_IDLE_EXIT_MS` (default `15000`; set `0` to keep the daemon
+running indefinitely).
 
 ## Using Codex App GUI
 
@@ -179,8 +182,9 @@ connection. Tune or disable this with `CLAUDE_CODEX_IDLE_EXIT_MS` (default
    streams into the conversation, `Bash` calls surface as Codex command
    approvals, and `Edit`/`Write`/`MultiEdit` surface as Codex file-change
    approvals with a live diff. Approve them in the Codex App UI as usual.
-5. Disconnecting the remote in Codex App closes the proxy; the adapter daemon
-   idles out and the runtime sidecar is reclaimed automatically.
+5. Disconnecting the remote in Codex App closes the proxy; once no turn is
+   active, the adapter daemon idles out and the runtime sidecar is reclaimed
+   automatically.
 
 `npm run acceptance:gui-ssh-localhost` drives this exact path end-to-end
 (real `codex app-server` daemon + `proxy` over SSH, real Claude Code turn,
@@ -201,11 +205,23 @@ Set `CLAUDE_CODEX_MOCK=1` for local protocol testing without Claude credentials.
 ## Claude runtime knobs
 
 ```bash
+# Runtime backend selection. The default preserves the existing Cloud Agent
+# SDK sidecar behavior.
+export CLAUDE_CODEX_RUNTIME_TYPE="agent-sdk-sidecar"
+
+# Also supported:
+#   codex             - pass app-server through to the real Codex CLI
+#   agent-sdk-socket  - existing GUI-session sidecar daemon via Unix socket
+#   agent-http        - HTTP/SSE bridge for Claude Code Channels / agent-http
+#   agentapi          - HTTP/SSE bridge for coder/agentapi
+#   claude-p          - one-shot PTY/transcript wrapper via claude-p
+#   mock              - local protocol testing
+
 # Defaults surfaced through config/read and used for new threads.
 export CLAUDE_CODEX_DEFAULT_MODEL="sonnet"
 export CLAUDE_CODEX_DEFAULT_EFFORT="medium"
 
-# Optional Codex++ model selector list. Accepts comma-separated ids or a JSON
+# Optional Codex App model selector list. Accepts comma-separated ids or a JSON
 # array of ids/objects: [{"id":"sonnet","displayName":"Claude Sonnet"}].
 export CLAUDE_CODEX_MODELS="sonnet,opus,haiku,sonnet-1m,opus-plan"
 
@@ -232,6 +248,130 @@ export CLAUDE_CODEX_ENABLE_FILE_CHECKPOINTING=1
 export CLAUDE_CODEX_AUTO_WORKTREE=1
 export CLAUDE_CODEX_WORKTREE_ROOT="$HOME/.claude-codex/worktrees"
 ```
+
+### Alternative Claude Code backends
+
+The adapter's internal Codex protocol layer talks to a small `ClaudeRuntime`
+interface, so non-SDK Claude Code bridges can be selected without removing the
+existing Agent SDK route.
+
+Codex App's model menu remains a model selector only. Pick `Claude Sonnet`,
+`Claude Opus`, `Claude Haiku`, etc. there; the active Claude Code connection
+route is selected outside the App with the remote shim mode.
+
+If you install `scripts/codex-shim` earlier in `PATH`, it acts as a router. Set
+`CODEX_REAL` to the real Codex CLI path and put per-host routing in
+`~/.claude-codex/runtime.env`:
+
+```bash
+# Keep native Codex behavior for Codex App Remote.
+export CLAUDE_CODEX_RUNTIME_TYPE="codex"
+export CODEX_REAL="/absolute/path/to/real/codex"
+```
+
+Non-`app-server` commands are always forwarded to the real Codex CLI when one is
+available, so the shim can coexist with normal command-line Codex usage.
+
+Native Codex passthrough is different from the four Claude backends: in
+`CLAUDE_CODEX_RUNTIME_TYPE=codex` the shim launches the real Codex app-server,
+so the adapter is not in the process and cannot dynamically switch back from any
+in-App control. Switch that mode with the host helper (for example
+`claude-codex-mode set codex` or `claude-codex-mode set agent-sdk-sidecar`) and
+reconnect the Remote session.
+
+Install the helper next to the shim:
+
+```bash
+install -m 0755 scripts/claude-codex-mode ~/.local/bin/claude-codex-mode
+```
+
+It rewrites `~/.claude-codex/runtime.env`, prepares the matching bridge daemon
+for `agent-http` or `agentapi`, stops the current app-server so Codex App will
+reconnect into the new route, and provides readback commands:
+
+```bash
+claude-codex-mode list         # all selectable modes; current one is marked *
+claude-codex-mode set agent-http
+claude-codex-mode set agent-http opus  # switch route and restart bridge with Opus
+claude-codex-mode set agent-http opus /repo/app  # optional explicit bridge cwd
+claude-codex-mode model opus           # keep current route; update default/bridge model
+claude-codex-mode ensure-bridge agent-http opus /repo/app # bridge only; no adapter restart
+claude-codex-mode trust                # accept Claude Code trust prompt for agentapi
+claude-codex-mode help         # also -h / --help
+claude-codex-mode status       # current mode, bridge health, last runtime logs
+claude-codex-mode read         # alias for status
+claude-codex-mode last-turn    # last runtime.turn.select JSON line
+claude-codex-mode last-user-turn # last user-visible turn; skips title/summary turns
+claude-codex-mode logs adapter
+claude-codex-mode logs agent-http
+claude-codex-mode logs agentapi
+```
+
+Model switching is exact per turn for the SDK runtimes and `claude-p`, because
+the adapter can pass `model` to those backends. For `agent-http` and `agentapi`,
+the HTTP bridge talks to a long-lived interactive Claude Code session; the safe
+way to change the model is to restart that bridge with `claude --model <alias>`
+via `claude-codex-mode model <alias>` or `claude-codex-mode set <mode> <alias>`.
+The adapter also prepares managed HTTP bridges per turn with the thread cwd, so
+the long-lived Claude Code process is relaunched in the current Codex App
+workspace when needed. `claude-codex-mode read` shows the configured bridge cwd
+and every running pooled bridge's cwd/model/port.
+When using `agentapi`, the helper also detects Claude Code's workspace trust
+prompt and tells you to run `claude-codex-mode trust` after reviewing the path.
+
+#### agent-http / Channels
+
+Set the mode through the helper. It loads the Channels bridge implementation
+from `$CLAUDE_CODEX_AGENT_HTTP_DIR` or `~/agent-http`, but launches Claude Code
+from the Codex App thread cwd. The helper writes an absolute MCP config under
+the matching bridge pool directory, so the channel server can be loaded even
+when Claude Code's process cwd is your project rather than the bridge checkout:
+
+```bash
+claude-codex-mode set agent-http opus
+```
+
+The backend uses `POST /message`, `GET /messages`, `GET /status`, and
+`GET /events` when available. It streams message-level deltas into Codex; it
+does not expose Agent SDK-level tool-use, thinking, or permission events.
+
+#### agentapi
+
+Set the mode through the helper. It starts `agentapi server --type=claude` from
+the Codex App thread cwd and points the adapter at its HTTP API:
+
+```bash
+claude-codex-mode set agentapi opus
+```
+
+This is useful for quickly reusing an existing terminal-backed Claude Code
+session. The adapter consumes agentapi's HTTP/SSE message stream and maps final
+agent text into Codex messages. Rich Codex approval/file-change events are not
+available because agentapi exposes terminal-derived text, not semantic tool
+events.
+
+#### claude-p
+
+Install `claude-p` somewhere on the remote host and select the one-shot
+transcript backend:
+
+```bash
+export CLAUDE_CODEX_RUNTIME_TYPE="claude-p"
+export CLAUDE_CODEX_CLAUDE_P_COMMAND="claude-p"
+# For npx-style launch:
+# export CLAUDE_CODEX_CLAUDE_P_COMMAND="npx"
+# export CLAUDE_CODEX_CLAUDE_P_ARGS='["claude-p"]'
+# Keep claude-p one-shot by default. Set to 1 only after verifying your
+# claude-p build handles --resume + --input-file correctly.
+# export CLAUDE_CODEX_CLAUDE_P_RESUME=0
+```
+
+This backend runs `claude-p --output-format json --input-file ...` for each
+turn, emits the final assistant text, and stores `claude-p:<session_id>` for
+diagnostics when the wrapper reports one. It is not a true streaming backend,
+does not support `turn/steer`, and defaults to one-shot turns instead of resume
+because current `claude-p` builds can replay the previous result when combining
+`--resume` with `--input-file`.
 
 `CLAUDE_CODEX_AUTO_WORKTREE` is off by default because it creates branches and
 worktrees in the target repository. When enabled, new Codex threads run in a

@@ -1,3 +1,5 @@
+import type { RuntimeBackendType } from './runtime-config.mjs'
+
 export type JsonRpcId = string | number | null
 
 export type JsonValue =
@@ -205,8 +207,12 @@ export interface FileUpdateChange {
 export interface RuntimeTurnContext {
   threadId: string
   turnId: string
+  // normal = user-visible chat/review turn; summary = Codex App's structured
+  // title/metadata turn; compact = explicit context compaction.
+  purpose?: 'normal' | 'summary' | 'compact'
   prompt: string
   cwd: string
+  runtimeType: RuntimeBackendType | null
   model: string | null
   effort: string | null
   claudeSessionId: string | null

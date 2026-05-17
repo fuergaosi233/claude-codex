@@ -1,27 +1,74 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+RUNTIME_ENV="${CLAUDE_CODEX_RUNTIME_ENV:-$HOME/.claude-codex/runtime.env}"
+
+if [ -f "$RUNTIME_ENV" ]; then
+  # shellcheck source=/dev/null
+  source "$RUNTIME_ENV"
+fi
+
 ADAPTER="${CLAUDE_CODEX_ADAPTER:-/opt/claude-codex-adapter/dist/src/adapter.mjs}"
 NODE_BIN="${CLAUDE_CODEX_NODE:-node}"
 # Keep the reported version in sync with codexCompatVersion() in src/util.mts —
 # both default to 0.130.0 and honour CLAUDE_CODEX_COMPAT_VERSION.
 COMPAT_VERSION="${CLAUDE_CODEX_COMPAT_VERSION:-${CODEX_SHIM_COMPAT_VERSION:-0.130.0}}"
+MODE="${CLAUDE_CODEX_ROUTE:-${CLAUDE_CODEX_RUNTIME_TYPE:-agent-sdk-sidecar}}"
+
+resolve_real_codex() {
+  if [ -n "${CODEX_REAL:-}" ] && [ -x "$CODEX_REAL" ]; then
+    printf '%s\n' "$CODEX_REAL"
+    return 0
+  fi
+
+  local self
+  self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")"
+
+  local candidate
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] || continue
+    [ "$candidate" != "$self" ] || continue
+    [ -x "$candidate" ] || continue
+    printf '%s\n' "$candidate"
+    return 0
+  done < <({ type -P -a codex 2>/dev/null || which -a codex 2>/dev/null; } | awk '!seen[$0]++')
+
+  return 1
+}
+
+is_native_codex_mode() {
+  case "$MODE" in
+    codex|native-codex|real-codex|native|real)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+REAL_CODEX="$(resolve_real_codex || true)"
 
 case "${1:-}" in
   --version|-V|version)
-    if [ -n "${CODEX_REAL:-}" ] && [ -x "$CODEX_REAL" ]; then
-      exec "$CODEX_REAL" "$@"
+    if is_native_codex_mode && [ -n "$REAL_CODEX" ]; then
+      exec "$REAL_CODEX" "$@"
     fi
     echo "${CODEX_SHIM_VERSION:-codex-cli ${COMPAT_VERSION}}"
     exit 0
     ;;
   app-server)
+    if is_native_codex_mode; then
+      if [ -n "$REAL_CODEX" ]; then
+        exec "$REAL_CODEX" "$@"
+      fi
+      echo "codex shim is in native Codex mode, but no real codex binary was found; set CODEX_REAL" >&2
+      exit 127
+    fi
     exec "$NODE_BIN" "$ADAPTER" "$@"
     ;;
 esac
 
-if [ -n "${CODEX_REAL:-}" ] && [ -x "$CODEX_REAL" ]; then
-  exec "$CODEX_REAL" "$@"
+if [ -n "$REAL_CODEX" ]; then
+  exec "$REAL_CODEX" "$@"
 fi
 
 echo "codex shim supports --version and app-server; set CODEX_REAL for fallback" >&2
