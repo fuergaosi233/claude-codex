@@ -1049,9 +1049,19 @@ export class CodexClaudeAppServer {
             activeSubagents.delete(event.toolUseId)
             subagentContexts.delete(event.toolUseId)
             if (!ctx) return
-            const resultText = toolResultText(event.content)
+            const rawResultText = toolResultText(event.content)
             const collabStatus: 'completed' | 'failed' = event.isError ? 'failed' : 'completed'
             const agentStatus: 'completed' | 'errored' = event.isError ? 'errored' : 'completed'
+
+            // claude-agent-sdk's Task tool appends a metadata trailer to the
+            // result content: an `agentId: <hex>` line + a `<usage>...</usage>`
+            // block. Codex App doesn't render those — they just leak as raw
+            // text. Strip them from the visible body and route the metadata
+            // into the proper protocol fields (agentNickname / tokenUsage /
+            // metrics) so the subagent timeline carries the same identity +
+            // usage the SDK reports.
+            const parsed = parseSubagentTrailer(rawResultText)
+            const resultText = parsed.cleanText
 
             // Materialize a one-turn transcript on the child thread so the
             // Codex App can drill in from the parent collabAgentToolCall.
@@ -1061,20 +1071,49 @@ export class CodexClaudeAppServer {
               status: event.isError ? 'failed' : 'completed',
               startedAt: nowSeconds(),
               completedAt: nowSeconds(),
-              durationMs: 0,
+              durationMs: parsed.usage?.durationMs ?? 0,
               items: [
                 { type: 'userMessage', id: newId(), content: [{ type: 'text', text: ctx.prompt, text_elements: [] }] },
                 { type: 'agentMessage', id: newId(), text: resultText, phase: null, memoryCitation: null },
               ],
               diff: '',
               error: event.isError ? { message: 'subagent failed' } : null,
+              apiDurationMs: parsed.usage?.durationMs ?? null,
+              numTurns: parsed.usage?.toolUses ?? null,
+              costUsd: null,
             }
             this.store.upsertTurn(childTurn)
             const childThread = this.store.getThread(ctx.childThreadId)
             if (childThread) {
               childThread.status = { type: 'idle' }
               childThread.updatedAt = nowSeconds()
+              // Replace our synthetic `agent-{hex}` nickname with the SDK-
+              // assigned id so SendMessage / SubAgent navigation in the App
+              // uses the same handle the SDK reports.
+              if (parsed.agentId) childThread.agentNickname = parsed.agentId
               this.store.upsertThread(childThread)
+            }
+
+            // Push the subagent's token usage as a Codex-native
+            // thread/tokenUsage/updated notification on the CHILD thread
+            // (App's status bar reads from this) and roll the totals into
+            // the parent thread so subagent costs aren't invisible.
+            if (parsed.usage && parsed.usage.totalTokens) {
+              const breakdown: TokenUsageBreakdown = {
+                totalTokens: parsed.usage.totalTokens,
+                inputTokens: 0,
+                cachedInputTokens: 0,
+                outputTokens: parsed.usage.totalTokens,
+                reasoningOutputTokens: 0,
+              }
+              const childUsage: ThreadTokenUsage = { total: breakdown, last: breakdown, modelContextWindow: null }
+              this.notify(peer, { method: 'thread/tokenUsage/updated', params: { threadId: ctx.childThreadId, turnId: childTurn.id, tokenUsage: childUsage } })
+              this.recordTokenUsage(peer, thread.id, turn.id, {
+                input_tokens: 0,
+                output_tokens: parsed.usage.totalTokens,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+              })
             }
 
             // Stage 2 close — wait (end). Re-emits the same waitItemId.
@@ -2335,6 +2374,45 @@ function sandboxEnvelope(mode: string | null, cwd: string): unknown {
 
 function emptyTokenBreakdown(): TokenUsageBreakdown {
   return { totalTokens: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0 }
+}
+
+// claude-agent-sdk's Task tool appends a fixed metadata trailer to the
+// subagent's tool_result content:
+//   `agentId: <hex> (use SendMessage with to: '<hex>' to continue this agent)`
+//   `<usage>total_tokens: N\ntool_uses: M\nduration_ms: K</usage>`
+// Codex App renders neither natively — they just show as raw text after the
+// real result. Strip both from the visible body and surface the values via
+// agentNickname / token usage / metrics so the subagent timeline carries the
+// SDK-reported identity and cost.
+interface SubagentTrailer {
+  cleanText: string
+  agentId: string | null
+  usage: { totalTokens: number; toolUses: number; durationMs: number } | null
+}
+
+function parseSubagentTrailer(text: string): SubagentTrailer {
+  if (!text) return { cleanText: '', agentId: null, usage: null }
+  let cleanText = text
+  let agentId: string | null = null
+  let usage: SubagentTrailer['usage'] = null
+
+  const usageMatch = cleanText.match(/<usage>\s*total_tokens:\s*(\d+)\s*\n\s*tool_uses:\s*(\d+)\s*\n\s*duration_ms:\s*(\d+)\s*<\/usage>\s*$/)
+  if (usageMatch) {
+    usage = {
+      totalTokens: Number(usageMatch[1]) || 0,
+      toolUses: Number(usageMatch[2]) || 0,
+      durationMs: Number(usageMatch[3]) || 0,
+    }
+    cleanText = cleanText.slice(0, usageMatch.index).replace(/\s+$/, '')
+  }
+
+  const agentMatch = cleanText.match(/\n?agentId:\s*([0-9a-f]{8,32})\b[^\n]*\s*$/i)
+  if (agentMatch) {
+    agentId = agentMatch[1]
+    cleanText = cleanText.slice(0, agentMatch.index).replace(/\s+$/, '')
+  }
+
+  return { cleanText, agentId, usage }
 }
 
 // Best-effort parse of a Claude Bash tool_result for the real shell exit

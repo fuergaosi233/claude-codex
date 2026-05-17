@@ -1154,8 +1154,22 @@ test('Task subagent emits Codex native spawnAgent → wait → closeAgent timeli
     assert.equal(childThread.threadSource, 'subagent')
     assert.equal(childThread.ephemeral, true)
     assert.equal(childThread.agentRole, 'general-purpose')
-    assert.match(childThread.agentNickname, /^agent-[0-9a-f]{12}$/)
+    // The Task tool_result carried an `agentId: deadbeefcafef00d` trailer
+    // (mock mirrors the real claude-agent-sdk format). The server should
+    // strip it from the visible text and overwrite the synthetic
+    // `agent-{hex}` nickname with the SDK-assigned id.
+    assert.equal(childThread.agentNickname, 'deadbeefcafef00d')
     assert.equal(childThread.forkedFromId, threadId, 'subagent thread should be forked from the parent user thread')
+
+    // Trailer is stripped from the child thread's visible agentMessage.
+    proc.stdin.write(json({ id: 6, method: 'thread/turns/list', params: { threadId: childThreadId } }))
+    const childTurns = await reader.nextResponse(6)
+    const childTurnItems = (childTurns.result.data[0] as any).items
+    const childAgent = childTurnItems.find((i: any) => i.type === 'agentMessage')
+    assert.ok(childAgent, 'child thread should have an agentMessage with the subagent result')
+    assert.doesNotMatch(childAgent.text, /agentId:/, '`agentId:` trailer should be stripped from the visible body')
+    assert.doesNotMatch(childAgent.text, /<usage>/, '`<usage>` block should be stripped from the visible body')
+    assert.match(childAgent.text, /subagent final summary/, 'the real subagent body must still be there')
 
     assert.equal(leakedInnerItems, 0, 'inner Bash tool calls should not appear at the parent level')
     assert.doesNotMatch(agentMessageText, /subagent thinking aloud/, 'subagent text should not bleed into the main agent message')
