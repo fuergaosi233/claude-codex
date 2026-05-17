@@ -424,8 +424,15 @@ test('unix websocket app-server accepts initialize', async () => {
     })
     await once(ws, 'open')
     ws.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { clientInfo: { name: 'test', title: 'Test', version: '0' }, capabilities: null } }))
-    const [data] = (await once(ws, 'message')) as [Buffer]
-    const response = JSON.parse(data.toString('utf8'))
+    // adapter now also pushes account/updated + mcpServer/status/updated
+    // notifications after handshake; filter by id rather than grabbing the
+    // first frame off the wire.
+    let response: any = null
+    for (let i = 0; i < 5; i += 1) {
+      const [data] = (await once(ws, 'message')) as [Buffer]
+      const msg = JSON.parse(data.toString('utf8'))
+      if (msg.id === 1) { response = msg; break }
+    }
     assert.equal(response.id, 1)
     assert.equal(response.result.codexHome, home)
     ws.close()
@@ -492,8 +499,13 @@ test('app-server proxy carries websocket JSON-RPC traffic over stdio', async () 
     })
     await once(ws, 'open')
     ws.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { clientInfo: { name: 'proxy-test', title: 'Proxy Test', version: '0' }, capabilities: null } }))
-    const [data] = (await once(ws, 'message')) as [Buffer]
-    const response = JSON.parse(data.toString('utf8'))
+    // adapter pushes notifications post-handshake; filter for the response.
+    let response: any = null
+    for (let i = 0; i < 5; i += 1) {
+      const [data] = (await once(ws, 'message')) as [Buffer]
+      const msg = JSON.parse(data.toString('utf8'))
+      if (msg.id === 1) { response = msg; break }
+    }
     assert.equal(response.id, 1)
     assert.equal(response.result.codexHome, home)
     ws.close()
@@ -525,9 +537,17 @@ test('remote shim launches daemon and proxy with Codex-compatible commands', asy
     })
     await once(ws, 'open')
     ws.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { clientInfo: { name: 'shim-test', title: 'Shim Test', version: '0' }, capabilities: null } }))
-    const [data] = (await once(ws, 'message')) as [Buffer]
-    const response = JSON.parse(data.toString('utf8'))
-    assert.equal(response.result.codexHome, home)
+    // The adapter now also pushes account/updated + mcpServer/status/updated
+    // notifications right after handshake; the response can land in any order
+    // relative to those. Filter for the matching id rather than grabbing the
+    // first frame off the wire.
+    let response: any = null
+    for (let i = 0; i < 5; i += 1) {
+      const [data] = (await once(ws, 'message')) as [Buffer]
+      const msg = JSON.parse(data.toString('utf8'))
+      if (msg.id === 1) { response = msg; break }
+    }
+    assert.equal(response?.result?.codexHome, home)
     ws.close()
   } finally {
     proxy.kill()

@@ -124,15 +124,32 @@ export class CodexClaudeAppServer {
 
   private async dispatch(peer: RpcPeer, method: string, params: unknown): Promise<unknown> {
     switch (method) {
-      case 'initialize':
+      case 'initialize': {
         const initParams = asRecord(params)
         const clientInfo = asRecord(initParams.clientInfo)
+        // Push the account snapshot + MCP server statuses right after handshake
+        // so the App's sidebar avatar and MCP panel populate without waiting
+        // for the next polling cycle. Without these the avatar stays "signed
+        // out" and the MCP list never reflects current boot state.
+        queueMicrotask(() => {
+          this.notify(peer, {
+            method: 'account/updated',
+            params: { authMode: 'apikey', planType: null },
+          })
+          for (const status of readMcpConfig().statuses) {
+            this.notify(peer, {
+              method: 'mcpServer/status/updated',
+              params: { name: status.name, status: status.status, error: status.error ?? null },
+            })
+          }
+        })
         return {
           userAgent: codexUserAgent(stringOr(clientInfo.name, 'codex-app'), stringOr(clientInfo.version, 'unknown')),
           codexHome: codexHome(),
           platformFamily: platformFamily(),
           platformOs: platformOs(),
         }
+      }
       case 'thread/start':
         return this.threadStart(peer, asRecord(params))
       case 'thread/resume':
@@ -177,8 +194,21 @@ export class CodexClaudeAppServer {
         return this.threadCompactStart(peer, asRecord(params))
       case 'thread/shellCommand':
         return this.threadShellCommand(peer, asRecord(params))
-      case 'thread/approveGuardianDeniedAction':
+      case 'thread/approveGuardianDeniedAction': {
+        // Codex App's "Guardian" is an OpenAI-side pre-tool safety classifier
+        // that can deny a tool call before it reaches the runtime. Claude
+        // Code has no equivalent — every denial in our pipeline already
+        // routes through the canUseTool round-trip, which the user resolves
+        // directly via the standard approval modal. There is no separate
+        // guardian-denied action to retry. We log the event (for parity
+        // debugging) and ack with the schema-correct {} response.
+        const evt = asRecord(params).event
+        debugLog('thread.approveGuardianDeniedAction', {
+          threadId: stringOr(asRecord(params).threadId, ''),
+          eventType: evt && typeof evt === 'object' ? (evt as Record<string, unknown>).type ?? null : null,
+        })
         return {}
+      }
       case 'thread/backgroundTerminals/clean':
         return this.threadBackgroundTerminalsClean(asRecord(params))
       case 'thread/rollback':
@@ -615,6 +645,15 @@ export class CodexClaudeAppServer {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
     if (!thread) throw new Error(`unknown thread: ${threadId}`)
+    // Honor the protocol's `numTurns: u32, must be >= 1` — drop that many
+    // turns from the end of the thread. Without this, App's rewind UI sends
+    // the request and we silently return the unchanged thread, leaving the
+    // user staring at the timeline they were trying to redo.
+    const numTurns = typeof params.numTurns === 'number' && params.numTurns >= 1 ? Math.floor(params.numTurns) : 0
+    if (numTurns > 0) {
+      const dropped = this.store.deleteRecentTurns(threadId, numTurns)
+      debugLog('thread.rollback', { threadId, requested: numTurns, dropped })
+    }
     return { thread: this.toThread(thread, this.store.listTurns(threadId)) }
   }
 
@@ -1613,6 +1652,25 @@ export class CodexClaudeAppServer {
     this.tokenUsageByThread.set(threadId, total)
     const tokenUsage: ThreadTokenUsage = { total, last, modelContextWindow: null }
     this.notify(peer, { method: 'thread/tokenUsage/updated', params: { threadId, turnId, tokenUsage } })
+    // Also push the global rate-limit snapshot so the App's account-usage
+    // meter is in sync with the per-thread token meter. We don't actually
+    // know Claude's rate-limit headers from here, but emitting the snapshot
+    // shape with null windows keeps the UI from getting stuck on a stale
+    // value (and lets it re-poll if it cares to).
+    this.notify(peer, {
+      method: 'account/rateLimits/updated',
+      params: {
+        rateLimits: {
+          limitId: 'claude-code',
+          limitName: 'Claude Code',
+          primary: null,
+          secondary: null,
+          credits: null,
+          planType: null,
+          rateLimitReachedType: null,
+        },
+      },
+    })
   }
 
   private async fsReadFile(params: Record<string, unknown>): Promise<unknown> {

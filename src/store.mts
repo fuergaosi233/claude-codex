@@ -252,6 +252,21 @@ export class SessionStore {
     return rows.map((row: unknown) => this.rowToTurn(row))
   }
 
+  // Used by thread/rollback to drop the N most recent turns from a thread's
+  // history. Codex App's rewind UI calls this when the user wants to redo a
+  // turn — without it our handler used to no-op and the App's "Rewind" button
+  // appeared dead. Returns the number of turns actually removed.
+  deleteRecentTurns(threadId: string, numTurns: number): number {
+    if (numTurns <= 0) return 0
+    const ids = this.db
+      .prepare('SELECT id FROM turns WHERE thread_id = ? ORDER BY started_at DESC LIMIT ?')
+      .all(threadId, numTurns) as Array<{ id: string }>
+    if (ids.length === 0) return 0
+    const stmt = this.db.prepare('DELETE FROM turns WHERE id = ?')
+    for (const row of ids) stmt.run(row.id)
+    return ids.length
+  }
+
   appendItem(turnId: string, item: ThreadItem): TurnRecord | null {
     const turn = this.getTurn(turnId)
     if (!turn) return null
