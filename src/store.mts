@@ -66,6 +66,31 @@ export class SessionStore {
     this.ensureColumn('threads', 'base_instructions', 'TEXT')
     this.ensureColumn('threads', 'developer_instructions', 'TEXT')
     this.ensureColumn('threads', 'personality', 'TEXT')
+    this.sanitizeLegacyEnumColumns()
+  }
+
+  // Older versions of the adapter stored empty strings (and a snake_case
+  // `app_server` source) in columns the Codex App treats as strict enums.
+  // Codex App's ts-rs deserializer rejects the invalid values on `thread/list`
+  // / `thread/read`, surfacing as the generic "Oops, an error has occurred"
+  // toast when reopening a page. Repair the rows in place once on startup so
+  // a downgrade-then-upgrade cycle doesn't leave permanent landmines.
+  private sanitizeLegacyEnumColumns(): void {
+    try {
+      this.db.exec(`
+        UPDATE threads
+        SET thread_source = NULL
+        WHERE thread_source IS NOT NULL
+          AND thread_source NOT IN ('user', 'subagent', 'memory_consolidation');
+        UPDATE threads SET agent_role = NULL WHERE agent_role = '';
+        UPDATE threads SET agent_nickname = NULL WHERE agent_nickname = '';
+        UPDATE threads SET base_instructions = NULL WHERE base_instructions = '';
+        UPDATE threads SET developer_instructions = NULL WHERE developer_instructions = '';
+        UPDATE threads SET source = 'appServer' WHERE source = 'app_server';
+      `)
+    } catch {
+      // Migrations are best-effort; never block adapter startup on cleanup.
+    }
   }
 
   private ensureColumn(table: string, column: string, definition: string): void {

@@ -368,18 +368,20 @@ export class CodexClaudeAppServer {
       reasoningEffort,
       modelProvider: 'claude-code',
       claudeSessionId: null,
-      source: 'app_server',
+      // v2 SessionSource is camelCase; the old `app_server` falls through to
+      // `unknown` on the App side, hiding the source in the thread sidebar.
+      source: 'appServer',
       createdAt: now,
       updatedAt: now,
       status: { type: 'idle' },
       approvalPolicy: normalizeApprovalPolicy(params.approvalPolicy),
       sandboxMode: normalizeSandboxMode(params.sandbox),
       ephemeral: params.ephemeral === true,
-      threadSource: typeof params.threadSource === 'string' ? params.threadSource : null,
-      agentRole: typeof params.agentRole === 'string' ? params.agentRole : null,
-      agentNickname: typeof params.agentNickname === 'string' ? params.agentNickname : null,
-      baseInstructions: typeof params.baseInstructions === 'string' ? params.baseInstructions : null,
-      developerInstructions: typeof params.developerInstructions === 'string' ? params.developerInstructions : null,
+      threadSource: normalizeThreadSource(params.threadSource),
+      agentRole: nullIfEmpty(typeof params.agentRole === 'string' ? params.agentRole : null),
+      agentNickname: nullIfEmpty(typeof params.agentNickname === 'string' ? params.agentNickname : null),
+      baseInstructions: nullIfEmpty(typeof params.baseInstructions === 'string' ? params.baseInstructions : null),
+      developerInstructions: nullIfEmpty(typeof params.developerInstructions === 'string' ? params.developerInstructions : null),
       personality: normalizePersonality(params.personality),
     }
     this.store.upsertThread(thread)
@@ -397,9 +399,9 @@ export class CodexClaudeAppServer {
     if (typeof params.effort === 'string') thread.reasoningEffort = normalizeCodexReasoningEffort(params.effort)
     if (typeof params.approvalPolicy === 'string') thread.approvalPolicy = normalizeApprovalPolicy(params.approvalPolicy)
     if (typeof params.sandbox === 'string') thread.sandboxMode = normalizeSandboxMode(params.sandbox)
-    if (typeof params.threadSource === 'string') thread.threadSource = params.threadSource
-    if (typeof params.baseInstructions === 'string') thread.baseInstructions = params.baseInstructions
-    if (typeof params.developerInstructions === 'string') thread.developerInstructions = params.developerInstructions
+    if (typeof params.threadSource === 'string') thread.threadSource = normalizeThreadSource(params.threadSource)
+    if (typeof params.baseInstructions === 'string') thread.baseInstructions = nullIfEmpty(params.baseInstructions)
+    if (typeof params.developerInstructions === 'string') thread.developerInstructions = nullIfEmpty(params.developerInstructions)
     if (typeof params.personality === 'string') thread.personality = normalizePersonality(params.personality)
     this.store.upsertThread(thread)
     return this.threadEnvelope(thread, params.excludeTurns === true ? [] : this.store.listTurns(thread.id))
@@ -433,11 +435,13 @@ export class CodexClaudeAppServer {
         ? normalizeSandboxMode(params.sandbox)
         : parent.sandboxMode,
       ephemeral: parent.ephemeral,
-      threadSource: typeof params.threadSource === 'string' ? params.threadSource : parent.threadSource,
-      agentRole: typeof params.agentRole === 'string' ? params.agentRole : parent.agentRole,
-      agentNickname: typeof params.agentNickname === 'string' ? params.agentNickname : parent.agentNickname,
-      baseInstructions: typeof params.baseInstructions === 'string' ? params.baseInstructions : parent.baseInstructions,
-      developerInstructions: typeof params.developerInstructions === 'string' ? params.developerInstructions : parent.developerInstructions,
+      threadSource: typeof params.threadSource === 'string'
+        ? normalizeThreadSource(params.threadSource)
+        : normalizeThreadSource(parent.threadSource),
+      agentRole: nullIfEmpty(typeof params.agentRole === 'string' ? params.agentRole : parent.agentRole),
+      agentNickname: nullIfEmpty(typeof params.agentNickname === 'string' ? params.agentNickname : parent.agentNickname),
+      baseInstructions: nullIfEmpty(typeof params.baseInstructions === 'string' ? params.baseInstructions : parent.baseInstructions),
+      developerInstructions: nullIfEmpty(typeof params.developerInstructions === 'string' ? params.developerInstructions : parent.developerInstructions),
       personality: typeof params.personality === 'string' ? normalizePersonality(params.personality) : parent.personality,
     }
     this.store.upsertThread(thread)
@@ -988,7 +992,7 @@ export class CodexClaudeAppServer {
               reasoningEffort: thread.reasoningEffort,
               modelProvider: thread.modelProvider,
               claudeSessionId: null,
-              source: thread.source,
+              source: normalizeSessionSource(thread.source),
               createdAt: nowSeconds(),
               updatedAt: nowSeconds(),
               status: { type: 'active', activeFlags: [] },
@@ -1912,7 +1916,7 @@ export class CodexClaudeAppServer {
         modelProvider: thread?.modelProvider ?? 'claude-code',
         cwd: thread?.cwd ?? process.cwd(),
         cliVersion: codexCliVersion(),
-        source: thread?.source ?? 'app_server',
+        source: normalizeSessionSource(thread?.source),
         gitInfo: null,
       },
     }
@@ -2040,10 +2044,14 @@ export class CodexClaudeAppServer {
       path: null,
       cwd: thread.cwd,
       cliVersion: codexCliVersion(),
-      source: thread.source,
-      threadSource: thread.threadSource,
-      agentNickname: thread.agentNickname,
-      agentRole: thread.agentRole,
+      // Defense-in-depth: even if older rows hold an invalid `source` or
+      // `threadSource` (legacy `app_server`, empty string from a buggy write
+      // path), coerce on the way out so the App's strict deserializer never
+      // sees a value outside the wire enum.
+      source: normalizeSessionSource(thread.source),
+      threadSource: normalizeThreadSource(thread.threadSource),
+      agentNickname: nullIfEmpty(thread.agentNickname),
+      agentRole: nullIfEmpty(thread.agentRole),
       gitInfo: null,
       name: thread.name,
       turns: turns.map((turn) => this.toTurn(turn)),
@@ -2323,6 +2331,38 @@ function normalizePersonality(value: unknown): string | null {
   const v = value.trim()
   if (v === 'none' || v === 'friendly' || v === 'pragmatic' || v === 'cynic' || v === 'robot' || v === 'nerd') return v
   return null
+}
+
+// Codex v2 `ThreadSource` is a strict 3-variant enum with no `serde(other)`
+// fallback. Anything outside this set (including an empty string) makes the
+// App's ts-rs deserializer panic on `thread/list` / `thread/read` — which the
+// user sees as the generic "Oops, an error has occurred" toast. Force every
+// write/read through this gate so we never persist or ship an invalid value.
+function normalizeThreadSource(value: unknown): 'user' | 'subagent' | 'memory_consolidation' | null {
+  if (typeof value !== 'string') return null
+  const v = value.trim()
+  if (v === 'user' || v === 'subagent' || v === 'memory_consolidation') return v
+  return null
+}
+
+// Codex v2 `SessionSource` is camelCase (`appServer`, not `app_server`); it
+// has `serde(other) Unknown` so the wrong casing won't crash the App, just
+// silently fall back to `unknown`. Convert to the wire form to keep the
+// thread metadata UI honest.
+function normalizeSessionSource(value: unknown): string {
+  if (typeof value !== 'string') return 'appServer'
+  const v = value.trim()
+  if (v === 'cli' || v === 'vscode' || v === 'exec' || v === 'appServer' || v === 'unknown') return v
+  if (v === 'app_server' || v === 'app-server') return 'appServer'
+  return 'unknown'
+}
+
+// `agentRole` / `agentNickname` are `string | null` on the wire (not enums),
+// so an empty string doesn't crash — but the App treats `""` as "present"
+// and renders an empty chip. Coerce to null so the field is just absent.
+function nullIfEmpty(value: string | null | undefined): string | null {
+  if (value == null) return null
+  return value === '' ? null : value
 }
 
 // Assemble the per-thread system prompt addendum from Codex App's instruction

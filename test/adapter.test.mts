@@ -1192,6 +1192,79 @@ test('Task subagent emits Codex native spawnAgent → wait → closeAgent timeli
   }
 })
 
+test('thread/start coerces invalid threadSource / source values so Codex App never sees a non-enum', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    // Empty string and bogus enum values must round-trip as null, not as the
+    // literal "" / "totally-bogus" — otherwise App ts-rs deserializer panics
+    // on reopen and shows "Oops, an error has occurred".
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), threadSource: '' } }))
+    const empty = await reader.nextResponse(1)
+    assert.equal(empty.result.thread.threadSource, null, 'empty threadSource must serialize as null')
+    assert.equal(empty.result.thread.source, 'appServer', 'source must use camelCase wire form')
+
+    proc.stdin.write(json({ id: 2, method: 'thread/start', params: { cwd: process.cwd(), threadSource: 'totally-bogus' } }))
+    const bogus = await reader.nextResponse(2)
+    assert.equal(bogus.result.thread.threadSource, null, 'unknown threadSource enum must serialize as null')
+
+    // Valid enum values still pass through unchanged.
+    proc.stdin.write(json({ id: 3, method: 'thread/start', params: { cwd: process.cwd(), threadSource: 'subagent' } }))
+    const valid = await reader.nextResponse(3)
+    assert.equal(valid.result.thread.threadSource, 'subagent')
+
+    // Empty string for agentRole / agentNickname collapses to null on the wire.
+    proc.stdin.write(json({ id: 4, method: 'thread/start', params: { cwd: process.cwd(), agentRole: '', agentNickname: '' } }))
+    const empties = await reader.nextResponse(4)
+    assert.equal(empties.result.thread.agentRole, null)
+    assert.equal(empties.result.thread.agentNickname, null)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('legacy DB rows with invalid thread_source / source are sanitized on startup', async () => {
+  const { SessionStore } = await import(resolve('dist/src/store.mjs'))
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-migrate-'))
+  const dbPath = join(home, 'state.sqlite')
+  try {
+    // First open: create schema, then poison the rows directly via raw SQL
+    // to mimic what an older adapter version would have written.
+    const initial = new SessionStore(dbPath)
+    const { createRequire } = await import('node:module')
+    const require = createRequire(import.meta.url)
+    const { DatabaseSync } = require('node:sqlite') as { DatabaseSync: new (p: string) => any }
+    initial.upsertThread({
+      id: 'th-bad', sessionId: 'th-bad', forkedFromId: null,
+      preview: '', name: null, archived: false, cwd: process.cwd(),
+      model: 'sonnet', reasoningEffort: null, modelProvider: 'claude-code',
+      claudeSessionId: null, source: 'app_server', createdAt: 0, updatedAt: 0,
+      status: { type: 'idle' }, approvalPolicy: null, sandboxMode: null,
+      ephemeral: false, threadSource: 'user', agentRole: null, agentNickname: null,
+      baseInstructions: null, developerInstructions: null, personality: null,
+    } as any)
+    // Now directly corrupt the columns the way the old adapter did.
+    const raw = new DatabaseSync(dbPath)
+    raw.prepare(`UPDATE threads SET source = 'app_server', thread_source = '', agent_role = '', agent_nickname = '' WHERE id = 'th-bad'`).run()
+    raw.close()
+
+    // Second open: migration must rewrite the bad values.
+    const repaired = new SessionStore(dbPath)
+    const row = repaired.getThread('th-bad')
+    assert.equal(row.source, 'appServer', 'legacy app_server should be rewritten to appServer')
+    assert.equal(row.threadSource, null, 'invalid threadSource should be NULLed out')
+    assert.equal(row.agentRole, null)
+    assert.equal(row.agentNickname, null)
+  } finally {
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('thread/start with ephemeral=true is hidden from thread/list and surfaces threadSource', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
