@@ -24,16 +24,13 @@ check('shim version probe', () => {
   if (!/codex-cli/.test(result.stdout)) throw new Error(`unexpected version output: ${result.stdout}`)
 })
 
-check('python >= 3.10', () => {
-  const python = resolvePythonCommand()
-  const result = run(python, ['-c', 'import sys; print(".".join(map(str, sys.version_info[:3])))'])
-  const [major, minor] = result.stdout.trim().split('.').map(Number)
-  if (major < 3 || (major === 3 && minor < 10)) throw new Error(`${python} is ${result.stdout.trim()}, need 3.10+`)
-})
-
-check('claude_agent_sdk import', () => {
-  const python = resolvePythonCommand()
-  run(python, ['-c', 'import claude_agent_sdk; print(getattr(claude_agent_sdk, "__version__", "unknown"))'])
+check('@anthropic-ai/claude-agent-sdk installed', () => {
+  // The native TS runtime imports the SDK dynamically; verify it resolves
+  // from this package's node_modules.
+  const pkgPath = resolve('node_modules/@anthropic-ai/claude-agent-sdk/package.json')
+  if (!existsSync(pkgPath)) {
+    throw new Error('run npm install — @anthropic-ai/claude-agent-sdk is missing')
+  }
 })
 
 check('Claude auth surface for real smoke', () => {
@@ -71,21 +68,4 @@ function run(command, args, env = {}) {
 function requireModule(name) {
   const result = spawnSync(process.execPath, ['-e', `import(${JSON.stringify(name)})`], { encoding: 'utf8' })
   if (result.status !== 0) throw new Error(result.stderr || result.stdout)
-}
-
-function resolvePythonCommand() {
-  const candidates = [
-    process.env.CLAUDE_CODEX_PYTHON,
-    resolve('.venv/bin/python'),
-    'python3.12',
-    'python3.11',
-    'python3.10',
-    'python3',
-  ].filter(Boolean)
-  for (const candidate of candidates) {
-    if (candidate.includes('/') && !existsSync(candidate)) continue
-    const result = spawnSync(candidate, ['-c', 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)'], { encoding: 'utf8' })
-    if (result.status === 0) return candidate
-  }
-  return process.env.CLAUDE_CODEX_PYTHON || 'python3'
 }

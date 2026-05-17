@@ -8,7 +8,6 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "install:python-sdk": "bash scripts/install-python-sdk.sh",
     "test": "npm run build && node --test dist/test/*.mjs",
     "doctor": "node scripts/doctor.mjs",
     "smoke:real": "npm run build && node scripts/smoke-real-claude.mjs",
@@ -20,6 +19,7 @@
     "generate:schema": "codex app-server generate-ts --experimental --out generated/codex-app-server"
   },
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.143",
     "ws": "^8.18.3"
   },
   "devDependencies": {

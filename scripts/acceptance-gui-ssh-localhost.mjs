@@ -32,11 +32,12 @@ initGitWorkspace(workspace)
 
 try {
   const expectedCodex = join(process.env.HOME || '', 'bin', 'codex')
-  const rawProbe = runSsh('printf "codex=%s\\n" "$(command -v codex)"; codex --version; test -S "$CLAUDE_CODEX_RUNTIME_SOCKET" && echo socket-ok')
+  const rawProbe = runSsh('printf "codex=%s\\n" "$(command -v codex)"; codex --version')
   assert.match(rawProbe.stdout, new RegExp(`codex=${expectedCodex.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`))
-  assert.match(rawProbe.stdout, /socket-ok/)
 
-  const probe = runSsh(`zsh -lc ${shQuote('printf "codex=%s\\n" "$(command -v codex)"; codex --version; printf "adapter=%s\\n" "$CLAUDE_CODEX_ADAPTER"; "$CLAUDE_CODEX_PYTHON" -c "import claude_agent_sdk; print(\\"sdk-ok\\")"')}`)
+  // Native TS runtime — @anthropic-ai/claude-agent-sdk lives in the adapter's
+  // node_modules, no Python sidecar to probe anymore.
+  const probe = runSsh(`zsh -lc ${shQuote('printf "codex=%s\\n" "$(command -v codex)"; codex --version; printf "adapter=%s\\n" "$CLAUDE_CODEX_ADAPTER"; node -e "import(\\"@anthropic-ai/claude-agent-sdk\\").then(()=>console.log(\\"sdk-ok\\"))"')}`)
   assert.match(probe.stdout, new RegExp(`codex=${expectedCodex.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`))
   assert.match(probe.stdout, /codex-cli/)
   assert.match(probe.stdout, /sdk-ok/)
