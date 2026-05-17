@@ -13,7 +13,16 @@ class StdioPeer implements RpcPeer {
   readonly id = 'stdio'
 
   send(message: WireMessage): void {
-    process.stdout.write(`${JSON.stringify(message)}\n`)
+    // process.stdout.write can throw a synchronous EPIPE if the consumer
+    // (App's SSH stream) has closed mid-stream. Without the guard a single
+    // peer disconnect during a Claude text stream would kill the entire
+    // adapter — which is exactly the pid-churn pattern we saw in debug.
+    try {
+      process.stdout.write(`${JSON.stringify(message)}\n`)
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException)?.code
+      if (code !== 'EPIPE' && code !== 'ECONNRESET' && code !== 'EBADF') throw error
+    }
   }
 
   close(): void {
@@ -27,8 +36,15 @@ class WebSocketPeer implements RpcPeer {
   constructor(private ws: WebSocket) {}
 
   send(message: WireMessage): void {
-    if (this.ws.readyState === WebSocket.OPEN) {
+    if (this.ws.readyState !== WebSocket.OPEN) return
+    try {
       this.ws.send(JSON.stringify(message))
+    } catch (error) {
+      // ws.send may still throw if the socket transitioned between the
+      // readyState check and the send (typical when a peer drops). Drop the
+      // message rather than crashing the daemon for other peers.
+      const code = (error as NodeJS.ErrnoException)?.code
+      if (code !== 'EPIPE' && code !== 'ECONNRESET' && code !== 'EBADF') throw error
     }
   }
 
@@ -134,6 +150,17 @@ export async function runProxy(socketPath: string, timeoutMs = 10_000): Promise<
       await new Promise<void>((resolve) => {
         process.stdin.pipe(socket)
         socket.pipe(process.stdout)
+        // `.pipe()` propagates errors as unhandled events. process.stdout
+        // throws EPIPE when the App's SSH channel closes mid-stream; without
+        // these handlers that error tears down the proxy process and the
+        // daemon's only client. Swallow expected disconnect codes, log
+        // anything else, and let `socket.on('close')` handle the lifecycle.
+        const swallow = (label: string) => (error: NodeJS.ErrnoException) => {
+          if (error.code === 'EPIPE' || error.code === 'ECONNRESET' || error.code === 'EBADF') return
+          process.stderr.write(`[claude-codex-adapter] proxy ${label} error: ${error.message}\n`)
+        }
+        process.stdin.on('error', swallow('stdin'))
+        process.stdout.on('error', swallow('stdout'))
         socket.on('close', () => resolve())
         socket.on('error', (error) => {
           process.stderr.write(`[claude-codex-adapter] proxy socket error: ${error.message}\n`)

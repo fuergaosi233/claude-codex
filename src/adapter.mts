@@ -12,7 +12,41 @@ import {
   startWebSocketTransport,
 } from './transports.mjs'
 import type { RpcPeer } from './types.mjs'
-import { defaultSocketPath, ensureParent } from './util.mjs'
+import { debugLog, defaultSocketPath, ensureParent } from './util.mjs'
+
+// Install global crash guards FIRST, before anything else can fail. Without
+// these, a single uncaught rejection or a synchronous EPIPE from a write to a
+// half-closed peer (Codex App's SSH stream blipping mid-stream) silently kills
+// the daemon — observed as pid churn (one daemon process per few minutes)
+// with no error trace in debug.jsonl. Logging here puts the cause on disk
+// AND keeps the daemon alive so the App's reconnect is a no-op.
+process.on('uncaughtException', (error: unknown) => {
+  const err = error as NodeJS.ErrnoException
+  const code = err?.code ?? null
+  const isExpected = code === 'EPIPE' || code === 'ECONNRESET' || code === 'EBADF'
+  debugLog('adapter.uncaughtException', {
+    code,
+    message: err?.message ?? String(error),
+    stack: err?.stack ?? null,
+    swallowed: isExpected,
+  })
+  // EPIPE/ECONNRESET from peer disconnects are routine; swallow them so the
+  // daemon keeps serving other peers. Anything else: re-throw on next tick to
+  // preserve normal error semantics (and we already logged it).
+  if (!isExpected) {
+    setImmediate(() => { throw error })
+  }
+})
+process.on('unhandledRejection', (reason: unknown) => {
+  const err = reason as NodeJS.ErrnoException
+  debugLog('adapter.unhandledRejection', {
+    code: err?.code ?? null,
+    message: err?.message ?? String(reason),
+    stack: err?.stack ?? null,
+  })
+  // Node ≥ 15 defaults to crashing on unhandled rejection. Keep the daemon
+  // up; we have logging now, so silent death is no longer a risk.
+})
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2)
@@ -44,9 +78,10 @@ async function main(): Promise<void> {
   const runtime = createRuntime()
   const server = new CodexClaudeAppServer(store, runtime)
   let shuttingDown = false
-  const shutdown = async () => {
+  const shutdown = async (reason: string) => {
     if (shuttingDown) return
     shuttingDown = true
+    debugLog('adapter.shutdown', { reason, pid: process.pid })
     await server.stop()
     if (pidFile) {
       try {
@@ -55,8 +90,10 @@ async function main(): Promise<void> {
     }
     process.exit(0)
   }
-  process.once('SIGINT', () => void shutdown())
-  process.once('SIGTERM', () => void shutdown())
+  process.once('SIGINT', () => void shutdown('SIGINT'))
+  process.once('SIGTERM', () => void shutdown('SIGTERM'))
+  process.once('SIGHUP', () => void shutdown('SIGHUP'))
+  debugLog('adapter.start', { pid: process.pid, listen, isUnixDaemon })
 
   const onMessage = server.handle.bind(server)
 
@@ -80,8 +117,9 @@ async function main(): Promise<void> {
   const armIdleExit = () => {
     if (!idleExitEnabled || activePeers > 0 || !everConnected || idleTimer) return
     idleTimer = setTimeout(() => {
+      debugLog('adapter.idleExit', { idleExitMs, pid: process.pid })
       process.stderr.write(`[claude-codex-adapter] no active peers for ${idleExitMs}ms, shutting down\n`)
-      void shutdown()
+      void shutdown('idleExit')
     }, idleExitMs)
     idleTimer.unref()
   }
