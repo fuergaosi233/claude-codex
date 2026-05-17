@@ -866,6 +866,10 @@ export class CodexClaudeAppServer {
     // collapsed item that goes silent for the duration of the subagent.
     const subagentContexts = new Map<string, { childThreadId: string; waitItemId: string; prompt: string; subType: string | null }>()
     const activeSubagents = new Set<string>()
+    // Track per-item start time so commandExecution / mcpToolCall items can
+    // report a real durationMs in turn/completed (otherwise the App's status
+    // bar shows "—" for every command).
+    const itemStartedAtMs = new Map<string, number>()
     // Mutable holder rather than `let collectedMetrics`: TS's control-flow
     // analysis doesn't see writes from inside the onEvent callback, so a bare
     // `let` would still be inferred as `null` outside the closure.
@@ -1136,8 +1140,17 @@ export class CodexClaudeAppServer {
             return
           }
           if (event.type === 'tool_use') {
+            // Defense in depth against duplicate tool_use events for the same
+            // tool_use_id. Claude SDK has been known to emit a block_start
+            // event with an empty input AND a complete copy in the final
+            // AssistantMessage — sidecar suppresses the empty start, but if
+            // anything slips through we'd otherwise create a husk
+            // commandExecution item that never closes (the second emit
+            // overwrites itemIds[] so the husk never sees its tool_result).
+            if (itemIds.has(event.toolUseId)) return
             const item = this.toolUseToItem(event, thread.cwd)
             itemIds.set(event.toolUseId, item.id)
+            itemStartedAtMs.set(item.id, nowMillis())
             this.store.appendItem(turn.id, item)
             this.notify(peer, { method: 'item/started', params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: nowMillis() } })
             if (item.type === 'fileChange') {
@@ -1162,13 +1175,19 @@ export class CodexClaudeAppServer {
             const itemId = itemIds.get(event.toolUseId)
             if (!itemId) return
             const resultText = toolResultText(event.content)
+            const durationMs = (() => {
+              const started = itemStartedAtMs.get(itemId)
+              return started == null ? null : Math.max(0, nowMillis() - started)
+            })()
+            const parsedExitCode = parseExitCodeFromResult(event.content) ?? (event.isError ? 1 : 0)
             const updated = this.store.updateItem(turn.id, itemId, (item) => {
               if (item.type === 'commandExecution') {
                 return {
                   ...item,
                   status: event.isError ? 'failed' : 'completed',
                   aggregatedOutput: item.aggregatedOutput ?? resultText,
-                  exitCode: event.isError ? 1 : 0,
+                  exitCode: parsedExitCode,
+                  durationMs,
                 }
               }
               if (item.type === 'fileChange') return { ...item, status: event.isError ? 'failed' : 'completed' }
@@ -1178,6 +1197,7 @@ export class CodexClaudeAppServer {
                   status: event.isError ? 'failed' : 'completed',
                   result: event.isError ? null : event.content,
                   error: event.isError ? event.content : null,
+                  durationMs,
                 }
               }
               if (item.type === 'webSearch') {
@@ -1903,7 +1923,12 @@ export class CodexClaudeAppServer {
         id,
         command: String(event.input.command ?? ''),
         cwd: String(event.input.cwd ?? cwd),
-        processId: null,
+        // Use the SDK's tool_use_id as a stable handle. Without a non-null
+        // processId the Codex App was treating these as "Background terminal"
+        // entries (no attached process) and hiding their output; with a
+        // synthetic id they render as inline command items like a normal
+        // foreground bash invocation.
+        processId: `claude:${event.toolUseId}`,
         source: 'agent',
         status: 'inProgress',
         commandActions: [],
@@ -2299,6 +2324,26 @@ function sandboxEnvelope(mode: string | null, cwd: string): unknown {
 function emptyTokenBreakdown(): TokenUsageBreakdown {
   return { totalTokens: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0 }
 }
+
+// Best-effort parse of a Claude Bash tool_result for the real shell exit
+// code. Claude's tool result content is usually plain stdout/stderr, but in
+// some failure modes (and via custom wrappers / Codex CLI shims) the SDK
+// suffixes a `Exit code: N` / `exit status N` marker. Returning null lets
+// the caller fall back to 0/1 from event.isError.
+function parseExitCodeFromResult(content: unknown): number | null {
+  const text = typeof content === 'string'
+    ? content
+    : Array.isArray(content)
+      ? content.map((p) => (typeof p === 'string' ? p : (p as Record<string, unknown>)?.text ?? '')).join('')
+      : ''
+  if (!text) return null
+  const match = text.match(/(?:Exit code|exit status|exit code):\s*(-?\d+)/i)
+  if (!match) return null
+  const code = Number(match[1])
+  return Number.isFinite(code) ? code : null
+}
+
+
 
 // Best-effort: when the WebSearch tool returns a result, sniff whether the
 // first result was an explicit page open vs a result list. Codex App's

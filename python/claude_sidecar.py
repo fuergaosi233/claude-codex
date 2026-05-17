@@ -555,8 +555,25 @@ class ClaudeSidecar:
             # once from the final ToolUseBlock carrying the parsed JSON input.
         elif event_type == "content_block_start":
             block = obj_get(event, "content_block", {})
-            if obj_get(block, "name", "") != "StructuredOutput":
-                self.emit_content_block(thread_id, turn_id, block)
+            name = obj_get(block, "name", "")
+            btype = obj_get(block, "type", "")
+            cname_b = class_name(block)
+            # StructuredOutput streams input_json_delta to itself; the final
+            # ToolUseBlock carries the parsed JSON. Nothing to emit at start.
+            if name == "StructuredOutput":
+                return
+            # Tool-use blocks arrive here with an EMPTY input (the JSON is
+            # streamed via subsequent input_json_delta events). If we emit at
+            # this point the server creates a commandExecution husk with an
+            # empty `command` field that never gets closed — because the
+            # full tool_use lands later via the AssistantMessage envelope's
+            # content list (different code path) and overwrites itemIds[],
+            # orphaning the first husk in `inProgress` forever. That's the
+            # "Background terminal · empty" entries Codex App was showing.
+            # Skip; the AssistantMessage path delivers a complete copy.
+            if btype == "tool_use" or cname_b == "ToolUseBlock":
+                return
+            self.emit_content_block(thread_id, turn_id, block)
         elif event_type in ("rate_limit_event", "hook_event", "subagent_event", "subagent_stop", "precompact", "postcompact"):
             level, message = summarize_runtime_event(event_type, event)
             emit({
