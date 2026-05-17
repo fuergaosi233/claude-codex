@@ -1192,6 +1192,49 @@ test('Task subagent emits Codex native spawnAgent → wait → closeAgent timeli
   }
 })
 
+test('thread/start picks up effort from config.model_reasoning_effort when top-level effort is absent', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    // Codex App's settings sheet writes the persistent effort under
+    // params.config.model_reasoning_effort (snake_case, just like the CLI's
+    // config.toml). Make sure we accept it from there even when the top-level
+    // `effort` field is absent — without this fix the user's "high" pick
+    // gets silently dropped and Claude runs at the env default.
+    proc.stdin.write(json({
+      id: 1,
+      method: 'thread/start',
+      params: { cwd: process.cwd(), config: { model_reasoning_effort: 'high' } },
+    }))
+    const start = await reader.nextResponse(1)
+    const threadId = start.result.thread.id
+
+    // Drive a turn with effort=null on the wire (mimicking what Codex App
+    // actually sends — top-level effort is null, the real value came in via
+    // thread/start.config). Mock echoes the effort the runtime received.
+    proc.stdin.write(json({
+      id: 2,
+      method: 'turn/start',
+      params: { threadId, input: [{ type: 'text', text: 'effort echo', text_elements: [] }], effort: null, model: null },
+    }))
+    await reader.nextResponse(2)
+    let echoed = ''
+    for (let i = 0; i < 500; i += 1) {
+      const message: any = await reader.next()
+      if (message.method === 'item/agentMessage/delta') echoed += String(message.params.delta ?? '')
+      if (message.method === 'turn/completed') break
+    }
+    assert.equal(echoed, 'effort=high', 'config.model_reasoning_effort should flow through to the runtime')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('thread/start coerces invalid threadSource / source values so Codex App never sees a non-enum', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {

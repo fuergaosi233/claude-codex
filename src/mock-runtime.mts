@@ -83,6 +83,14 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    if (/effort echo/i.test(context.prompt)) {
+      // Standalone effort echo so the test for config.model_reasoning_effort
+      // can assert the value end-to-end without scraping the model field.
+      await handlers.onEvent({ type: 'text_delta', delta: `effort=${context.effort ?? 'null'}` })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'effort echo' })
+      return
+    }
+
     if (/output schema check/i.test(context.prompt)) {
       await handlers.onEvent({
         type: 'text_delta',

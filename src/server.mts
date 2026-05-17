@@ -353,8 +353,17 @@ export class CodexClaudeAppServer {
     const requestedCwd = stringOr(params.cwd, process.cwd())
     const cwd = maybeCreateThreadWorktree(id, requestedCwd).cwd
     const model = stringOr(params.model, process.env.CLAUDE_CODEX_DEFAULT_MODEL ?? 'sonnet')
+    // Codex App stores reasoning effort in two places: top-level `effort` (what
+    // turn/start uses for per-turn overrides) AND nested under
+    // `config.model_reasoning_effort` (where the App's settings sheet writes
+    // the persistent default). Read both so a user picking "high" in the
+    // settings sheet actually reaches us instead of silently falling back to
+    // the env default.
+    const cfgEffort = readConfigReasoningEffort(params.config)
     const reasoningEffort = normalizeCodexReasoningEffort(
-      typeof params.effort === 'string' ? params.effort : process.env.CLAUDE_CODEX_DEFAULT_EFFORT ?? 'medium',
+      typeof params.effort === 'string'
+        ? params.effort
+        : cfgEffort ?? process.env.CLAUDE_CODEX_DEFAULT_EFFORT ?? 'medium',
     )
     const thread: ThreadRecord = {
       id,
@@ -397,6 +406,10 @@ export class CodexClaudeAppServer {
     if (typeof params.cwd === 'string' && params.cwd.length > 0) thread.cwd = params.cwd
     if (typeof params.model === 'string' && params.model.length > 0) thread.model = params.model
     if (typeof params.effort === 'string') thread.reasoningEffort = normalizeCodexReasoningEffort(params.effort)
+    else {
+      const cfgEffort = readConfigReasoningEffort(params.config)
+      if (cfgEffort) thread.reasoningEffort = normalizeCodexReasoningEffort(cfgEffort)
+    }
     if (typeof params.approvalPolicy === 'string') thread.approvalPolicy = normalizeApprovalPolicy(params.approvalPolicy)
     if (typeof params.sandbox === 'string') thread.sandboxMode = normalizeSandboxMode(params.sandbox)
     if (typeof params.threadSource === 'string') thread.threadSource = normalizeThreadSource(params.threadSource)
@@ -927,16 +940,36 @@ export class CodexClaudeAppServer {
       personality,
     })
 
+    const resolvedModel = resolveClaudeModel(
+      stringOr(params.model, thread.model),
+      params.outputSchema == null ? 'normal' : 'summary',
+    )
+    const resolvedEffort = resolveClaudeEffort(
+      typeof params.effort === 'string' ? params.effort : thread.reasoningEffort ?? process.env.CLAUDE_CODEX_EFFORT ?? null,
+    )
+    // Log the effective Claude SDK model+effort per turn so when a user
+    // reports "switching model didn't work" we can diff App's payload against
+    // what actually reached the SDK in one grep.
+    debugLog('turn.runtime.applied', {
+      threadId: thread.id,
+      turnId: turn.id,
+      paramsModel: params.model ?? null,
+      paramsEffort: params.effort ?? null,
+      threadModel: thread.model,
+      threadEffort: thread.reasoningEffort,
+      envDefaultModel: process.env.CLAUDE_CODEX_DEFAULT_MODEL ?? null,
+      envDefaultEffort: process.env.CLAUDE_CODEX_DEFAULT_EFFORT ?? process.env.CLAUDE_CODEX_EFFORT ?? null,
+      resolvedModel,
+      resolvedEffort,
+    })
     await this.runtime.runTurn(
       {
         threadId: thread.id,
         turnId: turn.id,
         prompt,
         cwd: stringOr(params.cwd, thread.cwd),
-        model: resolveClaudeModel(stringOr(params.model, thread.model), params.outputSchema == null ? 'normal' : 'summary'),
-        effort: resolveClaudeEffort(
-          typeof params.effort === 'string' ? params.effort : thread.reasoningEffort ?? process.env.CLAUDE_CODEX_EFFORT ?? null,
-        ),
+        model: resolvedModel,
+        effort: resolvedEffort,
         claudeSessionId: thread.claudeSessionId,
         forkSession,
         mcpServers: readMcpConfig().sdkValue,
@@ -2330,6 +2363,20 @@ function normalizePersonality(value: unknown): string | null {
   if (typeof value !== 'string') return null
   const v = value.trim()
   if (v === 'none' || v === 'friendly' || v === 'pragmatic' || v === 'cynic' || v === 'robot' || v === 'nerd') return v
+  return null
+}
+
+// Codex App's settings sheet writes the persistent reasoning-effort default
+// under `params.config.model_reasoning_effort` (the same shape as the Codex
+// CLI's `config.toml`). turn/start's top-level `effort` is only set when the
+// user overrides for a single turn — the chosen value from the model picker
+// otherwise lives in the config bag. Read both so the App's effort dropdown
+// actually changes Claude's thinking budget instead of silently no-op'ing.
+function readConfigReasoningEffort(config: unknown): string | null {
+  if (!config || typeof config !== 'object') return null
+  const cfg = config as Record<string, unknown>
+  const direct = cfg.model_reasoning_effort ?? cfg['model_reasoning_effort']
+  if (typeof direct === 'string' && direct.length > 0) return direct
   return null
 }
 
