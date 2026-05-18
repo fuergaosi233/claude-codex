@@ -1,5 +1,6 @@
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
-import { watch, type FSWatcher } from 'node:fs'
+import { readFileSync, watch, writeFileSync, type FSWatcher } from 'node:fs'
+import { join } from 'node:path'
 import { promisify } from 'node:util'
 import type {
   ClaudeRuntime,
@@ -28,8 +29,10 @@ import {
   defaultAllowedTools,
   debugLog,
   claudeModelOptions,
+  adapterHome,
   codexHome,
   codexUserAgent,
+  ensureParent,
   extractImageInputs,
   newId,
   nowMillis,
@@ -55,12 +58,18 @@ export class CodexClaudeAppServer {
   private goals = new Map<string, Record<string, unknown>>()
   private elicitationCounts = new Map<string, number>()
   private tokenUsageByThread = new Map<string, TokenUsageBreakdown>()
+  private configModel = defaultSelectableModelId()
+  private configReasoningEffort = normalizeCodexReasoningEffort(process.env.CLAUDE_CODEX_DEFAULT_EFFORT) ?? 'medium'
+  private readonly configPath = join(adapterHome(), 'config.json')
+  private idleCheckHandler: (() => void) | null = null
   private stopped = false
 
   constructor(
     private store: SessionStore,
     private runtime: ClaudeRuntime,
-  ) {}
+  ) {
+    this.loadPersistedConfig()
+  }
 
   async handle(peer: RpcPeer, message: WireMessage): Promise<void> {
     if ('method' in message && message.method) {
@@ -94,7 +103,16 @@ export class CodexClaudeAppServer {
     if (this.stopped) return
     this.stopped = true
     await this.runtime.stop()
+    this.completeActiveTurns('interrupted', { message: 'server stopped' })
     this.store.close()
+  }
+
+  hasActiveTurns(): boolean {
+    return this.activeTurnByThread.size > 0
+  }
+
+  setIdleCheckHandler(handler: () => void): void {
+    this.idleCheckHandler = handler
   }
 
   private async handleNotification(_peer: RpcPeer, _message: WireMessage): Promise<void> {
@@ -153,7 +171,7 @@ export class CodexClaudeAppServer {
       case 'thread/start':
         return this.threadStart(peer, asRecord(params))
       case 'thread/resume':
-        return this.threadResume(asRecord(params))
+        return this.threadResume(peer, asRecord(params))
       case 'thread/fork':
         return this.threadFork(peer, asRecord(params))
       case 'thread/list':
@@ -222,7 +240,7 @@ export class CodexClaudeAppServer {
       case 'turn/steer':
         return this.turnSteer(peer, asRecord(params))
       case 'turn/interrupt':
-        return this.turnInterrupt(asRecord(params))
+        return this.turnInterrupt(peer, asRecord(params))
       // Realtime voice is unsupported: Claude Code has no realtime audio
       // channel. These ack so the App's capability probe does not error; a
       // real session would need a separate audio backend.
@@ -328,7 +346,10 @@ export class CodexClaudeAppServer {
       case 'feedback/upload':
         return { threadId: stringOr(asRecord(params).threadId, '') }
       case 'account/read':
-        return { account: null, requiresOpenaiAuth: false }
+        // The App applies its OpenAI hidden-model allowlist unless auth is
+        // Bedrock-shaped. Claude Code is externally authenticated, so use that
+        // local auth shape to keep Claude aliases visible in the model picker.
+        return { account: { type: 'amazonBedrock' }, requiresOpenaiAuth: false }
       case 'account/rateLimits/read':
         return this.accountRateLimits()
       case 'fs/readFile':
@@ -396,19 +417,8 @@ export class CodexClaudeAppServer {
     const now = nowSeconds()
     const requestedCwd = stringOr(params.cwd, process.cwd())
     const cwd = maybeCreateThreadWorktree(id, requestedCwd).cwd
-    const model = stringOr(params.model, process.env.CLAUDE_CODEX_DEFAULT_MODEL ?? 'sonnet')
-    // Codex App stores reasoning effort in two places: top-level `effort` (what
-    // turn/start uses for per-turn overrides) AND nested under
-    // `config.model_reasoning_effort` (where the App's settings sheet writes
-    // the persistent default). Read both so a user picking "high" in the
-    // settings sheet actually reaches us instead of silently falling back to
-    // the env default.
-    const cfgEffort = readConfigReasoningEffort(params.config)
-    const reasoningEffort = normalizeCodexReasoningEffort(
-      typeof params.effort === 'string'
-        ? params.effort
-        : cfgEffort ?? process.env.CLAUDE_CODEX_DEFAULT_EFFORT ?? 'medium',
-    )
+    const model = modelFromParams(params, this.configModel)
+    const reasoningEffort = reasoningEffortFromParams(params, this.configReasoningEffort)
     const thread: ThreadRecord = {
       id,
       sessionId: id,
@@ -443,17 +453,15 @@ export class CodexClaudeAppServer {
     return this.threadEnvelope(thread)
   }
 
-  private threadResume(params: Record<string, unknown>): unknown {
+  private threadResume(peer: RpcPeer, params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
     if (!thread) throw new Error('unknown thread: ' + threadId)
     if (typeof params.cwd === 'string' && params.cwd.length > 0) thread.cwd = params.cwd
-    if (typeof params.model === 'string' && params.model.length > 0) thread.model = params.model
-    if (typeof params.effort === 'string') thread.reasoningEffort = normalizeCodexReasoningEffort(params.effort)
-    else {
-      const cfgEffort = readConfigReasoningEffort(params.config)
-      if (cfgEffort) thread.reasoningEffort = normalizeCodexReasoningEffort(cfgEffort)
-    }
+    const model = modelFromParams(params, null)
+    const reasoningEffort = reasoningEffortFromParams(params, null)
+    if (model) thread.model = model
+    if (reasoningEffort) thread.reasoningEffort = reasoningEffort
     if (typeof params.approvalPolicy === 'string') thread.approvalPolicy = normalizeApprovalPolicy(params.approvalPolicy)
     if (typeof params.sandbox === 'string') thread.sandboxMode = normalizeSandboxMode(params.sandbox)
     if (typeof params.threadSource === 'string') thread.threadSource = normalizeThreadSource(params.threadSource)
@@ -461,6 +469,7 @@ export class CodexClaudeAppServer {
     if (typeof params.developerInstructions === 'string') thread.developerInstructions = nullIfEmpty(params.developerInstructions)
     if (typeof params.personality === 'string') thread.personality = normalizePersonality(params.personality)
     this.store.upsertThread(thread)
+    this.activePeerByThread.set(threadId, peer)
     return this.threadEnvelope(thread, params.excludeTurns === true ? [] : this.store.listTurns(thread.id))
   }
 
@@ -479,8 +488,8 @@ export class CodexClaudeAppServer {
       forkedFromId: parent.id,
       archived: false,
       cwd,
-      model: stringOr(params.model, parent.model),
-      reasoningEffort: normalizeCodexReasoningEffort(typeof params.effort === 'string' ? params.effort : parent.reasoningEffort),
+      model: modelFromParams(params, parent.model),
+      reasoningEffort: reasoningEffortFromParams(params, parent.reasoningEffort),
       claudeSessionId: parent.claudeSessionId,
       createdAt: now,
       updatedAt: now,
@@ -719,7 +728,7 @@ export class CodexClaudeAppServer {
         const completed = this.store.completeTurn(turnId, 'failed', { message: error.message }) ?? turn
         this.notify(peer, { method: 'error', params: { threadId, turnId, willRetry: false, error: { message: error.message } } })
         this.notify(peer, { method: 'turn/completed', params: { threadId, turn: this.toTurn(completed) } })
-        this.activeTurnByThread.delete(threadId)
+        this.clearActiveTurn(threadId)
         this.setThreadStatus(peer, threadId, { type: 'idle' })
       })
     })
@@ -771,7 +780,7 @@ export class CodexClaudeAppServer {
           const finalAgent = this.store.getTurn(turnId)?.items.find((i) => i.id === agentItem.id) ?? agentItem
           this.notify(peer, { method: 'item/completed', params: { threadId, turnId, item: finalAgent, completedAtMs: nowMillis() } })
           const completed = this.store.completeTurn(turnId, 'completed') ?? turn
-          this.activeTurnByThread.delete(threadId)
+          this.clearActiveTurn(threadId)
           this.setThreadStatus(peer, threadId, { type: 'idle' })
           this.notify(peer, { method: 'turn/completed', params: { threadId, turn: this.toTurn(completed) } })
           this.notify(peer, { method: 'thread/compacted', params: { threadId } })
@@ -806,8 +815,10 @@ export class CodexClaudeAppServer {
       {
         threadId: thread.id,
         turnId,
+        purpose: 'compact',
         prompt: compactPrompt,
         cwd: thread.cwd,
+        runtimeType: null,
         model: resolveClaudeModel(thread.model, 'summary'),
         effort: resolveClaudeEffort(thread.reasoningEffort ?? null),
         claudeSessionId: null,
@@ -866,8 +877,10 @@ export class CodexClaudeAppServer {
     const { textPrompt, images } = extractImageInputs(input)
     const prompt = textPrompt || textFromInput(input)
     if (typeof params.cwd === 'string' && params.cwd.length > 0) thread.cwd = params.cwd
-    if (typeof params.model === 'string' && params.model.length > 0) thread.model = params.model
-    if (typeof params.effort === 'string') thread.reasoningEffort = normalizeCodexReasoningEffort(params.effort)
+    const model = modelFromParams(params, thread.model)
+    const reasoningEffort = reasoningEffortFromParams(params, thread.reasoningEffort)
+    if (model) thread.model = model
+    if (reasoningEffort) thread.reasoningEffort = reasoningEffort
     this.store.upsertThread(thread)
     if (!thread.preview && prompt) {
       thread.preview = prompt.slice(0, 200)
@@ -916,7 +929,7 @@ export class CodexClaudeAppServer {
       const completed = this.store.completeTurn(turnId, 'failed', { message: error.message }) ?? turn
       this.notify(peer, { method: 'error', params: { threadId, turnId, willRetry: false, error: { message: error.message } } })
       this.notify(peer, { method: 'turn/completed', params: { threadId, turn: this.toTurn(completed) } })
-      this.activeTurnByThread.delete(threadId)
+      this.clearActiveTurn(threadId)
       this.setThreadStatus(peer, threadId, { type: 'idle' })
       })
     })
@@ -1000,6 +1013,7 @@ export class CodexClaudeAppServer {
       developerInstructions,
       personality,
     })
+    const turnPurpose = params.outputSchema == null ? 'normal' : 'summary'
 
     const resolvedModel = resolveClaudeModel(
       stringOr(params.model, thread.model),
@@ -1027,8 +1041,10 @@ export class CodexClaudeAppServer {
       {
         threadId: thread.id,
         turnId: turn.id,
+        purpose: turnPurpose,
         prompt,
         cwd: stringOr(params.cwd, thread.cwd),
+        runtimeType: null,
         model: resolvedModel,
         effort: resolvedEffort,
         claudeSessionId: thread.claudeSessionId,
@@ -1467,7 +1483,7 @@ export class CodexClaudeAppServer {
       completed.numTurns = collectedMetrics.numTurns
       completed.costUsd = collectedMetrics.costUsd
     }
-    this.activeTurnByThread.delete(thread.id)
+    this.clearActiveTurn(thread.id)
     this.setThreadStatus(peer, thread.id, { type: 'idle' })
     this.notify(peer, { method: 'turn/completed', params: { threadId: thread.id, turn: this.toTurn(completed) } })
   }
@@ -1533,11 +1549,21 @@ export class CodexClaudeAppServer {
     return { decision }
   }
 
-  private async turnInterrupt(params: Record<string, unknown>): Promise<unknown> {
+  private async turnInterrupt(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
     const threadId = stringOr(params.threadId, '')
+    const requestedTurnId = stringOr(params.turnId, '')
+    const activeTurnId = this.activeTurnByThread.get(threadId)
     await this.runtime.interrupt(threadId)
-    this.activeTurnByThread.delete(threadId)
-    this.setThreadStatus(null, threadId, { type: 'idle' })
+    const turnId = activeTurnId || requestedTurnId
+    if (turnId) {
+      const turn = this.store.getTurn(turnId)
+      if (turn?.status === 'inProgress') {
+        const completed = this.store.completeTurn(turnId, 'interrupted', { message: 'interrupted' }) ?? turn
+        this.notify(peer, { method: 'turn/completed', params: { threadId, turn: this.toTurn(completed) } })
+      }
+    }
+    this.clearActiveTurn(threadId)
+    this.setThreadStatus(peer, threadId, { type: 'idle' })
     return {}
   }
 
@@ -1562,7 +1588,7 @@ export class CodexClaudeAppServer {
   private configRead(): unknown {
     return {
       config: {
-        model: process.env.CLAUDE_CODEX_DEFAULT_MODEL ?? 'sonnet',
+        model: this.configModel,
         review_model: null,
         model_context_window: null,
         model_auto_compact_token_limit: null,
@@ -1580,20 +1606,46 @@ export class CodexClaudeAppServer {
         instructions: null,
         developer_instructions: null,
         compact_prompt: null,
-        model_reasoning_effort: normalizeCodexReasoningEffort(process.env.CLAUDE_CODEX_DEFAULT_EFFORT) ?? 'medium',
+        model_reasoning_effort: this.configReasoningEffort,
         model_reasoning_summary: null,
         model_verbosity: null,
         service_tier: null,
         analytics: null,
         apps: null,
+        model_providers: {
+          'claude-code': {
+            name: 'Claude Code',
+            base_url: null,
+            env_key: null,
+            env_key_instructions: null,
+            experimental_bearer_token: null,
+            auth: null,
+            aws: null,
+            wire_api: 'responses',
+            query_params: null,
+            http_headers: null,
+            env_http_headers: null,
+            request_max_retries: null,
+            stream_max_retries: null,
+            stream_idle_timeout_ms: null,
+            websocket_connect_timeout_ms: null,
+            requires_openai_auth: false,
+            supports_websockets: false,
+          },
+        },
       },
-      origins: {},
+      origins: {
+        model_provider: configLayerMetadata(),
+        'model_providers.claude-code': configLayerMetadata(),
+      },
       layers: null,
     }
   }
 
   private modelList(): unknown {
-    const defaultModel = process.env.CLAUDE_CODEX_DEFAULT_MODEL ?? 'sonnet'
+    const defaultModel = this.configModel
+    const options = claudeModelOptions()
+    const hasConfiguredDefault = options.some((option) => option.id === defaultModel)
     const reasoningEfforts = [
       { reasoningEffort: 'low', description: 'Fast Claude Code runtime response' },
       { reasoningEffort: 'medium', description: 'Balanced Claude Code runtime response' },
@@ -1601,7 +1653,7 @@ export class CodexClaudeAppServer {
       { reasoningEffort: 'xhigh', description: 'Maximum Codex UI reasoning level for Claude Code' },
     ]
     return {
-      data: claudeModelOptions().map((option) => ({
+      data: options.map((option) => ({
         id: option.id,
         model: option.id,
         upgrade: null,
@@ -1611,12 +1663,11 @@ export class CodexClaudeAppServer {
         description: option.description,
         hidden: false,
         supportedReasoningEfforts: reasoningEfforts,
-        defaultReasoningEffort: normalizeCodexReasoningEffort(process.env.CLAUDE_CODEX_DEFAULT_EFFORT) ?? 'medium',
+        defaultReasoningEffort: this.configReasoningEffort,
         inputModalities: ['text', 'image'],
         supportsPersonality: false,
         additionalSpeedTiers: [],
-        serviceTiers: [],
-        isDefault: option.isDefault === true || option.id === defaultModel,
+        isDefault: hasConfiguredDefault ? option.id === defaultModel : option.isDefault === true,
       })),
       nextCursor: null,
     }
@@ -1991,6 +2042,15 @@ export class CodexClaudeAppServer {
   }
 
   private configWriteResponse(params: Record<string, unknown>): unknown {
+    for (const edit of configEdits(params)) {
+      if (edit.keyPath === 'model' && typeof edit.value === 'string' && edit.value.length > 0) {
+        this.configModel = normalizeSelectableModelId(edit.value, this.configModel)
+      }
+      if (edit.keyPath === 'model_reasoning_effort' && typeof edit.value === 'string') {
+        this.configReasoningEffort = normalizeCodexReasoningEffort(edit.value) ?? this.configReasoningEffort
+      }
+    }
+    this.persistConfig()
     const filePath = stringOr(params.filePath, `${codexHome()}/config.toml`)
     return {
       status: 'ok',
@@ -2212,8 +2272,14 @@ export class CodexClaudeAppServer {
   }
 
   private notify(peer: RpcPeer, notification: { method: string; params: unknown }): void {
-    debugLog('rpc.notify', { peerId: peer.id, method: notification.method, params: summarizeRpcParams(notification.method, notification.params) })
-    peer.send({ jsonrpc: '2.0', method: notification.method, params: notification.params })
+    const target = this.peerForParams(peer, notification.params)
+    debugLog('rpc.notify', {
+      peerId: target.id,
+      originalPeerId: target.id === peer.id ? null : peer.id,
+      method: notification.method,
+      params: summarizeRpcParams(notification.method, notification.params),
+    })
+    target.send({ jsonrpc: '2.0', method: notification.method, params: notification.params })
   }
 
   private notifyThread(threadId: string, notification: { method: string; params: unknown }): void {
@@ -2228,11 +2294,18 @@ export class CodexClaudeAppServer {
   }
 
   private sendServerRequest(peer: RpcPeer, method: string, id: string, params: unknown): Promise<unknown> {
-    const key = `${peer.id}:${id}`
+    const target = this.peerForParams(peer, params)
+    const key = `${target.id}:${id}`
     return new Promise((resolve, reject) => {
-      debugLog('rpc.serverRequest', { peerId: peer.id, id, method, params: summarizeRpcParams(method, params) })
+      debugLog('rpc.serverRequest', {
+        peerId: target.id,
+        originalPeerId: target.id === peer.id ? null : peer.id,
+        id,
+        method,
+        params: summarizeRpcParams(method, params),
+      })
       this.pendingServerRequests.set(key, { resolve, reject })
-      peer.send({ jsonrpc: '2.0', id, method, params })
+      target.send({ jsonrpc: '2.0', id, method, params })
     })
   }
 
@@ -2246,6 +2319,55 @@ export class CodexClaudeAppServer {
       }
     }
   }
+
+  private completeActiveTurns(status: 'interrupted' | 'failed', error: unknown): void {
+    for (const [threadId, turnId] of this.activeTurnByThread.entries()) {
+      const turn = this.store.getTurn(turnId)
+      if (turn?.status === 'inProgress') {
+        this.store.completeTurn(turnId, status, error)
+      }
+      this.store.updateThreadStatus(threadId, { type: 'idle' })
+    }
+    this.activeTurnByThread.clear()
+  }
+
+  private clearActiveTurn(threadId: string): void {
+    const existed = this.activeTurnByThread.delete(threadId)
+    if (existed && this.activeTurnByThread.size === 0) this.idleCheckHandler?.()
+  }
+
+  private peerForParams(peer: RpcPeer, params: unknown): RpcPeer {
+    const threadId = stringOr(asRecord(params).threadId, '')
+    if (!threadId) return peer
+    return this.activePeerByThread.get(threadId) ?? peer
+  }
+
+  private loadPersistedConfig(): void {
+    try {
+      const parsed = JSON.parse(readFileSync(this.configPath, 'utf8')) as Record<string, unknown>
+      let shouldRepair = false
+      if (typeof parsed.model === 'string' && parsed.model.length > 0) {
+        const normalized = normalizeSelectableModelId(parsed.model, this.configModel)
+        shouldRepair = normalized !== parsed.model
+        this.configModel = normalized
+      }
+      if (typeof parsed.model_reasoning_effort === 'string') {
+        this.configReasoningEffort = normalizeCodexReasoningEffort(parsed.model_reasoning_effort) ?? this.configReasoningEffort
+      }
+      if (shouldRepair) this.persistConfig()
+    } catch {}
+  }
+
+  private persistConfig(): void {
+    try {
+      ensureParent(this.configPath)
+      writeFileSync(
+        this.configPath,
+        JSON.stringify({ model: this.configModel, model_reasoning_effort: this.configReasoningEffort }, null, 2) + '\n',
+        { mode: 0o600 },
+      )
+    } catch {}
+  }
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -2254,6 +2376,59 @@ function asRecord(value: unknown): Record<string, unknown> {
 
 function stringOr(value: unknown, fallback: string): string {
   return typeof value === 'string' && value.length > 0 ? value : fallback
+}
+
+function configEdits(params: Record<string, unknown>): Array<{ keyPath: string; value: unknown }> {
+  if (Array.isArray(params.edits)) {
+    return params.edits.map((edit) => {
+      const rec = asRecord(edit)
+      return { keyPath: String(rec.keyPath ?? rec.key ?? ''), value: rec.value }
+    }).filter((edit) => edit.keyPath.length > 0)
+  }
+  const keyPath = String(params.keyPath ?? params.key ?? '')
+  return keyPath ? [{ keyPath, value: params.value }] : []
+}
+
+function configLayerMetadata(): unknown {
+  return {
+    name: { type: 'user', file: `${codexHome()}/config.toml` },
+    version: `claude-codex-${nowSeconds()}`,
+  }
+}
+
+function defaultSelectableModelId(): string {
+  const options = claudeModelOptions()
+  const defaultModel = process.env.CLAUDE_CODEX_DEFAULT_MODEL
+  if (defaultModel && options.some((option) => option.id === defaultModel)) return defaultModel
+  return options.find((option) => option.isDefault === true)?.id ?? options[0]?.id ?? 'sonnet'
+}
+
+function normalizeSelectableModelId(value: string, fallback: string): string {
+  const options = claudeModelOptions()
+  const ids = new Set(options.map((option) => option.id))
+  if (ids.has(value)) return value
+  if (ids.has(fallback)) return fallback
+  const defaultModel = defaultSelectableModelId()
+  debugLog('config.model.repaired', { requestedModel: value, repairedModel: defaultModel })
+  return defaultModel
+}
+
+function modelFromParams(params: Record<string, unknown>, fallback: string | null): string {
+  const config = asRecord(params.config)
+  if (typeof params.model === 'string' && params.model.length > 0) return params.model
+  if (typeof config.model === 'string' && config.model.length > 0) return config.model
+  return fallback ?? ''
+}
+
+function reasoningEffortFromParams(params: Record<string, unknown>, fallback: string | null): 'low' | 'medium' | 'high' | 'xhigh' | null {
+  const config = asRecord(params.config)
+  const effort =
+    typeof params.effort === 'string'
+      ? params.effort
+      : typeof config.model_reasoning_effort === 'string'
+        ? config.model_reasoning_effort
+        : fallback
+  return normalizeCodexReasoningEffort(effort)
 }
 
 function numberOr(value: unknown, fallback: number): number {
@@ -2274,6 +2449,7 @@ function summarizeRpcParams(method: string, params: unknown): unknown {
       cwd: rec.cwd,
       model: rec.model,
       effort: rec.effort,
+      configEffort: asRecord(rec.config).model_reasoning_effort,
       hasOutputSchema: rec.outputSchema != null,
       inputTypes: Array.isArray(rec.input) ? rec.input.map((item) => asRecord(item).type) : [],
     }

@@ -75,6 +75,12 @@ async function main(): Promise<void> {
   }
 
   const store = new SessionStore()
+  if (isUnixDaemon) {
+    const recovered = store.recoverStaleInProgressTurns()
+    if (recovered > 0) {
+      process.stderr.write(`[claude-codex-adapter] recovered ${recovered} stale in-progress turn(s)\n`)
+    }
+  }
   const runtime = createRuntime()
   const server = new CodexClaudeAppServer(store, runtime)
   let shuttingDown = false
@@ -115,7 +121,7 @@ async function main(): Promise<void> {
     }
   }
   const armIdleExit = () => {
-    if (!idleExitEnabled || activePeers > 0 || !everConnected || idleTimer) return
+    if (!idleExitEnabled || activePeers > 0 || !everConnected || idleTimer || server.hasActiveTurns()) return
     idleTimer = setTimeout(() => {
       debugLog('adapter.idleExit', { idleExitMs, pid: process.pid })
       process.stderr.write(`[claude-codex-adapter] no active peers for ${idleExitMs}ms, shutting down\n`)
@@ -123,6 +129,7 @@ async function main(): Promise<void> {
     }, idleExitMs)
     idleTimer.unref()
   }
+  server.setIdleCheckHandler(armIdleExit)
   const onConnect = (_peer: RpcPeer) => {
     everConnected = true
     activePeers += 1

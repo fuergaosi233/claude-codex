@@ -295,6 +295,33 @@ export class SessionStore {
     return turn
   }
 
+  recoverStaleInProgressTurns(message = 'server restarted before completing turn'): number {
+    const rows = this.db
+      .prepare('SELECT id, thread_id, started_at FROM turns WHERE status = ?')
+      .all('inProgress') as Array<{ id: string; thread_id: string; started_at: number | null }>
+    if (rows.length === 0) return 0
+
+    const completedAt = nowSeconds()
+    const errorJson = JSON.stringify({ message })
+    const updateTurn = this.db.prepare(`
+      UPDATE turns
+      SET status = ?, completed_at = ?, duration_ms = ?, error_json = ?
+      WHERE id = ?
+    `)
+    const updateThread = this.db.prepare('UPDATE threads SET status_json = ?, updated_at = ? WHERE id = ?')
+    const seenThreads = new Set<string>()
+    for (const row of rows) {
+      const startedAt = row.started_at == null ? null : Number(row.started_at)
+      const durationMs = startedAt == null ? null : Math.max(0, (completedAt - startedAt) * 1000)
+      updateTurn.run('interrupted', completedAt, durationMs, errorJson, row.id)
+      seenThreads.add(String(row.thread_id))
+    }
+    for (const threadId of seenThreads) {
+      updateThread.run(JSON.stringify({ type: 'idle' }), completedAt, threadId)
+    }
+    return rows.length
+  }
+
   updateTurnDiff(turnId: string, diff: string): TurnRecord | null {
     const turn = this.getTurn(turnId)
     if (!turn) return null

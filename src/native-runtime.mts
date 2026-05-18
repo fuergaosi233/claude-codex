@@ -209,8 +209,9 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }
     if (context.model) opts.model = context.model
     if (context.effort) opts.effort = context.effort
-    if (context.claudeSessionId) opts.resume = context.claudeSessionId
-    if (context.forkSession) opts.forkSession = true
+    const resume = sdkResumeSessionId(context.claudeSessionId)
+    if (resume) opts.resume = resume
+    if (resume && context.forkSession) opts.forkSession = true
     if (context.addDirs && context.addDirs.length > 0) opts.additionalDirectories = context.addDirs
     if (context.allowedTools && context.allowedTools.length > 0) opts.allowedTools = context.allowedTools
     if (context.mcpServers && typeof context.mcpServers === 'object') opts.mcpServers = context.mcpServers
@@ -539,8 +540,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
 }
 
 // Codex's (approvalPolicy, sandbox, planMode) tri-state → Claude SDK
-// permissionMode. Same logic as Python's derive_permission_mode (see
-// python/claude_sidecar.py L176-197).
+// permissionMode. This preserves the adapter's old sidecar mapping while using
+// the native TS SDK runtime.
 function derivePermissionMode(
   approvalPolicy: string | null,
   sandboxMode: string | null,
@@ -572,6 +573,12 @@ function numberOrNull(value: unknown): number | null {
 
 function stringOrNull(value: unknown): string | null {
   return typeof value === 'string' && value.length > 0 ? value : null
+}
+
+export function sdkResumeSessionId(value: string | null): string | null {
+  if (!value) return null
+  if (/^(agent-http|agentapi|claude-p):/.test(value)) return null
+  return value
 }
 
 void STREAMED_TEXT
