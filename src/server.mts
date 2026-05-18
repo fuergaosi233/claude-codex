@@ -29,6 +29,8 @@ import {
   defaultAllowedTools,
   debugLog,
   claudeModelOptions,
+  codexProxyModelOptions,
+  isCodexOpenAiModel,
   adapterHome,
   codexHome,
   codexUserAgent,
@@ -446,6 +448,11 @@ export class CodexClaudeAppServer {
       baseInstructions: nullIfEmpty(typeof params.baseInstructions === 'string' ? params.baseInstructions : null),
       developerInstructions: nullIfEmpty(typeof params.developerInstructions === 'string' ? params.developerInstructions : null),
       personality: normalizePersonality(params.personality),
+      // Pick the runtime backend from the chosen model — picking gpt-* in
+      // the App's model dropdown flips the new thread to runtimeBackend
+      // 'codex' so turns get forwarded to `codex exec`. Default 'claude'.
+      runtimeBackend: isCodexOpenAiModel(model) ? 'codex' : 'claude',
+      codexSessionId: null,
     }
     this.store.upsertThread(thread)
     this.activePeerByThread.set(id, peer)
@@ -460,7 +467,21 @@ export class CodexClaudeAppServer {
     if (typeof params.cwd === 'string' && params.cwd.length > 0) thread.cwd = params.cwd
     const model = modelFromParams(params, null)
     const reasoningEffort = reasoningEffortFromParams(params, null)
-    if (model) thread.model = model
+    if (model) {
+      // runtimeBackend is pinned at thread/start. Refuse cross-backend
+      // model changes on resume — the conversation history wouldn't carry
+      // over between Claude SDK and `codex exec`. App's model picker can
+      // still rebind same-backend models (e.g. sonnet → opus).
+      const newBackend = isCodexOpenAiModel(model) ? 'codex' : 'claude'
+      if (newBackend === thread.runtimeBackend) {
+        thread.model = model
+      } else {
+        debugLog('thread.resume.modelBackendMismatch', {
+          threadId, oldModel: thread.model, newModel: model,
+          oldBackend: thread.runtimeBackend, newBackend,
+        })
+      }
+    }
     if (reasoningEffort) thread.reasoningEffort = reasoningEffort
     if (typeof params.approvalPolicy === 'string') thread.approvalPolicy = normalizeApprovalPolicy(params.approvalPolicy)
     if (typeof params.sandbox === 'string') thread.sandboxMode = normalizeSandboxMode(params.sandbox)
@@ -509,6 +530,10 @@ export class CodexClaudeAppServer {
       baseInstructions: nullIfEmpty(typeof params.baseInstructions === 'string' ? params.baseInstructions : parent.baseInstructions),
       developerInstructions: nullIfEmpty(typeof params.developerInstructions === 'string' ? params.developerInstructions : parent.developerInstructions),
       personality: typeof params.personality === 'string' ? normalizePersonality(params.personality) : parent.personality,
+      // Fork: model may flip backend (forking from claude-thread with a
+      // gpt-* model = new codex-backed thread); otherwise inherit parent.
+      runtimeBackend: isCodexOpenAiModel(modelFromParams(params, parent.model)) ? 'codex' : 'claude',
+      codexSessionId: null,
     }
     this.store.upsertThread(thread)
     this.activePeerByThread.set(id, peer)
@@ -1037,6 +1062,14 @@ export class CodexClaudeAppServer {
       resolvedModel,
       resolvedEffort,
     })
+    // For codex-backed threads, force the per-turn runtimeType to 'codex-proxy'
+    // so the SelectableRuntime dispatches to CodexProxyRuntime instead of
+    // the default Claude SDK runtime. Also route the codex session id (stored
+    // separately from Claude's) through the existing claudeSessionId slot —
+    // CodexProxyRuntime consumes it as the resume id. In mock mode the
+    // mock runtime handles everything regardless of model id — bypass the
+    // codex-proxy override so unit tests stay deterministic.
+    const isCodexThread = thread.runtimeBackend === 'codex' && process.env.CLAUDE_CODEX_MOCK !== '1'
     await this.runtime.runTurn(
       {
         threadId: thread.id,
@@ -1044,10 +1077,10 @@ export class CodexClaudeAppServer {
         purpose: turnPurpose,
         prompt,
         cwd: stringOr(params.cwd, thread.cwd),
-        runtimeType: null,
+        runtimeType: isCodexThread ? 'codex-proxy' : null,
         model: resolvedModel,
         effort: resolvedEffort,
-        claudeSessionId: thread.claudeSessionId,
+        claudeSessionId: isCodexThread ? thread.codexSessionId : thread.claudeSessionId,
         forkSession,
         mcpServers: readMcpConfig().sdkValue,
         allowedTools: defaultAllowedTools(),
@@ -1117,6 +1150,11 @@ export class CodexClaudeAppServer {
               baseInstructions: thread.baseInstructions,
               developerInstructions: thread.developerInstructions,
               personality: thread.personality,
+              // Subagents always run via Claude — the Task tool is a Claude SDK
+              // construct. A codex-backed thread that spawns a subagent would
+              // never reach this code path (subagent detection is Claude-side).
+              runtimeBackend: 'claude',
+              codexSessionId: null,
             }
             this.store.upsertThread(childThread)
 
@@ -1425,7 +1463,16 @@ export class CodexClaudeAppServer {
             return
           }
           if (event.type === 'completed') {
-            if (event.claudeSessionId) this.store.updateClaudeSessionId(thread.id, event.claudeSessionId)
+            if (event.claudeSessionId) {
+              // Codex-backed threads route the SAME claudeSessionId slot into
+              // codex_session_id (used as `codex exec resume <id>` on the
+              // next turn). Claude threads keep the original wiring.
+              if (isCodexThread) {
+                this.store.updateCodexSessionId(thread.id, event.claudeSessionId)
+              } else {
+                this.store.updateClaudeSessionId(thread.id, event.claudeSessionId)
+              }
+            }
             if (!event.success) throw new Error(event.result ?? 'Claude turn failed')
           }
           if (event.type === 'error') {
@@ -1644,13 +1691,21 @@ export class CodexClaudeAppServer {
 
   private modelList(): unknown {
     const defaultModel = this.configModel
-    const options = claudeModelOptions()
+    const claudeOptions = claudeModelOptions()
+    // When a real Codex CLI binary is available on the host (CODEX_REAL env
+    // or auto-discovered), expose its native models alongside Claude's so
+    // the Codex App's per-thread model picker can route between backends
+    // without any reconnect or shell flip. Picking gpt-* flips the thread
+    // to runtimeBackend='codex' which the runtime router dispatches to
+    // CodexProxyRuntime (shells out to `codex exec --json`).
+    const codexOptions = codexProxyModelOptions()
+    const options = [...claudeOptions, ...codexOptions]
     const hasConfiguredDefault = options.some((option) => option.id === defaultModel)
     const reasoningEfforts = [
-      { reasoningEffort: 'low', description: 'Fast Claude Code runtime response' },
-      { reasoningEffort: 'medium', description: 'Balanced Claude Code runtime response' },
-      { reasoningEffort: 'high', description: 'Deeper Claude Code runtime response' },
-      { reasoningEffort: 'xhigh', description: 'Maximum Codex UI reasoning level for Claude Code' },
+      { reasoningEffort: 'low', description: 'Fast runtime response' },
+      { reasoningEffort: 'medium', description: 'Balanced runtime response' },
+      { reasoningEffort: 'high', description: 'Deeper runtime response' },
+      { reasoningEffort: 'xhigh', description: 'Maximum reasoning' },
     ]
     return {
       data: options.map((option) => ({

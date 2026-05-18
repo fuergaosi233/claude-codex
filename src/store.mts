@@ -66,6 +66,13 @@ export class SessionStore {
     this.ensureColumn('threads', 'base_instructions', 'TEXT')
     this.ensureColumn('threads', 'developer_instructions', 'TEXT')
     this.ensureColumn('threads', 'personality', 'TEXT')
+    // Which runtime drives this thread — 'claude' (default) or 'codex'.
+    // Default 'claude' keeps existing threads on the SDK runtime, new
+    // codex-model threads flip to 'codex' at thread/start.
+    this.ensureColumn('threads', 'runtime_backend', "TEXT NOT NULL DEFAULT 'claude'")
+    // Real Codex session id for runtime_backend='codex' threads (returned
+    // by `codex exec` as thread.started.thread_id). NULL until first turn.
+    this.ensureColumn('threads', 'codex_session_id', 'TEXT')
     this.sanitizeLegacyEnumColumns()
   }
 
@@ -106,8 +113,8 @@ export class SessionStore {
           id, session_id, forked_from_id, preview, name, archived, cwd, model, reasoning_effort,
           model_provider, claude_session_id, source, created_at, updated_at, status_json,
           approval_policy, sandbox_mode, ephemeral, thread_source, agent_role, agent_nickname,
-          base_instructions, developer_instructions, personality
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          base_instructions, developer_instructions, personality, runtime_backend, codex_session_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           session_id=excluded.session_id,
           forked_from_id=excluded.forked_from_id,
@@ -130,7 +137,9 @@ export class SessionStore {
           agent_nickname=excluded.agent_nickname,
           base_instructions=excluded.base_instructions,
           developer_instructions=excluded.developer_instructions,
-          personality=excluded.personality
+          personality=excluded.personality,
+          runtime_backend=excluded.runtime_backend,
+          codex_session_id=excluded.codex_session_id
       `)
       .run(
         thread.id,
@@ -157,6 +166,8 @@ export class SessionStore {
         thread.baseInstructions,
         thread.developerInstructions,
         thread.personality,
+        thread.runtimeBackend,
+        thread.codexSessionId,
       )
   }
 
@@ -209,6 +220,15 @@ export class SessionStore {
     this.db
       .prepare('UPDATE threads SET claude_session_id = ?, updated_at = ? WHERE id = ?')
       .run(claudeSessionId, nowSeconds(), threadId)
+  }
+
+  // Stored separately from Claude's session id so a thread that was
+  // codex-backed can be later inspected without confusing its provenance,
+  // and so a codex thread's resume id never collides with a claude session id.
+  updateCodexSessionId(threadId: string, codexSessionId: string | null): void {
+    this.db
+      .prepare('UPDATE threads SET codex_session_id = ?, updated_at = ? WHERE id = ?')
+      .run(codexSessionId, nowSeconds(), threadId)
   }
 
   setArchived(threadId: string, archived: boolean): void {
@@ -360,6 +380,8 @@ export class SessionStore {
       baseInstructions: row.base_instructions == null ? null : String(row.base_instructions),
       developerInstructions: row.developer_instructions == null ? null : String(row.developer_instructions),
       personality: row.personality == null ? null : String(row.personality),
+      runtimeBackend: row.runtime_backend === 'codex' ? 'codex' : 'claude',
+      codexSessionId: row.codex_session_id == null ? null : String(row.codex_session_id),
     }
   }
 

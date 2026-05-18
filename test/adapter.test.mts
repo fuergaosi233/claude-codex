@@ -162,6 +162,38 @@ test('stdio initialize -> thread/start -> turn/start streams mock response', asy
   }
 })
 
+test('thread/start with a gpt-* model marks the thread runtimeBackend=codex', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    // Claude model → claude backend.
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), model: 'sonnet' } }))
+    const claudeStart = await reader.nextResponse(1)
+    assert.equal(claudeStart.result.model, 'sonnet')
+
+    // Codex/OpenAI model → codex backend. The detection lives in
+    // thread/start (isCodexOpenAiModel) so the choice round-trips through
+    // thread/resume and survives a daemon restart.
+    proc.stdin.write(json({ id: 2, method: 'thread/start', params: { cwd: process.cwd(), model: 'gpt-5.4-mini' } }))
+    const codexStart = await reader.nextResponse(2)
+    assert.equal(codexStart.result.model, 'gpt-5.4-mini')
+
+    // Cross-backend model change on resume must be refused — the conversation
+    // history wouldn't transfer between Claude SDK and codex exec.
+    const codexId = codexStart.result.thread.id
+    proc.stdin.write(json({ id: 3, method: 'thread/resume', params: { threadId: codexId, model: 'opus' } }))
+    const resumed = await reader.nextResponse(3)
+    assert.equal(resumed.result.model, 'gpt-5.4-mini', 'resume must reject cross-backend model flip')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('model/list exposes Claude model aliases and Codex-safe reasoning efforts', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
@@ -1614,6 +1646,7 @@ test('legacy DB rows with invalid thread_source / source are sanitized on startu
       status: { type: 'idle' }, approvalPolicy: null, sandboxMode: null,
       ephemeral: false, threadSource: 'user', agentRole: null, agentNickname: null,
       baseInstructions: null, developerInstructions: null, personality: null,
+      runtimeBackend: 'claude', codexSessionId: null,
     } as any)
     // Now directly corrupt the columns the way the old adapter did.
     const raw = new DatabaseSync(dbPath)
@@ -2024,6 +2057,8 @@ test('turn interrupt completes requested in-progress turn after reconnect', asyn
         baseInstructions: null,
         developerInstructions: null,
         personality: null,
+        runtimeBackend: 'claude',
+        codexSessionId: null,
       })
       store.upsertTurn({
         id: turnId,

@@ -4,6 +4,9 @@ export type RuntimeBackendType =
   | 'agent-http'
   | 'agentapi'
   | 'claude-p'
+  // codex-proxy = `codex exec --json` per turn. Selected per-thread when the
+  // user picks a gpt-* model in the App's model dropdown.
+  | 'codex-proxy'
 
 export interface RuntimeConfig {
   type: RuntimeBackendType
@@ -88,6 +91,12 @@ export function normalizeRuntimeType(value: string | undefined): RuntimeBackendT
     case 'claudep':
     case 'pty-transcript':
       return 'claude-p'
+    case 'codex-proxy':
+    case 'codex-exec':
+      // Per-thread codex-proxy passthrough. Distinct from the shim-level
+      // 'codex' mode (which bypasses our adapter entirely) — codex-proxy
+      // keeps the adapter daemon in the loop and forwards just the turn.
+      return 'codex-proxy'
     default:
       throw new Error(`unknown CLAUDE_CODEX_RUNTIME_TYPE: ${value}`)
   }

@@ -344,8 +344,59 @@ function isNativeClaudeModel(model: string): boolean {
   )
 }
 
-function isCodexOpenAiModel(model: string): boolean {
+export function isCodexOpenAiModel(model: string): boolean {
   return /^gpt[-_]/.test(model) || /^o[0-9]/.test(model) || model.startsWith('codex-')
+}
+
+// Models exposed in model/list when a real Codex CLI is available — picking
+// any of these in the Codex App flips the new thread to runtimeBackend='codex'
+// so turns get forwarded to the OpenAI Codex CLI instead of the Claude SDK.
+// We only expose them when `resolveCodexBinary()` returns a real path; that
+// way Mac/Linux installs without `codex` see only Claude models and the
+// picker stays clean.
+export function codexProxyModelOptions(): Array<{ id: string; sdkModel: string | null; displayName: string; description: string; isDefault?: boolean }> {
+  // Suppressed in mock / opt-out flows. Mock runtime tests assume a clean
+  // Claude-only model list; environments without a real Codex shouldn't see
+  // unusable picker entries.
+  if (process.env.CLAUDE_CODEX_MOCK === '1') return []
+  if (process.env.CLAUDE_CODEX_DISABLE_CODEX_PROXY === '1') return []
+  if (!resolveCodexBinary()) return []
+  const env = process.env.CLAUDE_CODEX_CODEX_MODELS
+  const ids = env && env.trim()
+    ? env.split(',').map((s) => s.trim()).filter(Boolean)
+    : ['gpt-5.4', 'gpt-5.4-mini', 'gpt-5-codex']
+  return ids.map((id) => ({
+    id,
+    sdkModel: id,
+    displayName: `Codex · ${id}`,
+    description: 'Real OpenAI Codex CLI (forwarded via `codex exec --json`).',
+    isDefault: false,
+  }))
+}
+
+// Resolve the real codex CLI binary — explicit CODEX_REAL wins; otherwise
+// walk PATH for an entry that isn't this very script (to avoid recursion if
+// our shim is also called `codex`). Returns null when nothing usable found.
+export function resolveCodexBinary(): string | null {
+  const explicit = process.env.CODEX_REAL
+  if (explicit && explicit.trim()) return explicit.trim()
+  // PATH walk is mostly for dev — production deployments should set
+  // CODEX_REAL explicitly in the shim env (~/.zshenv).
+  const paths = (process.env.PATH ?? '').split(':').filter(Boolean)
+  const fsSync = require('node:fs') as typeof import('node:fs')
+  for (const dir of paths) {
+    const candidate = `${dir}/codex`
+    try {
+      const st = fsSync.statSync(candidate)
+      if (!st.isFile()) continue
+      // Skip our shim — a hashbang + 'CLAUDE_CODEX' header is a strong
+      // signal it's our codex-shim and would recurse.
+      const head = fsSync.readFileSync(candidate, { encoding: 'utf8' }).slice(0, 200)
+      if (head.includes('CLAUDE_CODEX_ADAPTER') || head.includes('claude-codex')) continue
+      return candidate
+    } catch {}
+  }
+  return null
 }
 
 export function sleep(ms: number): Promise<void> {

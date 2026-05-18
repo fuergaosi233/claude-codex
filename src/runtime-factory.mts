@@ -3,6 +3,7 @@ import { MockRuntime } from './mock-runtime.mjs'
 import { NativeClaudeRuntime } from './native-runtime.mjs'
 import { HttpAgentRuntime } from './http-agent-runtime.mjs'
 import { ClaudePTranscriptRuntime } from './claude-p-runtime.mjs'
+import { CodexProxyRuntime } from './codex-proxy-runtime.mjs'
 import { resolveRuntimeConfig, type RuntimeBackendType, type RuntimeConfig } from './runtime-config.mjs'
 import { debugLog } from './util.mjs'
 
@@ -140,6 +141,8 @@ function instantiateRuntime(config: RuntimeConfig, type: RuntimeBackendType): Cl
       return new HttpAgentRuntime({ kind: type, ...config.http })
     case 'claude-p':
       return new ClaudePTranscriptRuntime(config.claudeP)
+    case 'codex-proxy':
+      return new CodexProxyRuntime()
     case 'agent-sdk-sidecar':
     default:
       return new NativeClaudeRuntime()

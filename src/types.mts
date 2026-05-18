@@ -55,7 +55,20 @@ export interface ThreadRecord {
   model: string
   reasoningEffort: string | null
   modelProvider: string
+  // Which backend actually drives this thread's turns. 'claude' = our native
+  // @anthropic-ai/claude-agent-sdk runtime. 'codex' = a child `codex exec`
+  // process running the real OpenAI Codex CLI. Picked at thread/start based
+  // on the model the user chose in the App's model picker (gpt-* → codex,
+  // sonnet/opus/haiku → claude), persisted on the thread so every later
+  // turn / resume / fork / steer routes to the right backend without needing
+  // the model id again.
+  runtimeBackend: 'claude' | 'codex'
   claudeSessionId: string | null
+  // Real Codex's persisted session id (returned by `codex exec` as
+  // thread.started.thread_id). Reused on subsequent turns via
+  // `codex exec resume <id>` so the conversation history survives. Only
+  // populated for runtimeBackend='codex' threads.
+  codexSessionId: string | null
   source: string
   createdAt: number
   updatedAt: number
