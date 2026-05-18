@@ -13,16 +13,16 @@ const TURN_TIMEOUT_MS = Number(process.env.TURN_TIMEOUT_MS || 180_000)
 const RESTORE_ENV = process.env.MODE_MATRIX_RESTORE_ENV !== '0'
 
 async function runOverSsh(args) {
-  const host = args[0] || process.env.CLAUDE_CODEX_MATRIX_SSH_HOST || 'tencent-sg-chaos'
+  const host = args[0] || process.env.CLAUDE_CODEX_MATRIX_SSH_HOST
+  if (!host) throw new Error('usage: acceptance-ssh-runtime-matrix.mjs <ssh-host> <cwd-a> <cwd-b>')
   const cwds = args.slice(1)
+  if (cwds.length < 2) throw new Error('usage: acceptance-ssh-runtime-matrix.mjs <ssh-host> <cwd-a> <cwd-b>')
   const self = fileURLToPath(import.meta.url)
   const remoteScript = `/tmp/claude-codex-runtime-matrix-${Date.now()}-${process.pid}.mjs`
 
   runChecked('scp', ['-q', self, `${host}:${remoteScript}`])
   try {
-    const cwdArgs = cwds.length >= 2
-      ? cwds.map(shQuote).join(' ')
-      : '"$HOME/workspace/inksprig" "$HOME/workspace/happyclaw"'
+    const cwdArgs = cwds.slice(0, 2).map(shQuote).join(' ')
     const env = [
       `MODE_MATRIX_MODEL=${shQuote(MODEL)}`,
       `TURN_TIMEOUT_MS=${shQuote(String(TURN_TIMEOUT_MS))}`,
