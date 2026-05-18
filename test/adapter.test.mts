@@ -187,6 +187,11 @@ test('model/list exposes Claude model aliases and Codex-safe reasoning efforts',
     assert.equal(config.result.config.model_providers['claude-code'].name, 'Claude Code')
     assert.equal(config.result.config.model_providers['claude-code'].requires_openai_auth, false)
 
+    proc.stdin.write(json({ id: 7, method: 'account/read', params: {} }))
+    const account = await reader.nextResponse(7)
+    assert.deepEqual(account.result.account, { type: 'amazonBedrock' })
+    assert.equal(account.result.requiresOpenaiAuth, false)
+
     proc.stdin.write(json({ id: 2, method: 'model/list', params: {} }))
     const models = await reader.nextResponse(2)
     const ids = models.result.data.map((model: any) => model.id)

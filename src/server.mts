@@ -302,7 +302,10 @@ export class CodexClaudeAppServer {
       case 'feedback/upload':
         return { threadId: stringOr(asRecord(params).threadId, '') }
       case 'account/read':
-        return { account: null, requiresOpenaiAuth: false }
+        // The App applies its OpenAI hidden-model allowlist unless auth is
+        // Bedrock-shaped. Claude Code is externally authenticated, so use that
+        // local auth shape to keep Claude aliases visible in the model picker.
+        return { account: { type: 'amazonBedrock' }, requiresOpenaiAuth: false }
       case 'account/rateLimits/read':
         return this.accountRateLimits()
       case 'fs/readFile':
