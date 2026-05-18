@@ -8,6 +8,7 @@ import test from 'node:test'
 import { ClaudePTranscriptRuntime } from '../src/claude-p-runtime.mjs'
 import { HttpAgentRuntime, hasAgentapiTrustPrompt, sanitizeAgentapiTerminalContent } from '../src/http-agent-runtime.mjs'
 import { resolveRuntimeConfig } from '../src/runtime-config.mjs'
+import { ClaudeSdkSidecarRuntime } from '../src/sidecar-runtime.mjs'
 
 test('runtime config keeps legacy defaults and accepts explicit backends', () => {
   assert.equal(resolveRuntimeConfig({}).type, 'agent-sdk-sidecar')
@@ -20,6 +21,185 @@ test('runtime config keeps legacy defaults and accepts explicit backends', () =>
   assert.equal(resolveRuntimeConfig({ CLAUDE_CODEX_MODE_COMMAND: '/tmp/mode' }).http.modeCommand, '/tmp/mode')
   assert.equal(resolveRuntimeConfig({}).claudeP.stopTimeoutRetries, 1)
   assert.equal(resolveRuntimeConfig({ CLAUDE_CODEX_CLAUDE_P_STOP_TIMEOUT_RETRIES: '0' }).claudeP.stopTimeoutRetries, 0)
+})
+
+test('sidecar runtime rejects the turn when an event handler throws', async () => {
+  const tmp = await mkdtemp(join(tmpdir(), 'claude-codex-sidecar-error-'))
+  const fakePython = join(tmp, 'fake-python')
+  const fakeSidecar = join(tmp, 'fake-sidecar.mjs')
+  await writeFile(
+    fakePython,
+    [
+      '#!/usr/bin/env bash',
+      'if [ "$1" = "-c" ]; then exit 0; fi',
+      'exec "$@"',
+      '',
+    ].join('\n'),
+  )
+  await chmod(fakePython, 0o755)
+  await writeFile(
+    fakeSidecar,
+    [
+      '#!/usr/bin/env node',
+      "process.stdin.setEncoding('utf8')",
+      "let buffer = ''",
+      "process.stdin.on('data', (chunk) => {",
+      '  buffer += chunk',
+      '  let idx',
+      "  while ((idx = buffer.indexOf('\\n')) >= 0) {",
+      '    const line = buffer.slice(0, idx).trim()',
+      '    buffer = buffer.slice(idx + 1)',
+      '    if (!line) continue',
+      '    const message = JSON.parse(line)',
+      "    if (message.type === 'query') {",
+      "      console.log(JSON.stringify({ type: 'error', turn_id: message.turn_id, message: 'sidecar boom' }))",
+      '    }',
+      '  }',
+      '})',
+      'setInterval(() => {}, 1000)',
+      '',
+    ].join('\n'),
+  )
+  await chmod(fakeSidecar, 0o755)
+
+  const oldPython = process.env.CLAUDE_CODEX_PYTHON
+  const oldSidecar = process.env.CLAUDE_CODEX_SIDECAR
+  process.env.CLAUDE_CODEX_PYTHON = fakePython
+  process.env.CLAUDE_CODEX_SIDECAR = fakeSidecar
+  const runtime = new ClaudeSdkSidecarRuntime()
+  try {
+    await assert.rejects(
+      runtime.runTurn(
+        {
+          threadId: 'thread',
+          turnId: 'turn',
+          prompt: 'hello',
+          cwd: tmp,
+          runtimeType: null,
+          model: null,
+          effort: null,
+          claudeSessionId: null,
+          forkSession: false,
+          mcpServers: null,
+          allowedTools: null,
+          addDirs: [],
+          enableFileCheckpointing: false,
+          outputFormat: null,
+          approvalPolicy: null,
+          sandboxMode: null,
+          systemPromptAddendum: null,
+          planMode: false,
+          imageInputs: [],
+        },
+        {
+          onEvent: async (event) => {
+            if (event.type === 'error') throw new Error(`handler observed ${event.message}`)
+          },
+          onPermissionRequest: async () => ({ decision: 'decline' }),
+        },
+      ),
+      /handler observed sidecar boom/,
+    )
+  } finally {
+    await runtime.stop()
+    if (oldPython == null) delete process.env.CLAUDE_CODEX_PYTHON
+    else process.env.CLAUDE_CODEX_PYTHON = oldPython
+    if (oldSidecar == null) delete process.env.CLAUDE_CODEX_SIDECAR
+    else process.env.CLAUDE_CODEX_SIDECAR = oldSidecar
+    await rm(tmp, { recursive: true, force: true })
+  }
+})
+
+test('sidecar runtime ignores HTTP bridge session markers when resuming SDK turns', async () => {
+  const tmp = await mkdtemp(join(tmpdir(), 'claude-codex-sidecar-resume-'))
+  const fakePython = join(tmp, 'fake-python')
+  const fakeSidecar = join(tmp, 'fake-sidecar.mjs')
+  const capturedQuery = join(tmp, 'query.json')
+  await writeFile(
+    fakePython,
+    [
+      '#!/usr/bin/env bash',
+      'if [ "$1" = "-c" ]; then exit 0; fi',
+      'exec "$@"',
+      '',
+    ].join('\n'),
+  )
+  await chmod(fakePython, 0o755)
+  await writeFile(
+    fakeSidecar,
+    [
+      '#!/usr/bin/env node',
+      'import { writeFileSync } from "node:fs"',
+      "process.stdin.setEncoding('utf8')",
+      "let buffer = ''",
+      "process.stdin.on('data', (chunk) => {",
+      '  buffer += chunk',
+      '  let idx',
+      "  while ((idx = buffer.indexOf('\\n')) >= 0) {",
+      '    const line = buffer.slice(0, idx).trim()',
+      '    buffer = buffer.slice(idx + 1)',
+      '    if (!line) continue',
+      '    const message = JSON.parse(line)',
+      "    if (message.type === 'query') {",
+      `      writeFileSync(${JSON.stringify(capturedQuery)}, JSON.stringify(message))`,
+      "      console.log(JSON.stringify({ type: 'completed', turn_id: message.turn_id, success: true, claude_session_id: 'sdk-session' }))",
+      '    }',
+      '  }',
+      '})',
+      'setInterval(() => {}, 1000)',
+      '',
+    ].join('\n'),
+  )
+  await chmod(fakeSidecar, 0o755)
+
+  const oldPython = process.env.CLAUDE_CODEX_PYTHON
+  const oldSidecar = process.env.CLAUDE_CODEX_SIDECAR
+  process.env.CLAUDE_CODEX_PYTHON = fakePython
+  process.env.CLAUDE_CODEX_SIDECAR = fakeSidecar
+  const runtime = new ClaudeSdkSidecarRuntime()
+  const events: unknown[] = []
+  try {
+    await runtime.runTurn(
+      {
+        threadId: 'thread',
+        turnId: 'turn',
+        prompt: 'hello',
+        cwd: tmp,
+        runtimeType: null,
+        model: null,
+        effort: null,
+        claudeSessionId: 'agent-http:http://127.0.0.1:3284',
+        forkSession: true,
+        mcpServers: null,
+        allowedTools: null,
+        addDirs: [],
+        enableFileCheckpointing: false,
+        outputFormat: null,
+        approvalPolicy: null,
+        sandboxMode: null,
+        systemPromptAddendum: null,
+        planMode: false,
+        imageInputs: [],
+      },
+      {
+        onEvent: async (event) => {
+          events.push(event)
+        },
+        onPermissionRequest: async () => ({ decision: 'decline' }),
+      },
+    )
+    const query = JSON.parse(await readFile(capturedQuery, 'utf8'))
+    assert.equal(query.resume, null)
+    assert.equal(query.fork_session, false)
+    assert.deepEqual(events.at(-1), { type: 'completed', success: true, result: null, claudeSessionId: 'sdk-session' })
+  } finally {
+    await runtime.stop()
+    if (oldPython == null) delete process.env.CLAUDE_CODEX_PYTHON
+    else process.env.CLAUDE_CODEX_PYTHON = oldPython
+    if (oldSidecar == null) delete process.env.CLAUDE_CODEX_SIDECAR
+    else process.env.CLAUDE_CODEX_SIDECAR = oldSidecar
+    await rm(tmp, { recursive: true, force: true })
+  }
 })
 
 test('HTTP agent runtime streams agentapi-compatible message updates', async () => {
