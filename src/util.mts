@@ -364,7 +364,7 @@ export function codexProxyModelOptions(): Array<{ id: string; sdkModel: string |
   const env = process.env.CLAUDE_CODEX_CODEX_MODELS
   const ids = env && env.trim()
     ? env.split(',').map((s) => s.trim()).filter(Boolean)
-    : ['gpt-5.4', 'gpt-5.4-mini', 'gpt-5-codex']
+    : ['gpt-5.5', 'gpt-5.5-mini', 'gpt-5.5-codex', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5-codex']
   return ids.map((id) => ({
     id,
     sdkModel: id,

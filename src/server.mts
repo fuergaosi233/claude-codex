@@ -1659,34 +1659,71 @@ export class CodexClaudeAppServer {
         service_tier: null,
         analytics: null,
         apps: null,
-        model_providers: {
-          'claude-code': {
-            name: 'Claude Code',
-            base_url: null,
-            env_key: null,
-            env_key_instructions: null,
-            experimental_bearer_token: null,
-            auth: null,
-            aws: null,
-            wire_api: 'responses',
-            query_params: null,
-            http_headers: null,
-            env_http_headers: null,
-            request_max_retries: null,
-            stream_max_retries: null,
-            stream_idle_timeout_ms: null,
-            websocket_connect_timeout_ms: null,
-            requires_openai_auth: false,
-            supports_websockets: false,
-          },
-        },
+        model_providers: this.exposedModelProviders(),
       },
       origins: {
         model_provider: configLayerMetadata(),
         'model_providers.claude-code': configLayerMetadata(),
+        ...(codexProxyModelOptions().length > 0 ? { 'model_providers.codex': configLayerMetadata() } : {}),
       },
       layers: null,
     }
+  }
+
+  // Build the model_providers map served by config/read. Always exposes
+  // 'claude-code'; conditionally adds 'codex' when a real Codex CLI is
+  // resolvable on the host. Exposing 'codex' as a separate provider entry
+  // gives the App's settings panel a way to surface OpenAI-family models
+  // (gpt-*) without the App treating them as foreign to the Claude
+  // provider's allowlist.
+  private exposedModelProviders(): Record<string, unknown> {
+    const providers: Record<string, unknown> = {
+      'claude-code': {
+        name: 'Claude Code',
+        base_url: null,
+        env_key: null,
+        env_key_instructions: null,
+        experimental_bearer_token: null,
+        auth: null,
+        aws: null,
+        wire_api: 'responses',
+        query_params: null,
+        http_headers: null,
+        env_http_headers: null,
+        request_max_retries: null,
+        stream_max_retries: null,
+        stream_idle_timeout_ms: null,
+        websocket_connect_timeout_ms: null,
+        requires_openai_auth: false,
+        supports_websockets: false,
+      },
+    }
+    if (codexProxyModelOptions().length > 0) {
+      // 'codex' = real OpenAI Codex CLI forwarded via `codex exec --json`.
+      // Auth is delegated to the real codex binary (its own OAuth login),
+      // so we advertise requires_openai_auth: false to keep our own
+      // account/read amazonBedrock shim from gating these.
+      providers.codex = {
+        name: 'Codex (OpenAI · forwarded)',
+        base_url: null,
+        env_key: null,
+        env_key_instructions: null,
+        experimental_bearer_token: null,
+        auth: null,
+        aws: null,
+        wire_api: 'responses',
+        query_params: null,
+        http_headers: null,
+        env_http_headers: null,
+        request_max_retries: null,
+        stream_max_retries: null,
+        stream_idle_timeout_ms: null,
+        websocket_connect_timeout_ms: null,
+        requires_openai_auth: false,
+        supports_websockets: false,
+      }
+    }
+    return providers
   }
 
   private modelList(): unknown {
