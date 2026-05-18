@@ -1,14 +1,12 @@
 export type RuntimeBackendType =
   | 'mock'
   | 'agent-sdk-sidecar'
-  | 'agent-sdk-socket'
   | 'agent-http'
   | 'agentapi'
   | 'claude-p'
 
 export interface RuntimeConfig {
   type: RuntimeBackendType
-  socketPath: string | null
   http: {
     baseUrl: string
     useSse: boolean
@@ -33,12 +31,10 @@ export function resolveRuntimeConfig(env: NodeJS.ProcessEnv = process.env): Runt
   const type =
     env.CLAUDE_CODEX_MOCK === '1'
       ? 'mock'
-      : explicit ??
-        (env.CLAUDE_CODEX_RUNTIME_SOCKET ? 'agent-sdk-socket' : 'agent-sdk-sidecar')
+      : explicit ?? 'agent-sdk-sidecar'
 
   return {
     type,
-    socketPath: env.CLAUDE_CODEX_RUNTIME_SOCKET ?? null,
     http: {
       baseUrl: normalizeBaseUrl(
         env.CLAUDE_CODEX_HTTP_BASE_URL ??
@@ -79,7 +75,7 @@ export function normalizeRuntimeType(value: string | undefined): RuntimeBackendT
     case 'agent-sdk-socket':
     case 'socket':
     case 'runtime-socket':
-      return 'agent-sdk-socket'
+      return 'agent-sdk-sidecar'
     case 'agent-http':
     case 'channels':
     case 'channel':

@@ -142,15 +142,32 @@ export class CodexClaudeAppServer {
 
   private async dispatch(peer: RpcPeer, method: string, params: unknown): Promise<unknown> {
     switch (method) {
-      case 'initialize':
+      case 'initialize': {
         const initParams = asRecord(params)
         const clientInfo = asRecord(initParams.clientInfo)
+        // Push the account snapshot + MCP server statuses right after handshake
+        // so the App's sidebar avatar and MCP panel populate without waiting
+        // for the next polling cycle. Without these the avatar stays "signed
+        // out" and the MCP list never reflects current boot state.
+        queueMicrotask(() => {
+          this.notify(peer, {
+            method: 'account/updated',
+            params: { authMode: 'apikey', planType: null },
+          })
+          for (const status of readMcpConfig().statuses) {
+            this.notify(peer, {
+              method: 'mcpServer/status/updated',
+              params: { name: status.name, status: status.status, error: status.error ?? null },
+            })
+          }
+        })
         return {
           userAgent: codexUserAgent(stringOr(clientInfo.name, 'codex-app'), stringOr(clientInfo.version, 'unknown')),
           codexHome: codexHome(),
           platformFamily: platformFamily(),
           platformOs: platformOs(),
         }
+      }
       case 'thread/start':
         return this.threadStart(peer, asRecord(params))
       case 'thread/resume':
@@ -195,8 +212,21 @@ export class CodexClaudeAppServer {
         return this.threadCompactStart(peer, asRecord(params))
       case 'thread/shellCommand':
         return this.threadShellCommand(peer, asRecord(params))
-      case 'thread/approveGuardianDeniedAction':
+      case 'thread/approveGuardianDeniedAction': {
+        // Codex App's "Guardian" is an OpenAI-side pre-tool safety classifier
+        // that can deny a tool call before it reaches the runtime. Claude
+        // Code has no equivalent — every denial in our pipeline already
+        // routes through the canUseTool round-trip, which the user resolves
+        // directly via the standard approval modal. There is no separate
+        // guardian-denied action to retry. We log the event (for parity
+        // debugging) and ack with the schema-correct {} response.
+        const evt = asRecord(params).event
+        debugLog('thread.approveGuardianDeniedAction', {
+          threadId: stringOr(asRecord(params).threadId, ''),
+          eventType: evt && typeof evt === 'object' ? (evt as Record<string, unknown>).type ?? null : null,
+        })
         return {}
+      }
       case 'thread/backgroundTerminals/clean':
         return this.threadBackgroundTerminalsClean(asRecord(params))
       case 'thread/rollback':
@@ -275,6 +305,20 @@ export class CodexClaudeAppServer {
         return { effectiveEnabled: asRecord(params).enabled === true }
       case 'plugin/share/list':
         return { data: [] }
+      // Stub the three RPC methods Codex App may call but our dispatcher
+      // previously threw "method not implemented" on. Stubs return the
+      // schema-correct empty shape so the App's call sites don't surface an
+      // RPC error toast.
+      case 'plugin/share/checkout':
+        // PluginShareCheckoutResponse — App polls after a share/save; nothing to checkout.
+        return {}
+      case 'environment/add':
+        // EnvironmentAddResponse — adds a workspace environment; we have no concept of one.
+        return {}
+      case 'attestation/generate':
+        // AttestationGenerateResponse — returns a signed blob; clients with
+        // requestAttestation:true expect a string. Empty string is permissive.
+        return { attestation: '' }
       case 'app/list':
         return { data: [], nextCursor: null }
       case 'mcpServer/oauth/login':
@@ -387,18 +431,20 @@ export class CodexClaudeAppServer {
       reasoningEffort,
       modelProvider: 'claude-code',
       claudeSessionId: null,
-      source: 'app_server',
+      // v2 SessionSource is camelCase; the old `app_server` falls through to
+      // `unknown` on the App side, hiding the source in the thread sidebar.
+      source: 'appServer',
       createdAt: now,
       updatedAt: now,
       status: { type: 'idle' },
       approvalPolicy: normalizeApprovalPolicy(params.approvalPolicy),
       sandboxMode: normalizeSandboxMode(params.sandbox),
       ephemeral: params.ephemeral === true,
-      threadSource: typeof params.threadSource === 'string' ? params.threadSource : null,
-      agentRole: typeof params.agentRole === 'string' ? params.agentRole : null,
-      agentNickname: typeof params.agentNickname === 'string' ? params.agentNickname : null,
-      baseInstructions: typeof params.baseInstructions === 'string' ? params.baseInstructions : null,
-      developerInstructions: typeof params.developerInstructions === 'string' ? params.developerInstructions : null,
+      threadSource: normalizeThreadSource(params.threadSource),
+      agentRole: nullIfEmpty(typeof params.agentRole === 'string' ? params.agentRole : null),
+      agentNickname: nullIfEmpty(typeof params.agentNickname === 'string' ? params.agentNickname : null),
+      baseInstructions: nullIfEmpty(typeof params.baseInstructions === 'string' ? params.baseInstructions : null),
+      developerInstructions: nullIfEmpty(typeof params.developerInstructions === 'string' ? params.developerInstructions : null),
       personality: normalizePersonality(params.personality),
     }
     this.store.upsertThread(thread)
@@ -418,9 +464,9 @@ export class CodexClaudeAppServer {
     if (reasoningEffort) thread.reasoningEffort = reasoningEffort
     if (typeof params.approvalPolicy === 'string') thread.approvalPolicy = normalizeApprovalPolicy(params.approvalPolicy)
     if (typeof params.sandbox === 'string') thread.sandboxMode = normalizeSandboxMode(params.sandbox)
-    if (typeof params.threadSource === 'string') thread.threadSource = params.threadSource
-    if (typeof params.baseInstructions === 'string') thread.baseInstructions = params.baseInstructions
-    if (typeof params.developerInstructions === 'string') thread.developerInstructions = params.developerInstructions
+    if (typeof params.threadSource === 'string') thread.threadSource = normalizeThreadSource(params.threadSource)
+    if (typeof params.baseInstructions === 'string') thread.baseInstructions = nullIfEmpty(params.baseInstructions)
+    if (typeof params.developerInstructions === 'string') thread.developerInstructions = nullIfEmpty(params.developerInstructions)
     if (typeof params.personality === 'string') thread.personality = normalizePersonality(params.personality)
     this.store.upsertThread(thread)
     this.activePeerByThread.set(threadId, peer)
@@ -455,11 +501,13 @@ export class CodexClaudeAppServer {
         ? normalizeSandboxMode(params.sandbox)
         : parent.sandboxMode,
       ephemeral: parent.ephemeral,
-      threadSource: typeof params.threadSource === 'string' ? params.threadSource : parent.threadSource,
-      agentRole: typeof params.agentRole === 'string' ? params.agentRole : parent.agentRole,
-      agentNickname: typeof params.agentNickname === 'string' ? params.agentNickname : parent.agentNickname,
-      baseInstructions: typeof params.baseInstructions === 'string' ? params.baseInstructions : parent.baseInstructions,
-      developerInstructions: typeof params.developerInstructions === 'string' ? params.developerInstructions : parent.developerInstructions,
+      threadSource: typeof params.threadSource === 'string'
+        ? normalizeThreadSource(params.threadSource)
+        : normalizeThreadSource(parent.threadSource),
+      agentRole: nullIfEmpty(typeof params.agentRole === 'string' ? params.agentRole : parent.agentRole),
+      agentNickname: nullIfEmpty(typeof params.agentNickname === 'string' ? params.agentNickname : parent.agentNickname),
+      baseInstructions: nullIfEmpty(typeof params.baseInstructions === 'string' ? params.baseInstructions : parent.baseInstructions),
+      developerInstructions: nullIfEmpty(typeof params.developerInstructions === 'string' ? params.developerInstructions : parent.developerInstructions),
       personality: typeof params.personality === 'string' ? normalizePersonality(params.personality) : parent.personality,
     }
     this.store.upsertThread(thread)
@@ -606,6 +654,15 @@ export class CodexClaudeAppServer {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
     if (!thread) throw new Error(`unknown thread: ${threadId}`)
+    // Honor the protocol's `numTurns: u32, must be >= 1` — drop that many
+    // turns from the end of the thread. Without this, App's rewind UI sends
+    // the request and we silently return the unchanged thread, leaving the
+    // user staring at the timeline they were trying to redo.
+    const numTurns = typeof params.numTurns === 'number' && params.numTurns >= 1 ? Math.floor(params.numTurns) : 0
+    if (numTurns > 0) {
+      const dropped = this.store.deleteRecentTurns(threadId, numTurns)
+      debugLog('thread.rollback', { threadId, requested: numTurns, dropped })
+    }
     return { thread: this.toThread(thread, this.store.listTurns(threadId)) }
   }
 
@@ -820,8 +877,8 @@ export class CodexClaudeAppServer {
     const { textPrompt, images } = extractImageInputs(input)
     const prompt = textPrompt || textFromInput(input)
     if (typeof params.cwd === 'string' && params.cwd.length > 0) thread.cwd = params.cwd
-    const model = modelFromParams(params, this.configModel)
-    const reasoningEffort = reasoningEffortFromParams(params, this.configReasoningEffort)
+    const model = modelFromParams(params, thread.model)
+    const reasoningEffort = reasoningEffortFromParams(params, thread.reasoningEffort)
     if (model) thread.model = model
     if (reasoningEffort) thread.reasoningEffort = reasoningEffort
     this.store.upsertThread(thread)
@@ -832,7 +889,15 @@ export class CodexClaudeAppServer {
     }
     const initialItems: ThreadItem[] = [{ type: 'userMessage', id: newId(), content: input }]
     for (const img of images) {
-      initialItems.push({ type: 'imageView', id: newId(), path: img.displayPath })
+      // Codex v2 imageView.path is AbsolutePathBuf — Rust's custom Deserialize
+      // rejects anything that isn't an absolute filesystem path (URLs, data:
+      // URIs, relative paths). For non-local images we'd otherwise crash the
+      // App on persist/reload. Only emit imageView for kind:'base64' inputs
+      // that came from a real local file path (the displayPath in that case
+      // is the original absolute path captured by extractImageInputs).
+      if (img.kind === 'base64' && img.displayPath.startsWith('/')) {
+        initialItems.push({ type: 'imageView', id: newId(), path: img.displayPath })
+      }
     }
     // Note: we used to short-circuit Codex App's title-generation turn with a
     // local regex-derived title to avoid prompt leakage into the parent thread.
@@ -892,6 +957,10 @@ export class CodexClaudeAppServer {
     // collapsed item that goes silent for the duration of the subagent.
     const subagentContexts = new Map<string, { childThreadId: string; waitItemId: string; prompt: string; subType: string | null }>()
     const activeSubagents = new Set<string>()
+    // Track per-item start time so commandExecution / mcpToolCall items can
+    // report a real durationMs in turn/completed (otherwise the App's status
+    // bar shows "—" for every command).
+    const itemStartedAtMs = new Map<string, number>()
     // Mutable holder rather than `let collectedMetrics`: TS's control-flow
     // analysis doesn't see writes from inside the onEvent callback, so a bare
     // `let` would still be inferred as `null` outside the closure.
@@ -944,9 +1013,30 @@ export class CodexClaudeAppServer {
       developerInstructions,
       personality,
     })
-    const selectedModel = stringOr(params.model, thread.model)
     const turnPurpose = params.outputSchema == null ? 'normal' : 'summary'
 
+    const resolvedModel = resolveClaudeModel(
+      stringOr(params.model, thread.model),
+      params.outputSchema == null ? 'normal' : 'summary',
+    )
+    const resolvedEffort = resolveClaudeEffort(
+      typeof params.effort === 'string' ? params.effort : thread.reasoningEffort ?? process.env.CLAUDE_CODEX_EFFORT ?? null,
+    )
+    // Log the effective Claude SDK model+effort per turn so when a user
+    // reports "switching model didn't work" we can diff App's payload against
+    // what actually reached the SDK in one grep.
+    debugLog('turn.runtime.applied', {
+      threadId: thread.id,
+      turnId: turn.id,
+      paramsModel: params.model ?? null,
+      paramsEffort: params.effort ?? null,
+      threadModel: thread.model,
+      threadEffort: thread.reasoningEffort,
+      envDefaultModel: process.env.CLAUDE_CODEX_DEFAULT_MODEL ?? null,
+      envDefaultEffort: process.env.CLAUDE_CODEX_DEFAULT_EFFORT ?? process.env.CLAUDE_CODEX_EFFORT ?? null,
+      resolvedModel,
+      resolvedEffort,
+    })
     await this.runtime.runTurn(
       {
         threadId: thread.id,
@@ -955,10 +1045,8 @@ export class CodexClaudeAppServer {
         prompt,
         cwd: stringOr(params.cwd, thread.cwd),
         runtimeType: null,
-        model: resolveClaudeModel(selectedModel, turnPurpose),
-        effort: resolveClaudeEffort(
-          typeof params.effort === 'string' ? params.effort : thread.reasoningEffort ?? process.env.CLAUDE_CODEX_EFFORT ?? null,
-        ),
+        model: resolvedModel,
+        effort: resolvedEffort,
         claudeSessionId: thread.claudeSessionId,
         forkSession,
         mcpServers: readMcpConfig().sdkValue,
@@ -980,11 +1068,11 @@ export class CodexClaudeAppServer {
           }
           if (activeSubagents.size > 0) {
             if (event.type === 'text_delta' || event.type === 'reasoning_delta') return
-            if (event.type === 'tool_use' && event.toolName !== 'Task') return
+            if (event.type === 'tool_use' && !isSubagentToolName(event.toolName)) return
             if (event.type === 'tool_output_delta' && !itemIds.has(event.toolUseId)) return
             if (event.type === 'tool_result' && !activeSubagents.has(event.toolUseId) && !itemIds.has(event.toolUseId)) return
           }
-          if (event.type === 'tool_use' && event.toolName === 'Task') {
+          if (event.type === 'tool_use' && isSubagentToolName(event.toolName)) {
             // Spawn the ephemeral subagent thread, then mirror Codex's native
             // 3-stage timeline: `spawnAgent` (begin+end), `wait` (begin only,
             // closes when the Task tool_result lands), and later `closeAgent`.
@@ -1014,7 +1102,7 @@ export class CodexClaudeAppServer {
               reasoningEffort: thread.reasoningEffort,
               modelProvider: thread.modelProvider,
               claudeSessionId: null,
-              source: thread.source,
+              source: normalizeSessionSource(thread.source),
               createdAt: nowSeconds(),
               updatedAt: nowSeconds(),
               status: { type: 'active', activeFlags: [] },
@@ -1035,11 +1123,16 @@ export class CodexClaudeAppServer {
             // Stage 1 — spawnAgent (begin + end emitted together; the agent is
             // already created so there's no real latency here).
             const spawnId = newId()
+            // Codex v2 collabAgentToolCall.reasoningEffort is `ReasoningEffort | null`
+            // (strict enum: none|minimal|low|medium|high|xhigh). Same Oops trap as
+            // threadSource — an empty string from a sloppy resume crashes the App.
+            // Normalize here once and reuse for every stage of the lifecycle.
+            const collabEffort = normalizeReasoningEffortEnum(thread.reasoningEffort)
             const spawnBegin: ThreadItem = {
               type: 'collabAgentToolCall', id: spawnId, tool: 'spawnAgent',
               status: 'inProgress', senderThreadId: thread.id, receiverThreadIds: [],
               prompt: promptText || null, model: subagentModel,
-              reasoningEffort: thread.reasoningEffort, agentsStates: {},
+              reasoningEffort: collabEffort, agentsStates: {},
             }
             this.store.appendItem(turn.id, spawnBegin)
             this.notify(peer, { method: 'item/started', params: { threadId: thread.id, turnId: turn.id, item: spawnBegin, startedAtMs: nowMillis() } })
@@ -1047,7 +1140,7 @@ export class CodexClaudeAppServer {
               type: 'collabAgentToolCall', id: spawnId, tool: 'spawnAgent',
               status: 'completed', senderThreadId: thread.id, receiverThreadIds: [childThreadId],
               prompt: promptText || null, model: subagentModel,
-              reasoningEffort: thread.reasoningEffort,
+              reasoningEffort: collabEffort,
               agentsStates: { [childThreadId]: { status: 'running', message: null } },
             }
             this.store.updateItem(turn.id, spawnId, () => spawnEnd)
@@ -1075,9 +1168,19 @@ export class CodexClaudeAppServer {
             activeSubagents.delete(event.toolUseId)
             subagentContexts.delete(event.toolUseId)
             if (!ctx) return
-            const resultText = toolResultText(event.content)
+            const rawResultText = toolResultText(event.content)
             const collabStatus: 'completed' | 'failed' = event.isError ? 'failed' : 'completed'
             const agentStatus: 'completed' | 'errored' = event.isError ? 'errored' : 'completed'
+
+            // claude-agent-sdk's Task tool appends a metadata trailer to the
+            // result content: an `agentId: <hex>` line + a `<usage>...</usage>`
+            // block. Codex App doesn't render those — they just leak as raw
+            // text. Strip them from the visible body and route the metadata
+            // into the proper protocol fields (agentNickname / tokenUsage /
+            // metrics) so the subagent timeline carries the same identity +
+            // usage the SDK reports.
+            const parsed = parseSubagentTrailer(rawResultText)
+            const resultText = parsed.cleanText
 
             // Materialize a one-turn transcript on the child thread so the
             // Codex App can drill in from the parent collabAgentToolCall.
@@ -1087,20 +1190,49 @@ export class CodexClaudeAppServer {
               status: event.isError ? 'failed' : 'completed',
               startedAt: nowSeconds(),
               completedAt: nowSeconds(),
-              durationMs: 0,
+              durationMs: parsed.usage?.durationMs ?? 0,
               items: [
                 { type: 'userMessage', id: newId(), content: [{ type: 'text', text: ctx.prompt, text_elements: [] }] },
                 { type: 'agentMessage', id: newId(), text: resultText, phase: null, memoryCitation: null },
               ],
               diff: '',
               error: event.isError ? { message: 'subagent failed' } : null,
+              apiDurationMs: parsed.usage?.durationMs ?? null,
+              numTurns: parsed.usage?.toolUses ?? null,
+              costUsd: null,
             }
             this.store.upsertTurn(childTurn)
             const childThread = this.store.getThread(ctx.childThreadId)
             if (childThread) {
               childThread.status = { type: 'idle' }
               childThread.updatedAt = nowSeconds()
+              // Replace our synthetic `agent-{hex}` nickname with the SDK-
+              // assigned id so SendMessage / SubAgent navigation in the App
+              // uses the same handle the SDK reports.
+              if (parsed.agentId) childThread.agentNickname = parsed.agentId
               this.store.upsertThread(childThread)
+            }
+
+            // Push the subagent's token usage as a Codex-native
+            // thread/tokenUsage/updated notification on the CHILD thread
+            // (App's status bar reads from this) and roll the totals into
+            // the parent thread so subagent costs aren't invisible.
+            if (parsed.usage && parsed.usage.totalTokens) {
+              const breakdown: TokenUsageBreakdown = {
+                totalTokens: parsed.usage.totalTokens,
+                inputTokens: 0,
+                cachedInputTokens: 0,
+                outputTokens: parsed.usage.totalTokens,
+                reasoningOutputTokens: 0,
+              }
+              const childUsage: ThreadTokenUsage = { total: breakdown, last: breakdown, modelContextWindow: null }
+              this.notify(peer, { method: 'thread/tokenUsage/updated', params: { threadId: ctx.childThreadId, turnId: childTurn.id, tokenUsage: childUsage } })
+              this.recordTokenUsage(peer, thread.id, turn.id, {
+                input_tokens: 0,
+                output_tokens: parsed.usage.totalTokens,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+              })
             }
 
             // Stage 2 close — wait (end). Re-emits the same waitItemId.
@@ -1166,8 +1298,17 @@ export class CodexClaudeAppServer {
             return
           }
           if (event.type === 'tool_use') {
+            // Defense in depth against duplicate tool_use events for the same
+            // tool_use_id. Claude SDK has been known to emit a block_start
+            // event with an empty input AND a complete copy in the final
+            // AssistantMessage — sidecar suppresses the empty start, but if
+            // anything slips through we'd otherwise create a husk
+            // commandExecution item that never closes (the second emit
+            // overwrites itemIds[] so the husk never sees its tool_result).
+            if (itemIds.has(event.toolUseId)) return
             const item = this.toolUseToItem(event, thread.cwd)
             itemIds.set(event.toolUseId, item.id)
+            itemStartedAtMs.set(item.id, nowMillis())
             this.store.appendItem(turn.id, item)
             this.notify(peer, { method: 'item/started', params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: nowMillis() } })
             if (item.type === 'fileChange') {
@@ -1192,22 +1333,33 @@ export class CodexClaudeAppServer {
             const itemId = itemIds.get(event.toolUseId)
             if (!itemId) return
             const resultText = toolResultText(event.content)
+            const durationMs = (() => {
+              const started = itemStartedAtMs.get(itemId)
+              return started == null ? null : Math.max(0, nowMillis() - started)
+            })()
+            const parsedExitCode = parseExitCodeFromResult(event.content) ?? (event.isError ? 1 : 0)
             const updated = this.store.updateItem(turn.id, itemId, (item) => {
               if (item.type === 'commandExecution') {
                 return {
                   ...item,
                   status: event.isError ? 'failed' : 'completed',
                   aggregatedOutput: item.aggregatedOutput ?? resultText,
-                  exitCode: event.isError ? 1 : 0,
+                  exitCode: parsedExitCode,
+                  durationMs,
                 }
               }
               if (item.type === 'fileChange') return { ...item, status: event.isError ? 'failed' : 'completed' }
               if (item.type === 'mcpToolCall') {
+                // Protocol-correct shape: McpToolCallResult = {content[], structuredContent, _meta};
+                // McpToolCallError = {message}. We previously shipped raw event.content for both
+                // which crashed App's ts-rs deserializer for any tool that returned anything richer
+                // than a primitive. Always wrap into the strict shape.
                 return {
                   ...item,
                   status: event.isError ? 'failed' : 'completed',
-                  result: event.isError ? null : event.content,
-                  error: event.isError ? event.content : null,
+                  result: event.isError ? null : wrapMcpToolResult(event.content),
+                  error: event.isError ? wrapMcpToolError(event.content) : null,
+                  durationMs,
                 }
               }
               if (item.type === 'webSearch') {
@@ -1246,12 +1398,16 @@ export class CodexClaudeAppServer {
             // Render the hook event as a Codex hookPrompt item alongside the
             // (still-emitted) notice line, so the user sees structured hook
             // activity in the timeline instead of just a one-liner warning.
-            const fragments: Array<{ kind: 'text' | 'note'; text: string }> = [
-              { kind: 'text', text: `Hook · ${event.hookName}` },
+            // All fragments of the same hook run share one hookRunId so App
+            // groups them under a single execution; the format matches
+            // Codex's own hookprompt items (one synthetic run id per emit).
+            const hookRunId = newId()
+            const fragments: Array<{ text: string; hookRunId: string }> = [
+              { text: `Hook · ${event.hookName}`, hookRunId },
             ]
-            if (event.status) fragments.push({ kind: 'note', text: `status: ${event.status}` })
-            if (event.decision) fragments.push({ kind: 'note', text: `decision: ${event.decision}` })
-            if (event.message) fragments.push({ kind: 'text', text: event.message })
+            if (event.status) fragments.push({ text: `status: ${event.status}`, hookRunId })
+            if (event.decision) fragments.push({ text: `decision: ${event.decision}`, hookRunId })
+            if (event.message) fragments.push({ text: event.message, hookRunId })
             const hookItem: ThreadItem = { type: 'hookPrompt', id: newId(), fragments }
             this.store.appendItem(turn.id, hookItem)
             this.notify(peer, { method: 'item/started', params: { threadId: thread.id, turnId: turn.id, item: hookItem, startedAtMs: nowMillis() } })
@@ -1547,6 +1703,25 @@ export class CodexClaudeAppServer {
     this.tokenUsageByThread.set(threadId, total)
     const tokenUsage: ThreadTokenUsage = { total, last, modelContextWindow: null }
     this.notify(peer, { method: 'thread/tokenUsage/updated', params: { threadId, turnId, tokenUsage } })
+    // Also push the global rate-limit snapshot so the App's account-usage
+    // meter is in sync with the per-thread token meter. We don't actually
+    // know Claude's rate-limit headers from here, but emitting the snapshot
+    // shape with null windows keeps the UI from getting stuck on a stale
+    // value (and lets it re-poll if it cares to).
+    this.notify(peer, {
+      method: 'account/rateLimits/updated',
+      params: {
+        rateLimits: {
+          limitId: 'claude-code',
+          limitName: 'Claude Code',
+          primary: null,
+          secondary: null,
+          credits: null,
+          planType: null,
+          rateLimitReachedType: null,
+        },
+      },
+    })
   }
 
   private async fsReadFile(params: Record<string, unknown>): Promise<unknown> {
@@ -1927,7 +2102,7 @@ export class CodexClaudeAppServer {
         modelProvider: thread?.modelProvider ?? 'claude-code',
         cwd: thread?.cwd ?? process.cwd(),
         cliVersion: codexCliVersion(),
-        source: thread?.source ?? 'app_server',
+        source: normalizeSessionSource(thread?.source),
         gitInfo: null,
       },
     }
@@ -1977,7 +2152,12 @@ export class CodexClaudeAppServer {
         id,
         command: String(event.input.command ?? ''),
         cwd: String(event.input.cwd ?? cwd),
-        processId: null,
+        // Use the SDK's tool_use_id as a stable handle. Without a non-null
+        // processId the Codex App was treating these as "Background terminal"
+        // entries (no attached process) and hiding their output; with a
+        // synthetic id they render as inline command items like a normal
+        // foreground bash invocation.
+        processId: `claude:${event.toolUseId}`,
         source: 'agent',
         status: 'inProgress',
         commandActions: [],
@@ -1997,13 +2177,17 @@ export class CodexClaudeAppServer {
     if (event.toolName === 'WebSearch') {
       // Codex App has a dedicated `webSearch` ThreadItem with a structured
       // action — emit it instead of a generic mcpToolCall so the App can show
-      // the search badge (and follow-up open-page links) natively. Action is
-      // populated when the tool_result arrives (see tool_result handler).
+      // the search badge (and follow-up open-page links) natively. The action
+      // is finalized when the tool_result arrives (see tool_result handler).
+      // The 'search' variant's `query` / `queries` are required (Option fields
+      // with no serde default), so always populate both even on the initial
+      // inProgress emit.
+      const q = String(event.input.query ?? '')
       return {
         type: 'webSearch',
         id,
-        query: String(event.input.query ?? ''),
-        action: { type: 'search' },
+        query: q,
+        action: { type: 'search', query: q || null, queries: null },
       }
     }
     return {
@@ -2050,10 +2234,14 @@ export class CodexClaudeAppServer {
       path: null,
       cwd: thread.cwd,
       cliVersion: codexCliVersion(),
-      source: thread.source,
-      threadSource: thread.threadSource,
-      agentNickname: thread.agentNickname,
-      agentRole: thread.agentRole,
+      // Defense-in-depth: even if older rows hold an invalid `source` or
+      // `threadSource` (legacy `app_server`, empty string from a buggy write
+      // path), coerce on the way out so the App's strict deserializer never
+      // sees a value outside the wire enum.
+      source: normalizeSessionSource(thread.source),
+      threadSource: normalizeThreadSource(thread.threadSource),
+      agentNickname: nullIfEmpty(thread.agentNickname),
+      agentRole: nullIfEmpty(thread.agentRole),
       gitInfo: null,
       name: thread.name,
       turns: turns.map((turn) => this.toTurn(turn)),
@@ -2401,6 +2589,18 @@ function fallbackStructuredText(outputSchema: unknown, prompt: string): string {
   return JSON.stringify(coerceStructuredValue(outputSchema, prompt), null, 0)
 }
 
+// claude-agent-sdk has shipped the subagent-spawning tool under both `Task`
+// (older) and `Agent` (current 0.2.x) names; accept both plus a few common
+// variants so the native collabAgentToolCall path triggers regardless of
+// which name the model emits. Without this, an `Agent` tool_use falls
+// through to the generic mcpToolCall branch and its inner Bash calls leak
+// into the parent thread as a flat list (the bug seen on mac-mini).
+function isSubagentToolName(name: string | null | undefined): boolean {
+  if (typeof name !== 'string') return false
+  const n = name.trim().toLowerCase()
+  return n === 'task' || n === 'agent' || n === 'subagent' || n === 'spawn_agent' || n === 'spawnagent'
+}
+
 function normalizeApprovalPolicy(value: unknown): string | null {
   if (typeof value !== 'string') return null
   const v = value.trim()
@@ -2437,6 +2637,65 @@ function normalizePersonality(value: unknown): string | null {
   const v = value.trim()
   if (v === 'none' || v === 'friendly' || v === 'pragmatic' || v === 'cynic' || v === 'robot' || v === 'nerd') return v
   return null
+}
+
+// Codex v2 ReasoningEffort enum (top-level, used by collabAgentToolCall and
+// elsewhere). No serde(other) fallback — anything outside this set crashes
+// the App's deserializer (same trap as threadSource = ""). Pass any value
+// through here before emitting it on the wire.
+function normalizeReasoningEffortEnum(
+  value: string | null | undefined,
+): 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | null {
+  if (typeof value !== 'string') return null
+  const v = value.trim()
+  if (v === 'none' || v === 'minimal' || v === 'low' || v === 'medium' || v === 'high' || v === 'xhigh') return v
+  return null
+}
+
+// Codex App's settings sheet writes the persistent reasoning-effort default
+// under `params.config.model_reasoning_effort` (the same shape as the Codex
+// CLI's `config.toml`). turn/start's top-level `effort` is only set when the
+// user overrides for a single turn — the chosen value from the model picker
+// otherwise lives in the config bag. Read both so the App's effort dropdown
+// actually changes Claude's thinking budget instead of silently no-op'ing.
+function readConfigReasoningEffort(config: unknown): string | null {
+  if (!config || typeof config !== 'object') return null
+  const cfg = config as Record<string, unknown>
+  const direct = cfg.model_reasoning_effort ?? cfg['model_reasoning_effort']
+  if (typeof direct === 'string' && direct.length > 0) return direct
+  return null
+}
+
+// Codex v2 `ThreadSource` is a strict 3-variant enum with no `serde(other)`
+// fallback. Anything outside this set (including an empty string) makes the
+// App's ts-rs deserializer panic on `thread/list` / `thread/read` — which the
+// user sees as the generic "Oops, an error has occurred" toast. Force every
+// write/read through this gate so we never persist or ship an invalid value.
+function normalizeThreadSource(value: unknown): 'user' | 'subagent' | 'memory_consolidation' | null {
+  if (typeof value !== 'string') return null
+  const v = value.trim()
+  if (v === 'user' || v === 'subagent' || v === 'memory_consolidation') return v
+  return null
+}
+
+// Codex v2 `SessionSource` is camelCase (`appServer`, not `app_server`); it
+// has `serde(other) Unknown` so the wrong casing won't crash the App, just
+// silently fall back to `unknown`. Convert to the wire form to keep the
+// thread metadata UI honest.
+function normalizeSessionSource(value: unknown): string {
+  if (typeof value !== 'string') return 'appServer'
+  const v = value.trim()
+  if (v === 'cli' || v === 'vscode' || v === 'exec' || v === 'appServer' || v === 'unknown') return v
+  if (v === 'app_server' || v === 'app-server') return 'appServer'
+  return 'unknown'
+}
+
+// `agentRole` / `agentNickname` are `string | null` on the wire (not enums),
+// so an empty string doesn't crash — but the App treats `""` as "present"
+// and renders an empty chip. Coerce to null so the field is just absent.
+function nullIfEmpty(value: string | null | undefined): string | null {
+  if (value == null) return null
+  return value === '' ? null : value
 }
 
 // Assemble the per-thread system prompt addendum from Codex App's instruction
@@ -2490,18 +2749,113 @@ function emptyTokenBreakdown(): TokenUsageBreakdown {
   return { totalTokens: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0 }
 }
 
+// claude-agent-sdk's Task tool appends a fixed metadata trailer to the
+// subagent's tool_result content:
+//   `agentId: <hex> (use SendMessage with to: '<hex>' to continue this agent)`
+//   `<usage>total_tokens: N\ntool_uses: M\nduration_ms: K</usage>`
+// Codex App renders neither natively — they just show as raw text after the
+// real result. Strip both from the visible body and surface the values via
+// agentNickname / token usage / metrics so the subagent timeline carries the
+// SDK-reported identity and cost.
+interface SubagentTrailer {
+  cleanText: string
+  agentId: string | null
+  usage: { totalTokens: number; toolUses: number; durationMs: number } | null
+}
+
+// Codex v2 McpToolCallResult requires {content[], structuredContent, _meta}.
+// Claude SDK tool_result.content is one of: a string, an array of Anthropic
+// content blocks ({type:'text'|'image', ...}), or a structured JsonValue.
+// Wrap into the protocol shape — if content is already an array, use it; if
+// it's a primitive/object, materialize as a single text block so the App
+// renders something useful instead of an empty result.
+function wrapMcpToolResult(content: unknown): { content: unknown[]; structuredContent: unknown | null; _meta: unknown | null } {
+  if (content == null) return { content: [], structuredContent: null, _meta: null }
+  if (Array.isArray(content)) return { content, structuredContent: null, _meta: null }
+  const text = typeof content === 'string' ? content : JSON.stringify(content)
+  return { content: [{ type: 'text', text }], structuredContent: typeof content === 'object' ? content : null, _meta: null }
+}
+
+// Codex v2 McpToolCallError requires { message: string } — and nothing else.
+// Coerce any tool_result body the SDK gave us into that single-field shape.
+function wrapMcpToolError(content: unknown): { message: string } {
+  if (content == null) return { message: 'tool call failed' }
+  if (typeof content === 'string') return { message: content }
+  if (Array.isArray(content)) {
+    // Concatenate any text blocks; fall back to a JSON dump.
+    const text = content
+      .map((b) => (b && typeof b === 'object' && (b as any).type === 'text' ? String((b as any).text ?? '') : ''))
+      .filter(Boolean)
+      .join('\n')
+    return { message: text || JSON.stringify(content) }
+  }
+  if (typeof content === 'object' && content && typeof (content as any).message === 'string') {
+    return { message: (content as any).message }
+  }
+  return { message: JSON.stringify(content) }
+}
+
+function parseSubagentTrailer(text: string): SubagentTrailer {
+  if (!text) return { cleanText: '', agentId: null, usage: null }
+  let cleanText = text
+  let agentId: string | null = null
+  let usage: SubagentTrailer['usage'] = null
+
+  const usageMatch = cleanText.match(/<usage>\s*total_tokens:\s*(\d+)\s*\n\s*tool_uses:\s*(\d+)\s*\n\s*duration_ms:\s*(\d+)\s*<\/usage>\s*$/)
+  if (usageMatch) {
+    usage = {
+      totalTokens: Number(usageMatch[1]) || 0,
+      toolUses: Number(usageMatch[2]) || 0,
+      durationMs: Number(usageMatch[3]) || 0,
+    }
+    cleanText = cleanText.slice(0, usageMatch.index).replace(/\s+$/, '')
+  }
+
+  const agentMatch = cleanText.match(/\n?agentId:\s*([0-9a-f]{8,32})\b[^\n]*\s*$/i)
+  if (agentMatch) {
+    agentId = agentMatch[1]
+    cleanText = cleanText.slice(0, agentMatch.index).replace(/\s+$/, '')
+  }
+
+  return { cleanText, agentId, usage }
+}
+
+// Best-effort parse of a Claude Bash tool_result for the real shell exit
+// code. Claude's tool result content is usually plain stdout/stderr, but in
+// some failure modes (and via custom wrappers / Codex CLI shims) the SDK
+// suffixes a `Exit code: N` / `exit status N` marker. Returning null lets
+// the caller fall back to 0/1 from event.isError.
+function parseExitCodeFromResult(content: unknown): number | null {
+  const text = typeof content === 'string'
+    ? content
+    : Array.isArray(content)
+      ? content.map((p) => (typeof p === 'string' ? p : (p as Record<string, unknown>)?.text ?? '')).join('')
+      : ''
+  if (!text) return null
+  const match = text.match(/(?:Exit code|exit status|exit code):\s*(-?\d+)/i)
+  if (!match) return null
+  const code = Number(match[1])
+  return Number.isFinite(code) ? code : null
+}
+
+
+
 // Best-effort: when the WebSearch tool returns a result, sniff whether the
 // first result was an explicit page open vs a result list. Codex App's
 // `webSearch` ThreadItem renders the action badge accordingly.
 function parseWebSearchAction(query: string, resultText: string):
-  | { type: 'search' }
-  | { type: 'openPage'; url: string }
-  | { type: 'findInPage'; pattern: string; url: string }
+  | { type: 'search'; query: string | null; queries: string[] | null }
+  | { type: 'openPage'; url: string | null }
+  | { type: 'findInPage'; pattern: string | null; url: string | null }
   | { type: 'other' } {
-  if (!resultText) return { type: 'search' }
+  // Codex v2 WebSearchAction variants are tagged but the inner fields are NOT
+  // optional in Rust — they're `Option<...>` with NO `#[serde(default)]`, so
+  // App rejects an item that ships a bare {type:'search'} (missing required
+  // fields). Always populate every field of the chosen variant, even if null.
+  if (!resultText) return { type: 'search', query: query || null, queries: null }
   const urlMatch = resultText.match(/https?:\/\/[^\s)\]"'<]+/)
   if (urlMatch && query) return { type: 'openPage', url: urlMatch[0] }
-  return { type: 'search' }
+  return { type: 'search', query: query || null, queries: null }
 }
 
 // Maps the raw Anthropic usage block carried on the Claude Agent SDK

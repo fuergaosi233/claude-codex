@@ -1,7 +1,6 @@
 import type { ClaudeRuntime, RuntimeHandlers, RuntimeTurnContext } from './types.mjs'
 import { MockRuntime } from './mock-runtime.mjs'
-import { ClaudeSdkSidecarRuntime } from './sidecar-runtime.mjs'
-import { ClaudeSdkSocketRuntime } from './socket-runtime.mjs'
+import { NativeClaudeRuntime } from './native-runtime.mjs'
 import { HttpAgentRuntime } from './http-agent-runtime.mjs'
 import { ClaudePTranscriptRuntime } from './claude-p-runtime.mjs'
 import { resolveRuntimeConfig, type RuntimeBackendType, type RuntimeConfig } from './runtime-config.mjs'
@@ -11,7 +10,6 @@ export function createRuntime(): ClaudeRuntime {
   const config = resolveRuntimeConfig()
   debugLog('runtime.create', {
     type: config.type,
-    socketPath: config.socketPath,
     httpBaseUrl: config.http.baseUrl,
     claudePCommand: config.claudeP.command,
   })
@@ -41,14 +39,13 @@ class SelectableRuntime implements ClaudeRuntime {
       return
     }
 
-    const type = requestedType
-    const runtime = this.runtimeFor(type)
+    const runtime = this.runtimeFor(requestedType)
     debugLog('runtime.turn.select', {
       threadId: context.threadId,
       turnId: context.turnId,
       purpose: context.purpose ?? 'normal',
       requestedType: context.runtimeType,
-      selectedType: type,
+      selectedType: requestedType,
       model: context.model,
       effort: context.effort,
     })
@@ -138,9 +135,6 @@ function instantiateRuntime(config: RuntimeConfig, type: RuntimeBackendType): Cl
   switch (type) {
     case 'mock':
       return new MockRuntime()
-    case 'agent-sdk-socket':
-      if (!config.socketPath) throw new Error('agent-sdk-socket runtime requires CLAUDE_CODEX_RUNTIME_SOCKET')
-      return new ClaudeSdkSocketRuntime(config.socketPath)
     case 'agent-http':
     case 'agentapi':
       return new HttpAgentRuntime({ kind: type, ...config.http })
@@ -148,6 +142,6 @@ function instantiateRuntime(config: RuntimeConfig, type: RuntimeBackendType): Cl
       return new ClaudePTranscriptRuntime(config.claudeP)
     case 'agent-sdk-sidecar':
     default:
-      return new ClaudeSdkSidecarRuntime()
+      return new NativeClaudeRuntime()
   }
 }

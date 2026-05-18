@@ -66,6 +66,31 @@ export class SessionStore {
     this.ensureColumn('threads', 'base_instructions', 'TEXT')
     this.ensureColumn('threads', 'developer_instructions', 'TEXT')
     this.ensureColumn('threads', 'personality', 'TEXT')
+    this.sanitizeLegacyEnumColumns()
+  }
+
+  // Older versions of the adapter stored empty strings (and a snake_case
+  // `app_server` source) in columns the Codex App treats as strict enums.
+  // Codex App's ts-rs deserializer rejects the invalid values on `thread/list`
+  // / `thread/read`, surfacing as the generic "Oops, an error has occurred"
+  // toast when reopening a page. Repair the rows in place once on startup so
+  // a downgrade-then-upgrade cycle doesn't leave permanent landmines.
+  private sanitizeLegacyEnumColumns(): void {
+    try {
+      this.db.exec(`
+        UPDATE threads
+        SET thread_source = NULL
+        WHERE thread_source IS NOT NULL
+          AND thread_source NOT IN ('user', 'subagent', 'memory_consolidation');
+        UPDATE threads SET agent_role = NULL WHERE agent_role = '';
+        UPDATE threads SET agent_nickname = NULL WHERE agent_nickname = '';
+        UPDATE threads SET base_instructions = NULL WHERE base_instructions = '';
+        UPDATE threads SET developer_instructions = NULL WHERE developer_instructions = '';
+        UPDATE threads SET source = 'appServer' WHERE source = 'app_server';
+      `)
+    } catch {
+      // Migrations are best-effort; never block adapter startup on cleanup.
+    }
   }
 
   private ensureColumn(table: string, column: string, definition: string): void {
@@ -225,6 +250,21 @@ export class SessionStore {
   listTurns(threadId: string): TurnRecord[] {
     const rows = this.db.prepare('SELECT * FROM turns WHERE thread_id = ? ORDER BY started_at ASC').all(threadId)
     return rows.map((row: unknown) => this.rowToTurn(row))
+  }
+
+  // Used by thread/rollback to drop the N most recent turns from a thread's
+  // history. Codex App's rewind UI calls this when the user wants to redo a
+  // turn — without it our handler used to no-op and the App's "Rewind" button
+  // appeared dead. Returns the number of turns actually removed.
+  deleteRecentTurns(threadId: string, numTurns: number): number {
+    if (numTurns <= 0) return 0
+    const ids = this.db
+      .prepare('SELECT id FROM turns WHERE thread_id = ? ORDER BY started_at DESC LIMIT ?')
+      .all(threadId, numTurns) as Array<{ id: string }>
+    if (ids.length === 0) return 0
+    const stmt = this.db.prepare('DELETE FROM turns WHERE id = ?')
+    for (const row of ids) stmt.run(row.id)
+    return ids.length
   }
 
   appendItem(turnId: string, item: ThreadItem): TurnRecord | null {

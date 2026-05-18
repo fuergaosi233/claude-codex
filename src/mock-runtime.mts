@@ -83,6 +83,14 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    if (/effort echo/i.test(context.prompt)) {
+      // Standalone effort echo so the test for config.model_reasoning_effort
+      // can assert the value end-to-end without scraping the model field.
+      await handlers.onEvent({ type: 'text_delta', delta: `effort=${context.effort ?? 'null'}` })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'effort echo' })
+      return
+    }
+
     if (/output schema check/i.test(context.prompt)) {
       await handlers.onEvent({
         type: 'text_delta',
@@ -202,7 +210,17 @@ export class MockRuntime implements ClaudeRuntime {
       await handlers.onEvent({ type: 'text_delta', delta: 'subagent thinking aloud (should be hidden)' })
       await handlers.onEvent({ type: 'tool_use', toolUseId: innerToolId, toolName: 'Bash', input: { command: 'echo inner', description: 'leaked inner call' } })
       await handlers.onEvent({ type: 'tool_result', toolUseId: innerToolId, content: 'inner result' })
-      await handlers.onEvent({ type: 'tool_result', toolUseId: taskId, content: 'subagent final summary' })
+      // Mirror the real claude-agent-sdk Task tool result format: actual body
+      // followed by an `agentId: ...` line and a `<usage>` block. The server
+      // should strip both from the visible agentMessage and route the values
+      // into agentNickname + tokenUsage instead.
+      const trailer = [
+        "agentId: deadbeefcafef00d (use SendMessage with to: 'deadbeefcafef00d' to continue this agent)",
+        '<usage>total_tokens: 4242',
+        'tool_uses: 7',
+        'duration_ms: 31415</usage>',
+      ].join('\n')
+      await handlers.onEvent({ type: 'tool_result', toolUseId: taskId, content: `subagent final summary\n${trailer}` })
       await handlers.onEvent({ type: 'text_delta', delta: 'main agent summary' })
       await handlers.onEvent({ type: 'completed', success: true, result: 'subagent check' })
       return

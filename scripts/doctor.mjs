@@ -25,16 +25,13 @@ check('shim version probe', () => {
   if (!/codex-cli/.test(result.stdout)) throw new Error(`unexpected version output: ${result.stdout}`)
 })
 
-if (runtimeType === 'agent-sdk-sidecar' || runtimeType === 'agent-sdk-socket') check('python >= 3.10', () => {
-  const python = resolvePythonCommand()
-  const result = run(python, ['-c', 'import sys; print(".".join(map(str, sys.version_info[:3])))'])
-  const [major, minor] = result.stdout.trim().split('.').map(Number)
-  if (major < 3 || (major === 3 && minor < 10)) throw new Error(`${python} is ${result.stdout.trim()}, need 3.10+`)
-})
-
-if (runtimeType === 'agent-sdk-sidecar' || runtimeType === 'agent-sdk-socket') check('claude_agent_sdk import', () => {
-  const python = resolvePythonCommand()
-  run(python, ['-c', 'import claude_agent_sdk; print(getattr(claude_agent_sdk, "__version__", "unknown"))'])
+if (runtimeType === 'agent-sdk-sidecar') check('@anthropic-ai/claude-agent-sdk installed', () => {
+  // The native TS runtime imports the SDK dynamically; verify it resolves
+  // from this package's node_modules.
+  const pkgPath = resolve('node_modules/@anthropic-ai/claude-agent-sdk/package.json')
+  if (!existsSync(pkgPath)) {
+    throw new Error('run npm install - @anthropic-ai/claude-agent-sdk is missing')
+  }
 })
 
 if (runtimeType === 'agent-http' || runtimeType === 'agentapi') check(`${runtimeType} HTTP endpoint`, () => {
@@ -53,7 +50,7 @@ if (runtimeType === 'codex') check('real Codex passthrough', () => {
   run(command, ['--version'])
 })
 
-if (runtimeType === 'agent-sdk-sidecar' || runtimeType === 'agent-sdk-socket') check('Claude auth surface for real smoke', () => {
+if (runtimeType === 'agent-sdk-sidecar') check('Claude auth surface for real smoke', () => {
   if (process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_CODE_USE_BEDROCK || process.env.CLAUDE_CODE_USE_VERTEX) return
   run(resolveClaudeCommand(), ['--version'])
 })
@@ -93,10 +90,8 @@ function requireModule(name) {
 function resolveRuntimeType() {
   if (process.env.CLAUDE_CODEX_MOCK === '1') return 'mock'
   const raw = (process.env.CLAUDE_CODEX_RUNTIME_TYPE || process.env.CLAUDE_CODEX_RUNTIME || process.env.CLAUDE_CODEX_BACKEND || '').trim().toLowerCase()
-  if (!raw && process.env.CLAUDE_CODEX_RUNTIME_SOCKET) return 'agent-sdk-socket'
   if (!raw) return 'agent-sdk-sidecar'
-  if (['sdk', 'agent-sdk', 'agent-sdk-sidecar', 'sidecar', 'cloud-agent-sdk'].includes(raw)) return 'agent-sdk-sidecar'
-  if (['agent-sdk-socket', 'socket', 'runtime-socket'].includes(raw)) return 'agent-sdk-socket'
+  if (['sdk', 'agent-sdk', 'agent-sdk-sidecar', 'sidecar', 'cloud-agent-sdk', 'agent-sdk-socket', 'socket', 'runtime-socket'].includes(raw)) return 'agent-sdk-sidecar'
   if (['agent-http', 'channels', 'channel', 'http-channel'].includes(raw)) return 'agent-http'
   if (['agentapi', 'agent-api'].includes(raw)) return 'agentapi'
   if (['claude-p', 'claudep', 'pty-transcript'].includes(raw)) return 'claude-p'
@@ -112,23 +107,6 @@ function httpBaseUrl() {
     process.env.CLAUDE_CODEX_AGENTAPI_URL ||
     'http://127.0.0.1:3284'
   return value.endsWith('/') ? value.slice(0, -1) : value
-}
-
-function resolvePythonCommand() {
-  const candidates = [
-    process.env.CLAUDE_CODEX_PYTHON,
-    resolve('.venv/bin/python'),
-    'python3.12',
-    'python3.11',
-    'python3.10',
-    'python3',
-  ].filter(Boolean)
-  for (const candidate of candidates) {
-    if (candidate.includes('/') && !existsSync(candidate)) continue
-    const result = spawnSync(candidate, ['-c', 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)'], { encoding: 'utf8' })
-    if (result.status === 0) return candidate
-  }
-  return process.env.CLAUDE_CODEX_PYTHON || 'python3'
 }
 
 function resolveClaudeCommand() {

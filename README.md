@@ -12,17 +12,17 @@ adapter instead of the real Codex runtime.
 
 ```bash
 npm install
-npm run install:python-sdk
 npm run build
-python3 -m pip install claude-agent-sdk
 ```
 
 The adapter requires **Node.js 24+** for stable `node:sqlite`. Node 22 ships
 `node:sqlite` behind `--experimental-sqlite`, which the adapter does not pass,
 so it crashes at runtime on 22 even though it imports cleanly on 24. Set
 `CLAUDE_CODEX_NODE` in the shim environment to pin a specific node binary.
-The Python sidecar needs Python 3.10+ for `claude-agent-sdk`; set
-`CLAUDE_CODEX_PYTHON` if the remote host's `python3` is older.
+`@anthropic-ai/claude-agent-sdk` is the only runtime dependency for Claude
+itself — the prior Python sidecar (`python/claude_sidecar.py`) is gone; the
+TS SDK is loaded in-process and ships its own `claude-code` native binary via
+npm `optionalDependencies` for the host platform.
 
 ## Remote shim
 
@@ -42,7 +42,6 @@ export PATH="$HOME/bin:$PATH"
 export ANTHROPIC_API_KEY="..."                    # or sign in with `claude /login`
 export CLAUDE_CODEX_ADAPTER="/opt/claude-codex-adapter/dist/src/adapter.mjs"
 export CLAUDE_CODEX_NODE="/absolute/path/to/node" # optional
-export CLAUDE_CODEX_PYTHON="/absolute/path/to/python3.11" # optional
 export CODEX_REAL="/usr/local/bin/codex.real"     # optional fallback
 
 # Optional: route Anthropic API traffic through a reverse proxy. Useful when the
@@ -68,27 +67,21 @@ use:
 curl -fsSL https://nodejs.org/dist/v24.11.0/node-v24.11.0-darwin-arm64.tar.xz \
   | tar -xJ -C ~/.local
 
-# 2. uv as a single-binary Python manager, then Python 3.11 itself.
-curl -LsSf https://astral.sh/uv/install.sh | sh
-~/.local/bin/uv python install 3.11
-
-# 3. Claude Code CLI, installed under a user prefix so no sudo is needed.
+# 2. Claude Code CLI, installed under a user prefix so no sudo is needed.
 mkdir -p ~/.local/npm-global
 ~/.local/node-v24.11.0-darwin-arm64/bin/npm config set prefix ~/.local/npm-global
 ~/.local/npm-global/bin/npm install -g @anthropic-ai/claude-code
 ~/.local/npm-global/bin/claude /login   # interactive: claude.ai OAuth
 
-# 4. Adapter checkout, build, and Python sidecar SDK.
+# 3. Adapter checkout + build (also installs @anthropic-ai/claude-agent-sdk).
 git clone <this repo> ~/claude-codex
 cd ~/claude-codex
 npm install
 npm run build
-CLAUDE_CODEX_PYTHON="$(uv python find 3.11)" npm run install:python-sdk
 
 # Persist PATH + adapter pointers for non-interactive SSH:
 cat >>~/.zshenv <<'EOF'
 export PATH="$HOME/.local/npm-global/bin:$HOME/.local/node-v24.11.0-darwin-arm64/bin:$HOME/.local/bin:$PATH"
-export CLAUDE_CODEX_PYTHON="$HOME/claude-codex/.venv/bin/python"
 export CLAUDE_CODEX_ADAPTER="$HOME/claude-codex/dist/src/adapter.mjs"
 export CLAUDE_CODEX_NODE="$HOME/.local/node-v24.11.0-darwin-arm64/bin/node"
 # Uncomment if api.anthropic.com is blocked from this host:
@@ -97,47 +90,28 @@ EOF
 
 cp scripts/codex-shim ~/.local/bin/codex && chmod +x ~/.local/bin/codex
 
-npm run doctor   # 6 checks should all be ok
+npm run doctor   # 4 checks should all be ok
 npm run smoke:real   # round-trips an actual Claude turn
 ```
 
 After this, Codex App's Remote connection to the host hits `~/.local/bin/codex`
 first and is routed into the adapter. Disconnecting reclaims the daemon so the
-sidecar exits.
+adapter exits.
 
 ### Localhost GUI testing on macOS
 
-For localhost GUI testing on macOS, the adapter can be launched by SSH while
-Claude Code runs in the logged-in GUI session. Put these lightweight exports in
-`~/.zshenv` so both login shells and non-interactive SSH remote commands can see
-the shim:
+For localhost GUI testing on macOS, the adapter can be launched by SSH and
+the in-process TS runtime invokes the Claude Code CLI directly — no external
+daemon to manage. Put these lightweight exports in `~/.zshenv` so both login
+shells and non-interactive SSH remote commands can see the shim:
 
 ```bash
 REPO="$HOME/path/to/claude-codex" # adjust to your checkout
 export PATH="$HOME/bin:$PATH"
 export CLAUDE_CODEX_ADAPTER="$REPO/dist/src/adapter.mjs"
 export CLAUDE_CODEX_NODE="$(command -v node)"
-export CLAUDE_CODEX_PYTHON="$REPO/.venv/bin/python"
 export CLAUDE_CODEX_CLI="$(command -v claude)"
-export CLAUDE_CODEX_RUNTIME_SOCKET="$REPO/.claude-codex/runtime.sock"
 export CODEX_REAL="$(command -v codex)"
-```
-
-Start the GUI-session Claude runtime daemon manually:
-
-```bash
-CLAUDE_CODEX_RUNTIME_SOCKET="$PWD/.claude-codex/runtime.sock" \
-CLAUDE_CODEX_PYTHON="$PWD/.venv/bin/python" \
-CLAUDE_CODEX_CLI="$(command -v claude)" \
-node scripts/claude-runtime-daemon.mjs --socket "$PWD/.claude-codex/runtime.sock"
-```
-
-Or install it as a user LaunchAgent so Codex App GUI remote can use it without a
-terminal process:
-
-```bash
-launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.claude-codex.runtime-daemon.plist
-launchctl kickstart -k "gui/$(id -u)/com.claude-codex.runtime-daemon"
 ```
 
 Quick remote probe:
@@ -159,7 +133,7 @@ ssh host '
 
 The daemon owns the Unix socket while a Codex client is connected. When the
 last client (`app-server proxy`) disconnects, the daemon shuts down after a
-short idle grace period so its Claude runtime sidecar is reclaimed instead of
+short idle grace period so its in-process Claude SDK runtime is reclaimed instead of
 leaking. If a turn is still active, idle shutdown is deferred until that turn
 completes; reconnecting/resuming the thread during that window reattaches
 notifications to the new client peer. Codex App re-probes and restarts the
@@ -171,19 +145,16 @@ running indefinitely).
 
 1. Install the shim and exports on the remote host as described above
    (`~/bin/codex`, `~/.zshenv` for the localhost-GUI flow), and build the
-   adapter (`npm install && npm run build && npm run install:python-sdk`).
-2. For the localhost-GUI flow, start the runtime daemon — either manually or as
-   the LaunchAgent shown below — so Codex App GUI can reach Claude Code without
-   a terminal process.
-3. Open Codex App and add a Remote connection to the host (or `localhost`).
+   adapter (`npm install && npm run build`).
+2. Open Codex App and add a Remote connection to the host (or `localhost`).
    Codex App runs its native SSH version probe and bootstrap; the shim routes
    `codex app-server` to this adapter.
-4. Start a new thread and send a prompt. Claude Code runs the turn: agent text
+3. Start a new thread and send a prompt. Claude Code runs the turn: agent text
    streams into the conversation, `Bash` calls surface as Codex command
    approvals, and `Edit`/`Write`/`MultiEdit` surface as Codex file-change
    approvals with a live diff. Approve them in the Codex App UI as usual.
-5. Disconnecting the remote in Codex App closes the proxy; once no turn is
-   active, the adapter daemon idles out and the runtime sidecar is reclaimed
+4. Disconnecting the remote in Codex App closes the proxy; once no turn is
+   active, the adapter daemon idles out and the in-process Claude SDK runtime is reclaimed
    automatically.
 
 `npm run acceptance:gui-ssh-localhost` drives this exact path end-to-end
@@ -205,13 +176,12 @@ Set `CLAUDE_CODEX_MOCK=1` for local protocol testing without Claude credentials.
 ## Claude runtime knobs
 
 ```bash
-# Runtime backend selection. The default preserves the existing Cloud Agent
-# SDK sidecar behavior.
+# Runtime backend selection. The default uses the in-process Claude Agent SDK
+# runtime and preserves the existing Claude Code behavior.
 export CLAUDE_CODEX_RUNTIME_TYPE="agent-sdk-sidecar"
 
 # Also supported:
 #   codex             - pass app-server through to the real Codex CLI
-#   agent-sdk-socket  - existing GUI-session sidecar daemon via Unix socket
 #   agent-http        - HTTP/SSE bridge for Claude Code Channels / agent-http
 #   agentapi          - HTTP/SSE bridge for coder/agentapi
 #   claude-p          - one-shot PTY/transcript wrapper via claude-p
@@ -307,7 +277,7 @@ claude-codex-mode logs agent-http
 claude-codex-mode logs agentapi
 ```
 
-Model switching is exact per turn for the SDK runtimes and `claude-p`, because
+Model switching is exact per turn for the SDK runtime and `claude-p`, because
 the adapter can pass `model` to those backends. For `agent-http` and `agentapi`,
 the HTTP bridge talks to a long-lived interactive Claude Code session; the safe
 way to change the model is to restart that bridge with `claude --model <alias>`
@@ -415,7 +385,6 @@ npm run acceptance:local-remote # full local Remote shim/daemon/proxy + real Cla
 npm run acceptance:gui-ssh-localhost # SSH localhost -> login shell -> shim -> GUI-session Claude runtime
 ./scripts/codex-shim --version
 CLAUDE_CODEX_ADAPTER="$PWD/dist/src/adapter.mjs" ./scripts/codex-shim app-server --help
-python3 -m py_compile python/claude_sidecar.py
 ```
 
 `acceptance:local-remote` creates an ignored `.claude-codex/local-remote-acceptance-*`
