@@ -31,6 +31,8 @@ import type {
   PermissionDecision,
   RuntimeHandlers,
   RuntimeTurnContext,
+  UserInputAnswers,
+  UserInputQuestion,
 } from './types.mjs'
 import { newId } from './util.mjs'
 
@@ -225,11 +227,15 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     const mode = derivePermissionMode(context.approvalPolicy, context.sandboxMode, context.planMode)
     opts.permissionMode = mode
 
-    // Per-tool approval round-trip with Codex App. Only attach the callback
-    // when the mode actually consults it — bypassPermissions/dontAsk never
-    // call it, so we save the round-trip overhead.
-    if (mode !== 'bypassPermissions' && mode !== 'dontAsk' && mode !== 'plan') {
-      opts.canUseTool = this.makeCanUseTool(context)
+    // Per-tool approval round-trip with Codex App. We attach canUseTool in
+    // every non-plan mode so we can also intercept AskUserQuestion (which
+    // needs to be bridged to the App's native request_user_input even when
+    // the user has chosen Full Access / bypassPermissions). In bypass modes
+    // the callback short-circuits non-AskUserQuestion tools to auto-allow,
+    // preserving the no-prompt behaviour.
+    if (mode !== 'plan') {
+      const autoAllow = mode === 'bypassPermissions' || mode === 'dontAsk'
+      opts.canUseTool = this.makeCanUseTool(context, autoAllow)
     }
 
     // Project + developer + personality instructions ride along as a system
@@ -249,17 +255,53 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     return opts
   }
 
-  private makeCanUseTool(context: RuntimeTurnContext) {
+  private makeCanUseTool(context: RuntimeTurnContext, autoAllow: boolean) {
     return async (
       toolName: string,
       input: Record<string, unknown>,
       options: { toolUseID?: string; signal: AbortSignal },
     ): Promise<{ behavior: 'allow'; updatedInput?: unknown } | { behavior: 'deny'; message: string }> => {
       const toolUseId = options.toolUseID || `tool-${newId()}`
-      const requestId = `${context.threadId}:${context.turnId}:${toolName}:${toolUseId}`
       const pending = this.turns.get(context.turnId)
       if (!pending) return { behavior: 'deny', message: 'turn already finished' }
 
+      // AskUserQuestion is a CLI built-in that, in SDK mode, has no TUI to
+      // render the question. Bridge it to Codex's native request_user_input
+      // primitive so the App can show a structured choice card. We return
+      // the user's answer back to the model through canUseTool's deny
+      // channel — denying suppresses the built-in CLI rendering while the
+      // `message` body carries the formatted AskUserQuestionOutput JSON so
+      // Claude reads the answer just like a normal tool_result.
+      if (toolName === 'AskUserQuestion') {
+        try {
+          const requestId = `${context.threadId}:${context.turnId}:askq:${toolUseId}`
+          const questions = parseAskUserQuestions(input)
+          if (questions.length === 0) {
+            return { behavior: 'deny', message: 'no questions provided' }
+          }
+          if (typeof pending.handlers.onUserInputRequest !== 'function') {
+            return { behavior: 'deny', message: 'user input not available in this runtime' }
+          }
+          const answers = await pending.handlers.onUserInputRequest({
+            type: 'user_input_request',
+            requestId,
+            toolUseId,
+            questions,
+          })
+          const formatted = formatAskUserQuestionAnswers(input, questions, answers)
+          return { behavior: 'deny', message: formatted }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err)
+          return { behavior: 'deny', message: `AskUserQuestion failed: ${msg}` }
+        }
+      }
+
+      // Auto-allow when the App has selected Full Access / bypassPermissions —
+      // matches the previous behaviour of skipping the canUseTool round-trip
+      // entirely for those modes.
+      if (autoAllow) return { behavior: 'allow' }
+
+      const requestId = `${context.threadId}:${context.turnId}:${toolName}:${toolUseId}`
       // Subagent-aware approval suppression: when Claude is mid-subagent we
       // still want THIS tool to be approved by the user (otherwise nested
       // tools would silently bypass approval). The server-side already
@@ -445,6 +487,13 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
           // Defer emission; the final coercion happens at result-time.
           continue
         }
+        if (name === 'AskUserQuestion') {
+          // The canUseTool bridge below renders this as a Codex-native
+          // dynamicToolCall via onUserInputRequest. Skip the generic
+          // tool_use event so the App doesn't also draw an mcpToolCall card
+          // for the same question.
+          continue
+        }
         await pending.handlers.onEvent({ type: 'tool_use', toolUseId: id, toolName: name, input })
       }
     }
@@ -583,3 +632,80 @@ export function sdkResumeSessionId(value: string | null): string | null {
 
 void STREAMED_TEXT
 void STREAMED_THINKING
+
+// ── AskUserQuestion bridging helpers ──
+
+// Parse the Claude SDK AskUserQuestionInput envelope into Codex's per-question
+// shape. Claude's input is `{questions: [{question, header, options:[{label,
+// description, preview?}], multiSelect}]}`. Codex's wire format separates the
+// "Other" / free-text path via the `isOther` flag — we synthesise an extra
+// option per question to mirror the harness behaviour (AskUserQuestion always
+// implicitly offers an Other choice).
+export function parseAskUserQuestions(input: Record<string, unknown>): UserInputQuestion[] {
+  const raw = (input.questions as Array<Record<string, unknown>>) || []
+  const out: UserInputQuestion[] = []
+  for (let i = 0; i < raw.length; i++) {
+    const q = raw[i] || {}
+    const header = String(q.header ?? `Question ${i + 1}`)
+    const question = String(q.question ?? '')
+    const optionsRaw = (q.options as Array<Record<string, unknown>>) || []
+    const options = optionsRaw.map((o) => ({
+      label: String(o.label ?? ''),
+      description: String(o.description ?? ''),
+    }))
+    // Claude's harness implicitly offers an "Other" free-text choice; surface
+    // it as a Codex isOther option so the App renders the free-text affordance.
+    options.push({ label: 'Other', description: 'Provide a custom answer' })
+    out.push({
+      id: `q${i}`,
+      header: header.slice(0, 12),
+      question,
+      isOther: false,
+      isSecret: false,
+      options,
+    })
+  }
+  return out
+}
+
+// Build the AskUserQuestionOutput JSON Claude expects. We push it through the
+// canUseTool deny `message` field — Claude's model reads denied-tool messages
+// as part of the tool_result, so the structured JSON arrives in the same
+// schema the model would have seen had the CLI rendered the question itself.
+export function formatAskUserQuestionAnswers(
+  input: Record<string, unknown>,
+  questions: UserInputQuestion[],
+  answers: UserInputAnswers,
+): string {
+  const original = (input.questions as Array<Record<string, unknown>>) || []
+  const answersByQuestion: Record<string, string> = {}
+  const annotations: Record<string, { notes?: string; preview?: string }> = {}
+  for (let i = 0; i < questions.length; i++) {
+    const q = questions[i]
+    const origQ = original[i] || {}
+    const questionText = String(origQ.question ?? q.question)
+    const slot = answers.answers[q.id]
+    if (!slot) {
+      answersByQuestion[questionText] = ''
+      continue
+    }
+    const picked = Array.isArray(slot.answers) ? slot.answers.filter((s) => s !== 'Other') : []
+    const notes = typeof slot.notes === 'string' ? slot.notes : null
+    // Other-only: notes is the user's free-text reply.
+    if (picked.length === 0 && notes) {
+      answersByQuestion[questionText] = notes
+    } else if (notes && picked.includes('Other')) {
+      answersByQuestion[questionText] = notes
+    } else {
+      // Multi-select Claude format = comma-separated labels.
+      answersByQuestion[questionText] = picked.join(', ')
+    }
+    if (notes) annotations[questionText] = { notes }
+  }
+  const payload = {
+    questions: original,
+    answers: answersByQuestion,
+    ...(Object.keys(annotations).length > 0 ? { annotations } : {}),
+  }
+  return JSON.stringify(payload)
+}

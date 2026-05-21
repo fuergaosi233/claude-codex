@@ -227,6 +227,21 @@ export type ThreadItem =
       reasoningEffort: string | null
       agentsStates: Record<string, { status: 'pendingInit' | 'running' | 'interrupted' | 'completed' | 'errored' | 'shutdown' | 'notFound'; message: string | null }>
     }
+  // Codex's native dynamic tool call item — used to surface AskUserQuestion as
+  // a structured choice card the App renders inline (paired with the
+  // item/tool/requestUserInput reverse RPC). The contentItems array carries
+  // the user's free-form answer text (Codex `DynamicToolCallOutputContentItem`).
+  | {
+      type: 'dynamicToolCall'
+      id: string
+      namespace: string | null
+      tool: string
+      arguments: unknown
+      status: 'inProgress' | 'completed' | 'failed'
+      contentItems: Array<{ type: 'inputText'; text: string } | { type: 'inputImage'; imageUrl: string }> | null
+      success: boolean | null
+      durationMs: number | null
+    }
 
 export interface FileUpdateChange {
   path: string
@@ -288,12 +303,33 @@ export type RuntimeEvent =
   | { type: 'tool_output_delta'; toolUseId: string; delta: string }
   | { type: 'tool_result'; toolUseId: string; content: unknown; isError?: boolean }
   | { type: 'permission_request'; requestId: string; toolUseId: string; toolName: string; input: Record<string, unknown> }
+  | { type: 'user_input_request'; requestId: string; toolUseId: string; questions: UserInputQuestion[] }
   | { type: 'notice'; level: 'info' | 'warning' | 'error'; message: string }
   | { type: 'usage'; usage: Record<string, unknown> }
   | { type: 'metrics'; durationMs: number | null; apiDurationMs: number | null; numTurns: number | null; costUsd: number | null }
   | { type: 'hook'; hookName: string; status: string | null; decision: string | null; message: string | null }
   | { type: 'completed'; claudeSessionId?: string | null; result?: string | null; success: boolean }
   | { type: 'error'; message: string }
+
+// Codex's request_user_input primitive — surfaces Claude's AskUserQuestion as a
+// native choice card in the App instead of a generic mcpToolCall blob. Matches
+// the Codex v2 ToolRequestUserInputQuestion shape so the App's structured UI
+// (`isOther` for free-text, `isSecret` for masked, options list) renders correctly.
+export interface UserInputQuestion {
+  id: string
+  header: string
+  question: string
+  isOther: boolean
+  isSecret: boolean
+  options: Array<{ label: string; description: string }> | null
+}
+
+export interface UserInputAnswers {
+  // Keyed by question id. Each answer is an array of selected option labels
+  // (size > 1 only when the original question was multi-select). When the
+  // user picks "Other", the free-text reply lives in `notes`.
+  answers: Record<string, { answers: string[]; notes?: string | null }>
+}
 
 export interface TokenUsageBreakdown {
   totalTokens: number
@@ -317,6 +353,13 @@ export interface PermissionDecision {
 export interface RuntimeHandlers {
   onEvent(event: RuntimeEvent): Promise<void> | void
   onPermissionRequest(event: Extract<RuntimeEvent, { type: 'permission_request' }>): Promise<PermissionDecision>
+  // Routed when Claude invokes AskUserQuestion. The server bridges this to
+  // Codex's native `item/tool/requestUserInput` reverse RPC so the App can
+  // render structured choice cards instead of a raw tool_use blob. Optional
+  // because not every consumer (mock harnesses, compaction subturns) needs
+  // to expose a real user-input surface — when absent the runtime returns an
+  // empty answer to the model.
+  onUserInputRequest?(event: Extract<RuntimeEvent, { type: 'user_input_request' }>): Promise<UserInputAnswers>
 }
 
 export interface ClaudeRuntime {
