@@ -226,6 +226,42 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    if (/ask user question check/i.test(context.prompt)) {
+      // Drive the AskUserQuestion → request_user_input bridge end-to-end via
+      // the runtime handler. The mock plays the role the native runtime's
+      // canUseTool plays in production: invoke onUserInputRequest, then
+      // surface the user's answers as a text_delta so the test can assert
+      // the round-trip worked.
+      const handler = handlers.onUserInputRequest
+      if (typeof handler !== 'function') {
+        await handlers.onEvent({ type: 'text_delta', delta: 'no onUserInputRequest handler' })
+        await handlers.onEvent({ type: 'completed', success: true, result: 'ask user question check' })
+        return
+      }
+      const answers = await handler({
+        type: 'user_input_request',
+        requestId: `askq-${context.threadId}-${context.turnId}`,
+        toolUseId: `askq-tool-${Date.now()}`,
+        questions: [
+          {
+            id: 'q0',
+            header: 'Auth',
+            question: 'Which auth method do you want?',
+            isOther: false,
+            isSecret: false,
+            options: [
+              { label: 'OAuth', description: 'Use OAuth' },
+              { label: 'API Key', description: 'Use API key' },
+            ],
+          },
+        ],
+      })
+      const picked = answers.answers.q0?.answers.join(',') ?? ''
+      await handlers.onEvent({ type: 'text_delta', delta: `picked=${picked}` })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'ask user question check' })
+      return
+    }
+
     if (/usage check/i.test(context.prompt)) {
       await handlers.onEvent({
         type: 'usage',

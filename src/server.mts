@@ -18,6 +18,8 @@ import type {
   TokenUsageBreakdown,
   TurnRecord,
   UserInput,
+  UserInputAnswers,
+  UserInputQuestion,
   WireMessage,
 } from './types.mjs'
 import { SessionStore } from './store.mjs'
@@ -875,6 +877,11 @@ export class CodexClaudeAppServer {
         },
         // Compaction never asks for approvals — it's read-only summarisation.
         onPermissionRequest: async () => ({ decision: 'accept' }),
+        // Compaction shouldn't ever invoke AskUserQuestion; if it does, return
+        // an empty answer so the model proceeds with its summary.
+        onUserInputRequest: async (event) => ({
+          answers: Object.fromEntries(event.questions.map((q) => [q.id, { answers: [] }])),
+        }),
       },
     )
 
@@ -1502,6 +1509,41 @@ export class CodexClaudeAppServer {
           }
           return decision
         },
+        onUserInputRequest: async (event) => {
+          // Render AskUserQuestion as Codex's native dynamicToolCall item +
+          // item/tool/requestUserInput reverse RPC. The App pops its
+          // structured choice card; we wait for the answers, finalise the
+          // item, then return the structured answer back to the runtime
+          // (which forwards it to the model via the canUseTool deny path).
+          const item: ThreadItem = {
+            type: 'dynamicToolCall',
+            id: newId(),
+            namespace: 'claude',
+            tool: 'AskUserQuestion',
+            arguments: { questions: event.questions },
+            status: 'inProgress',
+            contentItems: null,
+            success: null,
+            durationMs: null,
+          }
+          this.store.appendItem(turn.id, item)
+          const startedAt = nowMillis()
+          this.notify(peer, { method: 'item/started', params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: startedAt } })
+          this.setThreadStatus(peer, thread.id, { type: 'active', activeFlags: ['waitingOnUserInput'] })
+          const answers = await this.requestUserInput(peer, thread.id, turn.id, item.id, event.questions)
+          const contentItems = userInputAnswersAsContent(event.questions, answers)
+          const completedItem: ThreadItem = {
+            ...item,
+            status: 'completed',
+            success: true,
+            contentItems,
+            durationMs: Math.max(0, nowMillis() - startedAt),
+          }
+          this.store.updateItem(turn.id, item.id, () => completedItem)
+          this.notify(peer, { method: 'item/completed', params: { threadId: thread.id, turnId: turn.id, item: completedItem, completedAtMs: nowMillis() } })
+          this.setThreadStatus(peer, thread.id, { type: 'active', activeFlags: [] })
+          return answers
+        },
       },
     )
 
@@ -1594,6 +1636,32 @@ export class CodexClaudeAppServer {
     }
     const decision = normalizeDecision(response)
     return { decision }
+  }
+
+  private async requestUserInput(
+    peer: RpcPeer,
+    threadId: string,
+    turnId: string,
+    itemId: string,
+    questions: UserInputQuestion[],
+  ): Promise<UserInputAnswers> {
+    const requestId = newId()
+    // Always guarantee an "Other" affordance so the App's free-text fallback
+    // is available, even when the upstream caller (Claude tool input, mock
+    // runtime, etc.) didn't model it explicitly.
+    const normalized = questions.map((q) => {
+      const options = q.options ?? []
+      const hasOther = options.some((o) => o.label === 'Other')
+      return hasOther ? q : { ...q, options: [...options, { label: 'Other', description: 'Provide a free-form answer' }] }
+    })
+    const params = { threadId, turnId, itemId, questions: normalized }
+    let response: unknown
+    try {
+      response = await this.sendServerRequest(peer, 'item/tool/requestUserInput', requestId, params)
+    } finally {
+      this.notify(peer, { method: 'serverRequest/resolved', params: { threadId, requestId } })
+    }
+    return normalizeUserInputAnswers(response, normalized)
   }
 
   private async turnInterrupt(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
@@ -3117,4 +3185,60 @@ async function listFiles(root: string): Promise<string[]> {
       return []
     }
   }
+}
+
+// Normalise the App's item/tool/requestUserInput response into the shape the
+// runtime expects. The Codex wire schema is
+// `{answers: {[questionId]: {answers: string[]}}}` — we accept that plus a
+// couple of forgiving variants (the App's experimental field set changes over
+// time) and fall back to empty per-question selections when nothing parses.
+function normalizeUserInputAnswers(response: unknown, questions: UserInputQuestion[]): UserInputAnswers {
+  const empty: UserInputAnswers = {
+    answers: Object.fromEntries(questions.map((q) => [q.id, { answers: [] as string[] }])),
+  }
+  if (!response || typeof response !== 'object') return empty
+  const root = response as Record<string, unknown>
+  const slot = (root.answers ?? root) as Record<string, unknown>
+  if (!slot || typeof slot !== 'object') return empty
+  const out: UserInputAnswers['answers'] = {}
+  for (const q of questions) {
+    const raw = (slot as Record<string, unknown>)[q.id]
+    if (!raw) {
+      out[q.id] = { answers: [] }
+      continue
+    }
+    if (Array.isArray(raw)) {
+      out[q.id] = { answers: raw.map(String) }
+      continue
+    }
+    if (typeof raw === 'string') {
+      out[q.id] = { answers: [raw] }
+      continue
+    }
+    const entry = raw as Record<string, unknown>
+    const list = Array.isArray(entry.answers) ? entry.answers.map(String) : []
+    const notes = typeof entry.notes === 'string' ? entry.notes : null
+    out[q.id] = notes != null ? { answers: list, notes } : { answers: list }
+  }
+  return { answers: out }
+}
+
+// Build the Codex dynamicToolCall contentItems body for the answered question.
+// One inputText item per question, formatted as `Header: answer`. This is what
+// the App renders under the choice card after the user picks an option.
+function userInputAnswersAsContent(
+  questions: UserInputQuestion[],
+  answers: UserInputAnswers,
+): Array<{ type: 'inputText'; text: string } | { type: 'inputImage'; imageUrl: string }> {
+  const out: Array<{ type: 'inputText'; text: string }> = []
+  for (const q of questions) {
+    const slot = answers.answers[q.id]
+    const picked = slot?.answers?.filter((s) => s && s !== 'Other') ?? []
+    const notes = slot?.notes ?? null
+    const body = notes && (picked.length === 0 || picked.includes('Other'))
+      ? notes
+      : picked.join(', ') || '(no answer)'
+    out.push({ type: 'inputText', text: `${q.header}: ${body}` })
+  }
+  return out
 }

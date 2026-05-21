@@ -1868,6 +1868,86 @@ test('turn/steer appends user input to an active Claude turn', async () => {
   }
 })
 
+test('AskUserQuestion is bridged to Codex item/tool/requestUserInput', async () => {
+  // Bug repro: Claude's AskUserQuestion tool calls weren't surfaced in the
+  // App UI — they fell through as generic mcpToolCall items with no choice
+  // card. We bridge them to Codex's native request_user_input reverse RPC
+  // so the App pops its structured picker, then route the user's answer
+  // back to the model.
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false } }))
+    const start = await reader.nextResponse(1)
+    const threadId = start.result.thread.id
+
+    proc.stdin.write(json({ id: 2, method: 'turn/start', params: { threadId, input: [{ type: 'text', text: 'ask user question check', text_elements: [] }] } }))
+    const started = await reader.nextResponse(2)
+    const turnId = started.result.turn.id
+
+    // Wait for the server's reverse-RPC asking us to answer. Real Codex
+    // protocol: request id is numeric/server-side, params carry the
+    // structured questions.
+    let askRequest: any | null = null
+    while (askRequest == null) {
+      const message = await reader.next()
+      if (message.method === 'item/tool/requestUserInput') {
+        askRequest = message
+      }
+    }
+    assert.equal(askRequest.params.threadId, threadId)
+    assert.equal(askRequest.params.turnId, turnId)
+    assert.equal(Array.isArray(askRequest.params.questions), true)
+    assert.equal(askRequest.params.questions[0].header, 'Auth')
+    assert.equal(askRequest.params.questions[0].question, 'Which auth method do you want?')
+    // The bridge auto-appends an "Other" option so the App's free-text
+    // affordance lights up even when Claude didn't model one explicitly.
+    assert.equal(askRequest.params.questions[0].options.some((o: any) => o.label === 'Other'), true)
+
+    // Answer as the App would.
+    proc.stdin.write(json({
+      jsonrpc: '2.0',
+      id: askRequest.id,
+      result: { answers: { q0: { answers: ['OAuth'] } } },
+    }))
+
+    let completed = false
+    for (let i = 0; i < 500; i += 1) {
+      const message = await reader.next()
+      if (message.method === 'turn/completed') {
+        completed = true
+        break
+      }
+    }
+    assert.equal(completed, true)
+
+    proc.stdin.write(json({ id: 4, method: 'thread/turns/items/list', params: { threadId, turnId } }))
+    const items = await reader.nextResponse(4)
+    const itemsList = items.result.data as Array<any>
+    const dynamic = itemsList.find((item) => item.type === 'dynamicToolCall')
+    assert.ok(dynamic, 'expected a dynamicToolCall item in the turn')
+    assert.equal(dynamic.tool, 'AskUserQuestion')
+    assert.equal(dynamic.status, 'completed')
+    assert.equal(dynamic.success, true)
+    assert.equal(Array.isArray(dynamic.contentItems), true)
+    assert.match(dynamic.contentItems[0].text, /OAuth/)
+    // No stray mcpToolCall for AskUserQuestion (otherwise the App would
+    // draw a duplicate generic card alongside the choice picker).
+    assert.equal(itemsList.some((item) => item.type === 'mcpToolCall' && item.tool === 'AskUserQuestion'), false)
+    // The chosen answer also reached the mock through onUserInputRequest's
+    // return value (and got echoed back as the final agent message text).
+    const agent = itemsList.find((item) => item.type === 'agentMessage')
+    assert.ok(agent && /picked=OAuth/.test(agent.text), 'expected the agent message to echo the picked answer')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('compatibility-only UI methods return schema-shaped responses', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
