@@ -64,6 +64,12 @@ export class CodexClaudeAppServer {
   private tokenUsageByThread = new Map<string, TokenUsageBreakdown>()
   private configModel = defaultSelectableModelId()
   private configReasoningEffort = normalizeCodexReasoningEffort(process.env.CLAUDE_CODEX_DEFAULT_EFFORT) ?? 'medium'
+  // Catch-all for arbitrary keys the App's settings sheet writes (approval
+  // policy, sandbox preference, instructions toggles, etc.). We don't apply
+  // them to typed runtime state, but we round-trip them through config/read
+  // so the user's settings survive a daemon restart instead of resetting on
+  // every reconnect.
+  private configOverrides: Record<string, unknown> = {}
   private readonly configPath = join(adapterHome(), 'config.json')
   private idleCheckHandler: (() => void) | null = null
   private stopped = false
@@ -238,7 +244,7 @@ export class CodexClaudeAppServer {
       case 'thread/loaded/list':
         return this.threadLoadedList(asRecord(params))
       case 'thread/inject_items':
-        return {}
+        return this.threadInjectItems(peer, asRecord(params))
       case 'turn/start':
         return this.turnStart(peer, asRecord(params))
       case 'turn/steer':
@@ -633,6 +639,65 @@ export class CodexClaudeAppServer {
     return { data: loaded.slice(0, limit), nextCursor: loaded.length > limit ? String(limit) : null }
   }
 
+  // Codex App calls thread/inject_items to push hidden context into a thread's
+  // model history — typically file-attachment ingestion, "pin this output as
+  // future context", or App-side memory consolidation. Items are raw Responses
+  // API entries (free-form JSON). Without an implementation the App's
+  // ingestion just disappears, breaking any feature that relies on it.
+  //
+  // Approach: synthesize an injected turn carrying a single agentMessage that
+  // recaps the items as a human-readable block. That turn becomes part of the
+  // thread's transcript so the next runRuntimeTurn picks it up as prior
+  // conversation context, AND it's visible in thread/read so the user can
+  // confirm what was added. We pick agentMessage (instead of a custom type)
+  // for App-compatibility — every Codex App build renders it without needing
+  // a new ThreadItem variant.
+  private threadInjectItems(peer: RpcPeer, params: Record<string, unknown>): unknown {
+    const threadId = stringOr(params.threadId, '')
+    const thread = this.store.getThread(threadId)
+    if (!thread) throw new Error(`unknown thread: ${threadId}`)
+    const items = Array.isArray(params.items) ? params.items : []
+    if (items.length === 0) return {}
+
+    const now = nowSeconds()
+    const turnId = newId()
+    const itemId = newId()
+    // Compact summary of injected items — try to extract human-readable text
+    // (Responses items often have `content` arrays with text segments).
+    const summary = items.map((raw) => summarizeInjectedItem(raw)).filter(Boolean).join('\n\n')
+    const text = summary.length > 0 ? summary : `[adapter] ${items.length} item(s) injected via thread/inject_items`
+    const agentItem: ThreadItem = { type: 'agentMessage', id: itemId, text, phase: null, memoryCitation: null }
+    const turn: TurnRecord = {
+      id: turnId,
+      threadId,
+      status: 'completed',
+      startedAt: now,
+      completedAt: now,
+      durationMs: 0,
+      items: [agentItem],
+      diff: '',
+      error: null,
+    }
+    this.store.upsertTurn(turn)
+    thread.updatedAt = now
+    this.store.upsertThread(thread)
+    // Defer notifications past the inject_items response. Firing them
+    // synchronously enqueues them in front of the response on the wire,
+    // which trips clients that do "await response, then read notifications"
+    // (they end up draining the notifications while waiting for the
+    // response, then loop forever looking for already-discarded events).
+    queueMicrotask(() => {
+      this.notify(peer, { method: 'turn/started', params: { threadId, turn: this.toTurn(turn) } })
+      this.notify(peer, {
+        method: 'item/completed',
+        params: { threadId, turnId, item: agentItem, completedAtMs: nowMillis() },
+      })
+      this.notify(peer, { method: 'turn/completed', params: { threadId, turn: this.toTurn(turn) } })
+    })
+    debugLog('thread.inject_items', { threadId, count: items.length })
+    return {}
+  }
+
   private threadGoalSet(params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     const existing = this.goals.get(threadId)
@@ -1003,6 +1068,25 @@ export class CodexClaudeAppServer {
       set: false,
     }
     const forkSession = thread.forkedFromId != null && thread.claudeSessionId != null && this.store.listTurns(thread.id).length <= 1
+    // Plan mode: Claude SDK runs with permissionMode='plan' — it produces
+    // planning text but does not execute tools. We surface the planning
+    // output as Codex's native `plan` ThreadItem (instead of agentMessage)
+    // and stream deltas via item/plan/delta + turn/plan/updated so the
+    // App's Plan-mode UI lights up properly. Detection:
+    //   * turn/start.planMode === true (App's explicit request)
+    //   * thread.approvalPolicy / sandbox flags don't suppress it
+    // The current planMode flag for this turn was computed above as
+    // `params.planMode === true`; reproduce here so the helpers can check it.
+    const planMode = params.planMode === true
+    let planItemId: string | null = null
+    const ensurePlanItem = (): string => {
+      if (planItemId) return planItemId
+      planItemId = newId()
+      const item: ThreadItem = { type: 'plan', id: planItemId, text: '' }
+      this.store.appendItem(turn.id, item)
+      this.notify(peer, { method: 'item/started', params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: nowMillis() } })
+      return planItemId
+    }
     const ensureAgentItem = (): string => {
       if (agentItemId) return agentItemId
       agentItemId = newId()
@@ -1311,6 +1395,19 @@ export class CodexClaudeAppServer {
             return
           }
           if (event.type === 'text_delta') {
+            // In plan mode, text is the plan body — route to a Plan item +
+            // item/plan/delta + (later) turn/plan/updated so the App's
+            // Plan-mode UI lights up natively. Outside plan mode it's a
+            // normal agentMessage delta.
+            if (planMode) {
+              const itemId = ensurePlanItem()
+              this.store.updateItem(turn.id, itemId, (item) => {
+                if (item.type === 'plan') return { ...item, text: item.text + event.delta }
+                return item
+              })
+              this.notify(peer, { method: 'item/plan/delta', params: { threadId: thread.id, turnId: turn.id, itemId, delta: event.delta } })
+              return
+            }
             const itemId = ensureAgentItem()
             this.store.updateItem(turn.id, itemId, (item) => {
               if (item.type === 'agentMessage') return { ...item, text: item.text + event.delta }
@@ -1562,7 +1659,7 @@ export class CodexClaudeAppServer {
       this.notify(peer, { method: 'item/agentMessage/delta', params: { threadId: thread.id, turnId: turn.id, itemId, delta: text } })
     }
     const latestTurn = this.store.getTurn(turn.id)
-    for (const completedItemId of [reasoningItemId, agentItemId]) {
+    for (const completedItemId of [reasoningItemId, agentItemId, planItemId]) {
       const item = latestTurn?.items.find((candidate) => candidate.id === completedItemId)
       if (item) this.notify(peer, { method: 'item/completed', params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() } })
     }
@@ -1574,6 +1671,20 @@ export class CodexClaudeAppServer {
     }
     this.clearActiveTurn(thread.id)
     this.setThreadStatus(peer, thread.id, { type: 'idle' })
+    // Plan-mode finale: emit turn/plan/updated with the final plan body so
+    // the App's Plan-mode UI gets a single authoritative blob alongside the
+    // streamed deltas. We only fire if a plan item actually accumulated;
+    // turns where Claude bailed out via ExitPlanMode early still get the
+    // notification with whatever text exists at the time.
+    if (planMode && planItemId) {
+      const planItem = latestTurn?.items.find((candidate) => candidate.id === planItemId)
+      if (planItem && planItem.type === 'plan') {
+        this.notify(peer, {
+          method: 'turn/plan/updated',
+          params: { threadId: thread.id, turnId: turn.id, planItemId, text: planItem.text },
+        })
+      }
+    }
     this.notify(peer, { method: 'turn/completed', params: { threadId: thread.id, turn: this.toTurn(completed) } })
   }
 
@@ -1701,32 +1812,39 @@ export class CodexClaudeAppServer {
   }
 
   private configRead(): unknown {
+    // Base config = our typed defaults; overrides (whatever the App's
+    // settings sheet has written previously via config/value/write) are
+    // layered on top so the user sees their last-saved values instead of
+    // the defaults bouncing back on every reconnect. Typed fields (model /
+    // model_reasoning_effort) take precedence over overrides since they're
+    // applied via a stricter validator.
     return {
       config: {
+        ...this.configOverrides,
         model: this.configModel,
         review_model: null,
         model_context_window: null,
         model_auto_compact_token_limit: null,
         model_provider: 'claude-code',
-        approval_policy: 'on-request',
-        approvals_reviewer: 'user',
-        sandbox_mode: 'workspace-write',
-        sandbox_workspace_write: null,
+        approval_policy: this.configOverrides.approval_policy ?? 'on-request',
+        approvals_reviewer: this.configOverrides.approvals_reviewer ?? 'user',
+        sandbox_mode: this.configOverrides.sandbox_mode ?? 'workspace-write',
+        sandbox_workspace_write: this.configOverrides.sandbox_workspace_write ?? null,
         forced_chatgpt_workspace_id: null,
         forced_login_method: null,
-        web_search: 'disabled',
-        tools: null,
-        profile: null,
+        web_search: this.configOverrides.web_search ?? 'disabled',
+        tools: this.configOverrides.tools ?? null,
+        profile: this.configOverrides.profile ?? null,
         profiles: {},
-        instructions: null,
-        developer_instructions: null,
-        compact_prompt: null,
+        instructions: this.configOverrides.instructions ?? null,
+        developer_instructions: this.configOverrides.developer_instructions ?? null,
+        compact_prompt: this.configOverrides.compact_prompt ?? null,
         model_reasoning_effort: this.configReasoningEffort,
-        model_reasoning_summary: null,
-        model_verbosity: null,
-        service_tier: null,
-        analytics: null,
-        apps: null,
+        model_reasoning_summary: this.configOverrides.model_reasoning_summary ?? null,
+        model_verbosity: this.configOverrides.model_verbosity ?? null,
+        service_tier: this.configOverrides.service_tier ?? null,
+        analytics: this.configOverrides.analytics ?? null,
+        apps: this.configOverrides.apps ?? null,
         model_providers: this.exposedModelProviders(),
       },
       origins: {
@@ -1863,25 +1981,14 @@ export class CodexClaudeAppServer {
     this.tokenUsageByThread.set(threadId, total)
     const tokenUsage: ThreadTokenUsage = { total, last, modelContextWindow: null }
     this.notify(peer, { method: 'thread/tokenUsage/updated', params: { threadId, turnId, tokenUsage } })
-    // Also push the global rate-limit snapshot so the App's account-usage
-    // meter is in sync with the per-thread token meter. We don't actually
-    // know Claude's rate-limit headers from here, but emitting the snapshot
-    // shape with null windows keeps the UI from getting stuck on a stale
-    // value (and lets it re-poll if it cares to).
-    this.notify(peer, {
-      method: 'account/rateLimits/updated',
-      params: {
-        rateLimits: {
-          limitId: 'claude-code',
-          limitName: 'Claude Code',
-          primary: null,
-          secondary: null,
-          credits: null,
-          planType: null,
-          rateLimitReachedType: null,
-        },
-      },
-    })
+    // NOTE: previously we also pushed `account/rateLimits/updated` here on
+    // every token-usage event "to keep the UI in sync". That backfired —
+    // Codex App treats every such notification as a fresh rate-limit signal
+    // and surfaces it as a transient warning banner, so the user saw a
+    // rate-limit pop on every assistant turn. Since we don't actually have
+    // real rate-limit data from the Anthropic SDK (no headers exposed), the
+    // notification was empty noise. The initial snapshot still fires once
+    // post-handshake in `initialize` so the UI populates on first connect.
   }
 
   private async fsReadFile(params: Record<string, unknown>): Promise<unknown> {
@@ -2203,11 +2310,21 @@ export class CodexClaudeAppServer {
 
   private configWriteResponse(params: Record<string, unknown>): unknown {
     for (const edit of configEdits(params)) {
-      if (edit.keyPath === 'model' && typeof edit.value === 'string' && edit.value.length > 0) {
-        this.configModel = normalizeSelectableModelId(edit.value, this.configModel)
-      }
-      if (edit.keyPath === 'model_reasoning_effort' && typeof edit.value === 'string') {
-        this.configReasoningEffort = normalizeCodexReasoningEffort(edit.value) ?? this.configReasoningEffort
+      const { keyPath, value } = edit
+      if (keyPath === 'model' && typeof value === 'string' && value.length > 0) {
+        this.configModel = normalizeSelectableModelId(value, this.configModel)
+      } else if (keyPath === 'model_reasoning_effort' && typeof value === 'string') {
+        this.configReasoningEffort = normalizeCodexReasoningEffort(value) ?? this.configReasoningEffort
+      } else {
+        // Unknown key — store in the generic overrides bag so it survives a
+        // restart even though we don't apply it to typed runtime state. This
+        // captures approvalPolicy, sandboxMode, instruction toggles, anything
+        // the App's settings sheet may emit. `null` value clears the entry.
+        if (value === null || value === undefined) {
+          delete this.configOverrides[keyPath]
+        } else {
+          this.configOverrides[keyPath] = value
+        }
       }
     }
     this.persistConfig()
@@ -2514,6 +2631,11 @@ export class CodexClaudeAppServer {
       if (typeof parsed.model_reasoning_effort === 'string') {
         this.configReasoningEffort = normalizeCodexReasoningEffort(parsed.model_reasoning_effort) ?? this.configReasoningEffort
       }
+      // Restore the overrides bag — any key persisted previously that isn't
+      // the strongly-typed model / effort lives here so it survives restarts.
+      if (parsed.overrides && typeof parsed.overrides === 'object' && !Array.isArray(parsed.overrides)) {
+        this.configOverrides = parsed.overrides as Record<string, unknown>
+      }
       if (shouldRepair) this.persistConfig()
     } catch {}
   }
@@ -2523,7 +2645,11 @@ export class CodexClaudeAppServer {
       ensureParent(this.configPath)
       writeFileSync(
         this.configPath,
-        JSON.stringify({ model: this.configModel, model_reasoning_effort: this.configReasoningEffort }, null, 2) + '\n',
+        JSON.stringify({
+          model: this.configModel,
+          model_reasoning_effort: this.configReasoningEffort,
+          overrides: this.configOverrides,
+        }, null, 2) + '\n',
         { mode: 0o600 },
       )
     } catch {}
@@ -2536,6 +2662,31 @@ function asRecord(value: unknown): Record<string, unknown> {
 
 function stringOr(value: unknown, fallback: string): string {
   return typeof value === 'string' && value.length > 0 ? value : fallback
+}
+
+// Pull a human-readable line out of a raw Responses-API item. Items are
+// free-form JSON; common shapes include {type, content:[{type:'text', text}]}
+// for assistant/user turns and {type:'message', role, content} for chat
+// segments. Fall back to a stringified JSON snippet otherwise.
+function summarizeInjectedItem(raw: unknown): string {
+  if (raw == null) return ''
+  if (typeof raw === 'string') return raw.slice(0, 1000)
+  if (typeof raw !== 'object') return String(raw).slice(0, 1000)
+  const rec = raw as Record<string, unknown>
+  const content = rec.content
+  if (Array.isArray(content)) {
+    const texts: string[] = []
+    for (const block of content) {
+      if (block && typeof block === 'object') {
+        const b = block as Record<string, unknown>
+        if (typeof b.text === 'string') texts.push(b.text)
+      }
+    }
+    if (texts.length > 0) return texts.join('\n').slice(0, 2000)
+  }
+  if (typeof rec.text === 'string') return rec.text.slice(0, 2000)
+  // Last-resort dump so something shows up in the transcript.
+  try { return JSON.stringify(raw).slice(0, 500) } catch { return '[non-serializable item]' }
 }
 
 function configEdits(params: Record<string, unknown>): Array<{ keyPath: string; value: unknown }> {
@@ -3114,7 +3265,29 @@ function isNotAGitRepo(error: unknown): boolean {
   return /not a git repository/i.test(message)
 }
 
+// Cheap upfront check — if cwd isn't in a git work-tree, skip the expensive
+// `git diff` spawn entirely. Without this guard a non-git workspace (App
+// Remote pointing at $HOME or any arbitrary dir) was spamming debug.jsonl
+// with multi-KB "not a git repository" failures on every turn cycle, since
+// gitDiff runs from runRuntimeTurn after each tool result.
+const gitRepoCache = new Map<string, boolean>()
+async function isGitWorkTree(cwd: string): Promise<boolean> {
+  if (gitRepoCache.has(cwd)) return gitRepoCache.get(cwd) as boolean
+  let inside = false
+  try {
+    const { stdout } = await execFileAsync('git', ['rev-parse', '--is-inside-work-tree'], {
+      cwd, timeout: 3_000, maxBuffer: 1024,
+    })
+    inside = stdout.trim() === 'true'
+  } catch {
+    inside = false
+  }
+  gitRepoCache.set(cwd, inside)
+  return inside
+}
+
 async function gitDiff(cwd: string): Promise<string> {
+  if (!(await isGitWorkTree(cwd))) return ''
   let trackedDiff = ''
   try {
     const { stdout } = await execFileAsync('git', ['diff', '--no-ext-diff', '--'], { cwd, timeout: 10_000, maxBuffer: 5 * 1024 * 1024 })

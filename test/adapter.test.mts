@@ -1372,6 +1372,95 @@ test('modelProvider/capabilities/read advertises webSearch=true unless CLAUDE_CO
   }
 })
 
+test('config/value/write persists arbitrary settings keys across restarts', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const env = { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' }
+  // Round 1: write a custom key + a known typed key.
+  let proc1 = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], { stdio: ['pipe', 'pipe', 'pipe'], env })
+  let reader = new JsonLineReader(proc1)
+  try {
+    proc1.stdin.write(json({ id: 1, method: 'config/value/write', params: { keyPath: 'approval_policy', value: 'never' } }))
+    await reader.nextResponse(1)
+    proc1.stdin.write(json({ id: 2, method: 'config/value/write', params: { keyPath: 'sandbox_mode', value: 'danger-full-access' } }))
+    await reader.nextResponse(2)
+    proc1.stdin.write(json({ id: 3, method: 'config/read', params: {} }))
+    const r = await reader.nextResponse(3)
+    assert.equal(r.result.config.approval_policy, 'never', 'override should appear in config/read on the same process')
+    assert.equal(r.result.config.sandbox_mode, 'danger-full-access')
+  } finally {
+    proc1.kill()
+    await once(proc1, 'exit')
+  }
+
+  // Round 2: a fresh adapter process re-reads from disk — overrides survive.
+  const proc2 = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], { stdio: ['pipe', 'pipe', 'pipe'], env })
+  reader = new JsonLineReader(proc2)
+  try {
+    proc2.stdin.write(json({ id: 1, method: 'config/read', params: {} }))
+    const r = await reader.nextResponse(1)
+    assert.equal(r.result.config.approval_policy, 'never', 'override must survive restart via persisted overrides bag')
+    assert.equal(r.result.config.sandbox_mode, 'danger-full-access')
+  } finally {
+    proc2.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('thread/inject_items appends a synthetic turn carrying the injected text', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const start = await reader.nextResponse(1)
+    const threadId = start.result.thread.id
+
+    // Codex App's actual payload shape: items[] of free-form Responses entries.
+    proc.stdin.write(json({
+      id: 2,
+      method: 'thread/inject_items',
+      params: {
+        threadId,
+        items: [
+          { type: 'message', role: 'user', content: [{ type: 'text', text: 'Here is some pinned context.' }] },
+          { type: 'message', role: 'assistant', content: [{ type: 'text', text: 'Got it, remembered.' }] },
+        ],
+      },
+    }))
+
+    // The response + 3 notifications (turn/started, item/completed, turn/completed)
+    // arrive in some order. Drain everything until we've seen all four signals
+    // — don't pre-filter via nextResponse(2) because that would discard the
+    // notifications which are exactly what we want to assert.
+    let sawResponse = false
+    let injectedText = ''
+    for (let i = 0; i < 100; i += 1) {
+      const m = await reader.next()
+      if (m.id === 2 && m.method == null) sawResponse = true
+      if (m.method === 'item/completed' && m.params?.item?.type === 'agentMessage') {
+        injectedText = m.params.item.text
+      }
+      if (sawResponse && injectedText) break
+    }
+    assert.equal(sawResponse, true, 'thread/inject_items response must arrive')
+    assert.match(injectedText, /pinned context/, 'injected text must round-trip into the synthetic agentMessage')
+    assert.match(injectedText, /Got it, remembered/)
+
+    // thread/read should show the synthetic turn so reload preserves it.
+    proc.stdin.write(json({ id: 3, method: 'thread/read', params: { threadId, includeTurns: true } }))
+    const read = await reader.nextResponse(3)
+    const turns = read.result.thread.turns
+    assert.ok(turns.length >= 1, 'thread/read should include the injected turn')
+    assert.equal(turns.at(-1).items[0].type, 'agentMessage')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('turn/start planMode=true flows into Claude SDK permission_mode plan', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
@@ -1387,13 +1476,19 @@ test('turn/start planMode=true flows into Claude SDK permission_mode plan', asyn
     proc.stdin.write(json({ id: 2, method: 'turn/start', params: { threadId, planMode: true, input: [{ type: 'text', text: 'plan mode check', text_elements: [] }] } }))
     await reader.nextResponse(2)
 
-    let text = ''
+    // Plan-mode text now routes to a Plan ThreadItem via item/plan/delta
+    // (and a final turn/plan/updated) so the App's Plan UI lights up.
+    // agentMessage is reserved for non-plan turns.
+    let planText = ''
+    let sawPlanUpdated = false
     for (let i = 0; i < 200; i += 1) {
       const message = await reader.next()
-      if (message.method === 'item/agentMessage/delta') text += message.params.delta
+      if (message.method === 'item/plan/delta') planText += message.params.delta
+      if (message.method === 'turn/plan/updated') sawPlanUpdated = true
       if (message.method === 'turn/completed') break
     }
-    assert.match(text, /planMode=true/, 'context.planMode should arrive at the runtime when turn/start.planMode=true')
+    assert.match(planText, /planMode=true/, 'plan deltas should carry the runtime context')
+    assert.equal(sawPlanUpdated, true, 'turn/plan/updated must fire at end of plan turn')
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
