@@ -1829,6 +1829,23 @@ export class CodexClaudeAppServer {
             // commandExecution item that never closes (the second emit
             // overwrites itemIds[] so the husk never sees its tool_result).
             if (itemIds.has(event.toolUseId)) return
+            // Claude's TodoWrite is the equivalent of Codex's `update_plan`
+            // todo/checklist tool, which the real app-server maps to a
+            // turn/plan/updated notification (structured steps) rather than a
+            // timeline item. Mirror that: emit the structured plan and suppress
+            // the generic tool item so the App's plan/checklist UI drives off
+            // the spec'd notification.
+            if (event.toolName === 'TodoWrite') {
+              const plan = todoWriteToPlanSteps(event.input)
+              if (plan) {
+                this.notify(peer, {
+                  method: 'turn/plan/updated',
+                  params: { threadId: thread.id, turnId: turn.id, explanation: null, plan },
+                })
+              }
+              itemIds.set(event.toolUseId, '')
+              return
+            }
             const item = this.toolUseToItem(event, thread.cwd)
             itemIds.set(event.toolUseId, item.id)
             itemStartedAtMs.set(item.id, nowMillis())
@@ -2150,20 +2167,10 @@ export class CodexClaudeAppServer {
     }
     this.clearActiveTurn(thread.id)
     this.setThreadStatus(peer, thread.id, { type: 'idle' })
-    // Plan-mode finale: emit turn/plan/updated with the final plan body so
-    // the App's Plan-mode UI gets a single authoritative blob alongside the
-    // streamed deltas. We only fire if a plan item actually accumulated;
-    // turns where Claude bailed out via ExitPlanMode early still get the
-    // notification with whatever text exists at the time.
-    if (planMode && planItemId) {
-      const planItem = latestTurn?.items.find((candidate) => candidate.id === planItemId)
-      if (planItem && planItem.type === 'plan') {
-        this.notify(peer, {
-          method: 'turn/plan/updated',
-          params: { threadId: thread.id, turnId: turn.id, planItemId, text: planItem.text },
-        })
-      }
-    }
+    // Plan-mode text streams through the `plan` ThreadItem + item/plan/delta
+    // events; turn/plan/updated is reserved for the update_plan/TodoWrite
+    // checklist tool (see the tool_use handler), matching the real app-server
+    // which keeps those two surfaces separate.
     this.notify(peer, {
       method: 'turn/completed',
       params: { threadId: thread.id, turn: this.toLifecycleTurn(completed) },
@@ -3858,6 +3865,32 @@ function parseSubagentTrailer(text: string): SubagentTrailer {
 // some failure modes (and via custom wrappers / Codex CLI shims) the SDK
 // suffixes a `Exit code: N` / `exit status N` marker. Returning null lets
 // the caller fall back to 0/1 from event.isError.
+// Map Claude's TodoWrite input to Codex v2 TurnPlanStep[]. Claude todos carry
+// { content, status, activeForm } with status pending|in_progress|completed;
+// the wire TurnPlanStepStatus is camelCase pending|inProgress|completed.
+function todoWriteToPlanSteps(
+  input: Record<string, unknown>,
+): Array<{ step: string; status: 'pending' | 'inProgress' | 'completed' }> | null {
+  const todos = (input as { todos?: unknown }).todos
+  if (!Array.isArray(todos)) return null
+  return todos.map((raw) => {
+    const todo = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>
+    const step =
+      typeof todo.content === 'string' && todo.content.length > 0
+        ? todo.content
+        : typeof todo.activeForm === 'string'
+          ? todo.activeForm
+          : ''
+    const status =
+      todo.status === 'in_progress'
+        ? 'inProgress'
+        : todo.status === 'completed'
+          ? 'completed'
+          : 'pending'
+    return { step, status }
+  })
+}
+
 function parseExitCodeFromResult(content: unknown): number | null {
   const text =
     typeof content === 'string'

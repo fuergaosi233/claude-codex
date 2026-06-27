@@ -80,6 +80,25 @@ export class MockRuntime implements ClaudeRuntime {
       }
     }
 
+    if (/todo|checklist|plan list/i.test(context.prompt)) {
+      // Claude's TodoWrite tool — the adapter maps this to a Codex
+      // turn/plan/updated notification rather than a timeline item.
+      const toolUseId = `tool-${Date.now()}`
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId,
+        toolName: 'TodoWrite',
+        input: {
+          todos: [
+            { content: 'Investigate', status: 'completed', activeForm: 'Investigating' },
+            { content: 'Implement', status: 'in_progress', activeForm: 'Implementing' },
+            { content: 'Verify', status: 'pending', activeForm: 'Verifying' },
+          ],
+        },
+      })
+      await handlers.onEvent({ type: 'tool_result', toolUseId, content: 'todos updated' })
+    }
+
     if (/generic tool|read tool/i.test(context.prompt)) {
       const toolUseId = `tool-${Date.now()}`
       await handlers.onEvent({

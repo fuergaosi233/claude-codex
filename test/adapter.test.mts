@@ -2092,9 +2092,9 @@ test('turn/start planMode=true flows into Claude SDK permission_mode plan', asyn
     )
     await reader.nextResponse(2)
 
-    // Plan-mode text now routes to a Plan ThreadItem via item/plan/delta
-    // (and a final turn/plan/updated) so the App's Plan UI lights up.
-    // agentMessage is reserved for non-plan turns.
+    // Plan-mode text routes to a Plan ThreadItem via item/plan/delta so the
+    // App's Plan UI lights up. turn/plan/updated is NOT used for plan-mode text;
+    // it is reserved for the update_plan/TodoWrite checklist tool.
     let planText = ''
     let sawPlanUpdated = false
     for (let i = 0; i < 200; i += 1) {
@@ -2104,7 +2104,60 @@ test('turn/start planMode=true flows into Claude SDK permission_mode plan', asyn
       if (message.method === 'turn/completed') break
     }
     assert.match(planText, /planMode=true/, 'plan deltas should carry the runtime context')
-    assert.equal(sawPlanUpdated, true, 'turn/plan/updated must fire at end of plan turn')
+    assert.equal(sawPlanUpdated, false, 'plan-mode text must not emit turn/plan/updated')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('TodoWrite maps to a Codex v2 turn/plan/updated notification, not a timeline item', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const start = await reader.nextResponse(1)
+    const threadId = start.result.thread.id
+
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'update the todo list', text_elements: [] }],
+        },
+      }),
+    )
+    await reader.nextResponse(2)
+
+    let planUpdate: any = null
+    let sawTodoItem = false
+    for (let i = 0; i < 200; i += 1) {
+      const message = await reader.next()
+      if (message.method === 'turn/plan/updated') planUpdate = message.params
+      if (
+        (message.method === 'item/started' || message.method === 'item/completed') &&
+        /todo/i.test(message.params.item?.tool ?? '')
+      )
+        sawTodoItem = true
+      if (message.method === 'turn/completed') break
+    }
+    assert.ok(planUpdate, 'expected a turn/plan/updated notification')
+    // Codex v2 TurnPlanUpdatedNotification = { threadId, turnId, explanation, plan }.
+    assert.equal(planUpdate.threadId, threadId)
+    assert.equal(planUpdate.explanation, null)
+    assert.deepEqual(planUpdate.plan, [
+      { step: 'Investigate', status: 'completed' },
+      { step: 'Implement', status: 'inProgress' },
+      { step: 'Verify', status: 'pending' },
+    ])
+    // The checklist tool itself is not surfaced as a separate timeline item.
+    assert.equal(sawTodoItem, false, 'TodoWrite must not produce a timeline tool item')
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
