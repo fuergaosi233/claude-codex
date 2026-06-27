@@ -87,6 +87,11 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 - Lifecycle turn envelopes carry only schema fields — internal api/cost/turn
   metrics are not serialized onto the wire (token metrics flow through
   `thread/tokenUsage/updated`).
+- `turn/plan/updated` is reserved for the `update_plan`/TodoWrite checklist tool
+  and ships the spec shape `{ explanation, plan: [{ step, status }] }` (status
+  ∈ pending/inProgress/completed); the checklist tool is not also surfaced as a
+  timeline item. Plan-mode prose stays on the separate `plan` ThreadItem +
+  `item/plan/delta` channel.
 
 ## Robustness notes
 
