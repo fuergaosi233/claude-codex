@@ -52,7 +52,10 @@ import {
 const execFileAsync = promisify(execFile)
 
 export class CodexClaudeAppServer {
-  private pendingServerRequests = new Map<string, { resolve: (value: unknown) => void; reject: (error: Error) => void }>()
+  private pendingServerRequests = new Map<
+    string,
+    { resolve: (value: unknown) => void; reject: (error: Error) => void }
+  >()
   private activePeerByThread = new Map<string, RpcPeer>()
   private activeTurnByThread = new Map<string, string>()
   private commandSessionAllow = new Map<string, Set<string>>()
@@ -63,7 +66,8 @@ export class CodexClaudeAppServer {
   private elicitationCounts = new Map<string, number>()
   private tokenUsageByThread = new Map<string, TokenUsageBreakdown>()
   private configModel = defaultSelectableModelId()
-  private configReasoningEffort = normalizeCodexReasoningEffort(process.env.CLAUDE_CODEX_DEFAULT_EFFORT) ?? 'medium'
+  private configReasoningEffort =
+    normalizeCodexReasoningEffort(process.env.CLAUDE_CODEX_DEFAULT_EFFORT) ?? 'medium'
   // Catch-all for arbitrary keys the App's settings sheet writes (approval
   // policy, sandbox preference, instructions toggles, etc.). We don't apply
   // them to typed runtime state, but we round-trip them through config/read
@@ -73,11 +77,12 @@ export class CodexClaudeAppServer {
   private readonly configPath = join(adapterHome(), 'config.json')
   private idleCheckHandler: (() => void) | null = null
   private stopped = false
+  private readonly store: SessionStore
+  private readonly runtime: ClaudeRuntime
 
-  constructor(
-    private store: SessionStore,
-    private runtime: ClaudeRuntime,
-  ) {
+  constructor(store: SessionStore, runtime: ClaudeRuntime) {
+    this.store = store
+    this.runtime = runtime
     this.loadPersistedConfig()
   }
 
@@ -97,7 +102,11 @@ export class CodexClaudeAppServer {
       return
     }
     if ('id' in message) {
-      debugLog('rpc.responseFromClient', { peerId: peer.id, id: message.id, hasError: Boolean((message as JsonRpcResponse).error) })
+      debugLog('rpc.responseFromClient', {
+        peerId: peer.id,
+        id: message.id,
+        hasError: Boolean((message as JsonRpcResponse).error),
+      })
       this.resolveServerRequest(message as JsonRpcResponse)
     }
   }
@@ -132,7 +141,12 @@ export class CodexClaudeAppServer {
   private async handleRequest(peer: RpcPeer, request: JsonRpcRequest): Promise<void> {
     try {
       const result = await this.dispatch(peer, request.method, request.params ?? {})
-      debugLog('rpc.response', { peerId: peer.id, id: request.id, method: request.method, ok: true })
+      debugLog('rpc.response', {
+        peerId: peer.id,
+        id: request.id,
+        method: request.method,
+        ok: true,
+      })
       this.sendResponse(peer, request.id, result)
     } catch (error) {
       debugLog('rpc.response', {
@@ -164,15 +178,18 @@ export class CodexClaudeAppServer {
             method: 'account/updated',
             params: { authMode: 'apikey', planType: null },
           })
-          for (const status of readMcpConfig().statuses) {
+          for (const status of readMcpConfig().startupStatuses) {
             this.notify(peer, {
-              method: 'mcpServer/status/updated',
+              method: 'mcpServer/startupStatus/updated',
               params: { name: status.name, status: status.status, error: status.error ?? null },
             })
           }
         })
         return {
-          userAgent: codexUserAgent(stringOr(clientInfo.name, 'codex-app'), stringOr(clientInfo.version, 'unknown')),
+          userAgent: codexUserAgent(
+            stringOr(clientInfo.name, 'codex-app'),
+            stringOr(clientInfo.version, 'unknown'),
+          ),
           codexHome: codexHome(),
           platformFamily: platformFamily(),
           platformOs: platformOs(),
@@ -233,7 +250,8 @@ export class CodexClaudeAppServer {
         const evt = asRecord(params).event
         debugLog('thread.approveGuardianDeniedAction', {
           threadId: stringOr(asRecord(params).threadId, ''),
-          eventType: evt && typeof evt === 'object' ? (evt as Record<string, unknown>).type ?? null : null,
+          eventType:
+            evt && typeof evt === 'object' ? ((evt as Record<string, unknown>).type ?? null) : null,
         })
         return {}
       }
@@ -285,7 +303,9 @@ export class CodexClaudeAppServer {
       case 'collaborationMode/list':
         return method === 'collaborationMode/list' ? { data: [] } : {}
       case 'mock/experimentalMethod':
-        return { echoed: typeof asRecord(params).value === 'string' ? asRecord(params).value : null }
+        return {
+          echoed: typeof asRecord(params).value === 'string' ? asRecord(params).value : null,
+        }
       case 'skills/list':
         return { data: [] }
       case 'hooks/list':
@@ -332,15 +352,24 @@ export class CodexClaudeAppServer {
       case 'app/list':
         return { data: [], nextCursor: null }
       case 'mcpServer/oauth/login':
-        return { authorizationUrl: `https://localhost.invalid/claude-codex/mcp-oauth/${encodeURIComponent(stringOr(asRecord(params).name, 'server'))}` }
+        return {
+          authorizationUrl: `https://localhost.invalid/claude-codex/mcp-oauth/${encodeURIComponent(stringOr(asRecord(params).name, 'server'))}`,
+        }
       case 'config/mcpServer/reload':
         return {}
       case 'mcpServerStatus/list':
-        return { data: readMcpConfig().statuses, nextCursor: null }
+        return { data: readMcpConfig().listStatuses, nextCursor: null }
       case 'mcpServer/resource/read':
-        return readMcpResource(stringOr(asRecord(params).server, ''), stringOr(asRecord(params).uri, ''))
+        return readMcpResource(
+          stringOr(asRecord(params).server, ''),
+          stringOr(asRecord(params).uri, ''),
+        )
       case 'mcpServer/tool/call':
-        return callMcpTool(stringOr(asRecord(params).server, ''), stringOr(asRecord(params).tool, ''), asRecord(params).arguments ?? {})
+        return callMcpTool(
+          stringOr(asRecord(params).server, ''),
+          stringOr(asRecord(params).tool, ''),
+          asRecord(params).arguments ?? {},
+        )
       case 'windowsSandbox/setupStart':
         return { started: false }
       case 'windowsSandbox/readiness':
@@ -452,9 +481,15 @@ export class CodexClaudeAppServer {
       ephemeral: params.ephemeral === true,
       threadSource: normalizeThreadSource(params.threadSource),
       agentRole: nullIfEmpty(typeof params.agentRole === 'string' ? params.agentRole : null),
-      agentNickname: nullIfEmpty(typeof params.agentNickname === 'string' ? params.agentNickname : null),
-      baseInstructions: nullIfEmpty(typeof params.baseInstructions === 'string' ? params.baseInstructions : null),
-      developerInstructions: nullIfEmpty(typeof params.developerInstructions === 'string' ? params.developerInstructions : null),
+      agentNickname: nullIfEmpty(
+        typeof params.agentNickname === 'string' ? params.agentNickname : null,
+      ),
+      baseInstructions: nullIfEmpty(
+        typeof params.baseInstructions === 'string' ? params.baseInstructions : null,
+      ),
+      developerInstructions: nullIfEmpty(
+        typeof params.developerInstructions === 'string' ? params.developerInstructions : null,
+      ),
       personality: normalizePersonality(params.personality),
       // Pick the runtime backend from the chosen model — picking gpt-* in
       // the App's model dropdown flips the new thread to runtimeBackend
@@ -485,21 +520,33 @@ export class CodexClaudeAppServer {
         thread.model = model
       } else {
         debugLog('thread.resume.modelBackendMismatch', {
-          threadId, oldModel: thread.model, newModel: model,
-          oldBackend: thread.runtimeBackend, newBackend,
+          threadId,
+          oldModel: thread.model,
+          newModel: model,
+          oldBackend: thread.runtimeBackend,
+          newBackend,
         })
       }
     }
     if (reasoningEffort) thread.reasoningEffort = reasoningEffort
-    if (typeof params.approvalPolicy === 'string') thread.approvalPolicy = normalizeApprovalPolicy(params.approvalPolicy)
-    if (typeof params.sandbox === 'string') thread.sandboxMode = normalizeSandboxMode(params.sandbox)
-    if (typeof params.threadSource === 'string') thread.threadSource = normalizeThreadSource(params.threadSource)
-    if (typeof params.baseInstructions === 'string') thread.baseInstructions = nullIfEmpty(params.baseInstructions)
-    if (typeof params.developerInstructions === 'string') thread.developerInstructions = nullIfEmpty(params.developerInstructions)
-    if (typeof params.personality === 'string') thread.personality = normalizePersonality(params.personality)
+    if (typeof params.approvalPolicy === 'string')
+      thread.approvalPolicy = normalizeApprovalPolicy(params.approvalPolicy)
+    if (typeof params.sandbox === 'string')
+      thread.sandboxMode = normalizeSandboxMode(params.sandbox)
+    if (typeof params.threadSource === 'string')
+      thread.threadSource = normalizeThreadSource(params.threadSource)
+    if (typeof params.baseInstructions === 'string')
+      thread.baseInstructions = nullIfEmpty(params.baseInstructions)
+    if (typeof params.developerInstructions === 'string')
+      thread.developerInstructions = nullIfEmpty(params.developerInstructions)
+    if (typeof params.personality === 'string')
+      thread.personality = normalizePersonality(params.personality)
     this.store.upsertThread(thread)
     this.activePeerByThread.set(threadId, peer)
-    return this.threadEnvelope(thread, params.excludeTurns === true ? [] : this.store.listTurns(thread.id))
+    return this.threadEnvelope(
+      thread,
+      params.excludeTurns === true ? [] : this.store.listTurns(thread.id),
+    )
   }
 
   private threadFork(peer: RpcPeer, params: Record<string, unknown>): unknown {
@@ -523,30 +570,53 @@ export class CodexClaudeAppServer {
       createdAt: now,
       updatedAt: now,
       status: { type: 'idle' },
-      approvalPolicy: typeof params.approvalPolicy === 'string'
-        ? normalizeApprovalPolicy(params.approvalPolicy)
-        : parent.approvalPolicy,
-      sandboxMode: typeof params.sandbox === 'string'
-        ? normalizeSandboxMode(params.sandbox)
-        : parent.sandboxMode,
+      approvalPolicy:
+        typeof params.approvalPolicy === 'string'
+          ? normalizeApprovalPolicy(params.approvalPolicy)
+          : parent.approvalPolicy,
+      sandboxMode:
+        typeof params.sandbox === 'string'
+          ? normalizeSandboxMode(params.sandbox)
+          : parent.sandboxMode,
       ephemeral: parent.ephemeral,
-      threadSource: typeof params.threadSource === 'string'
-        ? normalizeThreadSource(params.threadSource)
-        : normalizeThreadSource(parent.threadSource),
-      agentRole: nullIfEmpty(typeof params.agentRole === 'string' ? params.agentRole : parent.agentRole),
-      agentNickname: nullIfEmpty(typeof params.agentNickname === 'string' ? params.agentNickname : parent.agentNickname),
-      baseInstructions: nullIfEmpty(typeof params.baseInstructions === 'string' ? params.baseInstructions : parent.baseInstructions),
-      developerInstructions: nullIfEmpty(typeof params.developerInstructions === 'string' ? params.developerInstructions : parent.developerInstructions),
-      personality: typeof params.personality === 'string' ? normalizePersonality(params.personality) : parent.personality,
+      threadSource:
+        typeof params.threadSource === 'string'
+          ? normalizeThreadSource(params.threadSource)
+          : normalizeThreadSource(parent.threadSource),
+      agentRole: nullIfEmpty(
+        typeof params.agentRole === 'string' ? params.agentRole : parent.agentRole,
+      ),
+      agentNickname: nullIfEmpty(
+        typeof params.agentNickname === 'string' ? params.agentNickname : parent.agentNickname,
+      ),
+      baseInstructions: nullIfEmpty(
+        typeof params.baseInstructions === 'string'
+          ? params.baseInstructions
+          : parent.baseInstructions,
+      ),
+      developerInstructions: nullIfEmpty(
+        typeof params.developerInstructions === 'string'
+          ? params.developerInstructions
+          : parent.developerInstructions,
+      ),
+      personality:
+        typeof params.personality === 'string'
+          ? normalizePersonality(params.personality)
+          : parent.personality,
       // Fork: model may flip backend (forking from claude-thread with a
       // gpt-* model = new codex-backed thread); otherwise inherit parent.
-      runtimeBackend: isCodexOpenAiModel(modelFromParams(params, parent.model)) ? 'codex' : 'claude',
+      runtimeBackend: isCodexOpenAiModel(modelFromParams(params, parent.model))
+        ? 'codex'
+        : 'claude',
       codexSessionId: null,
     }
     this.store.upsertThread(thread)
     this.activePeerByThread.set(id, peer)
     this.notify(peer, { method: 'thread/started', params: { thread: this.toThread(thread, []) } })
-    return this.threadEnvelope(thread, params.excludeTurns === true ? [] : this.store.listTurns(parent.id))
+    return this.threadEnvelope(
+      thread,
+      params.excludeTurns === true ? [] : this.store.listTurns(parent.id),
+    )
   }
 
   private threadList(params: Record<string, unknown>): unknown {
@@ -554,13 +624,17 @@ export class CodexClaudeAppServer {
       archived: params.archived as boolean | null | undefined,
       limit: numberOr(params.limit, 50),
       cursor: typeof params.cursor === 'string' ? params.cursor : null,
-      cwd: typeof params.cwd === 'string' || Array.isArray(params.cwd) ? (params.cwd as string | string[]) : null,
+      cwd:
+        typeof params.cwd === 'string' || Array.isArray(params.cwd)
+          ? (params.cwd as string | string[])
+          : null,
       includeEphemeral: params.includeEphemeral === true,
     })
     const last = threads.at(-1)
     return {
       data: threads.map((thread) => this.toThread(thread, [])),
-      nextCursor: last && threads.length >= numberOr(params.limit, 50) ? String(last.updatedAt) : null,
+      nextCursor:
+        last && threads.length >= numberOr(params.limit, 50) ? String(last.updatedAt) : null,
       backwardsCursor: threads[0] ? String(threads[0].updatedAt) : null,
     }
   }
@@ -596,14 +670,20 @@ export class CodexClaudeAppServer {
     const threadId = stringOr(params.threadId, '')
     const name = params.name == null ? null : String(params.name)
     this.store.updateThreadName(threadId, name)
-    this.notifyThread(threadId, { method: 'thread/name/updated', params: { threadId, threadName: name ?? undefined } })
+    this.notifyThread(threadId, {
+      method: 'thread/name/updated',
+      params: { threadId, threadName: name ?? undefined },
+    })
     return {}
   }
 
   private threadArchive(params: Record<string, unknown>, archived: boolean): unknown {
     const threadId = stringOr(params.threadId, '')
     this.store.setArchived(threadId, archived)
-    this.notifyThread(threadId, { method: archived ? 'thread/archived' : 'thread/unarchived', params: { threadId } })
+    this.notifyThread(threadId, {
+      method: archived ? 'thread/archived' : 'thread/unarchived',
+      params: { threadId },
+    })
     if (!archived) {
       const thread = this.store.getThread(threadId)
       if (!thread) throw new Error(`unknown thread: ${threadId}`)
@@ -636,7 +716,10 @@ export class CodexClaudeAppServer {
   private threadLoadedList(params: Record<string, unknown>): unknown {
     const loaded = Array.from(this.activePeerByThread.keys())
     const limit = numberOr(params.limit, loaded.length || 50)
-    return { data: loaded.slice(0, limit), nextCursor: loaded.length > limit ? String(limit) : null }
+    return {
+      data: loaded.slice(0, limit),
+      nextCursor: loaded.length > limit ? String(limit) : null,
+    }
   }
 
   // Codex App calls thread/inject_items to push hidden context into a thread's
@@ -664,9 +747,21 @@ export class CodexClaudeAppServer {
     const itemId = newId()
     // Compact summary of injected items — try to extract human-readable text
     // (Responses items often have `content` arrays with text segments).
-    const summary = items.map((raw) => summarizeInjectedItem(raw)).filter(Boolean).join('\n\n')
-    const text = summary.length > 0 ? summary : `[adapter] ${items.length} item(s) injected via thread/inject_items`
-    const agentItem: ThreadItem = { type: 'agentMessage', id: itemId, text, phase: null, memoryCitation: null }
+    const summary = items
+      .map((raw) => summarizeInjectedItem(raw))
+      .filter(Boolean)
+      .join('\n\n')
+    const text =
+      summary.length > 0
+        ? summary
+        : `[adapter] ${items.length} item(s) injected via thread/inject_items`
+    const agentItem: ThreadItem = {
+      type: 'agentMessage',
+      id: itemId,
+      text,
+      phase: null,
+      memoryCitation: null,
+    }
     const turn: TurnRecord = {
       id: turnId,
       threadId,
@@ -687,12 +782,18 @@ export class CodexClaudeAppServer {
     // (they end up draining the notifications while waiting for the
     // response, then loop forever looking for already-discarded events).
     queueMicrotask(() => {
-      this.notify(peer, { method: 'turn/started', params: { threadId, turn: this.toTurn(turn) } })
+      this.notify(peer, {
+        method: 'turn/started',
+        params: { threadId, turn: this.toLifecycleTurn(turn) },
+      })
       this.notify(peer, {
         method: 'item/completed',
         params: { threadId, turnId, item: agentItem, completedAtMs: nowMillis() },
       })
-      this.notify(peer, { method: 'turn/completed', params: { threadId, turn: this.toTurn(turn) } })
+      this.notify(peer, {
+        method: 'turn/completed',
+        params: { threadId, turn: this.toLifecycleTurn(turn) },
+      })
     })
     debugLog('thread.inject_items', { threadId, count: items.length })
     return {}
@@ -705,8 +806,11 @@ export class CodexClaudeAppServer {
     const goal = {
       threadId,
       objective: stringOr(params.objective, String(existing?.objective ?? '')),
-      status: typeof params.status === 'string' ? params.status : existing?.status ?? 'active',
-      tokenBudget: typeof params.tokenBudget === 'number' ? params.tokenBudget : existing?.tokenBudget ?? null,
+      status: typeof params.status === 'string' ? params.status : (existing?.status ?? 'active'),
+      tokenBudget:
+        typeof params.tokenBudget === 'number'
+          ? params.tokenBudget
+          : (existing?.tokenBudget ?? null),
       tokensUsed: existing?.tokensUsed ?? 0,
       timeUsedSeconds: existing?.timeUsedSeconds ?? 0,
       createdAt: existing?.createdAt ?? now,
@@ -724,7 +828,8 @@ export class CodexClaudeAppServer {
   private threadGoalClear(params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     const cleared = this.goals.delete(threadId)
-    if (cleared) this.notifyThread(threadId, { method: 'thread/goal/cleared', params: { threadId } })
+    if (cleared)
+      this.notifyThread(threadId, { method: 'thread/goal/cleared', params: { threadId } })
     return { cleared }
   }
 
@@ -750,7 +855,8 @@ export class CodexClaudeAppServer {
     // turns from the end of the thread. Without this, App's rewind UI sends
     // the request and we silently return the unchanged thread, leaving the
     // user staring at the timeline they were trying to redo.
-    const numTurns = typeof params.numTurns === 'number' && params.numTurns >= 1 ? Math.floor(params.numTurns) : 0
+    const numTurns =
+      typeof params.numTurns === 'number' && params.numTurns >= 1 ? Math.floor(params.numTurns) : 0
     if (numTurns > 0) {
       const dropped = this.store.deleteRecentTurns(threadId, numTurns)
       debugLog('thread.rollback', { threadId, requested: numTurns, dropped })
@@ -769,9 +875,31 @@ export class CodexClaudeAppServer {
     debugLog('thread.shellCommand.start', { threadId, processId, cwd, command })
     const child = spawn(shell, ['-lc', command], { cwd, env: process.env, stdio: 'pipe' })
     this.commandProcesses.set(processId, child)
-    child.stdout?.on('data', (chunk) => this.notify(peer, { method: 'command/exec/outputDelta', params: { processId, stream: 'stdout', deltaBase64: Buffer.from(chunk).toString('base64'), capReached: false } }))
-    child.stderr?.on('data', (chunk) => this.notify(peer, { method: 'command/exec/outputDelta', params: { processId, stream: 'stderr', deltaBase64: Buffer.from(chunk).toString('base64'), capReached: false } }))
-    child.once('error', (error) => debugLog('thread.shellCommand.error', { threadId, processId, error: error.message }))
+    child.stdout?.on('data', (chunk) =>
+      this.notify(peer, {
+        method: 'command/exec/outputDelta',
+        params: {
+          processId,
+          stream: 'stdout',
+          deltaBase64: Buffer.from(chunk).toString('base64'),
+          capReached: false,
+        },
+      }),
+    )
+    child.stderr?.on('data', (chunk) =>
+      this.notify(peer, {
+        method: 'command/exec/outputDelta',
+        params: {
+          processId,
+          stream: 'stderr',
+          deltaBase64: Buffer.from(chunk).toString('base64'),
+          capReached: false,
+        },
+      }),
+    )
+    child.once('error', (error) =>
+      debugLog('thread.shellCommand.error', { threadId, processId, error: error.message }),
+    )
     child.once('close', (code, signal) => {
       debugLog('thread.shellCommand.close', { threadId, processId, code, signal })
       this.commandProcesses.delete(processId)
@@ -796,7 +924,11 @@ export class CodexClaudeAppServer {
     const turnId = newId()
     const review = reviewLabel(params.target)
     const prompt = reviewPrompt(params.target)
-    const userItem: ThreadItem = { type: 'userMessage', id: turnId, content: [{ type: 'text', text: review, text_elements: [] }] }
+    const userItem: ThreadItem = {
+      type: 'userMessage',
+      id: turnId,
+      content: [{ type: 'text', text: review, text_elements: [] }],
+    }
     const entered: ThreadItem = { type: 'enteredReviewMode', id: newId(), review }
     const turn: TurnRecord = {
       id: turnId,
@@ -812,19 +944,39 @@ export class CodexClaudeAppServer {
     this.store.upsertTurn(turn)
     this.activeTurnByThread.set(threadId, turnId)
     this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
-    const publicTurn = this.toTurn(turn)
+    // The review/start RESPONSE carries the synthesized userMessage item (the
+    // real app-server's build_review_turn does the same, with itemsView
+    // notLoaded); the turn/started NOTIFICATION stays empty like every other
+    // lifecycle turn.
+    const responseTurn = this.toLifecycleTurn(turn, [userItem])
     setImmediate(() => {
-      this.notify(peer, { method: 'turn/started', params: { threadId, turn: publicTurn } })
-      this.notify(peer, { method: 'item/started', params: { threadId, turnId, item: entered, startedAtMs: nowMillis() } })
-      void this.runRuntimeTurn(peer, thread, turn, prompt, { model: thread.model, effort: thread.reasoningEffort }).catch((error) => {
-        const completed = this.store.completeTurn(turnId, 'failed', { message: error.message }) ?? turn
-        this.notify(peer, { method: 'error', params: { threadId, turnId, willRetry: false, error: { message: error.message } } })
-        this.notify(peer, { method: 'turn/completed', params: { threadId, turn: this.toTurn(completed) } })
+      this.notify(peer, {
+        method: 'turn/started',
+        params: { threadId, turn: this.toLifecycleTurn(turn) },
+      })
+      this.notify(peer, {
+        method: 'item/started',
+        params: { threadId, turnId, item: entered, startedAtMs: nowMillis() },
+      })
+      void this.runRuntimeTurn(peer, thread, turn, prompt, {
+        model: thread.model,
+        effort: thread.reasoningEffort,
+      }).catch((error) => {
+        const completed =
+          this.store.completeTurn(turnId, 'failed', { message: error.message }) ?? turn
+        this.notify(peer, {
+          method: 'error',
+          params: { threadId, turnId, willRetry: false, error: { message: error.message } },
+        })
+        this.notify(peer, {
+          method: 'turn/completed',
+          params: { threadId, turn: this.toLifecycleTurn(completed) },
+        })
         this.clearActiveTurn(threadId)
         this.setThreadStatus(peer, threadId, { type: 'idle' })
       })
     })
-    return { turn: publicTurn, reviewThreadId: threadId }
+    return { turn: responseTurn, reviewThreadId: threadId }
   }
 
   private threadCompactStart(peer: RpcPeer, params: Record<string, unknown>): unknown {
@@ -847,13 +999,27 @@ export class CodexClaudeAppServer {
     this.store.upsertTurn(turn)
     this.activeTurnByThread.set(threadId, turnId)
     this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
-    const publicTurn = this.toTurn(turn)
     setImmediate(() => {
-      this.notify(peer, { method: 'turn/started', params: { threadId, turn: publicTurn } })
-      this.notify(peer, { method: 'item/started', params: { threadId, turnId, item: compactItem, startedAtMs: nowMillis() } })
-      const agentItem: ThreadItem = { type: 'agentMessage', id: newId(), text: '', phase: null, memoryCitation: null }
+      this.notify(peer, {
+        method: 'turn/started',
+        params: { threadId, turn: this.toLifecycleTurn(turn) },
+      })
+      this.notify(peer, {
+        method: 'item/started',
+        params: { threadId, turnId, item: compactItem, startedAtMs: nowMillis() },
+      })
+      const agentItem: ThreadItem = {
+        type: 'agentMessage',
+        id: newId(),
+        text: '',
+        phase: null,
+        memoryCitation: null,
+      }
       this.store.appendItem(turnId, agentItem)
-      this.notify(peer, { method: 'item/started', params: { threadId, turnId, item: agentItem, startedAtMs: nowMillis() } })
+      this.notify(peer, {
+        method: 'item/started',
+        params: { threadId, turnId, item: agentItem, startedAtMs: nowMillis() },
+      })
 
       // Drive an actual Claude (summary model) turn to compact the thread
       // instead of just stringifying the last 12 snippets locally — the
@@ -865,16 +1031,29 @@ export class CodexClaudeAppServer {
           this.store.updateItem(turnId, agentItem.id, (item) =>
             item.type === 'agentMessage' ? { ...item, text: fallback } : item,
           )
-          this.notify(peer, { method: 'item/agentMessage/delta', params: { threadId, turnId, itemId: agentItem.id, delta: fallback } })
+          this.notify(peer, {
+            method: 'item/agentMessage/delta',
+            params: { threadId, turnId, itemId: agentItem.id, delta: fallback },
+          })
         })
         .finally(() => {
-          this.notify(peer, { method: 'item/completed', params: { threadId, turnId, item: compactItem, completedAtMs: nowMillis() } })
-          const finalAgent = this.store.getTurn(turnId)?.items.find((i) => i.id === agentItem.id) ?? agentItem
-          this.notify(peer, { method: 'item/completed', params: { threadId, turnId, item: finalAgent, completedAtMs: nowMillis() } })
+          this.notify(peer, {
+            method: 'item/completed',
+            params: { threadId, turnId, item: compactItem, completedAtMs: nowMillis() },
+          })
+          const finalAgent =
+            this.store.getTurn(turnId)?.items.find((i) => i.id === agentItem.id) ?? agentItem
+          this.notify(peer, {
+            method: 'item/completed',
+            params: { threadId, turnId, item: finalAgent, completedAtMs: nowMillis() },
+          })
           const completed = this.store.completeTurn(turnId, 'completed') ?? turn
           this.clearActiveTurn(threadId)
           this.setThreadStatus(peer, threadId, { type: 'idle' })
-          this.notify(peer, { method: 'turn/completed', params: { threadId, turn: this.toTurn(completed) } })
+          this.notify(peer, {
+            method: 'turn/completed',
+            params: { threadId, turn: this.toLifecycleTurn(completed) },
+          })
           this.notify(peer, { method: 'thread/compacted', params: { threadId } })
         })
     })
@@ -933,7 +1112,10 @@ export class CodexClaudeAppServer {
             this.store.updateItem(turnId, agentItemId, (item) =>
               item.type === 'agentMessage' ? { ...item, text: item.text + event.delta } : item,
             )
-            this.notify(peer, { method: 'item/agentMessage/delta', params: { threadId: thread.id, turnId, itemId: agentItemId, delta: event.delta } })
+            this.notify(peer, {
+              method: 'item/agentMessage/delta',
+              params: { threadId: thread.id, turnId, itemId: agentItemId, delta: event.delta },
+            })
           }
           if (event.type === 'error') throw new Error(event.message)
           if (event.type === 'completed' && !event.success) {
@@ -985,6 +1167,7 @@ export class CodexClaudeAppServer {
       this.store.upsertThread(thread)
     }
     const initialItems: ThreadItem[] = [{ type: 'userMessage', id: newId(), content: input }]
+    const imageItems: ThreadItem[] = []
     for (const img of images) {
       // Codex v2 imageView.path is AbsolutePathBuf — Rust's custom Deserialize
       // rejects anything that isn't an absolute filesystem path (URLs, data:
@@ -993,9 +1176,13 @@ export class CodexClaudeAppServer {
       // that came from a real local file path (the displayPath in that case
       // is the original absolute path captured by extractImageInputs).
       if (img.kind === 'base64' && img.displayPath.startsWith('/')) {
-        initialItems.push({ type: 'imageView', id: newId(), path: img.displayPath })
+        imageItems.push({ type: 'imageView', id: newId(), path: img.displayPath })
       }
     }
+    // imageView items are retained on the turn for history (thread/read) and, in
+    // contrast to the userMessage, surfaced live through the item/* event stream
+    // so the App's transcript shows the uploaded image inline during the turn.
+    initialItems.push(...imageItems)
     // Note: we used to short-circuit Codex App's title-generation turn with a
     // local regex-derived title to avoid prompt leakage into the parent thread.
     // That leakage no longer happens (title turns run on their own ephemeral
@@ -1016,18 +1203,38 @@ export class CodexClaudeAppServer {
     this.store.upsertTurn(turn)
     this.activeTurnByThread.set(threadId, turnId)
     this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
-    const publicTurn = this.toTurn(turn)
+    const publicTurn = this.toLifecycleTurn(turn)
 
     setImmediate(() => {
       this.notify(peer, { method: 'turn/started', params: { threadId, turn: publicTurn } })
+      for (const item of imageItems) {
+        this.notify(peer, {
+          method: 'item/started',
+          params: { threadId, turnId, item, startedAtMs: nowMillis() },
+        })
+        this.notify(peer, {
+          method: 'item/completed',
+          params: { threadId, turnId, item, completedAtMs: nowMillis() },
+        })
+      }
       // Carry parsed images through the params bag so runRuntimeTurn can hand
       // them to the runtime context without re-parsing user input.
-      void this.runRuntimeTurn(peer, thread, turn, prompt, { ...params, _imageInputs: images }).catch((error) => {
-      const completed = this.store.completeTurn(turnId, 'failed', { message: error.message }) ?? turn
-      this.notify(peer, { method: 'error', params: { threadId, turnId, willRetry: false, error: { message: error.message } } })
-      this.notify(peer, { method: 'turn/completed', params: { threadId, turn: this.toTurn(completed) } })
-      this.clearActiveTurn(threadId)
-      this.setThreadStatus(peer, threadId, { type: 'idle' })
+      void this.runRuntimeTurn(peer, thread, turn, prompt, {
+        ...params,
+        _imageInputs: images,
+      }).catch((error) => {
+        const completed =
+          this.store.completeTurn(turnId, 'failed', { message: error.message }) ?? turn
+        this.notify(peer, {
+          method: 'error',
+          params: { threadId, turnId, willRetry: false, error: { message: error.message } },
+        })
+        this.notify(peer, {
+          method: 'turn/completed',
+          params: { threadId, turn: this.toLifecycleTurn(completed) },
+        })
+        this.clearActiveTurn(threadId)
+        this.setThreadStatus(peer, threadId, { type: 'idle' })
       })
     })
     return { turn: publicTurn }
@@ -1052,7 +1259,10 @@ export class CodexClaudeAppServer {
     // Together they tell Codex App which child thread to navigate into and
     // give the user a live "agent is running" indicator instead of a single
     // collapsed item that goes silent for the duration of the subagent.
-    const subagentContexts = new Map<string, { childThreadId: string; waitItemId: string; prompt: string; subType: string | null }>()
+    const subagentContexts = new Map<
+      string,
+      { childThreadId: string; waitItemId: string; prompt: string; subType: string | null }
+    >()
     const activeSubagents = new Set<string>()
     // Track per-item start time so commandExecution / mcpToolCall items can
     // report a real durationMs in turn/completed (otherwise the App's status
@@ -1061,13 +1271,21 @@ export class CodexClaudeAppServer {
     // Mutable holder rather than `let collectedMetrics`: TS's control-flow
     // analysis doesn't see writes from inside the onEvent callback, so a bare
     // `let` would still be inferred as `null` outside the closure.
-    const collectedMetrics: { apiDurationMs: number | null; numTurns: number | null; costUsd: number | null; set: boolean } = {
+    const collectedMetrics: {
+      apiDurationMs: number | null
+      numTurns: number | null
+      costUsd: number | null
+      set: boolean
+    } = {
       apiDurationMs: null,
       numTurns: null,
       costUsd: null,
       set: false,
     }
-    const forkSession = thread.forkedFromId != null && thread.claudeSessionId != null && this.store.listTurns(thread.id).length <= 1
+    const forkSession =
+      thread.forkedFromId != null &&
+      thread.claudeSessionId != null &&
+      this.store.listTurns(thread.id).length <= 1
     // Plan mode: Claude SDK runs with permissionMode='plan' — it produces
     // planning text but does not execute tools. We surface the planning
     // output as Codex's native `plan` ThreadItem (instead of agentMessage)
@@ -1084,23 +1302,43 @@ export class CodexClaudeAppServer {
       planItemId = newId()
       const item: ThreadItem = { type: 'plan', id: planItemId, text: '' }
       this.store.appendItem(turn.id, item)
-      this.notify(peer, { method: 'item/started', params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: nowMillis() } })
+      this.notify(peer, {
+        method: 'item/started',
+        params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: nowMillis() },
+      })
       return planItemId
     }
     const ensureAgentItem = (): string => {
       if (agentItemId) return agentItemId
       agentItemId = newId()
-      const item: ThreadItem = { type: 'agentMessage', id: agentItemId, text: '', phase: null, memoryCitation: null }
+      const item: ThreadItem = {
+        type: 'agentMessage',
+        id: agentItemId,
+        text: '',
+        phase: null,
+        memoryCitation: null,
+      }
       this.store.appendItem(turn.id, item)
-      this.notify(peer, { method: 'item/started', params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: nowMillis() } })
+      this.notify(peer, {
+        method: 'item/started',
+        params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: nowMillis() },
+      })
       return agentItemId
     }
     const ensureReasoningItem = (): string => {
       if (reasoningItemId) return reasoningItemId
       reasoningItemId = newId()
-      const item: ThreadItem = { type: 'reasoning', id: reasoningItemId, summary: [''], content: [''] }
+      const item: ThreadItem = {
+        type: 'reasoning',
+        id: reasoningItemId,
+        summary: [''],
+        content: [''],
+      }
       this.store.appendItem(turn.id, item)
-      this.notify(peer, { method: 'item/started', params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: nowMillis() } })
+      this.notify(peer, {
+        method: 'item/started',
+        params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: nowMillis() },
+      })
       return reasoningItemId
     }
 
@@ -1110,14 +1348,16 @@ export class CodexClaudeAppServer {
     // sandboxPolicy struct (e.g. {type:"dangerFullAccess"}); thread/start uses
     // the simpler sandbox string. Both are honoured.
     const approvalPolicy =
-      (typeof params.approvalPolicy === 'string' ? normalizeApprovalPolicy(params.approvalPolicy) : null) ??
-      thread.approvalPolicy
+      (typeof params.approvalPolicy === 'string'
+        ? normalizeApprovalPolicy(params.approvalPolicy)
+        : null) ?? thread.approvalPolicy
     const sandboxMode = sandboxFromTurnParams(params) ?? thread.sandboxMode
     // Per-turn instruction overrides: Codex App may resend its instruction
     // panel state when the user toggles personality mid-thread. Falls back to
     // whatever was captured at thread/start.
     const baseInstructions =
-      (typeof params.baseInstructions === 'string' ? params.baseInstructions : null) ?? thread.baseInstructions
+      (typeof params.baseInstructions === 'string' ? params.baseInstructions : null) ??
+      thread.baseInstructions
     const developerInstructions =
       (typeof params.developerInstructions === 'string' ? params.developerInstructions : null) ??
       thread.developerInstructions
@@ -1136,7 +1376,9 @@ export class CodexClaudeAppServer {
       params.outputSchema == null ? 'normal' : 'summary',
     )
     const resolvedEffort = resolveClaudeEffort(
-      typeof params.effort === 'string' ? params.effort : thread.reasoningEffort ?? process.env.CLAUDE_CODEX_EFFORT ?? null,
+      typeof params.effort === 'string'
+        ? params.effort
+        : (thread.reasoningEffort ?? process.env.CLAUDE_CODEX_EFFORT ?? null),
     )
     // Log the effective Claude SDK model+effort per turn so when a user
     // reports "switching model didn't work" we can diff App's payload against
@@ -1149,7 +1391,8 @@ export class CodexClaudeAppServer {
       threadModel: thread.model,
       threadEffort: thread.reasoningEffort,
       envDefaultModel: process.env.CLAUDE_CODEX_DEFAULT_MODEL ?? null,
-      envDefaultEffort: process.env.CLAUDE_CODEX_DEFAULT_EFFORT ?? process.env.CLAUDE_CODEX_EFFORT ?? null,
+      envDefaultEffort:
+        process.env.CLAUDE_CODEX_DEFAULT_EFFORT ?? process.env.CLAUDE_CODEX_EFFORT ?? null,
       resolvedModel,
       resolvedEffort,
     })
@@ -1182,7 +1425,9 @@ export class CodexClaudeAppServer {
         sandboxMode,
         systemPromptAddendum,
         planMode: params.planMode === true,
-        imageInputs: Array.isArray(params._imageInputs) ? (params._imageInputs as ImageInput[]) : [],
+        imageInputs: Array.isArray(params._imageInputs)
+          ? (params._imageInputs as ImageInput[])
+          : [],
       },
       {
         onEvent: async (event) => {
@@ -1194,7 +1439,12 @@ export class CodexClaudeAppServer {
             if (event.type === 'text_delta' || event.type === 'reasoning_delta') return
             if (event.type === 'tool_use' && !isSubagentToolName(event.toolName)) return
             if (event.type === 'tool_output_delta' && !itemIds.has(event.toolUseId)) return
-            if (event.type === 'tool_result' && !activeSubagents.has(event.toolUseId) && !itemIds.has(event.toolUseId)) return
+            if (
+              event.type === 'tool_result' &&
+              !activeSubagents.has(event.toolUseId) &&
+              !itemIds.has(event.toolUseId)
+            )
+              return
           }
           if (event.type === 'tool_use' && isSubagentToolName(event.toolName)) {
             // Spawn the ephemeral subagent thread, then mirror Codex's native
@@ -1209,8 +1459,10 @@ export class CodexClaudeAppServer {
             // field carries the actual SDK model the subagent runs on, NOT
             // the subagent_type — that distinction was wrong before.
             const promptText = String(event.input.prompt ?? event.input.description ?? '')
-            const subType = typeof event.input.subagent_type === 'string' ? event.input.subagent_type : null
-            const subagentModel = typeof event.input.model === 'string' ? event.input.model : thread.model
+            const subType =
+              typeof event.input.subagent_type === 'string' ? event.input.subagent_type : null
+            const subagentModel =
+              typeof event.input.model === 'string' ? event.input.model : thread.model
             const childThreadId = newId()
             const agentNickname = `agent-${childThreadId.replace(/-/g, '').slice(0, 12)}`
             const agentRole = subType ?? 'general-purpose'
@@ -1258,37 +1510,84 @@ export class CodexClaudeAppServer {
             // Normalize here once and reuse for every stage of the lifecycle.
             const collabEffort = normalizeReasoningEffortEnum(thread.reasoningEffort)
             const spawnBegin: ThreadItem = {
-              type: 'collabAgentToolCall', id: spawnId, tool: 'spawnAgent',
-              status: 'inProgress', senderThreadId: thread.id, receiverThreadIds: [],
-              prompt: promptText || null, model: subagentModel,
-              reasoningEffort: collabEffort, agentsStates: {},
+              type: 'collabAgentToolCall',
+              id: spawnId,
+              tool: 'spawnAgent',
+              status: 'inProgress',
+              senderThreadId: thread.id,
+              receiverThreadIds: [],
+              prompt: promptText || null,
+              model: subagentModel,
+              reasoningEffort: collabEffort,
+              agentsStates: {},
             }
             this.store.appendItem(turn.id, spawnBegin)
-            this.notify(peer, { method: 'item/started', params: { threadId: thread.id, turnId: turn.id, item: spawnBegin, startedAtMs: nowMillis() } })
+            this.notify(peer, {
+              method: 'item/started',
+              params: {
+                threadId: thread.id,
+                turnId: turn.id,
+                item: spawnBegin,
+                startedAtMs: nowMillis(),
+              },
+            })
             const spawnEnd: ThreadItem = {
-              type: 'collabAgentToolCall', id: spawnId, tool: 'spawnAgent',
-              status: 'completed', senderThreadId: thread.id, receiverThreadIds: [childThreadId],
-              prompt: promptText || null, model: subagentModel,
+              type: 'collabAgentToolCall',
+              id: spawnId,
+              tool: 'spawnAgent',
+              status: 'completed',
+              senderThreadId: thread.id,
+              receiverThreadIds: [childThreadId],
+              prompt: promptText || null,
+              model: subagentModel,
               reasoningEffort: collabEffort,
               agentsStates: { [childThreadId]: { status: 'running', message: null } },
             }
             this.store.updateItem(turn.id, spawnId, () => spawnEnd)
-            this.notify(peer, { method: 'item/completed', params: { threadId: thread.id, turnId: turn.id, item: spawnEnd, completedAtMs: nowMillis() } })
+            this.notify(peer, {
+              method: 'item/completed',
+              params: {
+                threadId: thread.id,
+                turnId: turn.id,
+                item: spawnEnd,
+                completedAtMs: nowMillis(),
+              },
+            })
 
             // Stage 2 — wait (begin only; this is the long phase that gives
             // Codex App its "agent is working" indicator while the subagent
             // runs. It closes when the Task tool_result arrives.)
             const waitId = newId()
             const waitBegin: ThreadItem = {
-              type: 'collabAgentToolCall', id: waitId, tool: 'wait',
-              status: 'inProgress', senderThreadId: thread.id, receiverThreadIds: [childThreadId],
-              prompt: null, model: null, reasoningEffort: null, agentsStates: {},
+              type: 'collabAgentToolCall',
+              id: waitId,
+              tool: 'wait',
+              status: 'inProgress',
+              senderThreadId: thread.id,
+              receiverThreadIds: [childThreadId],
+              prompt: null,
+              model: null,
+              reasoningEffort: null,
+              agentsStates: {},
             }
             this.store.appendItem(turn.id, waitBegin)
-            this.notify(peer, { method: 'item/started', params: { threadId: thread.id, turnId: turn.id, item: waitBegin, startedAtMs: nowMillis() } })
+            this.notify(peer, {
+              method: 'item/started',
+              params: {
+                threadId: thread.id,
+                turnId: turn.id,
+                item: waitBegin,
+                startedAtMs: nowMillis(),
+              },
+            })
 
             itemIds.set(event.toolUseId, waitId)
-            subagentContexts.set(event.toolUseId, { childThreadId, waitItemId: waitId, prompt: promptText, subType })
+            subagentContexts.set(event.toolUseId, {
+              childThreadId,
+              waitItemId: waitId,
+              prompt: promptText,
+              subType,
+            })
             activeSubagents.add(event.toolUseId)
             return
           }
@@ -1321,8 +1620,18 @@ export class CodexClaudeAppServer {
               completedAt: nowSeconds(),
               durationMs: parsed.usage?.durationMs ?? 0,
               items: [
-                { type: 'userMessage', id: newId(), content: [{ type: 'text', text: ctx.prompt, text_elements: [] }] },
-                { type: 'agentMessage', id: newId(), text: resultText, phase: null, memoryCitation: null },
+                {
+                  type: 'userMessage',
+                  id: newId(),
+                  content: [{ type: 'text', text: ctx.prompt, text_elements: [] }],
+                },
+                {
+                  type: 'agentMessage',
+                  id: newId(),
+                  text: resultText,
+                  phase: null,
+                  memoryCitation: null,
+                },
               ],
               diff: '',
               error: event.isError ? { message: 'subagent failed' } : null,
@@ -1354,8 +1663,19 @@ export class CodexClaudeAppServer {
                 outputTokens: parsed.usage.totalTokens,
                 reasoningOutputTokens: 0,
               }
-              const childUsage: ThreadTokenUsage = { total: breakdown, last: breakdown, modelContextWindow: null }
-              this.notify(peer, { method: 'thread/tokenUsage/updated', params: { threadId: ctx.childThreadId, turnId: childTurn.id, tokenUsage: childUsage } })
+              const childUsage: ThreadTokenUsage = {
+                total: breakdown,
+                last: breakdown,
+                modelContextWindow: null,
+              }
+              this.notify(peer, {
+                method: 'thread/tokenUsage/updated',
+                params: {
+                  threadId: ctx.childThreadId,
+                  turnId: childTurn.id,
+                  tokenUsage: childUsage,
+                },
+              })
               this.recordTokenUsage(peer, thread.id, turn.id, {
                 input_tokens: 0,
                 output_tokens: parsed.usage.totalTokens,
@@ -1366,32 +1686,75 @@ export class CodexClaudeAppServer {
 
             // Stage 2 close — wait (end). Re-emits the same waitItemId.
             const waitEnd: ThreadItem = {
-              type: 'collabAgentToolCall', id: ctx.waitItemId, tool: 'wait',
-              status: collabStatus, senderThreadId: thread.id, receiverThreadIds: [ctx.childThreadId],
-              prompt: null, model: null, reasoningEffort: null,
+              type: 'collabAgentToolCall',
+              id: ctx.waitItemId,
+              tool: 'wait',
+              status: collabStatus,
+              senderThreadId: thread.id,
+              receiverThreadIds: [ctx.childThreadId],
+              prompt: null,
+              model: null,
+              reasoningEffort: null,
               agentsStates: { [ctx.childThreadId]: { status: agentStatus, message: null } },
             }
             this.store.updateItem(turn.id, ctx.waitItemId, () => waitEnd)
-            this.notify(peer, { method: 'item/completed', params: { threadId: thread.id, turnId: turn.id, item: waitEnd, completedAtMs: nowMillis() } })
+            this.notify(peer, {
+              method: 'item/completed',
+              params: {
+                threadId: thread.id,
+                turnId: turn.id,
+                item: waitEnd,
+                completedAtMs: nowMillis(),
+              },
+            })
 
             // Stage 3 — closeAgent (begin + end emitted together; the SDK has
             // already torn down the subagent by the time we get the result).
             const closeId = newId()
             const closeBegin: ThreadItem = {
-              type: 'collabAgentToolCall', id: closeId, tool: 'closeAgent',
-              status: 'inProgress', senderThreadId: thread.id, receiverThreadIds: [ctx.childThreadId],
-              prompt: null, model: null, reasoningEffort: null, agentsStates: {},
+              type: 'collabAgentToolCall',
+              id: closeId,
+              tool: 'closeAgent',
+              status: 'inProgress',
+              senderThreadId: thread.id,
+              receiverThreadIds: [ctx.childThreadId],
+              prompt: null,
+              model: null,
+              reasoningEffort: null,
+              agentsStates: {},
             }
             this.store.appendItem(turn.id, closeBegin)
-            this.notify(peer, { method: 'item/started', params: { threadId: thread.id, turnId: turn.id, item: closeBegin, startedAtMs: nowMillis() } })
+            this.notify(peer, {
+              method: 'item/started',
+              params: {
+                threadId: thread.id,
+                turnId: turn.id,
+                item: closeBegin,
+                startedAtMs: nowMillis(),
+              },
+            })
             const closeEnd: ThreadItem = {
-              type: 'collabAgentToolCall', id: closeId, tool: 'closeAgent',
-              status: collabStatus, senderThreadId: thread.id, receiverThreadIds: [ctx.childThreadId],
-              prompt: null, model: null, reasoningEffort: null,
+              type: 'collabAgentToolCall',
+              id: closeId,
+              tool: 'closeAgent',
+              status: collabStatus,
+              senderThreadId: thread.id,
+              receiverThreadIds: [ctx.childThreadId],
+              prompt: null,
+              model: null,
+              reasoningEffort: null,
               agentsStates: { [ctx.childThreadId]: { status: agentStatus, message: null } },
             }
             this.store.updateItem(turn.id, closeId, () => closeEnd)
-            this.notify(peer, { method: 'item/completed', params: { threadId: thread.id, turnId: turn.id, item: closeEnd, completedAtMs: nowMillis() } })
+            this.notify(peer, {
+              method: 'item/completed',
+              params: {
+                threadId: thread.id,
+                turnId: turn.id,
+                item: closeEnd,
+                completedAtMs: nowMillis(),
+              },
+            })
             return
           }
           if (event.type === 'text_delta') {
@@ -1405,7 +1768,10 @@ export class CodexClaudeAppServer {
                 if (item.type === 'plan') return { ...item, text: item.text + event.delta }
                 return item
               })
-              this.notify(peer, { method: 'item/plan/delta', params: { threadId: thread.id, turnId: turn.id, itemId, delta: event.delta } })
+              this.notify(peer, {
+                method: 'item/plan/delta',
+                params: { threadId: thread.id, turnId: turn.id, itemId, delta: event.delta },
+              })
               return
             }
             const itemId = ensureAgentItem()
@@ -1413,7 +1779,10 @@ export class CodexClaudeAppServer {
               if (item.type === 'agentMessage') return { ...item, text: item.text + event.delta }
               return item
             })
-            this.notify(peer, { method: 'item/agentMessage/delta', params: { threadId: thread.id, turnId: turn.id, itemId, delta: event.delta } })
+            this.notify(peer, {
+              method: 'item/agentMessage/delta',
+              params: { threadId: thread.id, turnId: turn.id, itemId, delta: event.delta },
+            })
             return
           }
           if (event.type === 'reasoning_delta') {
@@ -1431,11 +1800,23 @@ export class CodexClaudeAppServer {
             })
             this.notify(peer, {
               method: 'item/reasoning/summaryTextDelta',
-              params: { threadId: thread.id, turnId: turn.id, itemId, delta: event.delta, summaryIndex: 0 },
+              params: {
+                threadId: thread.id,
+                turnId: turn.id,
+                itemId,
+                delta: event.delta,
+                summaryIndex: 0,
+              },
             })
             this.notify(peer, {
               method: 'item/reasoning/textDelta',
-              params: { threadId: thread.id, turnId: turn.id, itemId, delta: event.delta, contentIndex: 0 },
+              params: {
+                threadId: thread.id,
+                turnId: turn.id,
+                itemId,
+                delta: event.delta,
+                contentIndex: 0,
+              },
             })
             return
           }
@@ -1452,9 +1833,20 @@ export class CodexClaudeAppServer {
             itemIds.set(event.toolUseId, item.id)
             itemStartedAtMs.set(item.id, nowMillis())
             this.store.appendItem(turn.id, item)
-            this.notify(peer, { method: 'item/started', params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: nowMillis() } })
+            this.notify(peer, {
+              method: 'item/started',
+              params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: nowMillis() },
+            })
             if (item.type === 'fileChange') {
-              this.notify(peer, { method: 'item/fileChange/patchUpdated', params: { threadId: thread.id, turnId: turn.id, itemId: item.id, changes: item.changes } })
+              this.notify(peer, {
+                method: 'item/fileChange/patchUpdated',
+                params: {
+                  threadId: thread.id,
+                  turnId: turn.id,
+                  itemId: item.id,
+                  changes: item.changes,
+                },
+              })
             }
             return
           }
@@ -1468,7 +1860,10 @@ export class CodexClaudeAppServer {
               }
               return item
             })
-            this.notify(peer, { method: 'item/commandExecution/outputDelta', params: { threadId: thread.id, turnId: turn.id, itemId, delta: event.delta } })
+            this.notify(peer, {
+              method: 'item/commandExecution/outputDelta',
+              params: { threadId: thread.id, turnId: turn.id, itemId, delta: event.delta },
+            })
             return
           }
           if (event.type === 'tool_result') {
@@ -1490,7 +1885,8 @@ export class CodexClaudeAppServer {
                   durationMs,
                 }
               }
-              if (item.type === 'fileChange') return { ...item, status: event.isError ? 'failed' : 'completed' }
+              if (item.type === 'fileChange')
+                return { ...item, status: event.isError ? 'failed' : 'completed' }
               if (item.type === 'mcpToolCall') {
                 // Protocol-correct shape: McpToolCallResult = {content[], structuredContent, _meta};
                 // McpToolCallError = {message}. We previously shipped raw event.content for both
@@ -1511,25 +1907,43 @@ export class CodexClaudeAppServer {
             })
             const item = updated?.items.find((candidate) => candidate.id === itemId)
             if (item?.type === 'commandExecution' && resultText && !commandOutputSeen.has(itemId)) {
-              this.notify(peer, { method: 'item/commandExecution/outputDelta', params: { threadId: thread.id, turnId: turn.id, itemId, delta: resultText } })
+              this.notify(peer, {
+                method: 'item/commandExecution/outputDelta',
+                params: { threadId: thread.id, turnId: turn.id, itemId, delta: resultText },
+              })
             }
-            if (item) this.notify(peer, { method: 'item/completed', params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() } })
+            if (item)
+              this.notify(peer, {
+                method: 'item/completed',
+                params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
+              })
             const diff = await gitDiff(thread.cwd)
             if (diff) {
               this.store.updateTurnDiff(turn.id, diff)
-              this.notify(peer, { method: 'turn/diff/updated', params: { threadId: thread.id, turnId: turn.id, diff } })
+              this.notify(peer, {
+                method: 'turn/diff/updated',
+                params: { threadId: thread.id, turnId: turn.id, diff },
+              })
             }
             return
           }
           if (event.type === 'notice') {
             const itemId = ensureAgentItem()
-            const prefix = event.level === 'warning' ? '[Claude warning] ' : event.level === 'error' ? '[Claude error] ' : '[Claude event] '
+            const prefix =
+              event.level === 'warning'
+                ? '[Claude warning] '
+                : event.level === 'error'
+                  ? '[Claude error] '
+                  : '[Claude event] '
             const delta = prefix + event.message + '\n'
             this.store.updateItem(turn.id, itemId, (item) => {
               if (item.type === 'agentMessage') return { ...item, text: item.text + delta }
               return item
             })
-            this.notify(peer, { method: 'item/agentMessage/delta', params: { threadId: thread.id, turnId: turn.id, itemId, delta } })
+            this.notify(peer, {
+              method: 'item/agentMessage/delta',
+              params: { threadId: thread.id, turnId: turn.id, itemId, delta },
+            })
             return
           }
           if (event.type === 'usage') {
@@ -1552,8 +1966,24 @@ export class CodexClaudeAppServer {
             if (event.message) fragments.push({ text: event.message, hookRunId })
             const hookItem: ThreadItem = { type: 'hookPrompt', id: newId(), fragments }
             this.store.appendItem(turn.id, hookItem)
-            this.notify(peer, { method: 'item/started', params: { threadId: thread.id, turnId: turn.id, item: hookItem, startedAtMs: nowMillis() } })
-            this.notify(peer, { method: 'item/completed', params: { threadId: thread.id, turnId: turn.id, item: hookItem, completedAtMs: nowMillis() } })
+            this.notify(peer, {
+              method: 'item/started',
+              params: {
+                threadId: thread.id,
+                turnId: turn.id,
+                item: hookItem,
+                startedAtMs: nowMillis(),
+              },
+            })
+            this.notify(peer, {
+              method: 'item/completed',
+              params: {
+                threadId: thread.id,
+                turnId: turn.id,
+                item: hookItem,
+                completedAtMs: nowMillis(),
+              },
+            })
             return
           }
           if (event.type === 'metrics') {
@@ -1586,13 +2016,32 @@ export class CodexClaudeAppServer {
         onPermissionRequest: async (event) => {
           let itemId = itemIds.get(event.toolUseId)
           if (!itemId) {
-            const item = this.toolUseToItem({ type: 'tool_use', toolUseId: event.toolUseId, toolName: event.toolName, input: event.input }, thread.cwd)
+            const item = this.toolUseToItem(
+              {
+                type: 'tool_use',
+                toolUseId: event.toolUseId,
+                toolName: event.toolName,
+                input: event.input,
+              },
+              thread.cwd,
+            )
             itemId = item.id
             itemIds.set(event.toolUseId, item.id)
             this.store.appendItem(turn.id, item)
-            this.notify(peer, { method: 'item/started', params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: nowMillis() } })
+            this.notify(peer, {
+              method: 'item/started',
+              params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: nowMillis() },
+            })
             if (item.type === 'fileChange') {
-              this.notify(peer, { method: 'item/fileChange/patchUpdated', params: { threadId: thread.id, turnId: turn.id, itemId: item.id, changes: item.changes } })
+              this.notify(peer, {
+                method: 'item/fileChange/patchUpdated',
+                params: {
+                  threadId: thread.id,
+                  turnId: turn.id,
+                  itemId: item.id,
+                  changes: item.changes,
+                },
+              })
             }
           }
           const decision = await this.requestApproval(peer, thread.id, turn.id, itemId, event)
@@ -1625,9 +2074,21 @@ export class CodexClaudeAppServer {
           }
           this.store.appendItem(turn.id, item)
           const startedAt = nowMillis()
-          this.notify(peer, { method: 'item/started', params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: startedAt } })
-          this.setThreadStatus(peer, thread.id, { type: 'active', activeFlags: ['waitingOnUserInput'] })
-          const answers = await this.requestUserInput(peer, thread.id, turn.id, item.id, event.questions)
+          this.notify(peer, {
+            method: 'item/started',
+            params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: startedAt },
+          })
+          this.setThreadStatus(peer, thread.id, {
+            type: 'active',
+            activeFlags: ['waitingOnUserInput'],
+          })
+          const answers = await this.requestUserInput(
+            peer,
+            thread.id,
+            turn.id,
+            item.id,
+            event.questions,
+          )
           const contentItems = userInputAnswersAsContent(event.questions, answers)
           const completedItem: ThreadItem = {
             ...item,
@@ -1637,7 +2098,15 @@ export class CodexClaudeAppServer {
             durationMs: Math.max(0, nowMillis() - startedAt),
           }
           this.store.updateItem(turn.id, item.id, () => completedItem)
-          this.notify(peer, { method: 'item/completed', params: { threadId: thread.id, turnId: turn.id, item: completedItem, completedAtMs: nowMillis() } })
+          this.notify(peer, {
+            method: 'item/completed',
+            params: {
+              threadId: thread.id,
+              turnId: turn.id,
+              item: completedItem,
+              completedAtMs: nowMillis(),
+            },
+          })
           this.setThreadStatus(peer, thread.id, { type: 'active', activeFlags: [] })
           return answers
         },
@@ -1647,7 +2116,10 @@ export class CodexClaudeAppServer {
     const finalDiff = await gitDiff(thread.cwd)
     if (finalDiff) {
       this.store.updateTurnDiff(turn.id, finalDiff)
-      this.notify(peer, { method: 'turn/diff/updated', params: { threadId: thread.id, turnId: turn.id, diff: finalDiff } })
+      this.notify(peer, {
+        method: 'turn/diff/updated',
+        params: { threadId: thread.id, turnId: turn.id, diff: finalDiff },
+      })
     }
     if (params.outputSchema != null && agentItemId == null) {
       const text = fallbackStructuredText(params.outputSchema, prompt)
@@ -1656,12 +2128,19 @@ export class CodexClaudeAppServer {
         if (item.type === 'agentMessage') return { ...item, text }
         return item
       })
-      this.notify(peer, { method: 'item/agentMessage/delta', params: { threadId: thread.id, turnId: turn.id, itemId, delta: text } })
+      this.notify(peer, {
+        method: 'item/agentMessage/delta',
+        params: { threadId: thread.id, turnId: turn.id, itemId, delta: text },
+      })
     }
     const latestTurn = this.store.getTurn(turn.id)
     for (const completedItemId of [reasoningItemId, agentItemId, planItemId]) {
       const item = latestTurn?.items.find((candidate) => candidate.id === completedItemId)
-      if (item) this.notify(peer, { method: 'item/completed', params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() } })
+      if (item)
+        this.notify(peer, {
+          method: 'item/completed',
+          params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
+        })
     }
     const completed: TurnRecord = this.store.completeTurn(turn.id, 'completed') ?? turn
     if (collectedMetrics.set) {
@@ -1685,7 +2164,10 @@ export class CodexClaudeAppServer {
         })
       }
     }
-    this.notify(peer, { method: 'turn/completed', params: { threadId: thread.id, turn: this.toTurn(completed) } })
+    this.notify(peer, {
+      method: 'turn/completed',
+      params: { threadId: thread.id, turn: this.toLifecycleTurn(completed) },
+    })
   }
 
   private async requestApproval(
@@ -1701,7 +2183,10 @@ export class CodexClaudeAppServer {
     // future SDK path still emits permission_request, this prevents the
     // adapter from sitting on "Awaiting approval" forever.
     const thread = this.store.getThread(threadId)
-    if (thread && (thread.approvalPolicy === 'never' || thread.sandboxMode === 'danger-full-access')) {
+    if (
+      thread &&
+      (thread.approvalPolicy === 'never' || thread.sandboxMode === 'danger-full-access')
+    ) {
       return { decision: 'accept' }
     }
     const command = String(event.input.command ?? '')
@@ -1712,7 +2197,9 @@ export class CodexClaudeAppServer {
     this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: ['waitingOnApproval'] })
     const requestId = newId()
     const isCommand = event.toolName === 'Bash'
-    const method = isCommand ? 'item/commandExecution/requestApproval' : 'item/fileChange/requestApproval'
+    const method = isCommand
+      ? 'item/commandExecution/requestApproval'
+      : 'item/fileChange/requestApproval'
     const params = isCommand
       ? {
           threadId,
@@ -1763,7 +2250,12 @@ export class CodexClaudeAppServer {
     const normalized = questions.map((q) => {
       const options = q.options ?? []
       const hasOther = options.some((o) => o.label === 'Other')
-      return hasOther ? q : { ...q, options: [...options, { label: 'Other', description: 'Provide a free-form answer' }] }
+      return hasOther
+        ? q
+        : {
+            ...q,
+            options: [...options, { label: 'Other', description: 'Provide a free-form answer' }],
+          }
     })
     const params = { threadId, turnId, itemId, questions: normalized }
     let response: unknown
@@ -1784,8 +2276,12 @@ export class CodexClaudeAppServer {
     if (turnId) {
       const turn = this.store.getTurn(turnId)
       if (turn?.status === 'inProgress') {
-        const completed = this.store.completeTurn(turnId, 'interrupted', { message: 'interrupted' }) ?? turn
-        this.notify(peer, { method: 'turn/completed', params: { threadId, turn: this.toTurn(completed) } })
+        const completed =
+          this.store.completeTurn(turnId, 'interrupted', { message: 'interrupted' }) ?? turn
+        this.notify(peer, {
+          method: 'turn/completed',
+          params: { threadId, turn: this.toLifecycleTurn(completed) },
+        })
       }
     }
     this.clearActiveTurn(threadId)
@@ -1793,7 +2289,7 @@ export class CodexClaudeAppServer {
     return {}
   }
 
-  private async turnSteer(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
+  private async turnSteer(_peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
     const threadId = stringOr(params.threadId, '')
     const expectedTurnId = stringOr(params.expectedTurnId, '')
     const activeTurnId = this.activeTurnByThread.get(threadId)
@@ -1803,10 +2299,13 @@ export class CodexClaudeAppServer {
     }
     const input = Array.isArray(params.input) ? (params.input as UserInput[]) : []
     const prompt = textFromInput(input)
+    // The steered message is retained on the turn for history (thread/read), but
+    // — like a normal turn's user message — it is NOT surfaced as a userMessage
+    // item/started+item/completed event. The real app-server's turn_steer just
+    // feeds the input into the core (steer_input) and EventMsg::UserMessage is
+    // unhandled in the live stream, so no userMessage item event is emitted.
     const item: ThreadItem = { type: 'userMessage', id: newId(), content: input }
     this.store.appendItem(activeTurnId, item)
-    this.notify(peer, { method: 'item/started', params: { threadId, turnId: activeTurnId, item, startedAtMs: nowMillis() } })
-    this.notify(peer, { method: 'item/completed', params: { threadId, turnId: activeTurnId, item, completedAtMs: nowMillis() } })
     await this.runtime.steer(threadId, prompt)
     return { turnId: activeTurnId }
   }
@@ -1850,7 +2349,9 @@ export class CodexClaudeAppServer {
       origins: {
         model_provider: configLayerMetadata(),
         'model_providers.claude-code': configLayerMetadata(),
-        ...(codexProxyModelOptions().length > 0 ? { 'model_providers.codex': configLayerMetadata() } : {}),
+        ...(codexProxyModelOptions().length > 0
+          ? { 'model_providers.codex': configLayerMetadata() }
+          : {}),
       },
       layers: null,
     }
@@ -1967,7 +2468,12 @@ export class CodexClaudeAppServer {
   // Accumulates Claude Agent SDK token usage per thread and pushes a
   // `thread/tokenUsage/updated` notification so the Codex App can render real
   // consumption instead of leaving the meter blank.
-  private recordTokenUsage(peer: RpcPeer, threadId: string, turnId: string, usage: Record<string, unknown>): void {
+  private recordTokenUsage(
+    peer: RpcPeer,
+    threadId: string,
+    turnId: string,
+    usage: Record<string, unknown>,
+  ): void {
     const last = tokenBreakdownFromClaudeUsage(usage)
     if (last.totalTokens === 0) return
     const prior = this.tokenUsageByThread.get(threadId) ?? emptyTokenBreakdown()
@@ -1980,7 +2486,10 @@ export class CodexClaudeAppServer {
     }
     this.tokenUsageByThread.set(threadId, total)
     const tokenUsage: ThreadTokenUsage = { total, last, modelContextWindow: null }
-    this.notify(peer, { method: 'thread/tokenUsage/updated', params: { threadId, turnId, tokenUsage } })
+    this.notify(peer, {
+      method: 'thread/tokenUsage/updated',
+      params: { threadId, turnId, tokenUsage },
+    })
     // NOTE: previously we also pushed `account/rateLimits/updated` here on
     // every token-usage event "to keep the UI in sync". That backfired —
     // Codex App treats every such notification as a fresh rate-limit signal
@@ -2026,7 +2535,10 @@ export class CodexClaudeAppServer {
   private async fsWriteFile(params: Record<string, unknown>): Promise<unknown> {
     const { writeFile } = await import('node:fs/promises')
     const path = stringOr(params.path, '')
-    const data = typeof params.dataBase64 === 'string' ? Buffer.from(params.dataBase64, 'base64') : Buffer.alloc(0)
+    const data =
+      typeof params.dataBase64 === 'string'
+        ? Buffer.from(params.dataBase64, 'base64')
+        : Buffer.alloc(0)
     await writeFile(path, data)
     return {}
   }
@@ -2039,13 +2551,18 @@ export class CodexClaudeAppServer {
 
   private async fsRemove(params: Record<string, unknown>): Promise<unknown> {
     const { rm } = await import('node:fs/promises')
-    await rm(stringOr(params.path, ''), { recursive: params.recursive !== false, force: params.force !== false })
+    await rm(stringOr(params.path, ''), {
+      recursive: params.recursive !== false,
+      force: params.force !== false,
+    })
     return {}
   }
 
   private async fsCopy(params: Record<string, unknown>): Promise<unknown> {
     const { cp } = await import('node:fs/promises')
-    await cp(stringOr(params.sourcePath, ''), stringOr(params.destinationPath, ''), { recursive: params.recursive === true })
+    await cp(stringOr(params.sourcePath, ''), stringOr(params.destinationPath, ''), {
+      recursive: params.recursive === true,
+    })
     return {}
   }
 
@@ -2073,20 +2590,37 @@ export class CodexClaudeAppServer {
     const processId = typeof params.processId === 'string' ? params.processId : newId()
     const command = commandArray(params.command)
     if (command.length === 0) throw new Error('command/exec requires command')
-    if ((params.streamStdoutStderr === true || params.streamStdin === true || params.tty === true) && typeof params.processId !== 'string') {
+    if (
+      (params.streamStdoutStderr === true || params.streamStdin === true || params.tty === true) &&
+      typeof params.processId !== 'string'
+    ) {
       throw new Error('command/exec streaming requires processId')
     }
 
     const executable = command[0] as string
     const streamOutput = params.streamStdoutStderr === true || params.tty === true
     const cwd = stringOr(params.cwd, process.cwd())
-    debugLog('command.exec.start', { processId, cwd, command, streamOutput, streamStdin: params.streamStdin === true, tty: params.tty === true })
-    const child = spawn(executable, command.slice(1), { cwd, env: commandEnv(params.env), stdio: 'pipe' })
+    debugLog('command.exec.start', {
+      processId,
+      cwd,
+      command,
+      streamOutput,
+      streamStdin: params.streamStdin === true,
+      tty: params.tty === true,
+    })
+    const child = spawn(executable, command.slice(1), {
+      cwd,
+      env: commandEnv(params.env),
+      stdio: 'pipe',
+    })
     this.commandProcesses.set(processId, child)
 
     const stdout: Buffer[] = []
     const stderr: Buffer[] = []
-    const cap = params.disableOutputCap === true ? Number.POSITIVE_INFINITY : numberOr(params.outputBytesCap, 1_000_000)
+    const cap =
+      params.disableOutputCap === true
+        ? Number.POSITIVE_INFINITY
+        : numberOr(params.outputBytesCap, 1_000_000)
     let stdoutBytes = 0
     let stderrBytes = 0
 
@@ -2100,7 +2634,15 @@ export class CodexClaudeAppServer {
     child.stdout?.on('data', (chunk: Buffer | string) => {
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
       if (streamOutput) {
-        this.notify(peer, { method: 'command/exec/outputDelta', params: { processId, stream: 'stdout', deltaBase64: buffer.toString('base64'), capReached: false } })
+        this.notify(peer, {
+          method: 'command/exec/outputDelta',
+          params: {
+            processId,
+            stream: 'stdout',
+            deltaBase64: buffer.toString('base64'),
+            capReached: false,
+          },
+        })
         return
       }
       stdoutBytes = capture(stdout, buffer, stdoutBytes)
@@ -2108,7 +2650,15 @@ export class CodexClaudeAppServer {
     child.stderr?.on('data', (chunk: Buffer | string) => {
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
       if (streamOutput) {
-        this.notify(peer, { method: 'command/exec/outputDelta', params: { processId, stream: 'stderr', deltaBase64: buffer.toString('base64'), capReached: false } })
+        this.notify(peer, {
+          method: 'command/exec/outputDelta',
+          params: {
+            processId,
+            stream: 'stderr',
+            deltaBase64: buffer.toString('base64'),
+            capReached: false,
+          },
+        })
         return
       }
       stderrBytes = capture(stderr, buffer, stderrBytes)
@@ -2122,7 +2672,11 @@ export class CodexClaudeAppServer {
 
     return new Promise((resolve, reject) => {
       child.once('error', (error) => {
-        debugLog('command.exec.error', { processId, error: error.message, code: (error as NodeJS.ErrnoException).code })
+        debugLog('command.exec.error', {
+          processId,
+          error: error.message,
+          code: (error as NodeJS.ErrnoException).code,
+        })
         if (timeout) clearTimeout(timeout)
         this.commandProcesses.delete(processId)
         reject(error)
@@ -2164,12 +2718,14 @@ export class CodexClaudeAppServer {
   private processSpawn(peer: RpcPeer, params: Record<string, unknown>): unknown {
     const processHandle = stringOr(params.processHandle, '')
     if (!processHandle) throw new Error('process/spawn requires processHandle')
-    if (this.processHandles.has(processHandle)) throw new Error(`process handle already active: ${processHandle}`)
+    if (this.processHandles.has(processHandle))
+      throw new Error(`process handle already active: ${processHandle}`)
     const command = commandArray(params.command)
     if (command.length === 0) throw new Error('process/spawn requires command')
     const cwd = stringOr(params.cwd, process.cwd())
     const streamOutput = params.streamStdoutStderr === true || params.tty === true
-    const cap = params.outputBytesCap == null ? 1_000_000 : numberOr(params.outputBytesCap, 1_000_000)
+    const cap =
+      params.outputBytesCap == null ? 1_000_000 : numberOr(params.outputBytesCap, 1_000_000)
     const stdout: Buffer[] = []
     const stderr: Buffer[] = []
     let stdoutBytes = 0
@@ -2177,8 +2733,19 @@ export class CodexClaudeAppServer {
     let stdoutCapReached = false
     let stderrCapReached = false
     let exited = false
-    debugLog('process.spawn.start', { processHandle, cwd, command, streamOutput, streamStdin: params.streamStdin === true, tty: params.tty === true })
-    const child = spawn(command[0] as string, command.slice(1), { cwd, env: commandEnv(params.env), stdio: 'pipe' })
+    debugLog('process.spawn.start', {
+      processHandle,
+      cwd,
+      command,
+      streamOutput,
+      streamStdin: params.streamStdin === true,
+      tty: params.tty === true,
+    })
+    const child = spawn(command[0] as string, command.slice(1), {
+      cwd,
+      env: commandEnv(params.env),
+      stdio: 'pipe',
+    })
     this.processHandles.set(processHandle, child)
 
     const capture = (target: Buffer[], chunk: Buffer, currentBytes: number): [number, boolean] => {
@@ -2190,7 +2757,15 @@ export class CodexClaudeAppServer {
     child.stdout?.on('data', (chunk: Buffer | string) => {
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
       if (streamOutput) {
-        this.notify(peer, { method: 'process/outputDelta', params: { processHandle, stream: 'stdout', deltaBase64: buffer.toString('base64'), capReached: false } })
+        this.notify(peer, {
+          method: 'process/outputDelta',
+          params: {
+            processHandle,
+            stream: 'stdout',
+            deltaBase64: buffer.toString('base64'),
+            capReached: false,
+          },
+        })
       } else {
         ;[stdoutBytes, stdoutCapReached] = capture(stdout, buffer, stdoutBytes)
       }
@@ -2198,7 +2773,15 @@ export class CodexClaudeAppServer {
     child.stderr?.on('data', (chunk: Buffer | string) => {
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
       if (streamOutput) {
-        this.notify(peer, { method: 'process/outputDelta', params: { processHandle, stream: 'stderr', deltaBase64: buffer.toString('base64'), capReached: false } })
+        this.notify(peer, {
+          method: 'process/outputDelta',
+          params: {
+            processHandle,
+            stream: 'stderr',
+            deltaBase64: buffer.toString('base64'),
+            capReached: false,
+          },
+        })
       } else {
         ;[stderrBytes, stderrCapReached] = capture(stderr, buffer, stderrBytes)
       }
@@ -2206,27 +2789,41 @@ export class CodexClaudeAppServer {
     const timeoutMs = params.timeoutMs == null ? 60_000 : numberOr(params.timeoutMs, 60_000)
     const timeout = timeoutMs > 0 ? setTimeout(() => child.kill('SIGTERM'), timeoutMs) : null
     child.once('error', (error) => {
-      debugLog('process.spawn.error', { processHandle, error: error.message, code: (error as NodeJS.ErrnoException).code })
+      debugLog('process.spawn.error', {
+        processHandle,
+        error: error.message,
+        code: (error as NodeJS.ErrnoException).code,
+      })
       if (exited) return
       exited = true
       if (timeout) clearTimeout(timeout)
       this.processHandles.delete(processHandle)
-      setImmediate(() => this.notify(peer, {
-        method: 'process/exited',
-        params: {
-          processHandle,
-          exitCode: 1,
-          stdout: streamOutput ? '' : Buffer.concat(stdout).toString('utf8'),
-          stdoutCapReached,
-          stderr: error.message,
-          stderrCapReached: false,
-        },
-      }))
+      setImmediate(() =>
+        this.notify(peer, {
+          method: 'process/exited',
+          params: {
+            processHandle,
+            exitCode: 1,
+            stdout: streamOutput ? '' : Buffer.concat(stdout).toString('utf8'),
+            stdoutCapReached,
+            stderr: error.message,
+            stderrCapReached: false,
+          },
+        }),
+      )
     })
     child.once('close', (code, signal) => {
       if (exited) return
       exited = true
-      debugLog('process.spawn.close', { processHandle, code, signal, stdoutBytes, stderrBytes, stdoutCapReached, stderrCapReached })
+      debugLog('process.spawn.close', {
+        processHandle,
+        code,
+        signal,
+        stdoutBytes,
+        stderrBytes,
+        stdoutCapReached,
+        stderrCapReached,
+      })
       if (timeout) clearTimeout(timeout)
       this.processHandles.delete(processHandle)
       this.notify(peer, {
@@ -2248,7 +2845,8 @@ export class CodexClaudeAppServer {
     const processHandle = stringOr(params.processHandle, '')
     const child = this.processHandles.get(processHandle)
     if (!child) throw new Error(`unknown process handle: ${processHandle}`)
-    if (typeof params.deltaBase64 === 'string' && params.deltaBase64.length > 0) child.stdin?.write(Buffer.from(params.deltaBase64, 'base64'))
+    if (typeof params.deltaBase64 === 'string' && params.deltaBase64.length > 0)
+      child.stdin?.write(Buffer.from(params.deltaBase64, 'base64'))
     if (params.closeStdin === true) child.stdin?.end()
     return {}
   }
@@ -2263,7 +2861,10 @@ export class CodexClaudeAppServer {
 
   private marketplaceAdd(params: Record<string, unknown>): unknown {
     const source = stringOr(params.source, 'local')
-    const marketplaceName = stringOr(params.refName, source.split('/').filter(Boolean).at(-1) ?? 'marketplace')
+    const marketplaceName = stringOr(
+      params.refName,
+      source.split('/').filter(Boolean).at(-1) ?? 'marketplace',
+    )
     return {
       marketplaceName,
       installedRoot: `${codexHome()}/marketplaces/${marketplaceName}`,
@@ -2277,7 +2878,8 @@ export class CodexClaudeAppServer {
   }
 
   private marketplaceUpgrade(params: Record<string, unknown>): unknown {
-    const marketplaceName = typeof params.marketplaceName === 'string' ? params.marketplaceName : null
+    const marketplaceName =
+      typeof params.marketplaceName === 'string' ? params.marketplaceName : null
     return {
       selectedMarketplaces: marketplaceName ? [marketplaceName] : [],
       upgradedRoots: [],
@@ -2314,7 +2916,8 @@ export class CodexClaudeAppServer {
       if (keyPath === 'model' && typeof value === 'string' && value.length > 0) {
         this.configModel = normalizeSelectableModelId(value, this.configModel)
       } else if (keyPath === 'model_reasoning_effort' && typeof value === 'string') {
-        this.configReasoningEffort = normalizeCodexReasoningEffort(value) ?? this.configReasoningEffort
+        this.configReasoningEffort =
+          normalizeCodexReasoningEffort(value) ?? this.configReasoningEffort
       } else {
         // Unknown key — store in the generic overrides bag so it survives a
         // restart even though we don't apply it to typed runtime state. This
@@ -2421,7 +3024,10 @@ export class CodexClaudeAppServer {
     return { files }
   }
 
-  private toolUseToItem(event: Extract<RuntimeEvent, { type: 'tool_use' }>, cwd: string): ThreadItem {
+  private toolUseToItem(
+    event: Extract<RuntimeEvent, { type: 'tool_use' }>,
+    cwd: string,
+  ): ThreadItem {
     const id = newId()
     if (event.toolName === 'Bash') {
       return {
@@ -2525,6 +3131,9 @@ export class CodexClaudeAppServer {
     }
   }
 
+  // Full turn payload for history reads (thread/read, turns/list) — carries the
+  // loaded items. The Codex v2 `Turn` schema has no api/cost metadata fields, so
+  // the adapter's internal metrics are not serialized onto the wire.
   private toTurn(turn: TurnRecord): unknown {
     return {
       id: turn.id,
@@ -2535,13 +3144,33 @@ export class CodexClaudeAppServer {
       startedAt: turn.startedAt,
       completedAt: turn.completedAt,
       durationMs: turn.durationMs,
-      apiDurationMs: turn.apiDurationMs ?? null,
-      numTurns: turn.numTurns ?? null,
-      costUsd: turn.costUsd ?? null,
     }
   }
 
-  private sendResponse(peer: RpcPeer, id: JsonRpcId, result?: unknown, error?: { code: number; message: string; data?: unknown }): void {
+  // Turn payload for the turn lifecycle surface (turn/start response,
+  // turn/started, turn/completed). The real codex app-server deliberately ships
+  // an empty `items` list with `itemsView: "notLoaded"` here: the App's timeline
+  // is driven by the item/* event stream, not by items embedded in these turn
+  // envelopes. Re-shipping the full item list risks duplicate rendering.
+  private toLifecycleTurn(turn: TurnRecord, items: ThreadItem[] = []): unknown {
+    return {
+      id: turn.id,
+      items,
+      itemsView: 'notLoaded',
+      status: turn.status,
+      error: turn.error,
+      startedAt: turn.startedAt,
+      completedAt: turn.completedAt,
+      durationMs: turn.durationMs,
+    }
+  }
+
+  private sendResponse(
+    peer: RpcPeer,
+    id: JsonRpcId,
+    result?: unknown,
+    error?: { code: number; message: string; data?: unknown },
+  ): void {
     const response: JsonRpcResponse = { jsonrpc: '2.0', id }
     if (error) response.error = error
     else response.result = result ?? null
@@ -2564,13 +3193,23 @@ export class CodexClaudeAppServer {
     if (peer) this.notify(peer, notification)
   }
 
-  private setThreadStatus(peer: RpcPeer | null, threadId: string, status: ThreadRecord['status']): void {
+  private setThreadStatus(
+    peer: RpcPeer | null,
+    threadId: string,
+    status: ThreadRecord['status'],
+  ): void {
     this.store.updateThreadStatus(threadId, status)
     const target = peer ?? this.activePeerByThread.get(threadId)
-    if (target) this.notify(target, { method: 'thread/status/changed', params: { threadId, status } })
+    if (target)
+      this.notify(target, { method: 'thread/status/changed', params: { threadId, status } })
   }
 
-  private sendServerRequest(peer: RpcPeer, method: string, id: string, params: unknown): Promise<unknown> {
+  private sendServerRequest(
+    peer: RpcPeer,
+    method: string,
+    id: string,
+    params: unknown,
+  ): Promise<unknown> {
     const target = this.peerForParams(peer, params)
     const key = `${target.id}:${id}`
     return new Promise((resolve, reject) => {
@@ -2629,11 +3268,16 @@ export class CodexClaudeAppServer {
         this.configModel = normalized
       }
       if (typeof parsed.model_reasoning_effort === 'string') {
-        this.configReasoningEffort = normalizeCodexReasoningEffort(parsed.model_reasoning_effort) ?? this.configReasoningEffort
+        this.configReasoningEffort =
+          normalizeCodexReasoningEffort(parsed.model_reasoning_effort) ?? this.configReasoningEffort
       }
       // Restore the overrides bag — any key persisted previously that isn't
       // the strongly-typed model / effort lives here so it survives restarts.
-      if (parsed.overrides && typeof parsed.overrides === 'object' && !Array.isArray(parsed.overrides)) {
+      if (
+        parsed.overrides &&
+        typeof parsed.overrides === 'object' &&
+        !Array.isArray(parsed.overrides)
+      ) {
         this.configOverrides = parsed.overrides as Record<string, unknown>
       }
       if (shouldRepair) this.persistConfig()
@@ -2645,11 +3289,15 @@ export class CodexClaudeAppServer {
       ensureParent(this.configPath)
       writeFileSync(
         this.configPath,
-        JSON.stringify({
-          model: this.configModel,
-          model_reasoning_effort: this.configReasoningEffort,
-          overrides: this.configOverrides,
-        }, null, 2) + '\n',
+        JSON.stringify(
+          {
+            model: this.configModel,
+            model_reasoning_effort: this.configReasoningEffort,
+            overrides: this.configOverrides,
+          },
+          null,
+          2,
+        ) + '\n',
         { mode: 0o600 },
       )
     } catch {}
@@ -2657,7 +3305,9 @@ export class CodexClaudeAppServer {
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
-  return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {}
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {}
 }
 
 function stringOr(value: unknown, fallback: string): string {
@@ -2686,15 +3336,21 @@ function summarizeInjectedItem(raw: unknown): string {
   }
   if (typeof rec.text === 'string') return rec.text.slice(0, 2000)
   // Last-resort dump so something shows up in the transcript.
-  try { return JSON.stringify(raw).slice(0, 500) } catch { return '[non-serializable item]' }
+  try {
+    return JSON.stringify(raw).slice(0, 500)
+  } catch {
+    return '[non-serializable item]'
+  }
 }
 
 function configEdits(params: Record<string, unknown>): Array<{ keyPath: string; value: unknown }> {
   if (Array.isArray(params.edits)) {
-    return params.edits.map((edit) => {
-      const rec = asRecord(edit)
-      return { keyPath: String(rec.keyPath ?? rec.key ?? ''), value: rec.value }
-    }).filter((edit) => edit.keyPath.length > 0)
+    return params.edits
+      .map((edit) => {
+        const rec = asRecord(edit)
+        return { keyPath: String(rec.keyPath ?? rec.key ?? ''), value: rec.value }
+      })
+      .filter((edit) => edit.keyPath.length > 0)
   }
   const keyPath = String(params.keyPath ?? params.key ?? '')
   return keyPath ? [{ keyPath, value: params.value }] : []
@@ -2731,7 +3387,10 @@ function modelFromParams(params: Record<string, unknown>, fallback: string | nul
   return fallback ?? ''
 }
 
-function reasoningEffortFromParams(params: Record<string, unknown>, fallback: string | null): 'low' | 'medium' | 'high' | 'xhigh' | null {
+function reasoningEffortFromParams(
+  params: Record<string, unknown>,
+  fallback: string | null,
+): 'low' | 'medium' | 'high' | 'xhigh' | null {
   const config = asRecord(params.config)
   const effort =
     typeof params.effort === 'string'
@@ -2748,7 +3407,8 @@ function numberOr(value: unknown, fallback: number): number {
 
 function commandArray(value: unknown): string[] {
   if (Array.isArray(value)) return value.map(String).filter((part) => part.length > 0)
-  if (typeof value === 'string' && value.trim()) return [process.env.SHELL || '/bin/sh', '-lc', value]
+  if (typeof value === 'string' && value.trim())
+    return [process.env.SHELL || '/bin/sh', '-lc', value]
   return []
 }
 
@@ -2783,7 +3443,12 @@ function summarizeRpcParams(method: string, params: unknown): unknown {
       processId: rec.processId,
       itemId: rec.itemId,
       stream: rec.stream,
-      deltaBytes: typeof rec.deltaBase64 === 'string' ? Buffer.from(rec.deltaBase64, 'base64').byteLength : typeof rec.delta === 'string' ? rec.delta.length : 0,
+      deltaBytes:
+        typeof rec.deltaBase64 === 'string'
+          ? Buffer.from(rec.deltaBase64, 'base64').byteLength
+          : typeof rec.delta === 'string'
+            ? rec.delta.length
+            : 0,
       capReached: rec.capReached,
     }
   }
@@ -2805,7 +3470,9 @@ function summarizeRpcParams(method: string, params: unknown): unknown {
   }
   if (method === 'turn/started' || method === 'turn/completed') {
     const turn = asRecord(rec.turn)
-    const items = Array.isArray(turn.items) ? turn.items.map((item) => ({ id: asRecord(item).id, type: asRecord(item).type })) : []
+    const items = Array.isArray(turn.items)
+      ? turn.items.map((item) => ({ id: asRecord(item).id, type: asRecord(item).type }))
+      : []
     return {
       threadId: rec.threadId,
       turn: { id: turn.id, status: turn.status, items },
@@ -2817,7 +3484,10 @@ function summarizeRpcParams(method: string, params: unknown): unknown {
 function reviewLabel(target: unknown): string {
   const rec = asRecord(target)
   const type = stringOr(rec.type, 'uncommittedChanges')
-  if (type === 'commit') return 'commit ' + stringOr(rec.sha, '') + (typeof rec.title === 'string' ? ': ' + rec.title : '')
+  if (type === 'commit')
+    return (
+      'commit ' + stringOr(rec.sha, '') + (typeof rec.title === 'string' ? ': ' + rec.title : '')
+    )
   if (type === 'baseBranch') return 'base branch ' + stringOr(rec.branch, 'main')
   if (type === 'custom') return stringOr(rec.instructions, 'custom review')
   return 'uncommitted changes'
@@ -2848,7 +3518,9 @@ function compactSummary(thread: ThreadRecord, turns: TurnRecord[]): string {
   return [
     'Context compacted for thread ' + thread.id + '.',
     '',
-    snippets.length > 0 ? snippets.join('\n') : 'No prior conversation content was available to summarize.',
+    snippets.length > 0
+      ? snippets.join('\n')
+      : 'No prior conversation content was available to summarize.',
   ].join('\n')
 }
 
@@ -2869,7 +3541,10 @@ function stringListFromEnv(name: string, fallback: string[]): string[] {
     const parsed = JSON.parse(raw)
     if (Array.isArray(parsed)) return parsed.map(String).filter(Boolean)
   } catch {}
-  return raw.split(',').map((part) => part.trim()).filter(Boolean)
+  return raw
+    .split(',')
+    .map((part) => part.trim())
+    .filter(Boolean)
 }
 
 function toolResultText(content: unknown): string {
@@ -2909,7 +3584,9 @@ function fallbackStructuredText(outputSchema: unknown, prompt: string): string {
 function isSubagentToolName(name: string | null | undefined): boolean {
   if (typeof name !== 'string') return false
   const n = name.trim().toLowerCase()
-  return n === 'task' || n === 'agent' || n === 'subagent' || n === 'spawn_agent' || n === 'spawnagent'
+  return (
+    n === 'task' || n === 'agent' || n === 'subagent' || n === 'spawn_agent' || n === 'spawnagent'
+  )
 }
 
 function normalizeApprovalPolicy(value: unknown): string | null {
@@ -2946,7 +3623,15 @@ function sandboxFromTurnParams(params: Record<string, unknown>): string | null {
 function normalizePersonality(value: unknown): string | null {
   if (typeof value !== 'string') return null
   const v = value.trim()
-  if (v === 'none' || v === 'friendly' || v === 'pragmatic' || v === 'cynic' || v === 'robot' || v === 'nerd') return v
+  if (
+    v === 'none' ||
+    v === 'friendly' ||
+    v === 'pragmatic' ||
+    v === 'cynic' ||
+    v === 'robot' ||
+    v === 'nerd'
+  )
+    return v
   return null
 }
 
@@ -2959,7 +3644,15 @@ function normalizeReasoningEffortEnum(
 ): 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | null {
   if (typeof value !== 'string') return null
   const v = value.trim()
-  if (v === 'none' || v === 'minimal' || v === 'low' || v === 'medium' || v === 'high' || v === 'xhigh') return v
+  if (
+    v === 'none' ||
+    v === 'minimal' ||
+    v === 'low' ||
+    v === 'medium' ||
+    v === 'high' ||
+    v === 'xhigh'
+  )
+    return v
   return null
 }
 
@@ -2982,7 +3675,9 @@ function readConfigReasoningEffort(config: unknown): string | null {
 // App's ts-rs deserializer panic on `thread/list` / `thread/read` — which the
 // user sees as the generic "Oops, an error has occurred" toast. Force every
 // write/read through this gate so we never persist or ship an invalid value.
-function normalizeThreadSource(value: unknown): 'user' | 'subagent' | 'memory_consolidation' | null {
+function normalizeThreadSource(
+  value: unknown,
+): 'user' | 'subagent' | 'memory_consolidation' | null {
   if (typeof value !== 'string') return null
   const v = value.trim()
   if (v === 'user' || v === 'subagent' || v === 'memory_consolidation') return v
@@ -2996,7 +3691,8 @@ function normalizeThreadSource(value: unknown): 'user' | 'subagent' | 'memory_co
 function normalizeSessionSource(value: unknown): string {
   if (typeof value !== 'string') return 'appServer'
   const v = value.trim()
-  if (v === 'cli' || v === 'vscode' || v === 'exec' || v === 'appServer' || v === 'unknown') return v
+  if (v === 'cli' || v === 'vscode' || v === 'exec' || v === 'appServer' || v === 'unknown')
+    return v
   if (v === 'app_server' || v === 'app-server') return 'appServer'
   return 'unknown'
 }
@@ -3053,11 +3749,23 @@ function sandboxEnvelope(mode: string | null, cwd: string): unknown {
   if (mode === 'read-only') return { type: 'readOnly' }
   if (mode === 'danger-full-access') return { type: 'dangerFullAccess' }
   // Default: workspace-write (or null/legacy).
-  return { type: 'workspaceWrite', writableRoots: [cwd], networkAccess: true, excludeTmpdirEnvVar: false, excludeSlashTmp: false }
+  return {
+    type: 'workspaceWrite',
+    writableRoots: [cwd],
+    networkAccess: true,
+    excludeTmpdirEnvVar: false,
+    excludeSlashTmp: false,
+  }
 }
 
 function emptyTokenBreakdown(): TokenUsageBreakdown {
-  return { totalTokens: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0 }
+  return {
+    totalTokens: 0,
+    inputTokens: 0,
+    cachedInputTokens: 0,
+    outputTokens: 0,
+    reasoningOutputTokens: 0,
+  }
 }
 
 // claude-agent-sdk's Task tool appends a fixed metadata trailer to the
@@ -3080,11 +3788,19 @@ interface SubagentTrailer {
 // Wrap into the protocol shape — if content is already an array, use it; if
 // it's a primitive/object, materialize as a single text block so the App
 // renders something useful instead of an empty result.
-function wrapMcpToolResult(content: unknown): { content: unknown[]; structuredContent: unknown | null; _meta: unknown | null } {
+function wrapMcpToolResult(content: unknown): {
+  content: unknown[]
+  structuredContent: unknown | null
+  _meta: unknown | null
+} {
   if (content == null) return { content: [], structuredContent: null, _meta: null }
   if (Array.isArray(content)) return { content, structuredContent: null, _meta: null }
   const text = typeof content === 'string' ? content : JSON.stringify(content)
-  return { content: [{ type: 'text', text }], structuredContent: typeof content === 'object' ? content : null, _meta: null }
+  return {
+    content: [{ type: 'text', text }],
+    structuredContent: typeof content === 'object' ? content : null,
+    _meta: null,
+  }
 }
 
 // Codex v2 McpToolCallError requires { message: string } — and nothing else.
@@ -3095,7 +3811,11 @@ function wrapMcpToolError(content: unknown): { message: string } {
   if (Array.isArray(content)) {
     // Concatenate any text blocks; fall back to a JSON dump.
     const text = content
-      .map((b) => (b && typeof b === 'object' && (b as any).type === 'text' ? String((b as any).text ?? '') : ''))
+      .map((b) =>
+        b && typeof b === 'object' && (b as any).type === 'text'
+          ? String((b as any).text ?? '')
+          : '',
+      )
       .filter(Boolean)
       .join('\n')
     return { message: text || JSON.stringify(content) }
@@ -3112,7 +3832,9 @@ function parseSubagentTrailer(text: string): SubagentTrailer {
   let agentId: string | null = null
   let usage: SubagentTrailer['usage'] = null
 
-  const usageMatch = cleanText.match(/<usage>\s*total_tokens:\s*(\d+)\s*\n\s*tool_uses:\s*(\d+)\s*\n\s*duration_ms:\s*(\d+)\s*<\/usage>\s*$/)
+  const usageMatch = cleanText.match(
+    /<usage>\s*total_tokens:\s*(\d+)\s*\n\s*tool_uses:\s*(\d+)\s*\n\s*duration_ms:\s*(\d+)\s*<\/usage>\s*$/,
+  )
   if (usageMatch) {
     usage = {
       totalTokens: Number(usageMatch[1]) || 0,
@@ -3137,11 +3859,14 @@ function parseSubagentTrailer(text: string): SubagentTrailer {
 // suffixes a `Exit code: N` / `exit status N` marker. Returning null lets
 // the caller fall back to 0/1 from event.isError.
 function parseExitCodeFromResult(content: unknown): number | null {
-  const text = typeof content === 'string'
-    ? content
-    : Array.isArray(content)
-      ? content.map((p) => (typeof p === 'string' ? p : (p as Record<string, unknown>)?.text ?? '')).join('')
-      : ''
+  const text =
+    typeof content === 'string'
+      ? content
+      : Array.isArray(content)
+        ? content
+            .map((p) => (typeof p === 'string' ? p : ((p as Record<string, unknown>)?.text ?? '')))
+            .join('')
+        : ''
   if (!text) return null
   const match = text.match(/(?:Exit code|exit status|exit code):\s*(-?\d+)/i)
   if (!match) return null
@@ -3149,12 +3874,13 @@ function parseExitCodeFromResult(content: unknown): number | null {
   return Number.isFinite(code) ? code : null
 }
 
-
-
 // Best-effort: when the WebSearch tool returns a result, sniff whether the
 // first result was an explicit page open vs a result list. Codex App's
 // `webSearch` ThreadItem renders the action badge accordingly.
-function parseWebSearchAction(query: string, resultText: string):
+function parseWebSearchAction(
+  query: string,
+  resultText: string,
+):
   | { type: 'search'; query: string | null; queries: string[] | null }
   | { type: 'openPage'; url: string | null }
   | { type: 'findInPage'; pattern: string | null; url: string | null }
@@ -3173,7 +3899,8 @@ function parseWebSearchAction(query: string, resultText: string):
 // ResultMessage onto the Codex `TokenUsageBreakdown` shape. Cache-creation
 // tokens count as input; Claude does not separate reasoning output tokens.
 function tokenBreakdownFromClaudeUsage(usage: Record<string, unknown>): TokenUsageBreakdown {
-  const num = (value: unknown): number => (typeof value === 'number' && Number.isFinite(value) ? value : 0)
+  const num = (value: unknown): number =>
+    typeof value === 'number' && Number.isFinite(value) ? value : 0
   const cacheRead = num(usage.cache_read_input_tokens)
   const cacheCreation = num(usage.cache_creation_input_tokens)
   const inputTokens = num(usage.input_tokens) + cacheCreation
@@ -3187,42 +3914,67 @@ function tokenBreakdownFromClaudeUsage(usage: Record<string, unknown>): TokenUsa
   }
 }
 
-
 function coerceStructuredValue(schema: unknown, prompt: string): unknown {
   if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return prompt
   const record = schema as Record<string, unknown>
   if (record.type === 'string') return conciseStructuredString(prompt)
   if (record.type === 'array') {
-    const itemSchema = record.items && typeof record.items === 'object' && !Array.isArray(record.items) ? record.items : { type: 'string' }
-    const values = prompt.split(/\r?\n/).map((line) => line.trim().replace(/^[-*\d.、)\s]+/, '')).filter(Boolean)
-    return (values.length > 0 ? values : prompt.trim() ? [prompt.trim()] : []).slice(0, 10).map((value) => coerceStructuredValue(itemSchema, value))
+    const itemSchema =
+      record.items && typeof record.items === 'object' && !Array.isArray(record.items)
+        ? record.items
+        : { type: 'string' }
+    const values = prompt
+      .split(/\r?\n/)
+      .map((line) => line.trim().replace(/^[-*\d.、)\s]+/, ''))
+      .filter(Boolean)
+    return (values.length > 0 ? values : prompt.trim() ? [prompt.trim()] : [])
+      .slice(0, 10)
+      .map((value) => coerceStructuredValue(itemSchema, value))
   }
   if (record.type !== 'object') return null
-  const properties = record.properties && typeof record.properties === 'object' && !Array.isArray(record.properties)
-    ? (record.properties as Record<string, unknown>)
-    : {}
-  const required = Array.isArray(record.required) ? record.required.map(String) : Object.keys(properties)
+  const properties =
+    record.properties && typeof record.properties === 'object' && !Array.isArray(record.properties)
+      ? (record.properties as Record<string, unknown>)
+      : {}
+  const required = Array.isArray(record.required)
+    ? record.required.map(String)
+    : Object.keys(properties)
   const result: Record<string, unknown> = {}
   for (const key of required) {
     const property = properties[key]
-    const propertyType = property && typeof property === 'object' && !Array.isArray(property) ? (property as Record<string, unknown>).type : null
     result[key] = coerceStructuredValue(property, prompt)
   }
   return result
 }
 
 function conciseStructuredString(prompt: string): string {
-  const lines = prompt.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+  const lines = prompt
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
   const source = lines.at(-1) ?? prompt.trim()
   const colon = Math.max(source.lastIndexOf('：'), source.lastIndexOf(':'))
   const value = colon >= 0 ? source.slice(colon + 1).trim() : source
-  return value.replace(/^[-*\d.、)\s]+/, '').slice(0, 80).trim()
+  return value
+    .replace(/^[-*\d.、)\s]+/, '')
+    .slice(0, 80)
+    .trim()
 }
 
 function normalizeDecision(response: unknown): PermissionDecision['decision'] {
   const decision = asRecord(response).decision
-  if (decision === 'accept' || decision === 'acceptForSession' || decision === 'decline' || decision === 'cancel') return decision
-  if (decision && typeof decision === 'object' && ('acceptWithExecpolicyAmendment' in decision || 'applyNetworkPolicyAmendment' in decision)) {
+  if (
+    decision === 'accept' ||
+    decision === 'acceptForSession' ||
+    decision === 'decline' ||
+    decision === 'cancel'
+  )
+    return decision
+  if (
+    decision &&
+    typeof decision === 'object' &&
+    ('acceptWithExecpolicyAmendment' in decision || 'applyNetworkPolicyAmendment' in decision)
+  ) {
     return 'acceptForSession'
   }
   return 'decline'
@@ -3235,15 +3987,27 @@ function fileChangeFromTool(toolName: string, input: Record<string, unknown>): F
       return {
         path: String(input.file_path ?? input.path ?? `edit-${index}`),
         kind: { type: 'update', move_path: null },
-        diff: simpleDiff(String(input.file_path ?? input.path ?? `edit-${index}`), String(rec.old_string ?? ''), String(rec.new_string ?? '')),
+        diff: simpleDiff(
+          String(input.file_path ?? input.path ?? `edit-${index}`),
+          String(rec.old_string ?? ''),
+          String(rec.new_string ?? ''),
+        ),
       }
     })
   }
   const path = String(input.file_path ?? input.path ?? input.filename ?? 'unknown')
   if (toolName === 'Write') {
-    return [{ path, kind: { type: 'add' }, diff: simpleDiff(path, '', String(input.content ?? '')) }]
+    return [
+      { path, kind: { type: 'add' }, diff: simpleDiff(path, '', String(input.content ?? '')) },
+    ]
   }
-  return [{ path, kind: { type: 'update', move_path: null }, diff: simpleDiff(path, String(input.old_string ?? ''), String(input.new_string ?? '')) }]
+  return [
+    {
+      path,
+      kind: { type: 'update', move_path: null },
+      diff: simpleDiff(path, String(input.old_string ?? ''), String(input.new_string ?? '')),
+    },
+  ]
 }
 
 function simpleDiff(path: string, oldText: string, newText: string): string {
@@ -3251,8 +4015,14 @@ function simpleDiff(path: string, oldText: string, newText: string): string {
     `--- a/${path}`,
     `+++ b/${path}`,
     '@@',
-    ...oldText.split('\n').filter(Boolean).map((line) => `-${line}`),
-    ...newText.split('\n').filter(Boolean).map((line) => `+${line}`),
+    ...oldText
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => `-${line}`),
+    ...newText
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => `+${line}`),
     '',
   ].join('\n')
 }
@@ -3276,7 +4046,9 @@ async function isGitWorkTree(cwd: string): Promise<boolean> {
   let inside = false
   try {
     const { stdout } = await execFileAsync('git', ['rev-parse', '--is-inside-work-tree'], {
-      cwd, timeout: 3_000, maxBuffer: 1024,
+      cwd,
+      timeout: 3_000,
+      maxBuffer: 1024,
     })
     inside = stdout.trim() === 'true'
   } catch {
@@ -3290,7 +4062,11 @@ async function gitDiff(cwd: string): Promise<string> {
   if (!(await isGitWorkTree(cwd))) return ''
   let trackedDiff = ''
   try {
-    const { stdout } = await execFileAsync('git', ['diff', '--no-ext-diff', '--'], { cwd, timeout: 10_000, maxBuffer: 5 * 1024 * 1024 })
+    const { stdout } = await execFileAsync('git', ['diff', '--no-ext-diff', '--'], {
+      cwd,
+      timeout: 10_000,
+      maxBuffer: 5 * 1024 * 1024,
+    })
     trackedDiff = stdout
   } catch (error) {
     debugLog('git.diff.failed', {
@@ -3307,11 +4083,15 @@ async function gitDiff(cwd: string): Promise<string> {
 async function gitUntrackedDiff(cwd: string): Promise<string> {
   try {
     const { readFile } = await import('node:fs/promises')
-    const { stdout } = await execFileAsync('git', ['ls-files', '--others', '--exclude-standard', '-z'], {
-      cwd,
-      timeout: 10_000,
-      maxBuffer: 1024 * 1024,
-    })
+    const { stdout } = await execFileAsync(
+      'git',
+      ['ls-files', '--others', '--exclude-standard', '-z'],
+      {
+        cwd,
+        timeout: 10_000,
+        maxBuffer: 1024 * 1024,
+      },
+    )
     const paths = stdout.split('\0').filter(Boolean).slice(0, 50)
     const diffs: string[] = []
     for (const path of paths) {
@@ -3346,15 +4126,32 @@ function addedFileDiff(path: string, text: string): string {
 
 async function listFiles(root: string): Promise<string[]> {
   try {
-    const { stdout } = await execFileAsync('rg', ['--files'], { cwd: root, timeout: 10_000, maxBuffer: 5 * 1024 * 1024 })
+    const { stdout } = await execFileAsync('rg', ['--files'], {
+      cwd: root,
+      timeout: 10_000,
+      maxBuffer: 5 * 1024 * 1024,
+    })
     return stdout.split('\n').filter(Boolean)
   } catch (rgError) {
-    debugLog('listFiles.rgFailed', { root, error: rgError instanceof Error ? rgError.message : String(rgError) })
+    debugLog('listFiles.rgFailed', {
+      root,
+      error: rgError instanceof Error ? rgError.message : String(rgError),
+    })
     try {
-      const { stdout } = await execFileAsync('find', ['.', '-type', 'f'], { cwd: root, timeout: 10_000, maxBuffer: 5 * 1024 * 1024 })
-      return stdout.split('\n').filter(Boolean).map((path) => path.replace(/^\.\//, ''))
+      const { stdout } = await execFileAsync('find', ['.', '-type', 'f'], {
+        cwd: root,
+        timeout: 10_000,
+        maxBuffer: 5 * 1024 * 1024,
+      })
+      return stdout
+        .split('\n')
+        .filter(Boolean)
+        .map((path) => path.replace(/^\.\//, ''))
     } catch (findError) {
-      debugLog('listFiles.findFailed', { root, error: findError instanceof Error ? findError.message : String(findError) })
+      debugLog('listFiles.findFailed', {
+        root,
+        error: findError instanceof Error ? findError.message : String(findError),
+      })
       return []
     }
   }
@@ -3365,7 +4162,10 @@ async function listFiles(root: string): Promise<string[]> {
 // `{answers: {[questionId]: {answers: string[]}}}` — we accept that plus a
 // couple of forgiving variants (the App's experimental field set changes over
 // time) and fall back to empty per-question selections when nothing parses.
-function normalizeUserInputAnswers(response: unknown, questions: UserInputQuestion[]): UserInputAnswers {
+function normalizeUserInputAnswers(
+  response: unknown,
+  questions: UserInputQuestion[],
+): UserInputAnswers {
   const empty: UserInputAnswers = {
     answers: Object.fromEntries(questions.map((q) => [q.id, { answers: [] as string[] }])),
   }
@@ -3408,9 +4208,10 @@ function userInputAnswersAsContent(
     const slot = answers.answers[q.id]
     const picked = slot?.answers?.filter((s) => s && s !== 'Other') ?? []
     const notes = slot?.notes ?? null
-    const body = notes && (picked.length === 0 || picked.includes('Other'))
-      ? notes
-      : picked.join(', ') || '(no answer)'
+    const body =
+      notes && (picked.length === 0 || picked.includes('Other'))
+        ? notes
+        : picked.join(', ') || '(no answer)'
     out.push({ type: 'inputText', text: `${q.header}: ${body}` })
   }
   return out

@@ -30,11 +30,10 @@ export interface RuntimeConfig {
 }
 
 export function resolveRuntimeConfig(env: NodeJS.ProcessEnv = process.env): RuntimeConfig {
-  const explicit = normalizeRuntimeType(env.CLAUDE_CODEX_RUNTIME_TYPE ?? env.CLAUDE_CODEX_RUNTIME ?? env.CLAUDE_CODEX_BACKEND)
-  const type =
-    env.CLAUDE_CODEX_MOCK === '1'
-      ? 'mock'
-      : explicit ?? 'agent-sdk-sidecar'
+  const explicit = normalizeRuntimeType(
+    env.CLAUDE_CODEX_RUNTIME_TYPE ?? env.CLAUDE_CODEX_RUNTIME ?? env.CLAUDE_CODEX_BACKEND,
+  )
+  const type = env.CLAUDE_CODEX_MOCK === '1' ? 'mock' : (explicit ?? 'agent-sdk-sidecar')
 
   return {
     type,
@@ -55,7 +54,12 @@ export function resolveRuntimeConfig(env: NodeJS.ProcessEnv = process.env): Runt
     claudeP: {
       command: env.CLAUDE_CODEX_CLAUDE_P_COMMAND || env.CLAUDE_P || 'claude-p',
       extraArgs: stringList(env.CLAUDE_CODEX_CLAUDE_P_ARGS),
-      timeoutMs: numericEnv(env.CLAUDE_CODEX_CLAUDE_P_TIMEOUT_MS, 5 * 60_000, 1_000, 24 * 60 * 60_000),
+      timeoutMs: numericEnv(
+        env.CLAUDE_CODEX_CLAUDE_P_TIMEOUT_MS,
+        5 * 60_000,
+        1_000,
+        24 * 60 * 60_000,
+      ),
       skipPermissions: envFlag(env.CLAUDE_CODEX_CLAUDE_P_SKIP_PERMISSIONS, false),
       resume: envFlag(env.CLAUDE_CODEX_CLAUDE_P_RESUME, false),
       stopTimeoutRetries: numericEnv(env.CLAUDE_CODEX_CLAUDE_P_STOP_TIMEOUT_RETRIES, 1, 0, 5),

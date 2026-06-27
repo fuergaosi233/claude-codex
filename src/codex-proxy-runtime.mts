@@ -14,11 +14,7 @@
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createInterface, type Interface } from 'node:readline'
-import type {
-  ClaudeRuntime,
-  RuntimeHandlers,
-  RuntimeTurnContext,
-} from './types.mjs'
+import type { ClaudeRuntime, RuntimeHandlers, RuntimeTurnContext } from './types.mjs'
 import { resolveCodexBinary, debugLog } from './util.mjs'
 
 interface PendingTurn {
@@ -97,7 +93,12 @@ export class CodexProxyRuntime implements ClaudeRuntime {
       }
       args.push(context.prompt)
 
-      debugLog('codex-proxy.spawn', { binary, args, threadId: context.threadId, turnId: context.turnId })
+      debugLog('codex-proxy.spawn', {
+        binary,
+        args,
+        threadId: context.threadId,
+        turnId: context.turnId,
+      })
 
       const proc = spawn(binary, args, {
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -130,7 +131,11 @@ export class CodexProxyRuntime implements ClaudeRuntime {
         try {
           event = JSON.parse(trimmed)
         } catch (err) {
-          debugLog('codex-proxy.parseError', { turnId: context.turnId, line: trimmed.slice(0, 200), err: String(err) })
+          debugLog('codex-proxy.parseError', {
+            turnId: context.turnId,
+            line: trimmed.slice(0, 200),
+            err: String(err),
+          })
           return
         }
         void this.handleEvent(pending, event)
@@ -271,13 +276,21 @@ export class CodexProxyRuntime implements ClaudeRuntime {
         } else if (itemType === 'reasoning') {
           const text = stringOr(item.text) ?? ''
           if (text) await handlers.onEvent({ type: 'reasoning_delta', delta: text })
-        } else if (itemType === 'command_execution' || itemType === 'file_change' || itemType === 'mcp_tool_call') {
+        } else if (
+          itemType === 'command_execution' ||
+          itemType === 'file_change' ||
+          itemType === 'mcp_tool_call'
+        ) {
           // Tool result side — synthesize a tool_result so the server's
           // matching tool item closes properly.
           await handlers.onEvent({
             type: 'tool_result',
             toolUseId: itemId,
-            content: stringOr(item.aggregated_output) ?? stringOr(item.summary) ?? stringOr(item.result) ?? null,
+            content:
+              stringOr(item.aggregated_output) ??
+              stringOr(item.summary) ??
+              stringOr(item.result) ??
+              null,
             isError: Boolean(item.error ?? item.is_error),
           })
         }
@@ -315,7 +328,8 @@ export class CodexProxyRuntime implements ClaudeRuntime {
       case 'turn.failed':
       case 'error': {
         if (pending.resolved) return
-        const message = stringOr(event.message) ?? stringOr(asRecord(event.error).message) ?? 'codex turn failed'
+        const message =
+          stringOr(event.message) ?? stringOr(asRecord(event.error).message) ?? 'codex turn failed'
         pending.resolved = true
         this.turns.delete(context.turnId)
         try {
@@ -343,5 +357,7 @@ function stringOr(value: unknown): string | null {
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
-  return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {}
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {}
 }

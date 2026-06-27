@@ -6,22 +6,42 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { ClaudePTranscriptRuntime } from '../src/claude-p-runtime.mjs'
-import { HttpAgentRuntime, hasAgentapiTrustPrompt, sanitizeAgentapiTerminalContent } from '../src/http-agent-runtime.mjs'
-import { sdkResumeSessionId } from '../src/native-runtime.mjs'
+import {
+  HttpAgentRuntime,
+  hasAgentapiTrustPrompt,
+  sanitizeAgentapiTerminalContent,
+} from '../src/http-agent-runtime.mjs'
+import { NativeClaudeRuntime, sdkResumeSessionId } from '../src/native-runtime.mjs'
 import { resolveRuntimeConfig } from '../src/runtime-config.mjs'
 
 test('runtime config keeps legacy defaults and accepts explicit backends', () => {
   assert.equal(resolveRuntimeConfig({}).type, 'agent-sdk-sidecar')
   assert.equal(resolveRuntimeConfig({ CLAUDE_CODEX_MOCK: '1' }).type, 'mock')
-  assert.equal(resolveRuntimeConfig({ CLAUDE_CODEX_RUNTIME_SOCKET: '/tmp/runtime.sock' }).type, 'agent-sdk-sidecar')
-  assert.equal(resolveRuntimeConfig({ CLAUDE_CODEX_RUNTIME_TYPE: 'agent-sdk-socket' }).type, 'agent-sdk-sidecar')
+  assert.equal(
+    resolveRuntimeConfig({ CLAUDE_CODEX_RUNTIME_SOCKET: '/tmp/runtime.sock' }).type,
+    'agent-sdk-sidecar',
+  )
+  assert.equal(
+    resolveRuntimeConfig({ CLAUDE_CODEX_RUNTIME_TYPE: 'agent-sdk-socket' }).type,
+    'agent-sdk-sidecar',
+  )
   assert.equal(resolveRuntimeConfig({ CLAUDE_CODEX_RUNTIME_TYPE: 'channels' }).type, 'agent-http')
   assert.equal(resolveRuntimeConfig({ CLAUDE_CODEX_RUNTIME_TYPE: 'agentapi' }).type, 'agentapi')
   assert.equal(resolveRuntimeConfig({ CLAUDE_CODEX_RUNTIME_TYPE: 'claude-p' }).type, 'claude-p')
-  assert.equal(resolveRuntimeConfig({ CLAUDE_CODEX_HTTP_MANAGE_BRIDGE: '1' }).http.manageBridge, true)
-  assert.equal(resolveRuntimeConfig({ CLAUDE_CODEX_MODE_COMMAND: '/tmp/mode' }).http.modeCommand, '/tmp/mode')
+  assert.equal(
+    resolveRuntimeConfig({ CLAUDE_CODEX_HTTP_MANAGE_BRIDGE: '1' }).http.manageBridge,
+    true,
+  )
+  assert.equal(
+    resolveRuntimeConfig({ CLAUDE_CODEX_MODE_COMMAND: '/tmp/mode' }).http.modeCommand,
+    '/tmp/mode',
+  )
   assert.equal(resolveRuntimeConfig({}).claudeP.stopTimeoutRetries, 1)
-  assert.equal(resolveRuntimeConfig({ CLAUDE_CODEX_CLAUDE_P_STOP_TIMEOUT_RETRIES: '0' }).claudeP.stopTimeoutRetries, 0)
+  assert.equal(
+    resolveRuntimeConfig({ CLAUDE_CODEX_CLAUDE_P_STOP_TIMEOUT_RETRIES: '0' }).claudeP
+      .stopTimeoutRetries,
+    0,
+  )
 })
 
 test('native SDK runtime ignores bridge session markers when resuming SDK turns', () => {
@@ -30,6 +50,36 @@ test('native SDK runtime ignores bridge session markers when resuming SDK turns'
   assert.equal(sdkResumeSessionId('agentapi:http://127.0.0.1:3284'), null)
   assert.equal(sdkResumeSessionId('claude-p:session'), null)
   assert.equal(sdkResumeSessionId('sdk-session'), 'sdk-session')
+})
+
+test('native SDK permission allow result carries original input for SDK validation', async () => {
+  const runtime = new NativeClaudeRuntime()
+  const turns = Reflect.get(runtime, 'turns')
+  assert.ok(turns instanceof Map)
+  const input = { command: 'printf ok' }
+  const requests: unknown[] = []
+  turns.set('turn', {
+    handlers: {
+      onPermissionRequest: async (event: unknown) => {
+        requests.push(event)
+        return { decision: 'accept' }
+      },
+    },
+  })
+
+  try {
+    const makeCanUseTool = Reflect.get(runtime, 'makeCanUseTool')
+    assert.equal(typeof makeCanUseTool, 'function')
+    const canUseTool = makeCanUseTool.call(runtime, { threadId: 'thread', turnId: 'turn' }, false)
+    const result = await canUseTool('Bash', input, {
+      toolUseID: 'tool',
+      signal: new AbortController().signal,
+    })
+    assert.deepEqual(result, { behavior: 'allow', updatedInput: input })
+    assert.equal(requests.length, 1)
+  } finally {
+    turns.delete('turn')
+  }
 })
 
 test('HTTP agent runtime streams agentapi-compatible message updates', async () => {
@@ -54,7 +104,9 @@ test('HTTP agent runtime streams agentapi-compatible message updates', async () 
         messages.push({ id: 2, role: 'agent', content: 'hello', time: new Date().toISOString() })
       }, 20)
       setTimeout(() => {
-        messages = messages.map((message) => message.id === 2 ? { ...message, content: 'hello world' } : message)
+        messages = messages.map((message) =>
+          message.id === 2 ? { ...message, content: 'hello world' } : message,
+        )
         status = 'stable'
       }, 60)
       res.setHeader('content-type', 'application/json')
@@ -118,7 +170,9 @@ test('HTTP agent runtime streams agentapi-compatible message updates', async () 
 })
 
 test('HTTP agent runtime uses one managed bridge URL per cwd/model key', async () => {
-  async function startServer(label: string): Promise<{ url: string; close: () => Promise<void>; prompts: string[] }> {
+  async function startServer(
+    label: string,
+  ): Promise<{ url: string; close: () => Promise<void>; prompts: string[] }> {
     const prompts: string[] = []
     let messages: Array<{ id: number; role: 'assistant'; content: string; time: string }> = []
     const server = http.createServer((req, res) => {
@@ -140,7 +194,14 @@ test('HTTP agent runtime uses one managed bridge URL per cwd/model key', async (
         })
         req.on('end', () => {
           prompts.push(body)
-          messages = [{ id: 1, role: 'assistant', content: `answer from ${label}`, time: new Date().toISOString() }]
+          messages = [
+            {
+              id: 1,
+              role: 'assistant',
+              content: `answer from ${label}`,
+              time: new Date().toISOString(),
+            },
+          ]
           res.setHeader('content-type', 'application/json')
           res.end(JSON.stringify({ ok: true }))
         })
@@ -172,7 +233,10 @@ test('HTTP agent runtime uses one managed bridge URL per cwd/model key', async (
     modeCommand,
     [
       '#!/usr/bin/env node',
-      `const urls = new Map(${JSON.stringify([[cwdA, a.url], [cwdB, b.url]])});`,
+      `const urls = new Map(${JSON.stringify([
+        [cwdA, a.url],
+        [cwdB, b.url],
+      ])});`,
       'const cwd = process.argv[5];',
       'const url = urls.get(cwd);',
       'if (!url) { console.error(`unknown cwd: ${cwd}`); process.exit(2); }',
@@ -465,7 +529,7 @@ test('claude-p runtime retries a process timeout once', async () => {
   const runtime = new ClaudePTranscriptRuntime({
     command,
     extraArgs: [],
-    timeoutMs: 500,
+    timeoutMs: 2_000,
     skipPermissions: false,
     resume: false,
     stopTimeoutRetries: 1,
@@ -537,7 +601,9 @@ test('HTTP agent runtime keeps recoverable SSE fallback out of the conversation'
       req.resume()
       status = 'running'
       setTimeout(() => {
-        messages = [{ id: 1, role: 'agent', content: 'polling answer', time: new Date().toISOString() }]
+        messages = [
+          { id: 1, role: 'agent', content: 'polling answer', time: new Date().toISOString() },
+        ]
         status = 'stable'
       }, 20)
       res.setHeader('content-type', 'application/json')
@@ -621,10 +687,19 @@ test('agentapi runtime polls running terminal output before final status-only sc
       req.resume()
       status = 'running'
       setTimeout(() => {
-        messages = [{ id: 1, role: 'agent', content: 'TOKEN_FROM_RUNNING_SCREEN', time: new Date().toISOString() }]
+        messages = [
+          {
+            id: 1,
+            role: 'agent',
+            content: 'TOKEN_FROM_RUNNING_SCREEN',
+            time: new Date().toISOString(),
+          },
+        ]
       }, 20)
       setTimeout(() => {
-        messages = [{ id: 1, role: 'agent', content: '✻ Cooked for 1s', time: new Date().toISOString() }]
+        messages = [
+          { id: 1, role: 'agent', content: '✻ Cooked for 1s', time: new Date().toISOString() },
+        ]
         status = 'stable'
       }, 80)
       res.setHeader('content-type', 'application/json')
@@ -702,7 +777,9 @@ test('HTTP agent runtime detects Claude Code trust prompt in agentapi screen out
   )
   assert.equal(
     hasAgentapiTrustPrompt({
-      messages: [{ role: 'agent', content: 'Welcome back Renee!\nWhat would you like to work on?' }],
+      messages: [
+        { role: 'agent', content: 'Welcome back Renee!\nWhat would you like to work on?' },
+      ],
     }),
     false,
   )
@@ -710,18 +787,25 @@ test('HTTP agent runtime detects Claude Code trust prompt in agentapi screen out
 
 test('agentapi terminal sanitizer removes Claude Code TUI status artifacts', () => {
   assert.equal(
-    sanitizeAgentapiTerminalContent('● Hi! What can I help you with today?                                           \n                                                                                \n✻ Worked for 3s                                                                 '),
+    sanitizeAgentapiTerminalContent(
+      '● Hi! What can I help you with today?                                           \n                                                                                \n✻ Worked for 3s                                                                 ',
+    ),
     'Hi! What can I help you with today?',
   )
   assert.equal(
-    sanitizeAgentapiTerminalContent('* Fluttering...\n└ Tip: Run /install-github-app to tag @claude right from your Github issues\nand PRs'),
+    sanitizeAgentapiTerminalContent(
+      '* Fluttering...\n└ Tip: Run /install-github-app to tag @claude right from your Github issues\nand PRs',
+    ),
     '',
   )
   assert.equal(sanitizeAgentapiTerminalContent('✻ Cooked for 1s'), '')
   assert.equal(sanitizeAgentapiTerminalContent('✻ Crunched for 3s'), '')
   assert.equal(sanitizeAgentapiTerminalContent('✻ Churned for 1s'), '')
   assert.equal(sanitizeAgentapiTerminalContent('✶ Processing…'), '')
-  assert.equal(sanitizeAgentapiTerminalContent('* Caramelizing… (3s · ↓ 201 tokens · thinking)'), '')
+  assert.equal(
+    sanitizeAgentapiTerminalContent('* Caramelizing… (3s · ↓ 201 tokens · thinking)'),
+    '',
+  )
   assert.equal(sanitizeAgentapiTerminalContent('· Slithering…'), '')
 })
 

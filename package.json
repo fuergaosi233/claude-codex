@@ -7,7 +7,13 @@
     "claude-codex-adapter": "dist/src/adapter.mjs"
   },
   "scripts": {
+    "dev": "tsx src/adapter.mts",
     "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "biome lint src test scripts",
+    "format": "biome format --write src test scripts",
+    "check": "biome check src test scripts",
+    "check:fix": "biome check --write src test scripts",
     "test": "npm run build && node --test dist/test/*.mjs",
     "doctor": "node scripts/doctor.mjs",
     "smoke:real": "npm run build && node scripts/smoke-real-claude.mjs",
@@ -21,11 +27,13 @@
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.143",
-    "ws": "^8.18.3"
+    "ws": "^8.21.0"
   },
   "devDependencies": {
-    "@types/node": "^22.18.0",
+    "@biomejs/biome": "^2.5.1",
+    "@types/node": "^24.13.2",
     "@types/ws": "^8.18.1",
+    "tsx": "^4.22.4",
     "typescript": "^5.9.3"
   },
   "engines": {

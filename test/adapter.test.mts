@@ -133,16 +133,34 @@ test('stdio initialize -> thread/start -> turn/start streams mock response', asy
   })
   const reader = new JsonLineReader(proc)
   try {
-    proc.stdin.write(json({ id: 1, method: 'initialize', params: { clientInfo: { name: 'test', title: 'Test', version: '0' }, capabilities: null } }))
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'initialize',
+        params: { clientInfo: { name: 'test', title: 'Test', version: '0' }, capabilities: null },
+      }),
+    )
     const init = await reader.nextResponse(1)
     assert.equal(init.result.platformFamily, process.platform === 'win32' ? 'windows' : 'unix')
 
-    proc.stdin.write(json({ id: 2, method: 'thread/start', params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false } }))
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false },
+      }),
+    )
     const start = await reader.nextResponse(2)
     const threadId = start.result.thread.id
     assert.equal(start.result.modelProvider, 'claude-code')
 
-    proc.stdin.write(json({ id: 3, method: 'turn/start', params: { threadId, input: [{ type: 'text', text: 'hello', text_elements: [] }] } }))
+    proc.stdin.write(
+      json({
+        id: 3,
+        method: 'turn/start',
+        params: { threadId, input: [{ type: 'text', text: 'hello', text_elements: [] }] },
+      }),
+    )
     const turnStart = await reader.nextResponse(3)
     assert.equal(turnStart.result.turn.status, 'inProgress')
 
@@ -151,11 +169,140 @@ test('stdio initialize -> thread/start -> turn/start streams mock response', asy
     for (let i = 0; i < 500; i += 1) {
       const message = await reader.next()
       if (message.method === 'item/agentMessage/delta') deltas.push(message.params.delta)
-      if (message.method === 'item/completed' && message.params.item.type === 'agentMessage') sawAgentCompleted = true
+      if (message.method === 'item/completed' && message.params.item.type === 'agentMessage')
+        sawAgentCompleted = true
       if (message.method === 'turn/completed') break
     }
     assert.match(deltas.join(''), /Claude Code adapter mock response/)
     assert.equal(sawAgentCompleted, true)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('turn lifecycle envelopes carry empty notLoaded items like the real app-server', async () => {
+  // The real codex app-server ships `items: [], itemsView: "notLoaded"` in the
+  // turn/start response and the turn/started + turn/completed notifications; the
+  // timeline is driven by the item/* event stream. See codex-rs
+  // bespoke_event_handling.rs (turn started clears items; turn completed builds
+  // items: vec![]) and turn_processor.rs (TurnStartResponse turn is empty).
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'initialize',
+        params: { clientInfo: { name: 'test', title: 'Test', version: '0' }, capabilities: null },
+      }),
+    )
+    await reader.nextResponse(1)
+    proc.stdin.write(json({ id: 2, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const start = await reader.nextResponse(2)
+    const threadId = start.result.thread.id
+
+    proc.stdin.write(
+      json({
+        id: 3,
+        method: 'turn/start',
+        params: { threadId, input: [{ type: 'text', text: 'hello', text_elements: [] }] },
+      }),
+    )
+    const turnStart = await reader.nextResponse(3)
+    assert.deepEqual(turnStart.result.turn.items, [], 'turn/start response items must be empty')
+    assert.equal(turnStart.result.turn.itemsView, 'notLoaded')
+
+    let started = null
+    let completed = null
+    let userMessageItemEvent = false
+    for (let i = 0; i < 500; i += 1) {
+      const message = await reader.next()
+      if (message.method === 'turn/started') started = message.params.turn
+      if (
+        (message.method === 'item/started' || message.method === 'item/completed') &&
+        message.params.item?.type === 'userMessage'
+      ) {
+        userMessageItemEvent = true
+      }
+      if (message.method === 'turn/completed') {
+        completed = message.params.turn
+        break
+      }
+    }
+    assert.ok(started, 'expected turn/started')
+    assert.deepEqual(started.items, [], 'turn/started items must be empty')
+    assert.equal(started.itemsView, 'notLoaded')
+    assert.ok(completed, 'expected turn/completed')
+    assert.deepEqual(completed.items, [], 'turn/completed items must be empty')
+    assert.equal(completed.itemsView, 'notLoaded')
+    // Lifecycle turn envelopes must not carry non-schema fields.
+    assert.ok(!('apiDurationMs' in completed), 'Turn schema has no apiDurationMs')
+    assert.ok(!('costUsd' in completed), 'Turn schema has no costUsd')
+    // The real app-server does not emit a userMessage item event during a turn.
+    assert.equal(userMessageItemEvent, false, 'userMessage must not be emitted as an item event')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('mcpServerStatus/list and startup notifications use conformant Codex v2 shapes', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      CODEX_HOME: home,
+      CLAUDE_CODEX_MOCK: '1',
+      NODE_NO_WARNINGS: '1',
+      CLAUDE_CODEX_MCP_SERVERS: JSON.stringify({
+        github: { type: 'stdio', command: 'github-mcp' },
+      }),
+    },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'initialize',
+        params: { clientInfo: { name: 'test', title: 'Test', version: '0' }, capabilities: null },
+      }),
+    )
+    // Boot-time startup notification: correct method + valid McpServerStartupState.
+    // The boot notifications are flushed via queueMicrotask, so they can land
+    // before the initialize response — scan every message rather than reading
+    // (and discarding) the response first.
+    let startup = null
+    let sawInit = false
+    for (let i = 0; i < 50; i += 1) {
+      const message = await reader.next()
+      if (message.method === 'mcpServer/startupStatus/updated') startup = message.params
+      if (message.id === 1 && message.method == null) sawInit = true
+      if (startup && sawInit) break
+    }
+    assert.ok(startup, 'expected mcpServer/startupStatus/updated notification')
+    assert.equal(startup.name, 'github')
+    assert.ok(
+      ['starting', 'ready', 'failed', 'cancelled'].includes(startup.status),
+      `invalid startup state ${startup.status}`,
+    )
+
+    proc.stdin.write(json({ id: 2, method: 'mcpServerStatus/list', params: {} }))
+    const list = await reader.nextResponse(2)
+    const entry = list.result.data[0]
+    assert.equal(entry.name, 'github')
+    // McpServerStatus = { name, tools: map, resources: [], resourceTemplates: [], authStatus }
+    assert.deepEqual(entry.tools, {})
+    assert.deepEqual(entry.resources, [])
+    assert.deepEqual(entry.resourceTemplates, [])
+    assert.ok(['unsupported', 'notLoggedIn', 'bearerToken', 'oAuth'].includes(entry.authStatus))
+    assert.ok(!('status' in entry), 'McpServerStatus has no startup status field')
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -171,23 +318,37 @@ test('thread/start with a gpt-* model marks the thread runtimeBackend=codex', as
   const reader = new JsonLineReader(proc)
   try {
     // Claude model → claude backend.
-    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), model: 'sonnet' } }))
+    proc.stdin.write(
+      json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), model: 'sonnet' } }),
+    )
     const claudeStart = await reader.nextResponse(1)
     assert.equal(claudeStart.result.model, 'sonnet')
 
     // Codex/OpenAI model → codex backend. The detection lives in
     // thread/start (isCodexOpenAiModel) so the choice round-trips through
     // thread/resume and survives a daemon restart.
-    proc.stdin.write(json({ id: 2, method: 'thread/start', params: { cwd: process.cwd(), model: 'gpt-5.4-mini' } }))
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), model: 'gpt-5.4-mini' },
+      }),
+    )
     const codexStart = await reader.nextResponse(2)
     assert.equal(codexStart.result.model, 'gpt-5.4-mini')
 
     // Cross-backend model change on resume must be refused — the conversation
     // history wouldn't transfer between Claude SDK and codex exec.
     const codexId = codexStart.result.thread.id
-    proc.stdin.write(json({ id: 3, method: 'thread/resume', params: { threadId: codexId, model: 'opus' } }))
+    proc.stdin.write(
+      json({ id: 3, method: 'thread/resume', params: { threadId: codexId, model: 'opus' } }),
+    )
     const resumed = await reader.nextResponse(3)
-    assert.equal(resumed.result.model, 'gpt-5.4-mini', 'resume must reject cross-backend model flip')
+    assert.equal(
+      resumed.result.model,
+      'gpt-5.4-mini',
+      'resume must reject cross-backend model flip',
+    )
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -231,7 +392,10 @@ test('model/list exposes Claude model aliases and Codex-safe reasoning efforts',
     assert.equal(ids.includes('opus'), true)
     assert.equal(ids.includes('sonnet-1m'), true)
     assert.equal(ids.includes('opus-plan'), true)
-    assert.equal(ids.some((id: string) => id.startsWith('runtime-')), false)
+    assert.equal(
+      ids.some((id: string) => id.startsWith('runtime-')),
+      false,
+    )
     const opus = models.result.data.find((model: any) => model.id === 'opus')
     assert.equal(opus.isDefault, true)
     assert.equal('serviceTiers' in opus, false)
@@ -241,32 +405,36 @@ test('model/list exposes Claude model aliases and Codex-safe reasoning efforts',
       ['low', 'medium', 'high', 'xhigh'],
     )
 
-    proc.stdin.write(json({
-      id: 3,
-      method: 'config/batchWrite',
-      params: {
-        edits: [
-          { keyPath: 'model', value: 'haiku', mergeStrategy: 'upsert' },
-          { keyPath: 'model_reasoning_effort', value: 'low', mergeStrategy: 'upsert' },
-        ],
-      },
-    }))
+    proc.stdin.write(
+      json({
+        id: 3,
+        method: 'config/batchWrite',
+        params: {
+          edits: [
+            { keyPath: 'model', value: 'haiku', mergeStrategy: 'upsert' },
+            { keyPath: 'model_reasoning_effort', value: 'low', mergeStrategy: 'upsert' },
+          ],
+        },
+      }),
+    )
     await reader.nextResponse(3)
     proc.stdin.write(json({ id: 4, method: 'config/read', params: {} }))
     const updatedConfig = await reader.nextResponse(4)
     assert.equal(updatedConfig.result.config.model, 'haiku')
     assert.equal(updatedConfig.result.config.model_reasoning_effort, 'low')
 
-    proc.stdin.write(json({
-      id: 5,
-      method: 'config/batchWrite',
-      params: {
-        edits: [
-          { keyPath: 'model', value: 'runtime-agent-http', mergeStrategy: 'upsert' },
-          { keyPath: 'model_reasoning_effort', value: 'medium', mergeStrategy: 'upsert' },
-        ],
-      },
-    }))
+    proc.stdin.write(
+      json({
+        id: 5,
+        method: 'config/batchWrite',
+        params: {
+          edits: [
+            { keyPath: 'model', value: 'runtime-agent-http', mergeStrategy: 'upsert' },
+            { keyPath: 'model_reasoning_effort', value: 'medium', mergeStrategy: 'upsert' },
+          ],
+        },
+      }),
+    )
     await reader.nextResponse(5)
     proc.stdin.write(json({ id: 6, method: 'config/read', params: {} }))
     const repairedConfig = await reader.nextResponse(6)
@@ -293,16 +461,18 @@ test('config writes persist across adapter restarts', async () => {
       },
     })
     const firstReader = new JsonLineReader(first)
-    first.stdin.write(json({
-      id: 1,
-      method: 'config/batchWrite',
-      params: {
-        edits: [
-          { keyPath: 'model', value: 'haiku', mergeStrategy: 'upsert' },
-          { keyPath: 'model_reasoning_effort', value: 'low', mergeStrategy: 'upsert' },
-        ],
-      },
-    }))
+    first.stdin.write(
+      json({
+        id: 1,
+        method: 'config/batchWrite',
+        params: {
+          edits: [
+            { keyPath: 'model', value: 'haiku', mergeStrategy: 'upsert' },
+            { keyPath: 'model_reasoning_effort', value: 'low', mergeStrategy: 'upsert' },
+          ],
+        },
+      }),
+    )
     await firstReader.nextResponse(1)
     first.kill()
     await once(first, 'exit')
@@ -346,7 +516,11 @@ test('invalid persisted model selections are repaired to a selectable model', as
     await mkdir(adapterConfigDir, { recursive: true })
     await writeFile(
       join(adapterConfigDir, 'config.json'),
-      JSON.stringify({ model: 'runtime-agent-sdk-sidecar', model_reasoning_effort: 'high' }, null, 2) + '\n',
+      JSON.stringify(
+        { model: 'runtime-agent-sdk-sidecar', model_reasoning_effort: 'high' },
+        null,
+        2,
+      ) + '\n',
     )
 
     const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
@@ -368,8 +542,16 @@ test('invalid persisted model selections are repaired to a selectable model', as
 
       proc.stdin.write(json({ id: 2, method: 'model/list', params: {} }))
       const models = await reader.nextResponse(2)
-      assert.equal(models.result.data.some((model: any) => model.id.startsWith('runtime-')), false)
-      assert.deepEqual(models.result.data.filter((model: any) => model.isDefault === true).map((model: any) => model.id), ['opus'])
+      assert.equal(
+        models.result.data.some((model: any) => model.id.startsWith('runtime-')),
+        false,
+      )
+      assert.deepEqual(
+        models.result.data
+          .filter((model: any) => model.isDefault === true)
+          .map((model: any) => model.id),
+        ['opus'],
+      )
     } finally {
       proc.kill()
       await once(proc, 'exit')
@@ -395,13 +577,36 @@ test('Codex++ model and effort selections map into Claude runtime context', asyn
   })
   const reader = new JsonLineReader(proc)
   try {
-    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), model: 'sonnet-1m', effort: 'high', experimentalRawEvents: false, persistExtendedHistory: false } }))
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'thread/start',
+        params: {
+          cwd: process.cwd(),
+          model: 'sonnet-1m',
+          effort: 'high',
+          experimentalRawEvents: false,
+          persistExtendedHistory: false,
+        },
+      }),
+    )
     const start = await reader.nextResponse(1)
     const threadId = start.result.thread.id
     assert.equal(start.result.model, 'sonnet-1m')
     assert.equal(start.result.reasoningEffort, 'high')
 
-    proc.stdin.write(json({ id: 2, method: 'turn/start', params: { threadId, model: 'sonnet-1m', effort: 'xhigh', input: [{ type: 'text', text: 'model effort check', text_elements: [] }] } }))
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          model: 'sonnet-1m',
+          effort: 'xhigh',
+          input: [{ type: 'text', text: 'model effort check', text_elements: [] }],
+        },
+      }),
+    )
     await reader.nextResponse(2)
 
     let text = ''
@@ -437,30 +642,34 @@ test('Codex app config payload model and effort map into Claude runtime context'
   })
   const reader = new JsonLineReader(proc)
   try {
-    proc.stdin.write(json({
-      id: 1,
-      method: 'thread/start',
-      params: {
-        cwd: process.cwd(),
-        config: { model: 'opus', model_reasoning_effort: 'high' },
-        experimentalRawEvents: false,
-        persistExtendedHistory: false,
-      },
-    }))
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'thread/start',
+        params: {
+          cwd: process.cwd(),
+          config: { model: 'opus', model_reasoning_effort: 'high' },
+          experimentalRawEvents: false,
+          persistExtendedHistory: false,
+        },
+      }),
+    )
     const start = await reader.nextResponse(1)
     const threadId = start.result.thread.id
     assert.equal(start.result.model, 'opus')
     assert.equal(start.result.reasoningEffort, 'high')
 
-    proc.stdin.write(json({
-      id: 2,
-      method: 'turn/start',
-      params: {
-        threadId,
-        config: { model: 'haiku', model_reasoning_effort: 'xhigh' },
-        input: [{ type: 'text', text: 'model effort check', text_elements: [] }],
-      },
-    }))
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          config: { model: 'haiku', model_reasoning_effort: 'xhigh' },
+          input: [{ type: 'text', text: 'model effort check', text_elements: [] }],
+        },
+      }),
+    )
     await reader.nextResponse(2)
 
     let text = ''
@@ -493,7 +702,18 @@ test('Codex app model ids and outputSchema map into Claude runtime context', asy
   })
   const reader = new JsonLineReader(proc)
   try {
-    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), model: 'gpt-5.4-mini', experimentalRawEvents: false, persistExtendedHistory: false } }))
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'thread/start',
+        params: {
+          cwd: process.cwd(),
+          model: 'gpt-5.4-mini',
+          experimentalRawEvents: false,
+          persistExtendedHistory: false,
+        },
+      }),
+    )
     const start = await reader.nextResponse(1)
     const threadId = start.result.thread.id
     assert.equal(start.result.model, 'gpt-5.4-mini')
@@ -504,16 +724,18 @@ test('Codex app model ids and outputSchema map into Claude runtime context', asy
       required: ['title'],
       additionalProperties: false,
     }
-    proc.stdin.write(json({
-      id: 2,
-      method: 'turn/start',
-      params: {
-        threadId,
-        model: 'gpt-5.4-mini',
-        outputSchema,
-        input: [{ type: 'text', text: 'output schema check', text_elements: [] }],
-      },
-    }))
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          model: 'gpt-5.4-mini',
+          outputSchema,
+          input: [{ type: 'text', text: 'output schema check', text_elements: [] }],
+        },
+      }),
+    )
     await reader.nextResponse(2)
 
     let text = ''
@@ -552,7 +774,19 @@ test('Codex title-generation turn runs through the runtime instead of a hardcode
   })
   const reader = new JsonLineReader(proc)
   try {
-    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), model: 'sonnet', ephemeral: true, experimentalRawEvents: false, persistExtendedHistory: false } }))
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'thread/start',
+        params: {
+          cwd: process.cwd(),
+          model: 'sonnet',
+          ephemeral: true,
+          experimentalRawEvents: false,
+          persistExtendedHistory: false,
+        },
+      }),
+    )
     const start = await reader.nextResponse(1)
     const threadId = start.result.thread.id
     const outputSchema = {
@@ -569,20 +803,25 @@ test('Codex title-generation turn runs through the runtime instead of a hardcode
       'User prompt:',
       'output schema check',
     ].join('\n')
-    proc.stdin.write(json({
-      id: 2,
-      method: 'turn/start',
-      params: {
-        threadId,
-        model: 'gpt-5.4-mini',
-        effort: 'medium',
-        outputSchema,
-        input: [{ type: 'text', text: prompt, text_elements: [] }],
-      },
-    }))
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          model: 'gpt-5.4-mini',
+          effort: 'medium',
+          outputSchema,
+          input: [{ type: 'text', text: prompt, text_elements: [] }],
+        },
+      }),
+    )
     const turnStart = await reader.nextResponse(2)
-    // The user message IS recorded now (we no longer skip the items list).
-    assert.equal(turnStart.result.turn.items.some((item: any) => item.type === 'userMessage'), true)
+    // The turn/start response envelope is empty/notLoaded like the real
+    // app-server; the user message is recorded in turn history (verified via
+    // thread/read below), not echoed back in the turn envelope.
+    assert.deepEqual(turnStart.result.turn.items, [])
+    assert.equal(turnStart.result.turn.itemsView, 'notLoaded')
 
     let text = ''
     for (let i = 0; i < 200; i += 1) {
@@ -590,14 +829,32 @@ test('Codex title-generation turn runs through the runtime instead of a hardcode
       if (message.method === 'item/agentMessage/delta') text += message.params.delta
       if (message.method === 'turn/completed') break
     }
+
+    // The user message IS recorded now (we no longer skip the items list) — it
+    // shows up in the persisted turn history.
+    proc.stdin.write(json({ id: 3, method: 'thread/read', params: { threadId } }))
+    const read = await reader.nextResponse(3)
+    const historyItems = (read.result.thread.turns as any[]).flatMap((t) => t.items)
+    assert.equal(
+      historyItems.some((item: any) => item.type === 'userMessage'),
+      true,
+    )
     // The text is whatever the runtime produced (the mock echoes the resolved
     // model + outputFormat). Importantly it must NOT be the old hardcoded
     // "处理X" string the local short-circuit would have produced.
     assert.doesNotMatch(text, /^\{"title":"处理/)
     const parsed = JSON.parse(text)
-    assert.equal(parsed.model, 'haiku', 'gpt-5.4-mini should map to the summary model (haiku) when an outputSchema is set')
+    assert.equal(
+      parsed.model,
+      'haiku',
+      'gpt-5.4-mini should map to the summary model (haiku) when an outputSchema is set',
+    )
     const logText = await readFile(debugLog, 'utf8')
-    assert.doesNotMatch(logText, /turn\.internalTitle\.shortCircuit/, 'no local title short-circuit should fire')
+    assert.doesNotMatch(
+      logText,
+      /turn\.internalTitle\.shortCircuit/,
+      'no local title short-circuit should fire',
+    )
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -621,7 +878,19 @@ test('stateful HTTP bridge runtimes keep Codex title-generation turns local', as
   })
   const reader = new JsonLineReader(proc)
   try {
-    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), model: 'sonnet', ephemeral: true, experimentalRawEvents: false, persistExtendedHistory: false } }))
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'thread/start',
+        params: {
+          cwd: process.cwd(),
+          model: 'sonnet',
+          ephemeral: true,
+          experimentalRawEvents: false,
+          persistExtendedHistory: false,
+        },
+      }),
+    )
     const start = await reader.nextResponse(1)
     const threadId = start.result.thread.id
     const outputSchema = {
@@ -630,16 +899,18 @@ test('stateful HTTP bridge runtimes keep Codex title-generation turns local', as
       required: ['title'],
       additionalProperties: false,
     }
-    proc.stdin.write(json({
-      id: 2,
-      method: 'turn/start',
-      params: {
-        threadId,
-        model: 'gpt-5.4-mini',
-        outputSchema,
-        input: [{ type: 'text', text: 'User prompt:\nhi', text_elements: [] }],
-      },
-    }))
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          model: 'gpt-5.4-mini',
+          outputSchema,
+          input: [{ type: 'text', text: 'User prompt:\nhi', text_elements: [] }],
+        },
+      }),
+    )
     await reader.nextResponse(2)
 
     let text = ''
@@ -672,11 +943,26 @@ test('default runtime tool policy leaves Claude Code tools unrestricted unless e
   })
   const reader = new JsonLineReader(proc)
   try {
-    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false } }))
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false },
+      }),
+    )
     const start = await reader.nextResponse(1)
     const threadId = start.result.thread.id
 
-    proc.stdin.write(json({ id: 2, method: 'turn/start', params: { threadId, input: [{ type: 'text', text: 'tool policy check', text_elements: [] }] } }))
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'tool policy check', text_elements: [] }],
+        },
+      }),
+    )
     await reader.nextResponse(2)
 
     let text = ''
@@ -707,15 +993,25 @@ test('unix websocket app-server accepts initialize', async () => {
       createConnection: (() => net.createConnection(sock)) as typeof net.createConnection,
     })
     await once(ws, 'open')
-    ws.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { clientInfo: { name: 'test', title: 'Test', version: '0' }, capabilities: null } }))
-    // adapter now also pushes account/updated + mcpServer/status/updated
+    ws.send(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: { clientInfo: { name: 'test', title: 'Test', version: '0' }, capabilities: null },
+      }),
+    )
+    // adapter now also pushes account/updated + mcpServer/startupStatus/updated
     // notifications after handshake; filter by id rather than grabbing the
     // first frame off the wire.
     let response: any = null
     for (let i = 0; i < 5; i += 1) {
       const [data] = (await once(ws, 'message')) as [Buffer]
       const msg = JSON.parse(data.toString('utf8'))
-      if (msg.id === 1) { response = msg; break }
+      if (msg.id === 1) {
+        response = msg
+        break
+      }
     }
     assert.equal(response.id, 1)
     assert.equal(response.result.codexHome, home)
@@ -746,11 +1042,25 @@ test('unix daemon keeps active turns alive across peer reconnect', async () => {
     })
     const reader1 = new WebSocketJsonReader(ws1)
     await once(ws1, 'open')
-    ws1.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'thread/start', params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false } }))
+    ws1.send(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false },
+      }),
+    )
     const start = await reader1.nextResponse(1)
     const threadId = start.result.thread.id
     const slowPrompt = `active reconnect check ${'x'.repeat(400)}`
-    ws1.send(JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'turn/start', params: { threadId, input: [{ type: 'text', text: slowPrompt, text_elements: [] }] } }))
+    ws1.send(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: [{ type: 'text', text: slowPrompt, text_elements: [] }] },
+      }),
+    )
     await reader1.nextResponse(2)
 
     ws1.close()
@@ -763,7 +1073,9 @@ test('unix daemon keeps active turns alive across peer reconnect', async () => {
     })
     const reader2 = new WebSocketJsonReader(ws2)
     await once(ws2, 'open')
-    ws2.send(JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'thread/resume', params: { threadId } }))
+    ws2.send(
+      JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'thread/resume', params: { threadId } }),
+    )
     await reader2.nextResponse(3)
 
     let text = ''
@@ -802,15 +1114,29 @@ test('unix daemon recovers stale in-progress turns after process restart', async
     })
     const reader1 = new WebSocketJsonReader(ws1)
     await once(ws1, 'open')
-    ws1.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'thread/start', params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false } }))
+    ws1.send(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false },
+      }),
+    )
     const start = await reader1.nextResponse(1)
     const threadId = start.result.thread.id
-    ws1.send(JSON.stringify({
-      jsonrpc: '2.0',
-      id: 2,
-      method: 'turn/start',
-      params: { threadId, input: [{ type: 'text', text: `stale restart check ${'x'.repeat(20_000)}`, text_elements: [] }] },
-    }))
+    ws1.send(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [
+            { type: 'text', text: `stale restart check ${'x'.repeat(20_000)}`, text_elements: [] },
+          ],
+        },
+      }),
+    )
     const turnStart = await reader1.nextResponse(2)
     const turnId = turnStart.result.turn.id
 
@@ -834,7 +1160,14 @@ test('unix daemon recovers stale in-progress turns after process restart', async
     })
     const reader2 = new WebSocketJsonReader(ws2)
     await once(ws2, 'open')
-    ws2.send(JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'thread/read', params: { threadId, includeTurns: true } }))
+    ws2.send(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: 3,
+        method: 'thread/read',
+        params: { threadId, includeTurns: true },
+      }),
+    )
     const read = await reader2.nextResponse(3)
     assert.equal(read.result.thread.status.type, 'idle')
     const recoveredTurn = read.result.thread.turns.find((turn: any) => turn.id === turnId)
@@ -900,16 +1233,29 @@ test('app-server proxy carries websocket JSON-RPC traffic over stdio', async () 
     await waitForStderr(daemon, /listening on/)
     const stream = new ChildProcessDuplex(proxy)
     const ws = new WebSocket('ws://localhost/', {
-      createConnection: ((() => stream) as unknown) as typeof net.createConnection,
+      createConnection: (() => stream) as unknown as typeof net.createConnection,
     })
     await once(ws, 'open')
-    ws.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { clientInfo: { name: 'proxy-test', title: 'Proxy Test', version: '0' }, capabilities: null } }))
+    ws.send(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {
+          clientInfo: { name: 'proxy-test', title: 'Proxy Test', version: '0' },
+          capabilities: null,
+        },
+      }),
+    )
     // adapter pushes notifications post-handshake; filter for the response.
     let response: any = null
     for (let i = 0; i < 5; i += 1) {
       const [data] = (await once(ws, 'message')) as [Buffer]
       const msg = JSON.parse(data.toString('utf8'))
-      if (msg.id === 1) { response = msg; break }
+      if (msg.id === 1) {
+        response = msg
+        break
+      }
     }
     assert.equal(response.id, 1)
     assert.equal(response.result.codexHome, home)
@@ -928,21 +1274,43 @@ test('remote shim launches daemon and proxy with Codex-compatible commands', asy
   const sock = join(tmpdir(), `ccx-test-${randomUUID().slice(0, 8)}.sock`)
   const daemon = spawn(shim, ['app-server', '--listen', `unix://${sock}`], {
     stdio: ['ignore', 'ignore', 'pipe'],
-    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_ADAPTER: adapter, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+    env: {
+      ...process.env,
+      CODEX_HOME: home,
+      CLAUDE_CODEX_ADAPTER: adapter,
+      CLAUDE_CODEX_MOCK: '1',
+      NODE_NO_WARNINGS: '1',
+    },
   })
   const proxy = spawn(shim, ['app-server', 'proxy', '--sock', sock], {
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_ADAPTER: adapter, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+    env: {
+      ...process.env,
+      CODEX_HOME: home,
+      CLAUDE_CODEX_ADAPTER: adapter,
+      CLAUDE_CODEX_MOCK: '1',
+      NODE_NO_WARNINGS: '1',
+    },
   })
   try {
     await waitForStderr(daemon, /listening on/)
     const stream = new ChildProcessDuplex(proxy)
     const ws = new WebSocket('ws://localhost/', {
-      createConnection: ((() => stream) as unknown) as typeof net.createConnection,
+      createConnection: (() => stream) as unknown as typeof net.createConnection,
     })
     await once(ws, 'open')
-    ws.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { clientInfo: { name: 'shim-test', title: 'Shim Test', version: '0' }, capabilities: null } }))
-    // The adapter now also pushes account/updated + mcpServer/status/updated
+    ws.send(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {
+          clientInfo: { name: 'shim-test', title: 'Shim Test', version: '0' },
+          capabilities: null,
+        },
+      }),
+    )
+    // The adapter now also pushes account/updated + mcpServer/startupStatus/updated
     // notifications right after handshake; the response can land in any order
     // relative to those. Filter for the matching id rather than grabbing the
     // first frame off the wire.
@@ -950,7 +1318,10 @@ test('remote shim launches daemon and proxy with Codex-compatible commands', asy
     for (let i = 0; i < 5; i += 1) {
       const [data] = (await once(ws, 'message')) as [Buffer]
       const msg = JSON.parse(data.toString('utf8'))
-      if (msg.id === 1) { response = msg; break }
+      if (msg.id === 1) {
+        response = msg
+        break
+      }
     }
     assert.equal(response?.result?.codexHome, home)
     ws.close()
@@ -971,18 +1342,37 @@ test('remote utility methods use v2 response shapes', async () => {
   try {
     proc.stdin.write(json({ id: 1, method: 'fs/readFile', params: { path: resolve('README.md') } }))
     const file = await reader.nextResponse(1)
-    assert.match(Buffer.from(file.result.dataBase64, 'base64').toString('utf8'), /Claude Codex Adapter/)
+    assert.match(
+      Buffer.from(file.result.dataBase64, 'base64').toString('utf8'),
+      /Claude Codex Adapter/,
+    )
 
-    proc.stdin.write(json({ id: 2, method: 'fs/getMetadata', params: { path: resolve('README.md') } }))
+    proc.stdin.write(
+      json({ id: 2, method: 'fs/getMetadata', params: { path: resolve('README.md') } }),
+    )
     const metadata = await reader.nextResponse(2)
     assert.equal(metadata.result.isFile, true)
     assert.equal(metadata.result.isDirectory, false)
 
     proc.stdin.write(json({ id: 3, method: 'fs/readDirectory', params: { path: process.cwd() } }))
     const directory = await reader.nextResponse(3)
-    assert.equal(directory.result.entries.some((entry: any) => entry.fileName === 'package.json' && entry.isFile), true)
+    assert.equal(
+      directory.result.entries.some(
+        (entry: any) => entry.fileName === 'package.json' && entry.isFile,
+      ),
+      true,
+    )
 
-    proc.stdin.write(json({ id: 4, method: 'command/exec', params: { command: [process.execPath, '-e', 'process.stdout.write("ok")'], cwd: process.cwd() } }))
+    proc.stdin.write(
+      json({
+        id: 4,
+        method: 'command/exec',
+        params: {
+          command: [process.execPath, '-e', 'process.stdout.write("ok")'],
+          cwd: process.cwd(),
+        },
+      }),
+    )
     const command = await reader.nextResponse(4)
     assert.deepEqual(command.result, { exitCode: 0, stdout: 'ok', stderr: '' })
   } finally {
@@ -996,11 +1386,28 @@ test('process/spawn supports shell strings, errors, and debug logs terminal life
   const debugLog = join(home, 'adapter-debug.jsonl')
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_DEBUG_LOG: debugLog, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+    env: {
+      ...process.env,
+      CODEX_HOME: home,
+      CLAUDE_CODEX_DEBUG_LOG: debugLog,
+      CLAUDE_CODEX_MOCK: '1',
+      NODE_NO_WARNINGS: '1',
+    },
   })
   const reader = new JsonLineReader(proc)
   try {
-    proc.stdin.write(json({ id: 1, method: 'process/spawn', params: { processHandle: 'shell-process', command: 'printf shell-ok', cwd: process.cwd(), streamStdoutStderr: false } }))
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'process/spawn',
+        params: {
+          processHandle: 'shell-process',
+          command: 'printf shell-ok',
+          cwd: process.cwd(),
+          streamStdoutStderr: false,
+        },
+      }),
+    )
     await reader.nextResponse(1)
     let exited: any = null
     for (let i = 0; i < 100; i += 1) {
@@ -1013,12 +1420,25 @@ test('process/spawn supports shell strings, errors, and debug logs terminal life
     assert.equal(exited.exitCode, 0)
     assert.equal(exited.stdout, 'shell-ok')
 
-    proc.stdin.write(json({ id: 2, method: 'process/spawn', params: { processHandle: 'missing-process', command: ['/definitely/missing/claude-codex-test'], cwd: process.cwd() } }))
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'process/spawn',
+        params: {
+          processHandle: 'missing-process',
+          command: ['/definitely/missing/claude-codex-test'],
+          cwd: process.cwd(),
+        },
+      }),
+    )
     await reader.nextResponse(2)
     let errorExit: any = null
     for (let i = 0; i < 100; i += 1) {
       const message = await reader.next()
-      if (message.method === 'process/exited' && message.params.processHandle === 'missing-process') {
+      if (
+        message.method === 'process/exited' &&
+        message.params.processHandle === 'missing-process'
+      ) {
         errorExit = message.params
         break
       }
@@ -1044,7 +1464,13 @@ test('review/start and thread/compact/start emit real turn items', async () => {
   })
   const reader = new JsonLineReader(proc)
   try {
-    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false } }))
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false },
+      }),
+    )
     const start = await reader.nextResponse(1)
     const threadId = start.result.thread.id
 
@@ -1053,23 +1479,49 @@ test('review/start and thread/compact/start emit real turn items', async () => {
     let sawCompaction = false
     for (let i = 0; i < 100; i += 1) {
       const message = await reader.next()
-      if (message.method === 'item/completed' && message.params.item.type === 'contextCompaction') sawCompaction = true
+      if (message.method === 'item/completed' && message.params.item.type === 'contextCompaction')
+        sawCompaction = true
       if (message.method === 'turn/completed') break
     }
     assert.equal(sawCompaction, true)
 
-    proc.stdin.write(json({ id: 3, method: 'review/start', params: { threadId, delivery: 'inline', target: { type: 'custom', instructions: 'notice event' } } }))
+    proc.stdin.write(
+      json({
+        id: 3,
+        method: 'review/start',
+        params: {
+          threadId,
+          delivery: 'inline',
+          target: { type: 'custom', instructions: 'notice event' },
+        },
+      }),
+    )
     const review = await reader.nextResponse(3)
     assert.equal(review.result.reviewThreadId, threadId)
     assert.equal(review.result.turn.status, 'inProgress')
-    assert.equal(review.result.turn.items.some((item: any) => item.type === 'enteredReviewMode'), true)
+    // Like the real app-server's build_review_turn, the review/start RESPONSE
+    // carries the synthesized userMessage (review label) with itemsView
+    // notLoaded; enteredReviewMode arrives via the item/started event stream.
+    assert.equal(review.result.turn.itemsView, 'notLoaded')
+    assert.equal(
+      review.result.turn.items.some((item: any) => item.type === 'userMessage'),
+      true,
+    )
+    assert.equal(
+      review.result.turn.items.some((item: any) => item.type === 'enteredReviewMode'),
+      false,
+    )
 
     let reviewText = ''
+    let sawEnteredReviewMode = false
     for (let i = 0; i < 500; i += 1) {
       const message = await reader.next()
+      if (message.method === 'item/started' && message.params.item.type === 'enteredReviewMode')
+        sawEnteredReviewMode = true
       if (message.method === 'item/agentMessage/delta') reviewText += message.params.delta
       if (message.method === 'turn/completed') break
     }
+    assert.equal(sawEnteredReviewMode, true)
     assert.match(reviewText, /Claude Code adapter mock response|Claude warning/)
   } finally {
     proc.kill()
@@ -1085,11 +1537,23 @@ test('Claude thinking maps to Codex reasoning summary and content deltas', async
   })
   const reader = new JsonLineReader(proc)
   try {
-    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false } }))
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false },
+      }),
+    )
     const start = await reader.nextResponse(1)
     const threadId = start.result.thread.id
 
-    proc.stdin.write(json({ id: 2, method: 'turn/start', params: { threadId, input: [{ type: 'text', text: 'thinking check', text_elements: [] }] } }))
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: [{ type: 'text', text: 'thinking check', text_elements: [] }] },
+      }),
+    )
     await reader.nextResponse(2)
 
     let sawSummary = false
@@ -1099,7 +1563,8 @@ test('Claude thinking maps to Codex reasoning summary and content deltas', async
       const message = await reader.next()
       if (message.method === 'item/reasoning/summaryTextDelta') sawSummary = true
       if (message.method === 'item/reasoning/textDelta') sawContent = true
-      if (message.method === 'item/completed' && message.params.item.type === 'reasoning') completedReasoning = message.params.item
+      if (message.method === 'item/completed' && message.params.item.type === 'reasoning')
+        completedReasoning = message.params.item
       if (message.method === 'turn/completed') break
     }
     assert.equal(sawSummary, true)
@@ -1120,11 +1585,23 @@ test('Claude token usage maps to thread/tokenUsage/updated notifications', async
   })
   const reader = new JsonLineReader(proc)
   try {
-    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false } }))
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false },
+      }),
+    )
     const start = await reader.nextResponse(1)
     const threadId = start.result.thread.id
 
-    proc.stdin.write(json({ id: 2, method: 'turn/start', params: { threadId, input: [{ type: 'text', text: 'usage check', text_elements: [] }] } }))
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: [{ type: 'text', text: 'usage check', text_elements: [] }] },
+      }),
+    )
     await reader.nextResponse(2)
 
     let tokenUsage: any = null
@@ -1139,11 +1616,13 @@ test('Claude token usage maps to thread/tokenUsage/updated notifications', async
     }
     assert.ok(tokenUsage, 'expected a thread/tokenUsage/updated notification')
     assert.equal(tokenUsage.threadId, threadId)
-    // Metrics from ResultMessage flow through into turn/completed.
+    // The Codex v2 Turn schema has no api/cost metadata fields, so turn/completed
+    // must not carry the adapter's internal apiDurationMs/numTurns/costUsd; token
+    // metrics are surfaced through thread/tokenUsage/updated instead.
     assert.ok(completedTurn, 'turn/completed must arrive')
-    assert.equal(completedTurn.apiDurationMs, 987)
-    assert.equal(completedTurn.numTurns, 3)
-    assert.equal(completedTurn.costUsd, 0.0042)
+    assert.ok(!('apiDurationMs' in completedTurn))
+    assert.ok(!('numTurns' in completedTurn))
+    assert.ok(!('costUsd' in completedTurn))
     // input_tokens 100 + cache_creation 5 = 105 input; cache_read 10; output 40.
     assert.deepEqual(tokenUsage.tokenUsage.last, {
       inputTokens: 105,
@@ -1168,16 +1647,31 @@ test('baseInstructions / developerInstructions / personality flow into the syste
   })
   const reader = new JsonLineReader(proc)
   try {
-    proc.stdin.write(json({ id: 1, method: 'thread/start', params: {
-      cwd: process.cwd(),
-      baseInstructions: 'Always write SQL in lowercase.',
-      developerInstructions: 'Avoid SELECT *.',
-      personality: 'pragmatic',
-    } }))
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'thread/start',
+        params: {
+          cwd: process.cwd(),
+          baseInstructions: 'Always write SQL in lowercase.',
+          developerInstructions: 'Avoid SELECT *.',
+          personality: 'pragmatic',
+        },
+      }),
+    )
     const start = await reader.nextResponse(1)
     const threadId = start.result.thread.id
 
-    proc.stdin.write(json({ id: 2, method: 'turn/start', params: { threadId, input: [{ type: 'text', text: 'system prompt check', text_elements: [] }] } }))
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'system prompt check', text_elements: [] }],
+        },
+      }),
+    )
     await reader.nextResponse(2)
 
     let text = ''
@@ -1210,20 +1704,36 @@ test('Claude hook events are rendered as Codex hookPrompt ThreadItems', async ()
     const start = await reader.nextResponse(1)
     const threadId = start.result.thread.id
 
-    proc.stdin.write(json({ id: 2, method: 'turn/start', params: { threadId, input: [{ type: 'text', text: 'hook check', text_elements: [] }] } }))
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: [{ type: 'text', text: 'hook check', text_elements: [] }] },
+      }),
+    )
     await reader.nextResponse(2)
 
     let hookItem: any = null
     for (let i = 0; i < 200; i += 1) {
       const message = await reader.next()
-      if (message.method === 'item/started' && message.params.item.type === 'hookPrompt') hookItem = message.params.item
+      if (message.method === 'item/started' && message.params.item.type === 'hookPrompt')
+        hookItem = message.params.item
       if (message.method === 'turn/completed') break
     }
     assert.ok(hookItem, 'hook event should produce a hookPrompt ThreadItem')
     const fragmentTexts = (hookItem.fragments as Array<{ text: string }>).map((f) => f.text)
-    assert.ok(fragmentTexts.some((t) => /Hook · PreToolUse/.test(t)), 'fragments should include the hook name')
-    assert.ok(fragmentTexts.some((t) => /status: started/.test(t)), 'fragments should include the status')
-    assert.ok(fragmentTexts.some((t) => /decision: allow/.test(t)), 'fragments should include the decision')
+    assert.ok(
+      fragmentTexts.some((t) => /Hook · PreToolUse/.test(t)),
+      'fragments should include the hook name',
+    )
+    assert.ok(
+      fragmentTexts.some((t) => /status: started/.test(t)),
+      'fragments should include the status',
+    )
+    assert.ok(
+      fragmentTexts.some((t) => /decision: allow/.test(t)),
+      'fragments should include the decision',
+    )
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -1243,7 +1753,13 @@ test('thread/compact/start drives Claude (summary model) instead of the local st
     const threadId = start.result.thread.id
 
     // Need a turn or two of content for compactSummary to have snippets.
-    proc.stdin.write(json({ id: 2, method: 'turn/start', params: { threadId, input: [{ type: 'text', text: 'hello world', text_elements: [] }] } }))
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: [{ type: 'text', text: 'hello world', text_elements: [] }] },
+      }),
+    )
     await reader.nextResponse(2)
     let firstTurnDone = false
     for (let i = 0; i < 200 && !firstTurnDone; i += 1) {
@@ -1259,13 +1775,26 @@ test('thread/compact/start drives Claude (summary model) instead of the local st
     let sawTurnCompleted = false
     for (let i = 0; i < 300 && !(sawCompacted && sawTurnCompleted); i += 1) {
       const message = await reader.next()
-      if (message.method === 'item/agentMessage/delta') agentText += String(message.params.delta ?? '')
+      if (message.method === 'item/agentMessage/delta')
+        agentText += String(message.params.delta ?? '')
       if (message.method === 'thread/compacted') sawCompacted = true
       if (message.method === 'turn/completed') sawTurnCompleted = true
     }
-    assert.match(agentText, /MOCK_COMPACT_SUMMARY/, 'compact turn should stream the runtime-produced summary, not the local template')
-    assert.doesNotMatch(agentText, /Context compacted for thread/, 'local fallback should not have fired when the runtime succeeded')
-    assert.equal(sawCompacted, true, 'thread/compacted notification should still fire after compaction')
+    assert.match(
+      agentText,
+      /MOCK_COMPACT_SUMMARY/,
+      'compact turn should stream the runtime-produced summary, not the local template',
+    )
+    assert.doesNotMatch(
+      agentText,
+      /Context compacted for thread/,
+      'local fallback should not have fired when the runtime succeeded',
+    )
+    assert.equal(
+      sawCompacted,
+      true,
+      'thread/compacted notification should still fire after compaction',
+    )
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -1275,7 +1804,10 @@ test('thread/compact/start drives Claude (summary model) instead of the local st
 test('localImage user input becomes a multimodal Claude prompt + an imageView ThreadItem', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   // Tiny 1x1 PNG to avoid pulling a real image binary.
-  const png1x1 = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=', 'base64')
+  const png1x1 = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=',
+    'base64',
+  )
   const imgPath = join(home, 'pixel.png')
   const fs = await import('node:fs/promises')
   await fs.writeFile(imgPath, png1x1)
@@ -1290,28 +1822,41 @@ test('localImage user input becomes a multimodal Claude prompt + an imageView Th
     const start = await reader.nextResponse(1)
     const threadId = start.result.thread.id
 
-    proc.stdin.write(json({ id: 2, method: 'turn/start', params: {
-      threadId,
-      input: [
-        { type: 'text', text: 'image input check', text_elements: [] },
-        { type: 'localImage', path: imgPath },
-      ],
-    } }))
-    const turnStart = await reader.nextResponse(2)
-    const items = turnStart.result.turn.items as any[]
-    const imageView = items.find((i) => i.type === 'imageView')
-    assert.ok(imageView, 'turn should include an imageView ThreadItem for the user-uploaded image')
-    assert.equal(imageView.path, imgPath)
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [
+            { type: 'text', text: 'image input check', text_elements: [] },
+            { type: 'localImage', path: imgPath },
+          ],
+        },
+      }),
+    )
+    await reader.nextResponse(2)
 
     let text = ''
+    let imageView: any = null
     for (let i = 0; i < 200; i += 1) {
       const message = await reader.next()
+      if (message.method === 'item/completed' && message.params.item.type === 'imageView')
+        imageView = message.params.item
       if (message.method === 'item/agentMessage/delta') text += message.params.delta
       if (message.method === 'turn/completed') break
     }
+    // imageView is surfaced live via the item/* event stream (the turn envelope
+    // itself stays empty/notLoaded, matching the real app-server).
+    assert.ok(imageView, 'turn should emit an imageView item for the user-uploaded image')
+    assert.equal(imageView.path, imgPath)
     // Mock echoes the parsed image inputs; assert kind=base64 + media type +
     // a non-trivial payload landed in the runtime context.
-    assert.match(text, /^images=base64:image\/png:\d+/, 'runtime should receive base64 image input — got: ' + text)
+    assert.match(
+      text,
+      /^images=base64:image\/png:\d+/,
+      'runtime should receive base64 image input — got: ' + text,
+    )
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -1330,15 +1875,30 @@ test('Claude WebSearch tool maps to native Codex webSearch ThreadItem with actio
     const start = await reader.nextResponse(1)
     const threadId = start.result.thread.id
 
-    proc.stdin.write(json({ id: 2, method: 'turn/start', params: { threadId, input: [{ type: 'text', text: 'web search check', text_elements: [] }] } }))
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'web search check', text_elements: [] }],
+        },
+      }),
+    )
     await reader.nextResponse(2)
 
     let webSearchItem: any = null
     let completedWebSearch: any = null
     for (let i = 0; i < 200; i += 1) {
       const message = await reader.next()
-      if (message.method === 'item/started' && message.params.item.type === 'webSearch') webSearchItem = message.params.item
-      if (message.method === 'item/completed' && webSearchItem && message.params.item.id === webSearchItem.id) completedWebSearch = message.params.item
+      if (message.method === 'item/started' && message.params.item.type === 'webSearch')
+        webSearchItem = message.params.item
+      if (
+        message.method === 'item/completed' &&
+        webSearchItem &&
+        message.params.item.id === webSearchItem.id
+      )
+        completedWebSearch = message.params.item
       if (message.method === 'turn/completed') break
     }
     assert.ok(webSearchItem, 'WebSearch tool_use should emit a native webSearch ThreadItem')
@@ -1347,7 +1907,11 @@ test('Claude WebSearch tool maps to native Codex webSearch ThreadItem with actio
     // (Option<...> with no serde default) — bare {type:'search'} would crash App.
     assert.deepEqual(webSearchItem.action, { type: 'search', query: 'mock query', queries: null })
     assert.ok(completedWebSearch, 'webSearch item should complete')
-    assert.equal(completedWebSearch.action.type, 'openPage', 'tool_result with a URL should upgrade action to openPage')
+    assert.equal(
+      completedWebSearch.action.type,
+      'openPage',
+      'tool_result with a URL should upgrade action to openPage',
+    )
     assert.equal(completedWebSearch.action.url, 'https://example.com/article')
   } finally {
     proc.kill()
@@ -1376,16 +1940,35 @@ test('config/value/write persists arbitrary settings keys across restarts', asyn
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const env = { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' }
   // Round 1: write a custom key + a known typed key.
-  let proc1 = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], { stdio: ['pipe', 'pipe', 'pipe'], env })
+  let proc1 = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env,
+  })
   let reader = new JsonLineReader(proc1)
   try {
-    proc1.stdin.write(json({ id: 1, method: 'config/value/write', params: { keyPath: 'approval_policy', value: 'never' } }))
+    proc1.stdin.write(
+      json({
+        id: 1,
+        method: 'config/value/write',
+        params: { keyPath: 'approval_policy', value: 'never' },
+      }),
+    )
     await reader.nextResponse(1)
-    proc1.stdin.write(json({ id: 2, method: 'config/value/write', params: { keyPath: 'sandbox_mode', value: 'danger-full-access' } }))
+    proc1.stdin.write(
+      json({
+        id: 2,
+        method: 'config/value/write',
+        params: { keyPath: 'sandbox_mode', value: 'danger-full-access' },
+      }),
+    )
     await reader.nextResponse(2)
     proc1.stdin.write(json({ id: 3, method: 'config/read', params: {} }))
     const r = await reader.nextResponse(3)
-    assert.equal(r.result.config.approval_policy, 'never', 'override should appear in config/read on the same process')
+    assert.equal(
+      r.result.config.approval_policy,
+      'never',
+      'override should appear in config/read on the same process',
+    )
     assert.equal(r.result.config.sandbox_mode, 'danger-full-access')
   } finally {
     proc1.kill()
@@ -1393,12 +1976,19 @@ test('config/value/write persists arbitrary settings keys across restarts', asyn
   }
 
   // Round 2: a fresh adapter process re-reads from disk — overrides survive.
-  const proc2 = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], { stdio: ['pipe', 'pipe', 'pipe'], env })
+  const proc2 = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env,
+  })
   reader = new JsonLineReader(proc2)
   try {
     proc2.stdin.write(json({ id: 1, method: 'config/read', params: {} }))
     const r = await reader.nextResponse(1)
-    assert.equal(r.result.config.approval_policy, 'never', 'override must survive restart via persisted overrides bag')
+    assert.equal(
+      r.result.config.approval_policy,
+      'never',
+      'override must survive restart via persisted overrides bag',
+    )
     assert.equal(r.result.config.sandbox_mode, 'danger-full-access')
   } finally {
     proc2.kill()
@@ -1419,17 +2009,27 @@ test('thread/inject_items appends a synthetic turn carrying the injected text', 
     const threadId = start.result.thread.id
 
     // Codex App's actual payload shape: items[] of free-form Responses entries.
-    proc.stdin.write(json({
-      id: 2,
-      method: 'thread/inject_items',
-      params: {
-        threadId,
-        items: [
-          { type: 'message', role: 'user', content: [{ type: 'text', text: 'Here is some pinned context.' }] },
-          { type: 'message', role: 'assistant', content: [{ type: 'text', text: 'Got it, remembered.' }] },
-        ],
-      },
-    }))
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'thread/inject_items',
+        params: {
+          threadId,
+          items: [
+            {
+              type: 'message',
+              role: 'user',
+              content: [{ type: 'text', text: 'Here is some pinned context.' }],
+            },
+            {
+              type: 'message',
+              role: 'assistant',
+              content: [{ type: 'text', text: 'Got it, remembered.' }],
+            },
+          ],
+        },
+      }),
+    )
 
     // The response + 3 notifications (turn/started, item/completed, turn/completed)
     // arrive in some order. Drain everything until we've seen all four signals
@@ -1446,11 +2046,17 @@ test('thread/inject_items appends a synthetic turn carrying the injected text', 
       if (sawResponse && injectedText) break
     }
     assert.equal(sawResponse, true, 'thread/inject_items response must arrive')
-    assert.match(injectedText, /pinned context/, 'injected text must round-trip into the synthetic agentMessage')
+    assert.match(
+      injectedText,
+      /pinned context/,
+      'injected text must round-trip into the synthetic agentMessage',
+    )
     assert.match(injectedText, /Got it, remembered/)
 
     // thread/read should show the synthetic turn so reload preserves it.
-    proc.stdin.write(json({ id: 3, method: 'thread/read', params: { threadId, includeTurns: true } }))
+    proc.stdin.write(
+      json({ id: 3, method: 'thread/read', params: { threadId, includeTurns: true } }),
+    )
     const read = await reader.nextResponse(3)
     const turns = read.result.thread.turns
     assert.ok(turns.length >= 1, 'thread/read should include the injected turn')
@@ -1473,7 +2079,17 @@ test('turn/start planMode=true flows into Claude SDK permission_mode plan', asyn
     const start = await reader.nextResponse(1)
     const threadId = start.result.thread.id
 
-    proc.stdin.write(json({ id: 2, method: 'turn/start', params: { threadId, planMode: true, input: [{ type: 'text', text: 'plan mode check', text_elements: [] }] } }))
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          planMode: true,
+          input: [{ type: 'text', text: 'plan mode check', text_elements: [] }],
+        },
+      }),
+    )
     await reader.nextResponse(2)
 
     // Plan-mode text now routes to a Plan ThreadItem via item/plan/delta
@@ -1503,14 +2119,35 @@ test('Codex App approvalPolicy=never + sandbox=danger-full-access auto-accepts t
   })
   const reader = new JsonLineReader(proc)
   try {
-    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), approvalPolicy: 'never', sandbox: 'danger-full-access', experimentalRawEvents: false, persistExtendedHistory: false } }))
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'thread/start',
+        params: {
+          cwd: process.cwd(),
+          approvalPolicy: 'never',
+          sandbox: 'danger-full-access',
+          experimentalRawEvents: false,
+          persistExtendedHistory: false,
+        },
+      }),
+    )
     const start = await reader.nextResponse(1)
     const threadId = start.result.thread.id
     // Envelope reflects the App's chosen policy/sandbox instead of the previous hardcoded `on-request` + workspaceWrite.
     assert.equal(start.result.approvalPolicy, 'never')
     assert.equal((start.result.sandbox as any).type, 'dangerFullAccess')
 
-    proc.stdin.write(json({ id: 2, method: 'turn/start', params: { threadId, input: [{ type: 'text', text: 'please run approval bash', text_elements: [] }] } }))
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'please run approval bash', text_elements: [] }],
+        },
+      }),
+    )
     await reader.nextResponse(2)
 
     let sawApprovalRequest = false
@@ -1518,10 +2155,18 @@ test('Codex App approvalPolicy=never + sandbox=danger-full-access auto-accepts t
     for (let i = 0; i < 200; i += 1) {
       const message = await reader.next()
       if (message.method === 'item/commandExecution/requestApproval') sawApprovalRequest = true
-      if (message.method === 'item/commandExecution/outputDelta' && /mock approval/.test(message.params.delta)) sawCommandOutput = true
+      if (
+        message.method === 'item/commandExecution/outputDelta' &&
+        /mock approval/.test(message.params.delta)
+      )
+        sawCommandOutput = true
       if (message.method === 'turn/completed') break
     }
-    assert.equal(sawApprovalRequest, false, 'expected no requestApproval round-trip when approvalPolicy=never')
+    assert.equal(
+      sawApprovalRequest,
+      false,
+      'expected no requestApproval round-trip when approvalPolicy=never',
+    )
     assert.equal(sawCommandOutput, true, 'tool should still execute and stream output')
   } finally {
     proc.kill()
@@ -1537,11 +2182,23 @@ test('Task subagent emits Codex native spawnAgent → wait → closeAgent timeli
   })
   const reader = new JsonLineReader(proc)
   try {
-    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false } }))
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false },
+      }),
+    )
     const start = await reader.nextResponse(1)
     const threadId = start.result.thread.id
 
-    proc.stdin.write(json({ id: 2, method: 'turn/start', params: { threadId, input: [{ type: 'text', text: 'subagent check', text_elements: [] }] } }))
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: [{ type: 'text', text: 'subagent check', text_elements: [] }] },
+      }),
+    )
     await reader.nextResponse(2)
 
     type Lifecycle = { started?: any; completed?: any }
@@ -1555,7 +2212,10 @@ test('Task subagent emits Codex native spawnAgent → wait → closeAgent timeli
         if (item.type === 'collabAgentToolCall') {
           collabByTool[item.tool] = collabByTool[item.tool] ?? {}
           collabByTool[item.tool].started = item
-        } else if (item.type === 'commandExecution' || (item.type === 'mcpToolCall' && item.tool !== 'Task')) {
+        } else if (
+          item.type === 'commandExecution' ||
+          (item.type === 'mcpToolCall' && item.tool !== 'Task')
+        ) {
           leakedInnerItems += 1
         }
       }
@@ -1566,7 +2226,8 @@ test('Task subagent emits Codex native spawnAgent → wait → closeAgent timeli
           collabByTool[item.tool].completed = item
         }
       }
-      if (message.method === 'item/agentMessage/delta') agentMessageText += String(message.params.delta ?? '')
+      if (message.method === 'item/agentMessage/delta')
+        agentMessageText += String(message.params.delta ?? '')
       if (message.method === 'turn/completed') break
     }
 
@@ -1577,11 +2238,19 @@ test('Task subagent emits Codex native spawnAgent → wait → closeAgent timeli
       assert.ok(lc?.started, `expected item/started for ${tool}`)
       assert.ok(lc?.completed, `expected item/completed for ${tool}`)
       assert.equal(lc.started.id, lc.completed.id, `${tool} begin/end must share a single item id`)
-      assert.equal(lc.completed.status, 'completed', `${tool} should complete with status=completed`)
+      assert.equal(
+        lc.completed.status,
+        'completed',
+        `${tool} should complete with status=completed`,
+      )
     }
     const spawnEnd = collabByTool.spawnAgent.completed
     assert.equal(spawnEnd.senderThreadId, threadId)
-    assert.equal(spawnEnd.receiverThreadIds.length, 1, 'spawnAgent end should reference exactly one child thread')
+    assert.equal(
+      spawnEnd.receiverThreadIds.length,
+      1,
+      'spawnAgent end should reference exactly one child thread',
+    )
     const childThreadId = spawnEnd.receiverThreadIds[0]
     // After spawnAgent ends the subagent is now running; only wait/closeAgent
     // ends report the agent as completed.
@@ -1593,7 +2262,11 @@ test('Task subagent emits Codex native spawnAgent → wait → closeAgent timeli
     // NOT Claude's subagent_type — the App's "Agent · model" badge depends
     // on this. The mock runs without a subagent_type so the parent's model
     // (default 'sonnet') flows through unchanged.
-    assert.equal(spawnEnd.model, 'sonnet', 'collabAgentToolCall.model should be the parent thread model when no Task input.model is set')
+    assert.equal(
+      spawnEnd.model,
+      'sonnet',
+      'collabAgentToolCall.model should be the parent thread model when no Task input.model is set',
+    )
 
     // Codex App reads agentRole/agentNickname off the child thread to render
     // its native subagent identity. The mock has no subagent_type so we fall
@@ -1610,33 +2283,65 @@ test('Task subagent emits Codex native spawnAgent → wait → closeAgent timeli
     // strip it from the visible text and overwrite the synthetic
     // `agent-{hex}` nickname with the SDK-assigned id.
     assert.equal(childThread.agentNickname, 'deadbeefcafef00d')
-    assert.equal(childThread.forkedFromId, threadId, 'subagent thread should be forked from the parent user thread')
+    assert.equal(
+      childThread.forkedFromId,
+      threadId,
+      'subagent thread should be forked from the parent user thread',
+    )
 
     // Trailer is stripped from the child thread's visible agentMessage.
-    proc.stdin.write(json({ id: 6, method: 'thread/turns/list', params: { threadId: childThreadId } }))
+    proc.stdin.write(
+      json({ id: 6, method: 'thread/turns/list', params: { threadId: childThreadId } }),
+    )
     const childTurns = await reader.nextResponse(6)
     const childTurnItems = (childTurns.result.data[0] as any).items
     const childAgent = childTurnItems.find((i: any) => i.type === 'agentMessage')
     assert.ok(childAgent, 'child thread should have an agentMessage with the subagent result')
-    assert.doesNotMatch(childAgent.text, /agentId:/, '`agentId:` trailer should be stripped from the visible body')
-    assert.doesNotMatch(childAgent.text, /<usage>/, '`<usage>` block should be stripped from the visible body')
-    assert.match(childAgent.text, /subagent final summary/, 'the real subagent body must still be there')
+    assert.doesNotMatch(
+      childAgent.text,
+      /agentId:/,
+      '`agentId:` trailer should be stripped from the visible body',
+    )
+    assert.doesNotMatch(
+      childAgent.text,
+      /<usage>/,
+      '`<usage>` block should be stripped from the visible body',
+    )
+    assert.match(
+      childAgent.text,
+      /subagent final summary/,
+      'the real subagent body must still be there',
+    )
 
     assert.equal(leakedInnerItems, 0, 'inner Bash tool calls should not appear at the parent level')
-    assert.doesNotMatch(agentMessageText, /subagent thinking aloud/, 'subagent text should not bleed into the main agent message')
-    assert.match(agentMessageText, /main agent summary/, 'main agent text after subagent should still appear')
+    assert.doesNotMatch(
+      agentMessageText,
+      /subagent thinking aloud/,
+      'subagent text should not bleed into the main agent message',
+    )
+    assert.match(
+      agentMessageText,
+      /main agent summary/,
+      'main agent text after subagent should still appear',
+    )
 
     // Ephemeral child thread is hidden from the default list, exposed with includeEphemeral.
     proc.stdin.write(json({ id: 3, method: 'thread/list', params: {} }))
     const list = await reader.nextResponse(3)
     const ids = (list.result.data as any[]).map((t) => t.id)
-    assert.ok(!ids.includes(childThreadId), 'subagent child thread should be hidden from thread/list')
+    assert.ok(
+      !ids.includes(childThreadId),
+      'subagent child thread should be hidden from thread/list',
+    )
     assert.ok(ids.includes(threadId), 'parent user thread should remain visible')
 
     proc.stdin.write(json({ id: 4, method: 'thread/list', params: { includeEphemeral: true } }))
     const listAll = await reader.nextResponse(4)
     const allIds = (listAll.result.data as any[]).map((t) => t.id)
-    assert.ok(allIds.includes(childThreadId), 'includeEphemeral=true should surface the subagent child thread')
+    assert.ok(
+      allIds.includes(childThreadId),
+      'includeEphemeral=true should surface the subagent child thread',
+    )
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -1656,22 +2361,31 @@ test('thread/start picks up effort from config.model_reasoning_effort when top-l
     // config.toml). Make sure we accept it from there even when the top-level
     // `effort` field is absent — without this fix the user's "high" pick
     // gets silently dropped and Claude runs at the env default.
-    proc.stdin.write(json({
-      id: 1,
-      method: 'thread/start',
-      params: { cwd: process.cwd(), config: { model_reasoning_effort: 'high' } },
-    }))
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), config: { model_reasoning_effort: 'high' } },
+      }),
+    )
     const start = await reader.nextResponse(1)
     const threadId = start.result.thread.id
 
     // Drive a turn with effort=null on the wire (mimicking what Codex App
     // actually sends — top-level effort is null, the real value came in via
     // thread/start.config). Mock echoes the effort the runtime received.
-    proc.stdin.write(json({
-      id: 2,
-      method: 'turn/start',
-      params: { threadId, input: [{ type: 'text', text: 'effort echo', text_elements: [] }], effort: null, model: null },
-    }))
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'effort echo', text_elements: [] }],
+          effort: null,
+          model: null,
+        },
+      }),
+    )
     await reader.nextResponse(2)
     let echoed = ''
     for (let i = 0; i < 500; i += 1) {
@@ -1679,7 +2393,11 @@ test('thread/start picks up effort from config.model_reasoning_effort when top-l
       if (message.method === 'item/agentMessage/delta') echoed += String(message.params.delta ?? '')
       if (message.method === 'turn/completed') break
     }
-    assert.equal(echoed, 'effort=high', 'config.model_reasoning_effort should flow through to the runtime')
+    assert.equal(
+      echoed,
+      'effort=high',
+      'config.model_reasoning_effort should flow through to the runtime',
+    )
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -1697,22 +2415,50 @@ test('thread/start coerces invalid threadSource / source values so Codex App nev
     // Empty string and bogus enum values must round-trip as null, not as the
     // literal "" / "totally-bogus" — otherwise App ts-rs deserializer panics
     // on reopen and shows "Oops, an error has occurred".
-    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), threadSource: '' } }))
+    proc.stdin.write(
+      json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), threadSource: '' } }),
+    )
     const empty = await reader.nextResponse(1)
-    assert.equal(empty.result.thread.threadSource, null, 'empty threadSource must serialize as null')
+    assert.equal(
+      empty.result.thread.threadSource,
+      null,
+      'empty threadSource must serialize as null',
+    )
     assert.equal(empty.result.thread.source, 'appServer', 'source must use camelCase wire form')
 
-    proc.stdin.write(json({ id: 2, method: 'thread/start', params: { cwd: process.cwd(), threadSource: 'totally-bogus' } }))
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), threadSource: 'totally-bogus' },
+      }),
+    )
     const bogus = await reader.nextResponse(2)
-    assert.equal(bogus.result.thread.threadSource, null, 'unknown threadSource enum must serialize as null')
+    assert.equal(
+      bogus.result.thread.threadSource,
+      null,
+      'unknown threadSource enum must serialize as null',
+    )
 
     // Valid enum values still pass through unchanged.
-    proc.stdin.write(json({ id: 3, method: 'thread/start', params: { cwd: process.cwd(), threadSource: 'subagent' } }))
+    proc.stdin.write(
+      json({
+        id: 3,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), threadSource: 'subagent' },
+      }),
+    )
     const valid = await reader.nextResponse(3)
     assert.equal(valid.result.thread.threadSource, 'subagent')
 
     // Empty string for agentRole / agentNickname collapses to null on the wire.
-    proc.stdin.write(json({ id: 4, method: 'thread/start', params: { cwd: process.cwd(), agentRole: '', agentNickname: '' } }))
+    proc.stdin.write(
+      json({
+        id: 4,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), agentRole: '', agentNickname: '' },
+      }),
+    )
     const empties = await reader.nextResponse(4)
     assert.equal(empties.result.thread.agentRole, null)
     assert.equal(empties.result.thread.agentNickname, null)
@@ -1734,18 +2480,40 @@ test('legacy DB rows with invalid thread_source / source are sanitized on startu
     const require = createRequire(import.meta.url)
     const { DatabaseSync } = require('node:sqlite') as { DatabaseSync: new (p: string) => any }
     initial.upsertThread({
-      id: 'th-bad', sessionId: 'th-bad', forkedFromId: null,
-      preview: '', name: null, archived: false, cwd: process.cwd(),
-      model: 'sonnet', reasoningEffort: null, modelProvider: 'claude-code',
-      claudeSessionId: null, source: 'app_server', createdAt: 0, updatedAt: 0,
-      status: { type: 'idle' }, approvalPolicy: null, sandboxMode: null,
-      ephemeral: false, threadSource: 'user', agentRole: null, agentNickname: null,
-      baseInstructions: null, developerInstructions: null, personality: null,
-      runtimeBackend: 'claude', codexSessionId: null,
+      id: 'th-bad',
+      sessionId: 'th-bad',
+      forkedFromId: null,
+      preview: '',
+      name: null,
+      archived: false,
+      cwd: process.cwd(),
+      model: 'sonnet',
+      reasoningEffort: null,
+      modelProvider: 'claude-code',
+      claudeSessionId: null,
+      source: 'app_server',
+      createdAt: 0,
+      updatedAt: 0,
+      status: { type: 'idle' },
+      approvalPolicy: null,
+      sandboxMode: null,
+      ephemeral: false,
+      threadSource: 'user',
+      agentRole: null,
+      agentNickname: null,
+      baseInstructions: null,
+      developerInstructions: null,
+      personality: null,
+      runtimeBackend: 'claude',
+      codexSessionId: null,
     } as any)
     // Now directly corrupt the columns the way the old adapter did.
     const raw = new DatabaseSync(dbPath)
-    raw.prepare(`UPDATE threads SET source = 'app_server', thread_source = '', agent_role = '', agent_nickname = '' WHERE id = 'th-bad'`).run()
+    raw
+      .prepare(
+        `UPDATE threads SET source = 'app_server', thread_source = '', agent_role = '', agent_nickname = '' WHERE id = 'th-bad'`,
+      )
+      .run()
     raw.close()
 
     // Second open: migration must rewrite the bad values.
@@ -1768,13 +2536,30 @@ test('thread/start with ephemeral=true is hidden from thread/list and surfaces t
   })
   const reader = new JsonLineReader(proc)
   try {
-    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), ephemeral: true, threadSource: 'memory_consolidation', model: 'gpt-5.4-mini' } }))
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'thread/start',
+        params: {
+          cwd: process.cwd(),
+          ephemeral: true,
+          threadSource: 'memory_consolidation',
+          model: 'gpt-5.4-mini',
+        },
+      }),
+    )
     const ephemeralStart = await reader.nextResponse(1)
     const ephemeralId = ephemeralStart.result.thread.id
-    assert.equal(ephemeralStart.result.thread.ephemeral, true, 'envelope should reflect ephemeral=true')
+    assert.equal(
+      ephemeralStart.result.thread.ephemeral,
+      true,
+      'envelope should reflect ephemeral=true',
+    )
     assert.equal(ephemeralStart.result.thread.threadSource, 'memory_consolidation')
 
-    proc.stdin.write(json({ id: 2, method: 'thread/start', params: { cwd: process.cwd(), threadSource: 'user' } }))
+    proc.stdin.write(
+      json({ id: 2, method: 'thread/start', params: { cwd: process.cwd(), threadSource: 'user' } }),
+    )
     const userStart = await reader.nextResponse(2)
     const userId = userStart.result.thread.id
 
@@ -1807,7 +2592,10 @@ test('debug.jsonl rotates once it crosses CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES', asy
     assert.ok(entries.includes('debug.jsonl'), 'active log should exist')
     assert.ok(entries.includes('debug.jsonl.1'), 'rotation should have produced a .1 slot')
     // KEEP=2 means at most .1 + .2; .3 must never appear.
-    assert.ok(!entries.includes('debug.jsonl.3'), 'rotation should respect CLAUDE_CODEX_DEBUG_LOG_KEEP')
+    assert.ok(
+      !entries.includes('debug.jsonl.3'),
+      'rotation should respect CLAUDE_CODEX_DEBUG_LOG_KEEP',
+    )
     const activeSize = (await fs.stat(logPath)).size
     assert.ok(activeSize < 512 * 4, 'active log should have been freshly started after rotation')
   } finally {
@@ -1845,18 +2633,36 @@ test('approval requests round-trip through Codex server requests', async () => {
   })
   const reader = new JsonLineReader(proc)
   try {
-    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false } }))
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false },
+      }),
+    )
     const start = await reader.nextResponse(1)
     const threadId = start.result.thread.id
 
-    proc.stdin.write(json({ id: 2, method: 'turn/start', params: { threadId, input: [{ type: 'text', text: 'please run approval bash', text_elements: [] }] } }))
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'please run approval bash', text_elements: [] }],
+        },
+      }),
+    )
     await reader.nextResponse(2)
 
     let approvalRequest: any = null
     let sawWaitingOnApproval = false
     for (let i = 0; i < 100; i += 1) {
       const message = await reader.next()
-      if (message.method === 'thread/status/changed' && message.params.status.activeFlags?.includes('waitingOnApproval')) {
+      if (
+        message.method === 'thread/status/changed' &&
+        message.params.status.activeFlags?.includes('waitingOnApproval')
+      ) {
         sawWaitingOnApproval = true
       }
       if (message.method === 'item/commandExecution/requestApproval') {
@@ -1873,7 +2679,11 @@ test('approval requests round-trip through Codex server requests', async () => {
     for (let i = 0; i < 100; i += 1) {
       const message = await reader.next()
       if (message.method === 'serverRequest/resolved') sawResolved = true
-      if (message.method === 'item/commandExecution/outputDelta' && /mock approval/.test(message.params.delta)) sawOutput = true
+      if (
+        message.method === 'item/commandExecution/outputDelta' &&
+        /mock approval/.test(message.params.delta)
+      )
+        sawOutput = true
       if (message.method === 'turn/completed') break
     }
     assert.equal(sawResolved, true)
@@ -1892,19 +2702,36 @@ test('generic Claude tools complete as Codex mcpToolCall items', async () => {
   })
   const reader = new JsonLineReader(proc)
   try {
-    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false } }))
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false },
+      }),
+    )
     const start = await reader.nextResponse(1)
     const threadId = start.result.thread.id
 
-    proc.stdin.write(json({ id: 2, method: 'turn/start', params: { threadId, input: [{ type: 'text', text: 'please use generic tool', text_elements: [] }] } }))
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'please use generic tool', text_elements: [] }],
+        },
+      }),
+    )
     await reader.nextResponse(2)
 
     let completedTool: any = null
     let sawIdle = false
     for (let i = 0; i < 500; i += 1) {
       const message = await reader.next()
-      if (message.method === 'thread/status/changed' && message.params.status.type === 'idle') sawIdle = true
-      if (message.method === 'item/completed' && message.params.item.type === 'mcpToolCall') completedTool = message.params.item
+      if (message.method === 'thread/status/changed' && message.params.status.type === 'idle')
+        sawIdle = true
+      if (message.method === 'item/completed' && message.params.item.type === 'mcpToolCall')
+        completedTool = message.params.item
       if (message.method === 'turn/completed') break
     }
     assert.equal(completedTool?.tool, 'Read')
@@ -1932,15 +2759,40 @@ test('turn/steer appends user input to an active Claude turn', async () => {
   })
   const reader = new JsonLineReader(proc)
   try {
-    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false } }))
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false },
+      }),
+    )
     const start = await reader.nextResponse(1)
     const threadId = start.result.thread.id
 
-    proc.stdin.write(json({ id: 2, method: 'turn/start', params: { threadId, input: [{ type: 'text', text: 'slow turn for steering', text_elements: [] }] } }))
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'slow turn for steering', text_elements: [] }],
+        },
+      }),
+    )
     const started = await reader.nextResponse(2)
     const turnId = started.result.turn.id
 
-    proc.stdin.write(json({ id: 3, method: 'turn/steer', params: { threadId, expectedTurnId: turnId, input: [{ type: 'text', text: 'steered input', text_elements: [] }] } }))
+    proc.stdin.write(
+      json({
+        id: 3,
+        method: 'turn/steer',
+        params: {
+          threadId,
+          expectedTurnId: turnId,
+          input: [{ type: 'text', text: 'steered input', text_elements: [] }],
+        },
+      }),
+    )
     const steer = await reader.nextResponse(3)
     assert.equal(steer.result.turnId, turnId)
 
@@ -1954,9 +2806,16 @@ test('turn/steer appends user input to an active Claude turn', async () => {
     }
     assert.equal(completed, true)
 
-    proc.stdin.write(json({ id: 4, method: 'thread/turns/items/list', params: { threadId, turnId } }))
+    proc.stdin.write(
+      json({ id: 4, method: 'thread/turns/items/list', params: { threadId, turnId } }),
+    )
     const items = await reader.nextResponse(4)
-    assert.equal(items.result.data.some((item: any) => item.type === 'userMessage' && item.content?.[0]?.text === 'steered input'), true)
+    assert.equal(
+      items.result.data.some(
+        (item: any) => item.type === 'userMessage' && item.content?.[0]?.text === 'steered input',
+      ),
+      true,
+    )
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -1976,11 +2835,26 @@ test('AskUserQuestion is bridged to Codex item/tool/requestUserInput', async () 
   })
   const reader = new JsonLineReader(proc)
   try {
-    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false } }))
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false },
+      }),
+    )
     const start = await reader.nextResponse(1)
     const threadId = start.result.thread.id
 
-    proc.stdin.write(json({ id: 2, method: 'turn/start', params: { threadId, input: [{ type: 'text', text: 'ask user question check', text_elements: [] }] } }))
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'ask user question check', text_elements: [] }],
+        },
+      }),
+    )
     const started = await reader.nextResponse(2)
     const turnId = started.result.turn.id
 
@@ -2001,14 +2875,19 @@ test('AskUserQuestion is bridged to Codex item/tool/requestUserInput', async () 
     assert.equal(askRequest.params.questions[0].question, 'Which auth method do you want?')
     // The bridge auto-appends an "Other" option so the App's free-text
     // affordance lights up even when Claude didn't model one explicitly.
-    assert.equal(askRequest.params.questions[0].options.some((o: any) => o.label === 'Other'), true)
+    assert.equal(
+      askRequest.params.questions[0].options.some((o: any) => o.label === 'Other'),
+      true,
+    )
 
     // Answer as the App would.
-    proc.stdin.write(json({
-      jsonrpc: '2.0',
-      id: askRequest.id,
-      result: { answers: { q0: { answers: ['OAuth'] } } },
-    }))
+    proc.stdin.write(
+      json({
+        jsonrpc: '2.0',
+        id: askRequest.id,
+        result: { answers: { q0: { answers: ['OAuth'] } } },
+      }),
+    )
 
     let completed = false
     for (let i = 0; i < 500; i += 1) {
@@ -2020,7 +2899,9 @@ test('AskUserQuestion is bridged to Codex item/tool/requestUserInput', async () 
     }
     assert.equal(completed, true)
 
-    proc.stdin.write(json({ id: 4, method: 'thread/turns/items/list', params: { threadId, turnId } }))
+    proc.stdin.write(
+      json({ id: 4, method: 'thread/turns/items/list', params: { threadId, turnId } }),
+    )
     const items = await reader.nextResponse(4)
     const itemsList = items.result.data as Array<any>
     const dynamic = itemsList.find((item) => item.type === 'dynamicToolCall')
@@ -2032,11 +2913,17 @@ test('AskUserQuestion is bridged to Codex item/tool/requestUserInput', async () 
     assert.match(dynamic.contentItems[0].text, /OAuth/)
     // No stray mcpToolCall for AskUserQuestion (otherwise the App would
     // draw a duplicate generic card alongside the choice picker).
-    assert.equal(itemsList.some((item) => item.type === 'mcpToolCall' && item.tool === 'AskUserQuestion'), false)
+    assert.equal(
+      itemsList.some((item) => item.type === 'mcpToolCall' && item.tool === 'AskUserQuestion'),
+      false,
+    )
     // The chosen answer also reached the mock through onUserInputRequest's
     // return value (and got echoed back as the final agent message text).
     const agent = itemsList.find((item) => item.type === 'agentMessage')
-    assert.ok(agent && /picked=OAuth/.test(agent.text), 'expected the agent message to echo the picked answer')
+    assert.ok(
+      agent && /picked=OAuth/.test(agent.text),
+      'expected the agent message to echo the picked answer',
+    )
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -2051,7 +2938,13 @@ test('compatibility-only UI methods return schema-shaped responses', async () =>
   })
   const reader = new JsonLineReader(proc)
   try {
-    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false } }))
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false },
+      }),
+    )
     const start = await reader.nextResponse(1)
     const threadId = start.result.thread.id
 
@@ -2061,7 +2954,13 @@ test('compatibility-only UI methods return schema-shaped responses', async () =>
     proc.stdin.write(json({ id: 3, method: 'thread/decrement_elicitation', params: { threadId } }))
     assert.deepEqual((await reader.nextResponse(3)).result, { count: 0, paused: false })
 
-    proc.stdin.write(json({ id: 4, method: 'experimentalFeature/enablement/set', params: { enablement: { demo: true } } }))
+    proc.stdin.write(
+      json({
+        id: 4,
+        method: 'experimentalFeature/enablement/set',
+        params: { enablement: { demo: true } },
+      }),
+    )
     assert.deepEqual((await reader.nextResponse(4)).result, { enablement: { demo: true } })
 
     proc.stdin.write(json({ id: 5, method: 'mock/experimentalMethod', params: { value: 'ok' } }))
@@ -2071,7 +2970,10 @@ test('compatibility-only UI methods return schema-shaped responses', async () =>
     assert.deepEqual((await reader.nextResponse(6)).result, { status: 'notConfigured' })
 
     proc.stdin.write(json({ id: 7, method: 'plugin/install', params: { pluginName: 'demo' } }))
-    assert.deepEqual((await reader.nextResponse(7)).result, { authPolicy: 'ON_USE', appsNeedingAuth: [] })
+    assert.deepEqual((await reader.nextResponse(7)).result, {
+      authPolicy: 'ON_USE',
+      appsNeedingAuth: [],
+    })
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -2085,7 +2987,11 @@ test('file change approval emits patch and git diff updates', async () => {
   execFileSync('git', ['init'], { cwd: repo, stdio: 'ignore' })
   await writeFile(join(repo, 'README.md'), 'hello\n')
   execFileSync('git', ['add', 'README.md'], { cwd: repo })
-  execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-m', 'init'], { cwd: repo, stdio: 'ignore' })
+  execFileSync(
+    'git',
+    ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-m', 'init'],
+    { cwd: repo, stdio: 'ignore' },
+  )
 
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -2093,11 +2999,26 @@ test('file change approval emits patch and git diff updates', async () => {
   })
   const reader = new JsonLineReader(proc)
   try {
-    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: repo, experimentalRawEvents: false, persistExtendedHistory: false } }))
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: repo, experimentalRawEvents: false, persistExtendedHistory: false },
+      }),
+    )
     const start = await reader.nextResponse(1)
     const threadId = start.result.thread.id
 
-    proc.stdin.write(json({ id: 2, method: 'turn/start', params: { threadId, input: [{ type: 'text', text: 'please edit file', text_elements: [] }] } }))
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'please edit file', text_elements: [] }],
+        },
+      }),
+    )
     await reader.nextResponse(2)
 
     let approvalRequest: any = null
@@ -2135,7 +3056,11 @@ test('gitDiffToRemote includes untracked files for Codex diff review', async () 
   execFileSync('git', ['init'], { cwd: repo, stdio: 'ignore' })
   await writeFile(join(repo, 'README.md'), 'hello\n')
   execFileSync('git', ['add', 'README.md'], { cwd: repo })
-  execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-m', 'init'], { cwd: repo, stdio: 'ignore' })
+  execFileSync(
+    'git',
+    ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-m', 'init'],
+    { cwd: repo, stdio: 'ignore' },
+  )
   await writeFile(join(repo, 'new-file.txt'), 'new content\n')
 
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
@@ -2162,11 +3087,23 @@ test('thread resume, fork, and interrupt lifecycle methods are stable', async ()
   })
   const reader = new JsonLineReader(proc)
   try {
-    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false } }))
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false },
+      }),
+    )
     const start = await reader.nextResponse(1)
     const threadId = start.result.thread.id
 
-    proc.stdin.write(json({ id: 2, method: 'turn/start', params: { threadId, input: [{ type: 'text', text: 'session check', text_elements: [] }] } }))
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: [{ type: 'text', text: 'session check', text_elements: [] }] },
+      }),
+    )
     await reader.nextResponse(2)
     for (let i = 0; i < 500; i += 1) {
       const message = await reader.next()
@@ -2178,7 +3115,9 @@ test('thread resume, fork, and interrupt lifecycle methods are stable', async ()
     assert.equal(resume.result.thread.id, threadId)
     assert.equal(resume.result.thread.turns.length, 1)
 
-    proc.stdin.write(json({ id: 4, method: 'thread/fork', params: { threadId, persistExtendedHistory: false } }))
+    proc.stdin.write(
+      json({ id: 4, method: 'thread/fork', params: { threadId, persistExtendedHistory: false } }),
+    )
     const fork = await reader.nextResponse(4)
     assert.equal(fork.result.thread.forkedFromId, threadId)
     assert.equal(fork.result.thread.sessionId, resume.result.thread.sessionId)
@@ -2195,7 +3134,13 @@ test('thread resume, fork, and interrupt lifecycle methods are stable', async ()
 test('turn interrupt completes requested in-progress turn after reconnect', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   try {
-    execFileSync(process.execPath, ['--no-warnings', '--input-type=module', '-e', `
+    execFileSync(
+      process.execPath,
+      [
+        '--no-warnings',
+        '--input-type=module',
+        '-e',
+        `
       import assert from 'node:assert/strict'
       import { randomUUID } from 'node:crypto'
       import { join } from 'node:path'
@@ -2275,7 +3220,10 @@ test('turn interrupt completes requested in-progress turn after reconnect', asyn
       const response = messages.find((message) => 'id' in message && message.id === 1)
       assert.deepEqual(response?.result, {})
       await server.stop()
-    `], { cwd: resolve('.'), stdio: 'pipe' })
+    `,
+      ],
+      { cwd: resolve('.'), stdio: 'pipe' },
+    )
   } finally {
     await rm(home, { recursive: true, force: true })
   }
@@ -2289,7 +3237,9 @@ test('mcp status list reflects configured Claude SDK MCP servers', async () => {
       ...process.env,
       CODEX_HOME: home,
       CLAUDE_CODEX_MOCK: '1',
-      CLAUDE_CODEX_MCP_SERVERS: JSON.stringify({ demo: { type: 'stdio', command: 'node', args: ['mcp.js'] } }),
+      CLAUDE_CODEX_MCP_SERVERS: JSON.stringify({
+        demo: { type: 'stdio', command: 'node', args: ['mcp.js'] },
+      }),
       NODE_NO_WARNINGS: '1',
     },
   })
@@ -2297,9 +3247,16 @@ test('mcp status list reflects configured Claude SDK MCP servers', async () => {
   try {
     proc.stdin.write(json({ id: 1, method: 'mcpServerStatus/list', params: {} }))
     const response = await reader.nextResponse(1)
+    // Codex v2 McpServerStatus shape: { name, tools, resources, resourceTemplates, authStatus }.
     assert.equal(response.result.data[0].name, 'demo')
-    assert.equal(response.result.data[0].status, 'pending')
-    assert.equal(response.result.data[0].config.command, 'node')
+    assert.deepEqual(response.result.data[0].tools, {})
+    assert.deepEqual(response.result.data[0].resources, [])
+    assert.deepEqual(response.result.data[0].resourceTemplates, [])
+    assert.ok(
+      ['unsupported', 'notLoggedIn', 'bearerToken', 'oAuth'].includes(
+        response.result.data[0].authStatus,
+      ),
+    )
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -2315,18 +3272,32 @@ test('direct MCP stdio resource and tool calls work', async () => {
       ...process.env,
       CODEX_HOME: home,
       CLAUDE_CODEX_MOCK: '1',
-      CLAUDE_CODEX_MCP_SERVERS: JSON.stringify({ fixture: { type: 'stdio', command: process.execPath, args: [fixture] } }),
+      CLAUDE_CODEX_MCP_SERVERS: JSON.stringify({
+        fixture: { type: 'stdio', command: process.execPath, args: [fixture] },
+      }),
       NODE_NO_WARNINGS: '1',
     },
   })
   const reader = new JsonLineReader(proc)
   try {
-    proc.stdin.write(json({ id: 1, method: 'mcpServer/tool/call', params: { threadId: 't', server: 'fixture', tool: 'echo', arguments: { value: 'ok' } } }))
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'mcpServer/tool/call',
+        params: { threadId: 't', server: 'fixture', tool: 'echo', arguments: { value: 'ok' } },
+      }),
+    )
     const tool = await reader.nextResponse(1)
     assert.equal(tool.result.content[0].text, 'tool:echo:ok')
     assert.equal(tool.result.structuredContent.ok, true)
 
-    proc.stdin.write(json({ id: 2, method: 'mcpServer/resource/read', params: { threadId: 't', server: 'fixture', uri: 'fixture://resource' } }))
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'mcpServer/resource/read',
+        params: { threadId: 't', server: 'fixture', uri: 'fixture://resource' },
+      }),
+    )
     const resource = await reader.nextResponse(2)
     assert.equal(resource.result.contents[0].uri, 'fixture://resource')
     assert.equal(resource.result.contents[0].text, 'resource-ok')
@@ -2348,10 +3319,30 @@ test('direct MCP HTTP tool calls work', async () => {
       const message = JSON.parse(body)
       res.setHeader('content-type', 'application/json')
       if (message.method === 'initialize') {
-        res.end(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { protocolVersion: '2024-11-05', capabilities: {}, serverInfo: { name: 'http-fixture', version: '1' } } }))
+        res.end(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: message.id,
+            result: {
+              protocolVersion: '2024-11-05',
+              capabilities: {},
+              serverInfo: { name: 'http-fixture', version: '1' },
+            },
+          }),
+        )
         return
       }
-      res.end(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { content: [{ type: 'text', text: `http:${message.params.name}` }], structuredContent: { http: true }, isError: false } }))
+      res.end(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: message.id,
+          result: {
+            content: [{ type: 'text', text: `http:${message.params.name}` }],
+            structuredContent: { http: true },
+            isError: false,
+          },
+        }),
+      )
     })
   })
   await new Promise<void>((resolve) => httpServer.listen(0, '127.0.0.1', resolve))
@@ -2370,7 +3361,13 @@ test('direct MCP HTTP tool calls work', async () => {
   })
   const reader = new JsonLineReader(proc)
   try {
-    proc.stdin.write(json({ id: 1, method: 'mcpServer/tool/call', params: { threadId: 't', server: 'fixture', tool: 'echo', arguments: {} } }))
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'mcpServer/tool/call',
+        params: { threadId: 't', server: 'fixture', tool: 'echo', arguments: {} },
+      }),
+    )
     const tool = await reader.nextResponse(1)
     assert.equal(tool.result.content[0].text, 'http:echo')
     assert.equal(tool.result.structuredContent.http, true)
@@ -2390,7 +3387,11 @@ test('optional auto worktree binds new threads to isolated git worktrees', async
   execFileSync('git', ['init'], { cwd: repo, stdio: 'ignore' })
   await writeFile(join(repo, 'README.md'), 'hello\n')
   execFileSync('git', ['add', 'README.md'], { cwd: repo })
-  execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-m', 'init'], { cwd: repo, stdio: 'ignore' })
+  execFileSync(
+    'git',
+    ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-m', 'init'],
+    { cwd: repo, stdio: 'ignore' },
+  )
 
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -2405,7 +3406,13 @@ test('optional auto worktree binds new threads to isolated git worktrees', async
   })
   const reader = new JsonLineReader(proc)
   try {
-    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: repo, experimentalRawEvents: false, persistExtendedHistory: false } }))
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: repo, experimentalRawEvents: false, persistExtendedHistory: false },
+      }),
+    )
     const response = await reader.nextResponse(1)
     assert.match(response.result.cwd, /worktrees/)
     assert.match(response.result.thread.cwd, /worktrees/)
@@ -2442,7 +3449,7 @@ class JsonLineReader {
 
   private push(chunk: string): void {
     this.buffer += chunk
-    let idx
+    let idx: number
     while ((idx = this.buffer.indexOf('\n')) >= 0) {
       const line = this.buffer.slice(0, idx).trim()
       this.buffer = this.buffer.slice(idx + 1)
@@ -2507,21 +3514,28 @@ class TextCollector {
 }
 
 class ChildProcessDuplex extends Duplex {
-  constructor(private proc: ChildProcess) {
+  private readonly proc: ChildProcess
+
+  constructor(proc: ChildProcess) {
     super()
+    this.proc = proc
     if (!proc.stdin || !proc.stdout) throw new Error('proxy process needs stdin/stdout')
     proc.stdout.on('data', (chunk) => this.push(chunk))
     proc.stdout.on('end', () => this.push(null))
     proc.on('exit', () => this.push(null))
   }
 
-  _read(): void {}
+  override _read(): void {}
 
-  _write(chunk: Buffer, _encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
+  override _write(
+    chunk: Buffer,
+    _encoding: BufferEncoding,
+    callback: (error?: Error | null) => void,
+  ): void {
     this.proc.stdin?.write(chunk, callback)
   }
 
-  _final(callback: (error?: Error | null) => void): void {
+  override _final(callback: (error?: Error | null) => void): void {
     this.proc.stdin?.end()
     callback()
   }

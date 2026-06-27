@@ -185,13 +185,11 @@ export type ThreadItem =
       // Codex v2 McpToolCallResult shape — must have all three fields present
       // (structuredContent / _meta default to null). Raw content array is the
       // Anthropic tool-result block array.
-      result:
-        | {
-            content: unknown[]
-            structuredContent: unknown | null
-            _meta: unknown | null
-          }
-        | null
+      result: {
+        content: unknown[]
+        structuredContent: unknown | null
+        _meta: unknown | null
+      } | null
       // Codex v2 McpToolCallError shape — { message: string } and nothing else.
       error: { message: string } | null
       durationMs: number | null
@@ -225,7 +223,20 @@ export type ThreadItem =
       prompt: string | null
       model: string | null
       reasoningEffort: string | null
-      agentsStates: Record<string, { status: 'pendingInit' | 'running' | 'interrupted' | 'completed' | 'errored' | 'shutdown' | 'notFound'; message: string | null }>
+      agentsStates: Record<
+        string,
+        {
+          status:
+            | 'pendingInit'
+            | 'running'
+            | 'interrupted'
+            | 'completed'
+            | 'errored'
+            | 'shutdown'
+            | 'notFound'
+          message: string | null
+        }
+      >
     }
   // Codex's native dynamic tool call item — used to surface AskUserQuestion as
   // a structured choice card the App renders inline (paired with the
@@ -238,7 +249,9 @@ export type ThreadItem =
       tool: string
       arguments: unknown
       status: 'inProgress' | 'completed' | 'failed'
-      contentItems: Array<{ type: 'inputText'; text: string } | { type: 'inputImage'; imageUrl: string }> | null
+      contentItems: Array<
+        { type: 'inputText'; text: string } | { type: 'inputImage'; imageUrl: string }
+      > | null
       success: boolean | null
       durationMs: number | null
     }
@@ -302,12 +315,35 @@ export type RuntimeEvent =
   | { type: 'tool_use'; toolUseId: string; toolName: string; input: Record<string, unknown> }
   | { type: 'tool_output_delta'; toolUseId: string; delta: string }
   | { type: 'tool_result'; toolUseId: string; content: unknown; isError?: boolean }
-  | { type: 'permission_request'; requestId: string; toolUseId: string; toolName: string; input: Record<string, unknown> }
-  | { type: 'user_input_request'; requestId: string; toolUseId: string; questions: UserInputQuestion[] }
+  | {
+      type: 'permission_request'
+      requestId: string
+      toolUseId: string
+      toolName: string
+      input: Record<string, unknown>
+    }
+  | {
+      type: 'user_input_request'
+      requestId: string
+      toolUseId: string
+      questions: UserInputQuestion[]
+    }
   | { type: 'notice'; level: 'info' | 'warning' | 'error'; message: string }
   | { type: 'usage'; usage: Record<string, unknown> }
-  | { type: 'metrics'; durationMs: number | null; apiDurationMs: number | null; numTurns: number | null; costUsd: number | null }
-  | { type: 'hook'; hookName: string; status: string | null; decision: string | null; message: string | null }
+  | {
+      type: 'metrics'
+      durationMs: number | null
+      apiDurationMs: number | null
+      numTurns: number | null
+      costUsd: number | null
+    }
+  | {
+      type: 'hook'
+      hookName: string
+      status: string | null
+      decision: string | null
+      message: string | null
+    }
   | { type: 'completed'; claudeSessionId?: string | null; result?: string | null; success: boolean }
   | { type: 'error'; message: string }
 
@@ -352,14 +388,18 @@ export interface PermissionDecision {
 
 export interface RuntimeHandlers {
   onEvent(event: RuntimeEvent): Promise<void> | void
-  onPermissionRequest(event: Extract<RuntimeEvent, { type: 'permission_request' }>): Promise<PermissionDecision>
+  onPermissionRequest(
+    event: Extract<RuntimeEvent, { type: 'permission_request' }>,
+  ): Promise<PermissionDecision>
   // Routed when Claude invokes AskUserQuestion. The server bridges this to
   // Codex's native `item/tool/requestUserInput` reverse RPC so the App can
   // render structured choice cards instead of a raw tool_use blob. Optional
   // because not every consumer (mock harnesses, compaction subturns) needs
   // to expose a real user-input surface — when absent the runtime returns an
   // empty answer to the model.
-  onUserInputRequest?(event: Extract<RuntimeEvent, { type: 'user_input_request' }>): Promise<UserInputAnswers>
+  onUserInputRequest?(
+    event: Extract<RuntimeEvent, { type: 'user_input_request' }>,
+  ): Promise<UserInputAnswers>
 }
 
 export interface ClaudeRuntime {

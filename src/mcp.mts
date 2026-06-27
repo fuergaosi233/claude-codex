@@ -3,37 +3,46 @@ import { spawn } from 'node:child_process'
 
 export interface McpConfigSnapshot {
   sdkValue: unknown | null
-  statuses: Array<Record<string, unknown>>
+  // mcpServerStatus/list -> Array<McpServerStatus>
+  listStatuses: Array<Record<string, unknown>>
+  // mcpServer/startupStatus/updated -> { name, status: McpServerStartupState, error }
+  startupStatuses: Array<{ name: string; status: string; error: string | null }>
 }
 
 export function readMcpConfig(): McpConfigSnapshot {
   const raw = process.env.CLAUDE_CODEX_MCP_SERVERS
-  if (!raw) return { sdkValue: null, statuses: [] }
+  if (!raw) return { sdkValue: null, listStatuses: [], startupStatuses: [] }
 
   try {
     const sdkValue = parseMcpValue(raw)
+    const names = serverNames(sdkValue)
     return {
       sdkValue,
-      statuses: statusEntries(sdkValue),
+      listStatuses: names.map((name) => listStatusEntry(name)),
+      // The adapter passes MCP servers straight to the Claude Agent SDK; it
+      // does not run a separate startup handshake, so the optimistic terminal
+      // state is "ready" rather than the invalid "pending".
+      startupStatuses: names.map((name) => ({ name, status: 'ready', error: null })),
     }
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
     return {
       sdkValue: null,
-      statuses: [
-        {
-          name: 'CLAUDE_CODEX_MCP_SERVERS',
-          status: 'failed',
-          error: error instanceof Error ? error.message : String(error),
-          scope: 'adapter',
-          tools: [],
-        },
-      ],
+      listStatuses: [listStatusEntry('CLAUDE_CODEX_MCP_SERVERS')],
+      startupStatuses: [{ name: 'CLAUDE_CODEX_MCP_SERVERS', status: 'failed', error: message }],
     }
   }
 }
 
-export async function callMcpTool(serverName: string, toolName: string, args: unknown): Promise<Record<string, unknown>> {
-  const result = await runMcpRequest(serverName, 'tools/call', { name: toolName, arguments: args ?? {} })
+export async function callMcpTool(
+  serverName: string,
+  toolName: string,
+  args: unknown,
+): Promise<Record<string, unknown>> {
+  const result = await runMcpRequest(serverName, 'tools/call', {
+    name: toolName,
+    arguments: args ?? {},
+  })
   const record = asRecord(result)
   return {
     content: Array.isArray(record.content) ? record.content : [],
@@ -43,19 +52,28 @@ export async function callMcpTool(serverName: string, toolName: string, args: un
   }
 }
 
-export async function readMcpResource(serverName: string, uri: string): Promise<Record<string, unknown>> {
+export async function readMcpResource(
+  serverName: string,
+  uri: string,
+): Promise<Record<string, unknown>> {
   const result = await runMcpRequest(serverName, 'resources/read', { uri })
   const record = asRecord(result)
   return { contents: Array.isArray(record.contents) ? record.contents : [] }
 }
 
-async function runMcpRequest(serverName: string, method: string, params: unknown): Promise<unknown> {
+async function runMcpRequest(
+  serverName: string,
+  method: string,
+  params: unknown,
+): Promise<unknown> {
   const config = getServerConfig(serverName)
   if (config.type === 'http') {
     return runHttpMcpRequest(config, method, params)
   }
   if (config.type && config.type !== 'stdio') {
-    throw new Error(`direct MCP ${method} only supports stdio servers; ${serverName} is ${config.type}`)
+    throw new Error(
+      `direct MCP ${method} only supports stdio servers; ${serverName} is ${config.type}`,
+    )
   }
   const command = stringOr(config.command, '')
   if (!command) throw new Error(`MCP server ${serverName} has no command`)
@@ -64,7 +82,10 @@ async function runMcpRequest(serverName: string, method: string, params: unknown
     stdio: ['pipe', 'pipe', 'pipe'],
   })
 
-  const pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>()
+  const pending = new Map<
+    number,
+    { resolve: (value: unknown) => void; reject: (error: Error) => void }
+  >()
   let nextId = 1
   let buffer = ''
   let stderr = ''
@@ -75,7 +96,7 @@ async function runMcpRequest(serverName: string, method: string, params: unknown
   child.stdout.setEncoding('utf8')
   child.stdout.on('data', (chunk) => {
     buffer += String(chunk)
-    let lineEnd
+    let lineEnd: number
     while ((lineEnd = buffer.indexOf('\n')) >= 0) {
       const line = buffer.slice(0, lineEnd).trim()
       buffer = buffer.slice(lineEnd + 1)
@@ -92,12 +113,15 @@ async function runMcpRequest(serverName: string, method: string, params: unknown
 
   const request = (requestMethod: string, requestParams: unknown): Promise<unknown> => {
     const id = nextId++
-    child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method: requestMethod, params: requestParams })}\n`)
+    child.stdin.write(
+      `${JSON.stringify({ jsonrpc: '2.0', id, method: requestMethod, params: requestParams })}\n`,
+    )
     return new Promise((resolve, reject) => pending.set(id, { resolve, reject }))
   }
 
   const timeout = setTimeout(() => {
-    for (const wait of pending.values()) wait.reject(new Error(`MCP request timed out${stderr ? `: ${stderr}` : ''}`))
+    for (const wait of pending.values())
+      wait.reject(new Error(`MCP request timed out${stderr ? `: ${stderr}` : ''}`))
     pending.clear()
     child.kill()
   }, 20_000)
@@ -108,7 +132,9 @@ async function runMcpRequest(serverName: string, method: string, params: unknown
       capabilities: {},
       clientInfo: { name: 'claude-codex-adapter', version: '0.1.0' },
     })
-    child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} })}\n`)
+    child.stdin.write(
+      `${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} })}\n`,
+    )
     return await request(method, params)
   } finally {
     clearTimeout(timeout)
@@ -116,10 +142,18 @@ async function runMcpRequest(serverName: string, method: string, params: unknown
   }
 }
 
-async function runHttpMcpRequest(config: Record<string, unknown>, method: string, params: unknown): Promise<unknown> {
+async function runHttpMcpRequest(
+  config: Record<string, unknown>,
+  method: string,
+  params: unknown,
+): Promise<unknown> {
   const url = stringOr(config.url, '')
   if (!url) throw new Error('HTTP MCP server has no url')
-  const headers = { 'content-type': 'application/json', accept: 'application/json', ...stringRecord(config.headers) }
+  const headers = {
+    'content-type': 'application/json',
+    accept: 'application/json',
+    ...stringRecord(config.headers),
+  }
   const initialize = await fetchJsonRpc(url, headers, {
     jsonrpc: '2.0',
     id: 1,
@@ -137,7 +171,11 @@ async function runHttpMcpRequest(config: Record<string, unknown>, method: string
   return record.result
 }
 
-async function fetchJsonRpc(url: string, headers: Record<string, string>, body: Record<string, unknown>): Promise<unknown> {
+async function fetchJsonRpc(
+  url: string,
+  headers: Record<string, string>,
+  body: Record<string, unknown>,
+): Promise<unknown> {
   const response = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) })
   const text = await response.text()
   if (!response.ok) throw new Error(`HTTP MCP request failed ${response.status}: ${text}`)
@@ -152,9 +190,11 @@ async function fetchJsonRpc(url: string, headers: Record<string, string>, body: 
 function getServerConfig(serverName: string): Record<string, unknown> {
   const snapshot = readMcpConfig()
   const value = snapshot.sdkValue
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('CLAUDE_CODEX_MCP_SERVERS is not an object config')
+  if (!value || typeof value !== 'object' || Array.isArray(value))
+    throw new Error('CLAUDE_CODEX_MCP_SERVERS is not an object config')
   const config = (value as Record<string, unknown>)[serverName]
-  if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error(`unknown MCP server: ${serverName}`)
+  if (!config || typeof config !== 'object' || Array.isArray(config))
+    throw new Error(`unknown MCP server: ${serverName}`)
   return config as Record<string, unknown>
 }
 
@@ -169,19 +209,29 @@ function parseMcpValue(raw: string): unknown {
   return JSON.parse(readFileSync(trimmed, 'utf8'))
 }
 
-function statusEntries(value: unknown): Array<Record<string, unknown>> {
+function serverNames(value: unknown): string[] {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return []
-  return Object.entries(value as Record<string, unknown>).map(([name, config]) => ({
+  return Object.keys(value as Record<string, unknown>)
+}
+
+// Codex v2 McpServerStatus: { name, tools: { [name]: Tool }, resources: [],
+// resourceTemplates: [], authStatus }. The adapter does not eagerly enumerate
+// tools/resources, so it reports the conformant empty shape with authStatus
+// "unsupported" (no Codex-managed OAuth) instead of a non-schema object.
+function listStatusEntry(name: string): Record<string, unknown> {
+  return {
     name,
-    status: 'pending',
-    config,
-    scope: 'adapter',
-    tools: [],
-  }))
+    tools: {},
+    resources: [],
+    resourceTemplates: [],
+    authStatus: 'unsupported',
+  }
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
-  return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {}
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {}
 }
 
 function stringOr(value: unknown, fallback: string): string {
@@ -190,5 +240,7 @@ function stringOr(value: unknown, fallback: string): string {
 
 function stringRecord(value: unknown): Record<string, string> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
-  return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, raw]) => [key, String(raw)]))
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).map(([key, raw]) => [key, String(raw)]),
+  )
 }

@@ -176,13 +176,15 @@ export class SessionStore {
     return row ? this.rowToThread(row) : null
   }
 
-  listThreads(options: {
-    archived?: boolean | null
-    limit?: number | null
-    cursor?: string | null
-    cwd?: string | string[] | null
-    includeEphemeral?: boolean
-  } = {}): ThreadRecord[] {
+  listThreads(
+    options: {
+      archived?: boolean | null
+      limit?: number | null
+      cursor?: string | null
+      cwd?: string | string[] | null
+      includeEphemeral?: boolean
+    } = {},
+  ): ThreadRecord[] {
     const limit = Math.max(1, Math.min(Number(options.limit ?? 50), 200))
     const archived = options.archived === true ? 1 : 0
     const cursor = options.cursor ? Number(options.cursor) : Number.MAX_SAFE_INTEGER
@@ -201,7 +203,9 @@ export class SessionStore {
       return rows.map((row: unknown) => this.rowToThread(row))
     }
     const rows = this.db
-      .prepare(`SELECT * FROM threads WHERE archived = ? AND updated_at < ?${ephemeralFilter} ORDER BY updated_at DESC LIMIT ?`)
+      .prepare(
+        `SELECT * FROM threads WHERE archived = ? AND updated_at < ?${ephemeralFilter} ORDER BY updated_at DESC LIMIT ?`,
+      )
       .all(archived, cursor, limit)
     return rows.map((row: unknown) => this.rowToThread(row))
   }
@@ -213,7 +217,9 @@ export class SessionStore {
   }
 
   updateThreadName(threadId: string, name: string | null): void {
-    this.db.prepare('UPDATE threads SET name = ?, updated_at = ? WHERE id = ?').run(name, nowSeconds(), threadId)
+    this.db
+      .prepare('UPDATE threads SET name = ?, updated_at = ? WHERE id = ?')
+      .run(name, nowSeconds(), threadId)
   }
 
   updateClaudeSessionId(threadId: string, claudeSessionId: string | null): void {
@@ -232,7 +238,9 @@ export class SessionStore {
   }
 
   setArchived(threadId: string, archived: boolean): void {
-    this.db.prepare('UPDATE threads SET archived = ?, updated_at = ? WHERE id = ?').run(archived ? 1 : 0, nowSeconds(), threadId)
+    this.db
+      .prepare('UPDATE threads SET archived = ?, updated_at = ? WHERE id = ?')
+      .run(archived ? 1 : 0, nowSeconds(), threadId)
   }
 
   upsertTurn(turn: TurnRecord): void {
@@ -268,7 +276,9 @@ export class SessionStore {
   }
 
   listTurns(threadId: string): TurnRecord[] {
-    const rows = this.db.prepare('SELECT * FROM turns WHERE thread_id = ? ORDER BY started_at ASC').all(threadId)
+    const rows = this.db
+      .prepare('SELECT * FROM turns WHERE thread_id = ? ORDER BY started_at ASC')
+      .all(threadId)
     return rows.map((row: unknown) => this.rowToTurn(row))
   }
 
@@ -295,7 +305,11 @@ export class SessionStore {
     return turn
   }
 
-  updateItem(turnId: string, itemId: string, updater: (item: ThreadItem) => ThreadItem): TurnRecord | null {
+  updateItem(
+    turnId: string,
+    itemId: string,
+    updater: (item: ThreadItem) => ThreadItem,
+  ): TurnRecord | null {
     const turn = this.getTurn(turnId)
     if (!turn) return null
     turn.items = turn.items.map((item) => (item.id === itemId ? updater(jsonClone(item)) : item))
@@ -303,13 +317,18 @@ export class SessionStore {
     return turn
   }
 
-  completeTurn(turnId: string, status: TurnStatus, error: unknown | null = null): TurnRecord | null {
+  completeTurn(
+    turnId: string,
+    status: TurnStatus,
+    error: unknown | null = null,
+  ): TurnRecord | null {
     const turn = this.getTurn(turnId)
     if (!turn) return null
     const completedAt = nowSeconds()
     turn.status = status
     turn.completedAt = completedAt
-    turn.durationMs = turn.startedAt == null ? null : Math.max(0, (completedAt - turn.startedAt) * 1000)
+    turn.durationMs =
+      turn.startedAt == null ? null : Math.max(0, (completedAt - turn.startedAt) * 1000)
     turn.error = error
     this.upsertTurn(turn)
     return turn
@@ -328,7 +347,9 @@ export class SessionStore {
       SET status = ?, completed_at = ?, duration_ms = ?, error_json = ?
       WHERE id = ?
     `)
-    const updateThread = this.db.prepare('UPDATE threads SET status_json = ?, updated_at = ? WHERE id = ?')
+    const updateThread = this.db.prepare(
+      'UPDATE threads SET status_json = ?, updated_at = ? WHERE id = ?',
+    )
     const seenThreads = new Set<string>()
     for (const row of rows) {
       const startedAt = row.started_at == null ? null : Number(row.started_at)
@@ -378,7 +399,8 @@ export class SessionStore {
       agentRole: row.agent_role == null ? null : String(row.agent_role),
       agentNickname: row.agent_nickname == null ? null : String(row.agent_nickname),
       baseInstructions: row.base_instructions == null ? null : String(row.base_instructions),
-      developerInstructions: row.developer_instructions == null ? null : String(row.developer_instructions),
+      developerInstructions:
+        row.developer_instructions == null ? null : String(row.developer_instructions),
       personality: row.personality == null ? null : String(row.personality),
       runtimeBackend: row.runtime_backend === 'codex' ? 'codex' : 'claude',
       codexSessionId: row.codex_session_id == null ? null : String(row.codex_session_id),

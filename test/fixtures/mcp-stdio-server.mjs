@@ -16,7 +16,12 @@ rl.on('line', (line) => {
   }
   if (request.method === 'tools/call') {
     respond(request.id, {
-      content: [{ type: 'text', text: `tool:${request.params.name}:${request.params.arguments?.value ?? ''}` }],
+      content: [
+        {
+          type: 'text',
+          text: `tool:${request.params.name}:${request.params.arguments?.value ?? ''}`,
+        },
+      ],
       structuredContent: { ok: true },
       isError: false,
     })

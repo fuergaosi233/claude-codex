@@ -17,8 +17,11 @@ const READ_ONLY_TOOLS = ['Read', 'Glob', 'Grep', 'WebSearch', 'WebFetch', 'TodoW
 
 export class ClaudePTranscriptRuntime implements ClaudeRuntime {
   private active = new Map<string, ChildProcess>()
+  private readonly options: ClaudePRuntimeOptions
 
-  constructor(private options: ClaudePRuntimeOptions) {}
+  constructor(options: ClaudePRuntimeOptions) {
+    this.options = options
+  }
 
   async runTurn(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void> {
     const tmp = await mkdtemp(join(tmpdir(), 'claude-codex-claude-p-'))
@@ -30,7 +33,8 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
         await handlers.onEvent({
           type: 'notice',
           level: 'warning',
-          message: 'claude-p runtime does not support direct multimodal attachments; sending the text prompt only.',
+          message:
+            'claude-p runtime does not support direct multimodal attachments; sending the text prompt only.',
         })
       }
 
@@ -38,7 +42,9 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
       const result = await this.runProcessWithRetry(context.threadId, args, context.cwd, handlers)
       const parsed = parseClaudePJson(result.stdout)
       const text = parsed?.result ?? result.stdout.trim()
-      const sessionId = parsed?.sessionId ? `claude-p:${parsed.sessionId}` : context.claudeSessionId ?? `claude-p:${context.threadId}`
+      const sessionId = parsed?.sessionId
+        ? `claude-p:${parsed.sessionId}`
+        : (context.claudeSessionId ?? `claude-p:${context.threadId}`)
 
       await handlers.onEvent({ type: 'session', claudeSessionId: sessionId })
       if (parsed?.usage) await handlers.onEvent({ type: 'usage', usage: parsed.usage })
@@ -49,10 +55,13 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
       await handlers.onEvent({
         type: 'completed',
         success,
-        result: success ? text : result.stderr.trim() || text || `claude-p exited ${result.exitCode}`,
+        result: success
+          ? text
+          : result.stderr.trim() || text || `claude-p exited ${result.exitCode}`,
         claudeSessionId: sessionId,
       })
-      if (!success) throw new Error(result.stderr.trim() || text || `claude-p exited ${result.exitCode}`)
+      if (!success)
+        throw new Error(result.stderr.trim() || text || `claude-p exited ${result.exitCode}`)
     } finally {
       await rm(tmp, { recursive: true, force: true }).catch(() => {})
     }
@@ -67,7 +76,8 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
     if (!child) return
     terminateProcessTree(child, 'SIGINT')
     setTimeout(() => {
-      if (child.exitCode === null && child.signalCode === null) terminateProcessTree(child, 'SIGTERM')
+      if (child.exitCode === null && child.signalCode === null)
+        terminateProcessTree(child, 'SIGTERM')
     }, 1500).unref()
   }
 
@@ -77,7 +87,15 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
   }
 
   private argsForContext(context: RuntimeTurnContext, inputFile: string): string[] {
-    const args = [...this.options.extraArgs, '--output-format', 'json', '--cwd', context.cwd, '--input-file', inputFile]
+    const args = [
+      ...this.options.extraArgs,
+      '--output-format',
+      'json',
+      '--cwd',
+      context.cwd,
+      '--input-file',
+      inputFile,
+    ]
     if (context.model) args.push('--model', context.model)
     // claude-p is most reliable as a `claude -p`-style one-shot wrapper.
     // Its current `--resume + --input-file` path can run the new prompt but
@@ -87,14 +105,22 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
     if (resume && !context.forkSession) args.push('--resume', resume)
     const allowedTools = allowedToolsForContext(context)
     if (allowedTools) args.push('--allowedTools', allowedTools)
-    if (this.options.skipPermissions || context.approvalPolicy === 'never' || context.sandboxMode === 'danger-full-access') {
+    if (
+      this.options.skipPermissions ||
+      context.approvalPolicy === 'never' ||
+      context.sandboxMode === 'danger-full-access'
+    ) {
       args.push('--dangerously-skip-permissions')
     }
     args.push('--timeout', String(Math.max(1, Math.ceil(this.options.timeoutMs / 1000))))
     return args
   }
 
-  private runProcess(threadId: string, args: string[], cwd: string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  private runProcess(
+    threadId: string,
+    args: string[],
+    cwd: string,
+  ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
     const child = spawn(this.options.command, args, {
       cwd,
       env: { ...process.env },
@@ -120,7 +146,8 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
         timedOut = true
         terminateProcessTree(child, 'SIGTERM')
         killTimer = setTimeout(() => {
-          if (child.exitCode === null && child.signalCode === null) terminateProcessTree(child, 'SIGKILL')
+          if (child.exitCode === null && child.signalCode === null)
+            terminateProcessTree(child, 'SIGKILL')
         }, 1500).unref()
       }, this.options.timeoutMs)
       child.once('error', (error) => {
@@ -177,7 +204,11 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
   }
 }
 
-function isClaudePStopTimeout(result: { stdout: string; stderr: string; exitCode: number }): boolean {
+function isClaudePStopTimeout(result: {
+  stdout: string
+  stderr: string
+  exitCode: number
+}): boolean {
   return result.stdout.trim() === '' && /(?:^|\b)StopTimeout(?:\b|$)/i.test(result.stderr)
 }
 
@@ -272,7 +303,9 @@ function parseClaudePJson(stdout: string): ParsedClaudePResult | null {
 
 function allowedToolsForContext(context: RuntimeTurnContext): string | null {
   if (context.sandboxMode === 'read-only') return READ_ONLY_TOOLS.join(',')
-  return context.allowedTools && context.allowedTools.length > 0 ? context.allowedTools.join(',') : null
+  return context.allowedTools && context.allowedTools.length > 0
+    ? context.allowedTools.join(',')
+    : null
 }
 
 function claudePResumeId(value: string | null): string | null {
@@ -282,11 +315,15 @@ function claudePResumeId(value: string | null): string | null {
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
-  return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {}
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {}
 }
 
 function asOptionalRecord(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : null
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null
 }
 
 function numberOrNull(value: unknown): number | null {

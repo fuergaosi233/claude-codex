@@ -21,39 +21,56 @@ check('built adapter exists', () => {
 })
 
 check('shim version probe', () => {
-  const result = run(resolve('scripts/codex-shim'), ['--version'], { CLAUDE_CODEX_ADAPTER: process.env.CLAUDE_CODEX_ADAPTER || resolve('dist/src/adapter.mjs') })
-  if (!/codex-cli/.test(result.stdout)) throw new Error(`unexpected version output: ${result.stdout}`)
+  const result = run(resolve('scripts/codex-shim'), ['--version'], {
+    CLAUDE_CODEX_ADAPTER: process.env.CLAUDE_CODEX_ADAPTER || resolve('dist/src/adapter.mjs'),
+  })
+  if (!/codex-cli/.test(result.stdout))
+    throw new Error(`unexpected version output: ${result.stdout}`)
 })
 
-if (runtimeType === 'agent-sdk-sidecar') check('@anthropic-ai/claude-agent-sdk installed', () => {
-  // The native TS runtime imports the SDK dynamically; verify it resolves
-  // from this package's node_modules.
-  const pkgPath = resolve('node_modules/@anthropic-ai/claude-agent-sdk/package.json')
-  if (!existsSync(pkgPath)) {
-    throw new Error('run npm install - @anthropic-ai/claude-agent-sdk is missing')
-  }
-})
+if (runtimeType === 'agent-sdk-sidecar')
+  check('@anthropic-ai/claude-agent-sdk installed', () => {
+    // The native TS runtime imports the SDK dynamically; verify it resolves
+    // from this package's node_modules.
+    const pkgPath = resolve('node_modules/@anthropic-ai/claude-agent-sdk/package.json')
+    if (!existsSync(pkgPath)) {
+      throw new Error('run npm install - @anthropic-ai/claude-agent-sdk is missing')
+    }
+  })
 
-if (runtimeType === 'agent-http' || runtimeType === 'agentapi') check(`${runtimeType} HTTP endpoint`, () => {
-  const url = new URL('/status', httpBaseUrl())
-  const result = run(process.execPath, ['-e', `fetch(${JSON.stringify(url.toString())}).then(async r => { if (!r.ok) throw new Error(await r.text()); console.log(await r.text()) })`])
-  if (!/"status"\s*:/.test(result.stdout)) throw new Error(`unexpected /status response: ${result.stdout.trim()}`)
-})
+if (runtimeType === 'agent-http' || runtimeType === 'agentapi')
+  check(`${runtimeType} HTTP endpoint`, () => {
+    const url = new URL('/status', httpBaseUrl())
+    const result = run(process.execPath, [
+      '-e',
+      `fetch(${JSON.stringify(url.toString())}).then(async r => { if (!r.ok) throw new Error(await r.text()); console.log(await r.text()) })`,
+    ])
+    if (!/"status"\s*:/.test(result.stdout))
+      throw new Error(`unexpected /status response: ${result.stdout.trim()}`)
+  })
 
-if (runtimeType === 'claude-p') check('claude-p command', () => {
-  const command = process.env.CLAUDE_CODEX_CLAUDE_P_COMMAND || process.env.CLAUDE_P || 'claude-p'
-  run(command, ['--version'])
-})
+if (runtimeType === 'claude-p')
+  check('claude-p command', () => {
+    const command = process.env.CLAUDE_CODEX_CLAUDE_P_COMMAND || process.env.CLAUDE_P || 'claude-p'
+    run(command, ['--version'])
+  })
 
-if (runtimeType === 'codex') check('real Codex passthrough', () => {
-  const command = process.env.CODEX_REAL || 'codex'
-  run(command, ['--version'])
-})
+if (runtimeType === 'codex')
+  check('real Codex passthrough', () => {
+    const command = process.env.CODEX_REAL || 'codex'
+    run(command, ['--version'])
+  })
 
-if (runtimeType === 'agent-sdk-sidecar') check('Claude auth surface for real smoke', () => {
-  if (process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_CODE_USE_BEDROCK || process.env.CLAUDE_CODE_USE_VERTEX) return
-  run(resolveClaudeCommand(), ['--version'])
-})
+if (runtimeType === 'agent-sdk-sidecar')
+  check('Claude auth surface for real smoke', () => {
+    if (
+      process.env.ANTHROPIC_API_KEY ||
+      process.env.CLAUDE_CODE_USE_BEDROCK ||
+      process.env.CLAUDE_CODE_USE_VERTEX
+    )
+      return
+    run(resolveClaudeCommand(), ['--version'])
+  })
 
 for (const item of checks) {
   const marker = item.ok ? 'ok' : 'fail'
@@ -67,7 +84,11 @@ function check(name, fn) {
     fn()
     checks.push({ name, ok: true })
   } catch (error) {
-    checks.push({ name, ok: false, message: error instanceof Error ? error.message : String(error) })
+    checks.push({
+      name,
+      ok: false,
+      message: error instanceof Error ? error.message : String(error),
+    })
   }
 }
 
@@ -83,15 +104,36 @@ function run(command, args, env = {}) {
 }
 
 function requireModule(name) {
-  const result = spawnSync(process.execPath, ['-e', `import(${JSON.stringify(name)})`], { encoding: 'utf8' })
+  const result = spawnSync(process.execPath, ['-e', `import(${JSON.stringify(name)})`], {
+    encoding: 'utf8',
+  })
   if (result.status !== 0) throw new Error(result.stderr || result.stdout)
 }
 
 function resolveRuntimeType() {
   if (process.env.CLAUDE_CODEX_MOCK === '1') return 'mock'
-  const raw = (process.env.CLAUDE_CODEX_RUNTIME_TYPE || process.env.CLAUDE_CODEX_RUNTIME || process.env.CLAUDE_CODEX_BACKEND || '').trim().toLowerCase()
+  const raw = (
+    process.env.CLAUDE_CODEX_RUNTIME_TYPE ||
+    process.env.CLAUDE_CODEX_RUNTIME ||
+    process.env.CLAUDE_CODEX_BACKEND ||
+    ''
+  )
+    .trim()
+    .toLowerCase()
   if (!raw) return 'agent-sdk-sidecar'
-  if (['sdk', 'agent-sdk', 'agent-sdk-sidecar', 'sidecar', 'cloud-agent-sdk', 'agent-sdk-socket', 'socket', 'runtime-socket'].includes(raw)) return 'agent-sdk-sidecar'
+  if (
+    [
+      'sdk',
+      'agent-sdk',
+      'agent-sdk-sidecar',
+      'sidecar',
+      'cloud-agent-sdk',
+      'agent-sdk-socket',
+      'socket',
+      'runtime-socket',
+    ].includes(raw)
+  )
+    return 'agent-sdk-sidecar'
   if (['agent-http', 'channels', 'channel', 'http-channel'].includes(raw)) return 'agent-http'
   if (['agentapi', 'agent-api'].includes(raw)) return 'agentapi'
   if (['claude-p', 'claudep', 'pty-transcript'].includes(raw)) return 'claude-p'

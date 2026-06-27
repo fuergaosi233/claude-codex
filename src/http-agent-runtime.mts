@@ -30,11 +30,16 @@ interface AgentMessage {
 export class HttpAgentRuntime implements ClaudeRuntime {
   private active = new Map<string, ActiveRun>()
   private turnQueues = new Map<string, Promise<void>>()
+  private readonly options: HttpAgentRuntimeOptions
 
-  constructor(private options: HttpAgentRuntimeOptions) {}
+  constructor(options: HttpAgentRuntimeOptions) {
+    this.options = options
+  }
 
   async runTurn(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void> {
-    await this.serializedRun(this.queueKeyForContext(context), () => this.runTurnLocked(context, handlers))
+    await this.serializedRun(this.queueKeyForContext(context), () =>
+      this.runTurnLocked(context, handlers),
+    )
   }
 
   private async serializedRun<T>(key: string, fn: () => Promise<T>): Promise<T> {
@@ -56,7 +61,10 @@ export class HttpAgentRuntime implements ClaudeRuntime {
     }
   }
 
-  private async runTurnLocked(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void> {
+  private async runTurnLocked(
+    context: RuntimeTurnContext,
+    handlers: RuntimeHandlers,
+  ): Promise<void> {
     const abort = new AbortController()
     this.active.set(context.threadId, { abort, baseUrl: this.options.baseUrl })
     const tracker = new MessageDeltaTracker(this.options.kind)
@@ -91,15 +99,17 @@ export class HttpAgentRuntime implements ClaudeRuntime {
 
       const useSse = this.options.useSse && this.options.kind !== 'agentapi'
       if (useSse) {
-        sseTask = this.listenEvents(baseUrl, tracker, handlers, abort.signal).catch(async (error) => {
-          if (!abort.signal.aborted) {
-            debugLog('http.sse.fallback', {
-              kind: this.options.kind,
-              baseUrl,
-              error: error instanceof Error ? error.message : String(error),
-            })
-          }
-        })
+        sseTask = this.listenEvents(baseUrl, tracker, handlers, abort.signal).catch(
+          async (error) => {
+            if (!abort.signal.aborted) {
+              debugLog('http.sse.fallback', {
+                kind: this.options.kind,
+                baseUrl,
+                error: error instanceof Error ? error.message : String(error),
+              })
+            }
+          },
+        )
       }
 
       try {
@@ -132,10 +142,18 @@ export class HttpAgentRuntime implements ClaudeRuntime {
       await handlers.onEvent({ type: 'completed', success: true, claudeSessionId: sessionId })
     } catch (error) {
       if (abort.signal.aborted) {
-        await handlers.onEvent({ type: 'completed', success: false, result: 'interrupted', claudeSessionId: sessionId })
+        await handlers.onEvent({
+          type: 'completed',
+          success: false,
+          result: 'interrupted',
+          claudeSessionId: sessionId,
+        })
         return
       }
-      await handlers.onEvent({ type: 'error', message: error instanceof Error ? error.message : String(error) })
+      await handlers.onEvent({
+        type: 'error',
+        message: error instanceof Error ? error.message : String(error),
+      })
       throw error
     } finally {
       abort.abort()
@@ -145,13 +163,19 @@ export class HttpAgentRuntime implements ClaudeRuntime {
   }
 
   async steer(_threadId: string, prompt: string): Promise<void> {
-    await this.postMessage(this.active.get(_threadId)?.baseUrl ?? this.options.baseUrl, prompt, 'user')
+    await this.postMessage(
+      this.active.get(_threadId)?.baseUrl ?? this.options.baseUrl,
+      prompt,
+      'user',
+    )
   }
 
   async interrupt(threadId: string): Promise<void> {
     const active = this.active.get(threadId)
     if (this.options.sendInterruptRaw) {
-      await this.postMessage(active?.baseUrl ?? this.options.baseUrl, '\u0003', 'raw').catch(() => {})
+      await this.postMessage(active?.baseUrl ?? this.options.baseUrl, '\u0003', 'raw').catch(
+        () => {},
+      )
     }
     active?.abort.abort()
   }
@@ -162,7 +186,8 @@ export class HttpAgentRuntime implements ClaudeRuntime {
   }
 
   private queueKeyForContext(context: RuntimeTurnContext): string {
-    if (!this.options.manageBridge || context.purpose === 'summary') return `${this.options.kind}\0${this.options.baseUrl}`
+    if (!this.options.manageBridge || context.purpose === 'summary')
+      return `${this.options.kind}\0${this.options.baseUrl}`
     return `${this.options.kind}\0${context.cwd}\0${context.model ?? ''}`
   }
 
@@ -201,16 +226,28 @@ export class HttpAgentRuntime implements ClaudeRuntime {
         stderr: err.stderr,
       })
       const detail = [err.message, err.stderr, err.stdout].filter(Boolean).join('\n')
-      throw new Error(`${this.options.kind} bridge could not be prepared for ${context.cwd}: ${detail}`)
+      throw new Error(
+        `${this.options.kind} bridge could not be prepared for ${context.cwd}: ${detail}`,
+      )
     }
   }
 
-  private async pollMessages(baseUrl: string, tracker: MessageDeltaTracker, handlers: RuntimeHandlers, signal: AbortSignal): Promise<void> {
+  private async pollMessages(
+    baseUrl: string,
+    tracker: MessageDeltaTracker,
+    handlers: RuntimeHandlers,
+    signal: AbortSignal,
+  ): Promise<void> {
     const payload = await this.fetchMessages(baseUrl, signal)
     await tracker.emitPayload(payload, handlers)
   }
 
-  private async postMessage(baseUrl: string, content: string, type: 'user' | 'raw', signal?: AbortSignal): Promise<void> {
+  private async postMessage(
+    baseUrl: string,
+    content: string,
+    type: 'user' | 'raw',
+    signal?: AbortSignal,
+  ): Promise<void> {
     const response = await fetch(this.url(baseUrl, '/message'), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -218,28 +255,42 @@ export class HttpAgentRuntime implements ClaudeRuntime {
       signal,
     })
     if (!response.ok) {
-      throw new Error(`${this.options.kind} POST /message failed ${response.status}: ${await response.text()}`)
+      throw new Error(
+        `${this.options.kind} POST /message failed ${response.status}: ${await response.text()}`,
+      )
     }
   }
 
   private async fetchMessages(baseUrl: string, signal?: AbortSignal): Promise<unknown> {
     const response = await fetch(this.url(baseUrl, '/messages'), { signal })
     if (!response.ok) {
-      throw new Error(`${this.options.kind} GET /messages failed ${response.status}: ${await response.text()}`)
+      throw new Error(
+        `${this.options.kind} GET /messages failed ${response.status}: ${await response.text()}`,
+      )
     }
     return response.json()
   }
 
-  private async fetchStatus(baseUrl: string, signal?: AbortSignal): Promise<'running' | 'stable' | null> {
+  private async fetchStatus(
+    baseUrl: string,
+    signal?: AbortSignal,
+  ): Promise<'running' | 'stable' | null> {
     const response = await fetch(this.url(baseUrl, '/status'), { signal })
     if (!response.ok) {
-      throw new Error(`${this.options.kind} GET /status failed ${response.status}: ${await response.text()}`)
+      throw new Error(
+        `${this.options.kind} GET /status failed ${response.status}: ${await response.text()}`,
+      )
     }
     const record = asRecord(await response.json())
     return record.status === 'running' || record.status === 'stable' ? record.status : null
   }
 
-  private async listenEvents(baseUrl: string, tracker: MessageDeltaTracker, handlers: RuntimeHandlers, signal: AbortSignal): Promise<void> {
+  private async listenEvents(
+    baseUrl: string,
+    tracker: MessageDeltaTracker,
+    handlers: RuntimeHandlers,
+    signal: AbortSignal,
+  ): Promise<void> {
     const response = await fetch(this.url(baseUrl, '/events'), {
       headers: { accept: 'text/event-stream' },
       signal,
@@ -296,8 +347,11 @@ function normalizeBaseUrl(value: string): string {
 
 class MessageDeltaTracker {
   private priorText = new Map<string, string>()
+  private readonly kind: 'agent-http' | 'agentapi'
 
-  constructor(private kind: 'agent-http' | 'agentapi') {}
+  constructor(kind: 'agent-http' | 'agentapi') {
+    this.kind = kind
+  }
 
   prime(payload: unknown): void {
     for (const message of normalizeMessages(payload)) {
@@ -343,8 +397,11 @@ class SseParser {
   private buffer = ''
   private eventName = 'message'
   private dataLines: string[] = []
+  private readonly onEvent: (eventName: string, data: string) => Promise<void>
 
-  constructor(private onEvent: (eventName: string, data: string) => Promise<void>) {}
+  constructor(onEvent: (eventName: string, data: string) => Promise<void>) {
+    this.onEvent = onEvent
+  }
 
   push(chunk: string): void {
     this.buffer += chunk
@@ -376,8 +433,14 @@ class SseParser {
 
 function normalizeMessages(payload: unknown): AgentMessage[] {
   const record = asRecord(payload)
-  const messages = Array.isArray(payload) ? payload : Array.isArray(record.messages) ? record.messages : []
-  return messages.map((message, index) => normalizeMessage(message, index)).filter((message): message is AgentMessage => message != null)
+  const messages = Array.isArray(payload)
+    ? payload
+    : Array.isArray(record.messages)
+      ? record.messages
+      : []
+  return messages
+    .map((message, index) => normalizeMessage(message, index))
+    .filter((message): message is AgentMessage => message != null)
 }
 
 function normalizeMessage(value: unknown, index: number): AgentMessage | null {
@@ -393,7 +456,12 @@ function normalizeMessage(value: unknown, index: number): AgentMessage | null {
           : ''
   if (!role && !content) return null
   const id = record.id == null ? null : String(record.id)
-  const time = typeof record.time === 'string' ? record.time : typeof record.timestamp === 'string' ? record.timestamp : null
+  const time =
+    typeof record.time === 'string'
+      ? record.time
+      : typeof record.timestamp === 'string'
+        ? record.timestamp
+        : null
   return { key: id ?? time ?? `${index}:${role}`, role, content }
 }
 
@@ -415,7 +483,11 @@ export function hasAgentapiTrustPrompt(payload: unknown): boolean {
 export function sanitizeAgentapiTerminalContent(content: string): string {
   const withoutAnsi = content.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
   if (/Claude Code v\d/i.test(withoutAnsi) && /Welcome back/i.test(withoutAnsi)) return ''
-  if (/[╭╰─│]/.test(withoutAnsi) && /Tips for getting started|What's new|Run \/init/i.test(withoutAnsi)) return ''
+  if (
+    /[╭╰─│]/.test(withoutAnsi) &&
+    /Tips for getting started|What's new|Run \/init/i.test(withoutAnsi)
+  )
+    return ''
 
   const kept: string[] = []
   let skipWrappedTip = false
@@ -437,19 +509,29 @@ export function sanitizeAgentapiTerminalContent(content: string): string {
     kept.push(line.replace(/^(\s*)●\s+/, '$1'))
   }
 
-  return kept.join('\n').replace(/\n{3,}/g, '\n\n').trim()
+  return kept
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
 }
 
 function isAgentapiStatusLine(trimmed: string): boolean {
   const hasStatusMarker = /^[✻✢✶✳✽✼✺✹✸*•·+\-.]\s*/.test(trimmed)
   const text = trimmed.replace(/^[✻✢✶✳✽✼✺✹✸*•·+\-.]\s*/, '')
-  if (hasStatusMarker && /(\.\.\.|…|for \d+s\b|[↑↓]\s*\d+\s+tokens|thinking\b)/i.test(text)) return true
-  if (/^(Fluttering|Baked|Brewed|Cooked|Crunched|Churned|Sauteed|Sautéed|Worked|Working|Thinking|Pondering|Musing|Deciphering|Processing|Sublimating|Caramelizing|Slithering|Crunching|Churning|Running|Reading|Searching|Exploring|Editing|Waiting)\b/i.test(text)) {
+  if (hasStatusMarker && /(\.\.\.|…|for \d+s\b|[↑↓]\s*\d+\s+tokens|thinking\b)/i.test(text))
+    return true
+  if (
+    /^(Fluttering|Baked|Brewed|Cooked|Crunched|Churned|Sauteed|Sautéed|Worked|Working|Thinking|Pondering|Musing|Deciphering|Processing|Sublimating|Caramelizing|Slithering|Crunching|Churning|Running|Reading|Searching|Exploring|Editing|Waiting)\b/i.test(
+      text,
+    )
+  ) {
     return /(\.\.\.|…|for \d+s\b)/i.test(text)
   }
   return false
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
-  return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {}
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {}
 }

@@ -1,6 +1,14 @@
 #!/usr/bin/env node
 import { spawn, spawnSync } from 'node:child_process'
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -16,7 +24,8 @@ async function runOverSsh(args) {
   const host = args[0] || process.env.CLAUDE_CODEX_MATRIX_SSH_HOST
   if (!host) throw new Error('usage: acceptance-ssh-runtime-matrix.mjs <ssh-host> <cwd-a> <cwd-b>')
   const cwds = args.slice(1)
-  if (cwds.length < 2) throw new Error('usage: acceptance-ssh-runtime-matrix.mjs <ssh-host> <cwd-a> <cwd-b>')
+  if (cwds.length < 2)
+    throw new Error('usage: acceptance-ssh-runtime-matrix.mjs <ssh-host> <cwd-a> <cwd-b>')
   const self = fileURLToPath(import.meta.url)
   const remoteScript = `/tmp/claude-codex-runtime-matrix-${Date.now()}-${process.pid}.mjs`
 
@@ -27,8 +36,12 @@ async function runOverSsh(args) {
       `MODE_MATRIX_MODEL=${shQuote(MODEL)}`,
       `TURN_TIMEOUT_MS=${shQuote(String(TURN_TIMEOUT_MS))}`,
       `MODE_MATRIX_RESTORE_ENV=${shQuote(RESTORE_ENV ? '1' : '0')}`,
-      process.env.MODE_MATRIX_MODES ? `MODE_MATRIX_MODES=${shQuote(process.env.MODE_MATRIX_MODES)}` : '',
-    ].filter(Boolean).join(' ')
+      process.env.MODE_MATRIX_MODES
+        ? `MODE_MATRIX_MODES=${shQuote(process.env.MODE_MATRIX_MODES)}`
+        : '',
+    ]
+      .filter(Boolean)
+      .join(' ')
     const command = [
       'set -e',
       '. "$HOME/.claude-codex/runtime.env"',
@@ -38,17 +51,24 @@ async function runOverSsh(args) {
     const proc = spawn('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=12', host, command], {
       stdio: 'inherit',
     })
-    const code = await new Promise((resolve) => proc.on('exit', (exitCode) => resolve(exitCode ?? 1)))
+    const code = await new Promise((resolve) =>
+      proc.on('exit', (exitCode) => resolve(exitCode ?? 1)),
+    )
     if (code !== 0) process.exit(code)
   } finally {
-    spawnSync('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=12', host, `rm -f ${shQuote(remoteScript)}`], {
-      stdio: 'ignore',
-    })
+    spawnSync(
+      'ssh',
+      ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=12', host, `rm -f ${shQuote(remoteScript)}`],
+      {
+        stdio: 'ignore',
+      },
+    )
   }
 }
 
 async function runMatrix(cwds) {
-  if (cwds.length < 2) throw new Error('usage: acceptance-ssh-runtime-matrix.mjs --runner <cwd-a> <cwd-b>')
+  if (cwds.length < 2)
+    throw new Error('usage: acceptance-ssh-runtime-matrix.mjs --runner <cwd-a> <cwd-b>')
   const selectedCwds = cwds.slice(0, 2)
   for (const cwd of selectedCwds) {
     if (!existsSync(cwd)) throw new Error(`cwd not found: ${cwd}`)
@@ -57,7 +77,9 @@ async function runMatrix(cwds) {
   const modes = modesFromEnv('MODE_MATRIX_MODES', DEFAULT_MODES)
   const fromModes = modesFromEnv('MODE_MATRIX_FROM_MODES', modes)
   const toModes = modesFromEnv('MODE_MATRIX_TO_MODES', modes)
-  const envFile = process.env.CLAUDE_CODEX_RUNTIME_ENV || join(process.env.HOME || '', '.claude-codex/runtime.env')
+  const envFile =
+    process.env.CLAUDE_CODEX_RUNTIME_ENV ||
+    join(process.env.HOME || '', '.claude-codex/runtime.env')
   const originalEnv = existsSync(envFile) ? readFileSync(envFile, 'utf8') : null
   const helper = process.env.CLAUDE_CODEX_MODE_COMMAND || 'claude-codex-mode'
   const codexReal = requireEnv('CODEX_REAL')
@@ -71,19 +93,21 @@ async function runMatrix(cwds) {
     writeToken(selectedCwds[i], `MODE_MATRIX_BOOT_${runId}_${i}_${basename(selectedCwds[i])}`)
   }
 
-  console.log(JSON.stringify({
-    event: 'matrix-start',
-    host: process.env.HOSTNAME || null,
-    modes,
-    fromModes,
-    toModes,
-    cwds: selectedCwds,
-    model: MODEL,
-    turnTimeoutMs: TURN_TIMEOUT_MS,
-    envFile,
-    helper,
-    adapter,
-  }))
+  console.log(
+    JSON.stringify({
+      event: 'matrix-start',
+      host: process.env.HOSTNAME || null,
+      modes,
+      fromModes,
+      toModes,
+      cwds: selectedCwds,
+      model: MODEL,
+      turnTimeoutMs: TURN_TIMEOUT_MS,
+      envFile,
+      helper,
+      adapter,
+    }),
+  )
 
   try {
     let transitionIndex = 0
@@ -118,9 +142,10 @@ async function runMatrix(cwds) {
           const started = Date.now()
           try {
             await ensureBridgeIfNeeded(helper, to, cwd)
-            const text = to === 'codex'
-              ? runCodex(codexReal, cwd, expected, scratch)
-              : await runAdapter({ nodeBin, adapter, cwd, expected, mode: to })
+            const text =
+              to === 'codex'
+                ? runCodex(codexReal, cwd, expected, scratch)
+                : await runAdapter({ nodeBin, adapter, cwd, expected, mode: to })
             rec.text = text.trim()
             rec.ok = rec.text.includes(expected)
             if (!rec.ok) rec.error = 'expected token not found in model response'
@@ -150,31 +175,37 @@ async function runMatrix(cwds) {
   }
 
   const failed = results.filter((entry) => !entry.ok)
-  console.log(JSON.stringify({
-    event: 'matrix-summary',
-    total: results.length,
-    passed: results.length - failed.length,
-    failed: failed.length,
-    failures: failed.map(({ transition, cwd, error, text }) => ({
-      transition,
-      cwd,
-      error,
-      text: text.slice(0, 240),
-    })),
-  }))
+  console.log(
+    JSON.stringify({
+      event: 'matrix-summary',
+      total: results.length,
+      passed: results.length - failed.length,
+      failed: failed.length,
+      failures: failed.map(({ transition, cwd, error, text }) => ({
+        transition,
+        cwd,
+        error,
+        text: text.slice(0, 240),
+      })),
+    }),
+  )
   process.exit(failed.length > 0 ? 1 : 0)
 }
 
 function modesFromEnv(key, fallback) {
   const raw = process.env[key]
   if (!raw) return fallback
-  const modes = raw.split(',').map((mode) => mode.trim()).filter(Boolean)
+  const modes = raw
+    .split(',')
+    .map((mode) => mode.trim())
+    .filter(Boolean)
   return modes.length > 0 ? modes : fallback
 }
 
 function requireEnv(key) {
   const value = process.env[key]
-  if (!value) throw new Error(`missing ${key}; source ~/.claude-codex/runtime.env before running the matrix`)
+  if (!value)
+    throw new Error(`missing ${key}; source ~/.claude-codex/runtime.env before running the matrix`)
   return value
 }
 
@@ -198,7 +229,13 @@ function runHelper(helper, args, timeout, allowFail = false) {
     maxBuffer: 1024 * 1024,
   })
   if (!allowFail && result.status !== 0) {
-    throw new Error((result.stderr || result.stdout || `${helper} ${args.join(' ')} exited ${result.status}`).trim())
+    throw new Error(
+      (
+        result.stderr ||
+        result.stdout ||
+        `${helper} ${args.join(' ')} exited ${result.status}`
+      ).trim(),
+    )
   }
   return result
 }
@@ -215,7 +252,17 @@ function runCodex(codexReal, cwd, expected, scratch) {
   const out = join(scratch, `codex-${Date.now()}-${Math.random().toString(16).slice(2)}.txt`)
   const result = spawnSync(
     codexReal,
-    ['exec', '--cd', cwd, '--skip-git-repo-check', '--sandbox', 'read-only', '--output-last-message', out, prompt(expected)],
+    [
+      'exec',
+      '--cd',
+      cwd,
+      '--skip-git-repo-check',
+      '--sandbox',
+      'read-only',
+      '--output-last-message',
+      out,
+      prompt(expected),
+    ],
     {
       encoding: 'utf8',
       timeout: TURN_TIMEOUT_MS,
@@ -230,10 +277,15 @@ function runCodex(codexReal, cwd, expected, scratch) {
 }
 
 async function runAdapter({ nodeBin, adapter, cwd, expected, mode }) {
-  const envFile = process.env.CLAUDE_CODEX_RUNTIME_ENV || join(process.env.HOME || '', '.claude-codex/runtime.env')
+  const envFile =
+    process.env.CLAUDE_CODEX_RUNTIME_ENV ||
+    join(process.env.HOME || '', '.claude-codex/runtime.env')
   const proc = spawn(
     'bash',
-    ['-lc', `set -a; . ${shQuote(envFile)}; set +a; exec ${shQuote(nodeBin)} ${shQuote(adapter)} app-server --listen stdio://`],
+    [
+      '-lc',
+      `set -a; . ${shQuote(envFile)}; set +a; exec ${shQuote(nodeBin)} ${shQuote(adapter)} app-server --listen stdio://`,
+    ],
     {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: adapterEnv(),
@@ -255,7 +307,10 @@ async function runAdapter({ nodeBin, adapter, cwd, expected, mode }) {
     send(proc, {
       id: 1,
       method: 'initialize',
-      params: { clientInfo: { name: 'runtime-mode-matrix', title: 'Runtime Mode Matrix', version: '1' }, capabilities: null },
+      params: {
+        clientInfo: { name: 'runtime-mode-matrix', title: 'Runtime Mode Matrix', version: '1' },
+        capabilities: null,
+      },
     })
     await reader.response(1)
     send(proc, {
@@ -294,13 +349,17 @@ async function runAdapter({ nodeBin, adapter, cwd, expected, mode }) {
       if (message.method === 'item/completed' && message.params?.item?.type === 'agentMessage') {
         text = message.params.item.text || text
       }
-      if (message.method === 'item/commandExecution/requestApproval' || message.method === 'item/fileChange/requestApproval') {
+      if (
+        message.method === 'item/commandExecution/requestApproval' ||
+        message.method === 'item/fileChange/requestApproval'
+      ) {
         send(proc, { id: message.id, result: { decision: 'accept' } })
       }
       if (message.method === 'error') throw new Error(JSON.stringify(message.params))
       if (message.method === 'turn/completed') {
         const status = message.params?.turn?.status
-        if (status && status !== 'completed') throw new Error(`turn completed with status ${status}`)
+        if (status && status !== 'completed')
+          throw new Error(`turn completed with status ${status}`)
         return text
       }
     }
@@ -335,7 +394,9 @@ class RpcReader {
     this.error = null
     proc.stdout.setEncoding('utf8')
     proc.stdout.on('data', (chunk) => this.push(chunk))
-    proc.on('exit', (code, signal) => this.fail(new Error(`app-server exited code=${code} signal=${signal}`)))
+    proc.on('exit', (code, signal) =>
+      this.fail(new Error(`app-server exited code=${code} signal=${signal}`)),
+    )
     proc.on('error', (error) => this.fail(error))
   }
 

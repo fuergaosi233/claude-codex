@@ -8,7 +8,10 @@ export class MockRuntime implements ClaudeRuntime {
 
   async runTurn(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void> {
     this.interrupted.delete(context.threadId)
-    await handlers.onEvent({ type: 'session', claudeSessionId: context.claudeSessionId ?? `mock-${context.threadId}` })
+    await handlers.onEvent({
+      type: 'session',
+      claudeSessionId: context.claudeSessionId ?? `mock-${context.threadId}`,
+    })
 
     if (/approval|permission|bash/i.test(context.prompt)) {
       const toolUseId = `tool-${Date.now()}`
@@ -35,31 +38,45 @@ export class MockRuntime implements ClaudeRuntime {
         await handlers.onEvent({ type: 'tool_output_delta', toolUseId, delta: 'mock approval\n' })
         await handlers.onEvent({ type: 'tool_result', toolUseId, content: 'mock approval\n' })
       } else {
-        await handlers.onEvent({ type: 'tool_result', toolUseId, content: 'declined', isError: true })
+        await handlers.onEvent({
+          type: 'tool_result',
+          toolUseId,
+          content: 'declined',
+          isError: true,
+        })
       }
     }
 
-    if (/edit|write file|file change/i.test(context.prompt)) {
+    if (/edit|write file|file change|create or overwrite|file named/i.test(context.prompt)) {
+      const fileChange = fileChangeFromPrompt(context)
       const toolUseId = `tool-${Date.now()}`
-      const filePath = join(context.cwd, 'README.md')
       await handlers.onEvent({
         type: 'tool_use',
         toolUseId,
         toolName: 'Write',
-        input: { file_path: filePath, content: 'changed by mock runtime\n' },
+        input: { file_path: fileChange.path, content: fileChange.content },
       })
       const decision = await handlers.onPermissionRequest({
         type: 'permission_request',
         requestId: `perm-${toolUseId}`,
         toolUseId,
         toolName: 'Write',
-        input: { file_path: filePath, content: 'changed by mock runtime\n' },
+        input: { file_path: fileChange.path, content: fileChange.content },
       })
       if (decision.decision === 'accept' || decision.decision === 'acceptForSession') {
-        await writeFile(filePath, 'changed by mock runtime\n')
-        await handlers.onEvent({ type: 'tool_result', toolUseId, content: 'wrote README.md' })
+        await writeFile(fileChange.path, fileChange.content)
+        await handlers.onEvent({
+          type: 'tool_result',
+          toolUseId,
+          content: `wrote ${fileChange.name}`,
+        })
       } else {
-        await handlers.onEvent({ type: 'tool_result', toolUseId, content: 'declined', isError: true })
+        await handlers.onEvent({
+          type: 'tool_result',
+          toolUseId,
+          content: 'declined',
+          isError: true,
+        })
       }
     }
 
@@ -71,7 +88,11 @@ export class MockRuntime implements ClaudeRuntime {
         toolName: 'Read',
         input: { file_path: join(context.cwd, 'README.md') },
       })
-      await handlers.onEvent({ type: 'tool_result', toolUseId, content: { text: 'mock read result' } })
+      await handlers.onEvent({
+        type: 'tool_result',
+        toolUseId,
+        content: { text: 'mock read result' },
+      })
     }
 
     if (/model effort check/i.test(context.prompt)) {
@@ -110,7 +131,11 @@ export class MockRuntime implements ClaudeRuntime {
     }
 
     if (/notice event/i.test(context.prompt)) {
-      await handlers.onEvent({ type: 'notice', level: 'warning', message: 'mock rate limit notice' })
+      await handlers.onEvent({
+        type: 'notice',
+        level: 'warning',
+        message: 'mock rate limit notice',
+      })
       await handlers.onEvent({ type: 'completed', success: true, result: 'notice event' })
       return
     }
@@ -156,13 +181,18 @@ export class MockRuntime implements ClaudeRuntime {
     if (/summarizing a Codex \/ Claude Code conversation/i.test(context.prompt)) {
       // Compaction turn — produce a fixed marker so tests can prove the
       // summary came from the runtime rather than the local fallback text.
-      await handlers.onEvent({ type: 'text_delta', delta: 'MOCK_COMPACT_SUMMARY: thread compacted by Claude.' })
+      await handlers.onEvent({
+        type: 'text_delta',
+        delta: 'MOCK_COMPACT_SUMMARY: thread compacted by Claude.',
+      })
       await handlers.onEvent({ type: 'completed', success: true, result: 'compact' })
       return
     }
 
     if (/image input check/i.test(context.prompt)) {
-      const summary = context.imageInputs.map((img) => `${img.kind}:${img.mediaType}:${img.data.length}`).join(',')
+      const summary = context.imageInputs
+        .map((img) => `${img.kind}:${img.mediaType}:${img.data.length}`)
+        .join(',')
       await handlers.onEvent({
         type: 'text_delta',
         delta: `images=${summary || 'none'}`,
@@ -206,10 +236,27 @@ export class MockRuntime implements ClaudeRuntime {
       // Task closes it and is forwarded as the visible Agent item completion.
       const taskId = `task-${Date.now()}`
       const innerToolId = `inner-${Date.now()}`
-      await handlers.onEvent({ type: 'tool_use', toolUseId: taskId, toolName: 'Task', input: { description: 'mock subagent', prompt: 'investigate' } })
-      await handlers.onEvent({ type: 'text_delta', delta: 'subagent thinking aloud (should be hidden)' })
-      await handlers.onEvent({ type: 'tool_use', toolUseId: innerToolId, toolName: 'Bash', input: { command: 'echo inner', description: 'leaked inner call' } })
-      await handlers.onEvent({ type: 'tool_result', toolUseId: innerToolId, content: 'inner result' })
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId: taskId,
+        toolName: 'Task',
+        input: { description: 'mock subagent', prompt: 'investigate' },
+      })
+      await handlers.onEvent({
+        type: 'text_delta',
+        delta: 'subagent thinking aloud (should be hidden)',
+      })
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId: innerToolId,
+        toolName: 'Bash',
+        input: { command: 'echo inner', description: 'leaked inner call' },
+      })
+      await handlers.onEvent({
+        type: 'tool_result',
+        toolUseId: innerToolId,
+        content: 'inner result',
+      })
       // Mirror the real claude-agent-sdk Task tool result format: actual body
       // followed by an `agentId: ...` line and a `<usage>` block. The server
       // should strip both from the visible agentMessage and route the values
@@ -220,7 +267,11 @@ export class MockRuntime implements ClaudeRuntime {
         'tool_uses: 7',
         'duration_ms: 31415</usage>',
       ].join('\n')
-      await handlers.onEvent({ type: 'tool_result', toolUseId: taskId, content: `subagent final summary\n${trailer}` })
+      await handlers.onEvent({
+        type: 'tool_result',
+        toolUseId: taskId,
+        content: `subagent final summary\n${trailer}`,
+      })
       await handlers.onEvent({ type: 'text_delta', delta: 'main agent summary' })
       await handlers.onEvent({ type: 'completed', success: true, result: 'subagent check' })
       return
@@ -235,7 +286,11 @@ export class MockRuntime implements ClaudeRuntime {
       const handler = handlers.onUserInputRequest
       if (typeof handler !== 'function') {
         await handlers.onEvent({ type: 'text_delta', delta: 'no onUserInputRequest handler' })
-        await handlers.onEvent({ type: 'completed', success: true, result: 'ask user question check' })
+        await handlers.onEvent({
+          type: 'completed',
+          success: true,
+          result: 'ask user question check',
+        })
         return
       }
       const answers = await handler({
@@ -258,14 +313,23 @@ export class MockRuntime implements ClaudeRuntime {
       })
       const picked = answers.answers.q0?.answers.join(',') ?? ''
       await handlers.onEvent({ type: 'text_delta', delta: `picked=${picked}` })
-      await handlers.onEvent({ type: 'completed', success: true, result: 'ask user question check' })
+      await handlers.onEvent({
+        type: 'completed',
+        success: true,
+        result: 'ask user question check',
+      })
       return
     }
 
     if (/usage check/i.test(context.prompt)) {
       await handlers.onEvent({
         type: 'usage',
-        usage: { input_tokens: 100, output_tokens: 40, cache_read_input_tokens: 10, cache_creation_input_tokens: 5 },
+        usage: {
+          input_tokens: 100,
+          output_tokens: 40,
+          cache_read_input_tokens: 10,
+          cache_creation_input_tokens: 5,
+        },
       })
       await handlers.onEvent({
         type: 'metrics',
@@ -298,4 +362,17 @@ export class MockRuntime implements ClaudeRuntime {
   async steer(_threadId: string, _prompt: string): Promise<void> {}
 
   async stop(): Promise<void> {}
+}
+
+function fileChangeFromPrompt(context: RuntimeTurnContext): {
+  name: string
+  path: string
+  content: string
+} {
+  const name = context.prompt.match(/\bfile named ([A-Za-z0-9._-]+)\b/i)?.[1] ?? 'README.md'
+  const content =
+    context.prompt.match(
+      /with exactly this content(?: and no extra whitespace)?:\s*([^\n]+)/i,
+    )?.[1] ?? 'changed by mock runtime\n'
+  return { name, path: join(context.cwd, name), content }
 }

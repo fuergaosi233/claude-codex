@@ -43,12 +43,21 @@ export function ensureParent(path: string): void {
 }
 
 export function debugLog(event: string, data: Record<string, unknown> = {}): void {
-  if (process.env.CLAUDE_CODEX_DEBUG_LOG === '0' || process.env.CLAUDE_CODEX_DEBUG_LOG === 'false') return
+  if (process.env.CLAUDE_CODEX_DEBUG_LOG === '0' || process.env.CLAUDE_CODEX_DEBUG_LOG === 'false')
+    return
   const path = resolve(process.env.CLAUDE_CODEX_DEBUG_LOG || join(adapterHome(), 'debug.jsonl'))
   try {
     ensureParent(path)
     rotateLogIfNeeded(path)
-    appendFileSync(path, JSON.stringify({ ts: new Date().toISOString(), pid: process.pid, event, ...(redact(data) as Record<string, unknown>) }) + '\n')
+    appendFileSync(
+      path,
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        pid: process.pid,
+        event,
+        ...(redact(data) as Record<string, unknown>),
+      }) + '\n',
+    )
   } catch {}
 }
 
@@ -70,13 +79,19 @@ export function rotateLogIfNeeded(path: string): void {
   if (size < maxBytes) return
   // Drop the oldest slot if it would push us past `keep`.
   const oldest = `${path}.${keep}`
-  try { unlinkSync(oldest) } catch {}
+  try {
+    unlinkSync(oldest)
+  } catch {}
   // Shift `.k-1` → `.k`, `.k-2` → `.k-1`, …, `.1` → `.2`.
   for (let i = keep - 1; i >= 1; i -= 1) {
-    try { renameSync(`${path}.${i}`, `${path}.${i + 1}`) } catch {}
+    try {
+      renameSync(`${path}.${i}`, `${path}.${i + 1}`)
+    } catch {}
   }
   // Move the active log to `.1`. The next appendFileSync recreates it.
-  try { renameSync(path, `${path}.1`) } catch {}
+  try {
+    renameSync(path, `${path}.1`)
+  } catch {}
 }
 
 function numericEnv(name: string, fallback: number): number {
@@ -102,7 +117,9 @@ export function platformOs(): string {
 }
 
 export function codexCompatVersion(): string {
-  return process.env.CLAUDE_CODEX_COMPAT_VERSION || process.env.CODEX_SHIM_COMPAT_VERSION || '0.130.0'
+  return (
+    process.env.CLAUDE_CODEX_COMPAT_VERSION || process.env.CODEX_SHIM_COMPAT_VERSION || '0.130.0'
+  )
 }
 
 export function codexCliVersion(): string {
@@ -112,7 +129,8 @@ export function codexCliVersion(): string {
 export function codexUserAgent(clientName: string, clientVersion: string): string {
   const name = clientName.trim() || 'codex-app'
   const version = clientVersion.trim() || 'unknown'
-  const cpu = process.arch === 'x64' ? 'x86_64' : process.arch === 'arm64' ? 'aarch64' : process.arch
+  const cpu =
+    process.arch === 'x64' ? 'x86_64' : process.arch === 'arm64' ? 'aarch64' : process.arch
   return `${name}/${codexCompatVersion()} (${platformOs()}; ${cpu}) unknown (${name}; ${version})`
 }
 
@@ -172,7 +190,12 @@ function readLocalImage(path: string): ImageInput | null {
     const stat = statSync(path)
     if (stat.size > 10 * 1024 * 1024) return null
     const buf = readFileSync(path)
-    return { kind: 'base64', mediaType: sniffImageMediaType(path), data: buf.toString('base64'), displayPath: path }
+    return {
+      kind: 'base64',
+      mediaType: sniffImageMediaType(path),
+      data: buf.toString('base64'),
+      displayPath: path,
+    }
   } catch {
     return null
   }
@@ -188,7 +211,9 @@ function parseImageUrl(url: string): ImageInput | null {
     return {
       kind: 'base64',
       mediaType,
-      data: isBase64 ? payload : Buffer.from(decodeURIComponent(payload), 'utf8').toString('base64'),
+      data: isBase64
+        ? payload
+        : Buffer.from(decodeURIComponent(payload), 'utf8').toString('base64'),
       displayPath: url.slice(0, 64) + (url.length > 64 ? '...' : ''),
     }
   }
@@ -226,7 +251,13 @@ export function modelDisplayName(model: string): string {
   return model
 }
 
-export function claudeModelOptions(): Array<{ id: string; sdkModel: string | null; displayName: string; description: string; isDefault?: boolean }> {
+export function claudeModelOptions(): Array<{
+  id: string
+  sdkModel: string | null
+  displayName: string
+  description: string
+  isDefault?: boolean
+}> {
   const configured = process.env.CLAUDE_CODEX_MODELS
   if (configured) {
     try {
@@ -239,9 +270,14 @@ export function claudeModelOptions(): Array<{ id: string; sdkModel: string | nul
             const id = typeof record.id === 'string' ? record.id : String(record.model ?? 'sonnet')
             return {
               id,
-              sdkModel: typeof record.sdkModel === 'string' ? record.sdkModel : resolveClaudeModel(id),
-              displayName: typeof record.displayName === 'string' ? record.displayName : modelDisplayName(id),
-              description: typeof record.description === 'string' ? record.description : 'Claude Code runtime model',
+              sdkModel:
+                typeof record.sdkModel === 'string' ? record.sdkModel : resolveClaudeModel(id),
+              displayName:
+                typeof record.displayName === 'string' ? record.displayName : modelDisplayName(id),
+              description:
+                typeof record.description === 'string'
+                  ? record.description
+                  : 'Claude Code runtime model',
               isDefault: record.isDefault === true,
             }
           }
@@ -249,7 +285,10 @@ export function claudeModelOptions(): Array<{ id: string; sdkModel: string | nul
         })
       }
     } catch {}
-    return configured.split(',').map((part) => modelOption(part.trim())).filter((entry) => entry.id.length > 0)
+    return configured
+      .split(',')
+      .map((part) => modelOption(part.trim()))
+      .filter((entry) => entry.id.length > 0)
   }
   return [
     modelOption('sonnet', true, 'Claude Code latest Sonnet alias'),
@@ -263,14 +302,20 @@ export function claudeModelOptions(): Array<{ id: string; sdkModel: string | nul
   ]
 }
 
-export function resolveClaudeModel(model: string | null | undefined, purpose: 'normal' | 'summary' = 'normal'): string | null {
+export function resolveClaudeModel(
+  model: string | null | undefined,
+  purpose: 'normal' | 'summary' = 'normal',
+): string | null {
   const raw = (model ?? '').trim()
   if (purpose === 'summary') {
-    const summaryModel = process.env.CLAUDE_CODEX_SUMMARY_MODEL || process.env.CLAUDE_CODEX_TITLE_MODEL || 'haiku'
+    const summaryModel =
+      process.env.CLAUDE_CODEX_SUMMARY_MODEL || process.env.CLAUDE_CODEX_TITLE_MODEL || 'haiku'
     if (isCodexOpenAiModel(raw) || !raw) return summaryModel
   }
-  if (!raw || raw === 'default' || raw === 'claude-default') return process.env.CLAUDE_CODEX_DEFAULT_MODEL || null
-  if (raw === 'claude-code' || raw === 'custom') return process.env.CLAUDE_CODEX_DEFAULT_MODEL || null
+  if (!raw || raw === 'default' || raw === 'claude-default')
+    return process.env.CLAUDE_CODEX_DEFAULT_MODEL || null
+  if (raw === 'claude-code' || raw === 'custom')
+    return process.env.CLAUDE_CODEX_DEFAULT_MODEL || null
   const aliases: Record<string, string> = {
     'claude-sonnet': 'sonnet',
     'claude-opus': 'opus',
@@ -292,7 +337,10 @@ export function defaultAllowedTools(): string[] | null {
   if (raw == null || raw.trim() === '') return null
   const value = raw.trim()
   if (value === '*' || value.toLowerCase() === 'default') return null
-  return value.split(',').map((part) => part.trim()).filter(Boolean)
+  return value
+    .split(',')
+    .map((part) => part.trim())
+    .filter(Boolean)
 }
 
 export function claudeOutputFormat(outputSchema: unknown): unknown | null {
@@ -304,30 +352,59 @@ export function claudeOutputFormat(outputSchema: unknown): unknown | null {
   return { type: 'json_schema', schema: outputSchema }
 }
 
-export function normalizeCodexReasoningEffort(value: string | null | undefined): 'low' | 'medium' | 'high' | 'xhigh' | null {
+export function normalizeCodexReasoningEffort(
+  value: string | null | undefined,
+): 'low' | 'medium' | 'high' | 'xhigh' | null {
   if (value === 'low' || value === 'medium' || value === 'high' || value === 'xhigh') return value
   if (value === 'minimal') return 'low'
   return null
 }
 
-export function resolveClaudeEffort(value: string | null | undefined): 'low' | 'medium' | 'high' | 'xhigh' | 'max' | null {
+export function resolveClaudeEffort(
+  value: string | null | undefined,
+): 'low' | 'medium' | 'high' | 'xhigh' | 'max' | null {
   const raw = (value ?? '').trim()
   const envAliases = parseJsonObject(process.env.CLAUDE_CODEX_EFFORT_ALIASES)
   const mapped = typeof envAliases[raw] === 'string' ? envAliases[raw] : raw
-  if (mapped === 'low' || mapped === 'medium' || mapped === 'high' || mapped === 'xhigh' || mapped === 'max') return mapped
+  if (
+    mapped === 'low' ||
+    mapped === 'medium' ||
+    mapped === 'high' ||
+    mapped === 'xhigh' ||
+    mapped === 'max'
+  )
+    return mapped
   if (mapped === 'minimal') return 'low'
   return null
 }
 
-function modelOption(id: string, isDefault = false, description = 'Claude Code runtime model'): { id: string; sdkModel: string | null; displayName: string; description: string; isDefault?: boolean } {
-  return { id, sdkModel: resolveClaudeModel(id), displayName: modelDisplayName(id), description, isDefault }
+function modelOption(
+  id: string,
+  isDefault = false,
+  description = 'Claude Code runtime model',
+): {
+  id: string
+  sdkModel: string | null
+  displayName: string
+  description: string
+  isDefault?: boolean
+} {
+  return {
+    id,
+    sdkModel: resolveClaudeModel(id),
+    displayName: modelDisplayName(id),
+    description,
+    isDefault,
+  }
 }
 
 function parseJsonObject(raw: string | undefined): Record<string, unknown> {
   if (!raw) return {}
   try {
     const parsed = JSON.parse(raw)
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {}
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {}
   } catch {
     return {}
   }
@@ -354,7 +431,13 @@ export function isCodexOpenAiModel(model: string): boolean {
 // We only expose them when `resolveCodexBinary()` returns a real path; that
 // way Mac/Linux installs without `codex` see only Claude models and the
 // picker stays clean.
-export function codexProxyModelOptions(): Array<{ id: string; sdkModel: string | null; displayName: string; description: string; isDefault?: boolean }> {
+export function codexProxyModelOptions(): Array<{
+  id: string
+  sdkModel: string | null
+  displayName: string
+  description: string
+  isDefault?: boolean
+}> {
   // Suppressed in mock / opt-out flows. Mock runtime tests assume a clean
   // Claude-only model list; environments without a real Codex shouldn't see
   // unusable picker entries.
@@ -362,9 +445,13 @@ export function codexProxyModelOptions(): Array<{ id: string; sdkModel: string |
   if (process.env.CLAUDE_CODEX_DISABLE_CODEX_PROXY === '1') return []
   if (!resolveCodexBinary()) return []
   const env = process.env.CLAUDE_CODEX_CODEX_MODELS
-  const ids = env && env.trim()
-    ? env.split(',').map((s) => s.trim()).filter(Boolean)
-    : ['gpt-5.5', 'gpt-5.5-mini', 'gpt-5.5-codex', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5-codex']
+  const ids =
+    env && env.trim()
+      ? env
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean)
+      : ['gpt-5.5', 'gpt-5.5-mini', 'gpt-5.5-codex', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5-codex']
   return ids.map((id) => ({
     id,
     sdkModel: id,
@@ -405,7 +492,8 @@ export function sleep(ms: number): Promise<void> {
 
 function redact(value: unknown, depth = 0): unknown {
   if (depth > 5) return '[truncated]'
-  if (typeof value === 'string') return value.length > 1200 ? value.slice(0, 1200) + '...[truncated]' : value
+  if (typeof value === 'string')
+    return value.length > 1200 ? value.slice(0, 1200) + '...[truncated]' : value
   if (value == null || typeof value !== 'object') return value
   if (Array.isArray(value)) return value.slice(0, 40).map((entry) => redact(entry, depth + 1))
   const result: Record<string, unknown> = {}

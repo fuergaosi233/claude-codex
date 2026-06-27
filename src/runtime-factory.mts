@@ -4,7 +4,11 @@ import { NativeClaudeRuntime } from './native-runtime.mjs'
 import { HttpAgentRuntime } from './http-agent-runtime.mjs'
 import { ClaudePTranscriptRuntime } from './claude-p-runtime.mjs'
 import { CodexProxyRuntime } from './codex-proxy-runtime.mjs'
-import { resolveRuntimeConfig, type RuntimeBackendType, type RuntimeConfig } from './runtime-config.mjs'
+import {
+  resolveRuntimeConfig,
+  type RuntimeBackendType,
+  type RuntimeConfig,
+} from './runtime-config.mjs'
 import { debugLog } from './util.mjs'
 
 export function createRuntime(): ClaudeRuntime {
@@ -20,8 +24,11 @@ export function createRuntime(): ClaudeRuntime {
 class SelectableRuntime implements ClaudeRuntime {
   private runtimes = new Map<RuntimeBackendType, ClaudeRuntime>()
   private activeRuntimeByThread = new Map<string, ClaudeRuntime>()
+  private readonly config: RuntimeConfig
 
-  constructor(private config: RuntimeConfig) {}
+  constructor(config: RuntimeConfig) {
+    this.config = config
+  }
 
   async runTurn(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void> {
     const requestedType = context.runtimeType ?? this.config.type
@@ -91,32 +98,52 @@ function shouldHandleLocally(type: RuntimeBackendType, context: RuntimeTurnConte
   return context.purpose === 'summary' && (type === 'agent-http' || type === 'agentapi')
 }
 
-async function runLocalStructuredSummaryTurn(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void> {
-  const text = JSON.stringify(coerceStructuredValue(schemaFromOutputFormat(context.outputFormat), context.prompt), null, 0)
+async function runLocalStructuredSummaryTurn(
+  context: RuntimeTurnContext,
+  handlers: RuntimeHandlers,
+): Promise<void> {
+  const text = JSON.stringify(
+    coerceStructuredValue(schemaFromOutputFormat(context.outputFormat), context.prompt),
+    null,
+    0,
+  )
   await handlers.onEvent({ type: 'text_delta', delta: text })
   await handlers.onEvent({ type: 'completed', success: true, result: 'local structured summary' })
 }
 
 function schemaFromOutputFormat(outputFormat: unknown): unknown {
-  if (!outputFormat || typeof outputFormat !== 'object' || Array.isArray(outputFormat)) return outputFormat
+  if (!outputFormat || typeof outputFormat !== 'object' || Array.isArray(outputFormat))
+    return outputFormat
   const record = outputFormat as Record<string, unknown>
   return record.type === 'json_schema' && 'schema' in record ? record.schema : outputFormat
 }
 
 function coerceStructuredValue(schema: unknown, prompt: string): unknown {
-  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return conciseStructuredString(prompt)
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema))
+    return conciseStructuredString(prompt)
   const record = schema as Record<string, unknown>
   if (record.type === 'string') return conciseStructuredString(prompt)
   if (record.type === 'array') {
-    const itemSchema = record.items && typeof record.items === 'object' && !Array.isArray(record.items) ? record.items : { type: 'string' }
-    const values = prompt.split(/\r?\n/).map((line) => line.trim().replace(/^[-*\d.、)\s]+/, '')).filter(Boolean)
-    return (values.length > 0 ? values : prompt.trim() ? [prompt.trim()] : []).slice(0, 10).map((value) => coerceStructuredValue(itemSchema, value))
+    const itemSchema =
+      record.items && typeof record.items === 'object' && !Array.isArray(record.items)
+        ? record.items
+        : { type: 'string' }
+    const values = prompt
+      .split(/\r?\n/)
+      .map((line) => line.trim().replace(/^[-*\d.、)\s]+/, ''))
+      .filter(Boolean)
+    return (values.length > 0 ? values : prompt.trim() ? [prompt.trim()] : [])
+      .slice(0, 10)
+      .map((value) => coerceStructuredValue(itemSchema, value))
   }
   if (record.type !== 'object') return null
-  const properties = record.properties && typeof record.properties === 'object' && !Array.isArray(record.properties)
-    ? (record.properties as Record<string, unknown>)
-    : {}
-  const required = Array.isArray(record.required) ? record.required.map(String) : Object.keys(properties)
+  const properties =
+    record.properties && typeof record.properties === 'object' && !Array.isArray(record.properties)
+      ? (record.properties as Record<string, unknown>)
+      : {}
+  const required = Array.isArray(record.required)
+    ? record.required.map(String)
+    : Object.keys(properties)
   const result: Record<string, unknown> = {}
   for (const key of required) {
     result[key] = coerceStructuredValue(properties[key], prompt)
@@ -125,11 +152,17 @@ function coerceStructuredValue(schema: unknown, prompt: string): unknown {
 }
 
 function conciseStructuredString(prompt: string): string {
-  const lines = prompt.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+  const lines = prompt
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
   const source = lines.at(-1) ?? prompt.trim()
   const colon = Math.max(source.lastIndexOf('：'), source.lastIndexOf(':'))
   const value = colon >= 0 ? source.slice(colon + 1).trim() : source
-  return value.replace(/^[-*\d.、)\s]+/, '').slice(0, 80).trim()
+  return value
+    .replace(/^[-*\d.、)\s]+/, '')
+    .slice(0, 80)
+    .trim()
 }
 
 function instantiateRuntime(config: RuntimeConfig, type: RuntimeBackendType): ClaudeRuntime {

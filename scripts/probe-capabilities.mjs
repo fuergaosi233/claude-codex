@@ -9,7 +9,12 @@ const home = await mkdtemp(join(tmpdir(), 'claude-codex-capability-probe-'))
 const adapter = resolve('dist/src/adapter.mjs')
 const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
   stdio: ['pipe', 'pipe', 'pipe'],
-  env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: process.env.CLAUDE_CODEX_MOCK ?? '1', NODE_NO_WARNINGS: '1' },
+  env: {
+    ...process.env,
+    CODEX_HOME: home,
+    CLAUDE_CODEX_MOCK: process.env.CLAUDE_CODEX_MOCK ?? '1',
+    NODE_NO_WARNINGS: '1',
+  },
 })
 
 let buffer = ''
@@ -32,13 +37,20 @@ proc.stdout.on('data', (chunk) => {
 proc.stderr.setEncoding('utf8')
 proc.stderr.on('data', (chunk) => process.stderr.write(chunk))
 
-function send(message) { proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n') }
+function send(message) {
+  proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n')
+}
 function next() {
   const existing = queue.shift()
   if (existing) return Promise.resolve(existing)
   return new Promise((resolve) => waiters.push(resolve))
 }
-async function response(id) { for (;;) { const message = await next(); if (message.id === id && message.method == null) return message } }
+async function response(id) {
+  for (;;) {
+    const message = await next()
+    if (message.id === id && message.method == null) return message
+  }
+}
 async function waitFor(method, predicate = () => true) {
   for (;;) {
     const message = await next()
@@ -46,9 +58,20 @@ async function waitFor(method, predicate = () => true) {
   }
 }
 
-const timeout = setTimeout(() => { proc.kill(); console.error('capability probe timed out'); process.exit(1) }, 120000)
+const timeout = setTimeout(() => {
+  proc.kill()
+  console.error('capability probe timed out')
+  process.exit(1)
+}, 120000)
 try {
-  send({ id: 1, method: 'initialize', params: { clientInfo: { name: 'probe', title: 'Probe', version: '0' }, capabilities: { experimentalApi: true } } })
+  send({
+    id: 1,
+    method: 'initialize',
+    params: {
+      clientInfo: { name: 'probe', title: 'Probe', version: '0' },
+      capabilities: { experimentalApi: true },
+    },
+  })
   const init = await response(1)
   assert.match(init.result.userAgent, /0\.130\.0/)
 
@@ -56,8 +79,22 @@ try {
   const started = await response(2)
   const threadId = started.result.thread.id
 
-  const outputSchema = { type: 'object', properties: { title: { type: 'string' } }, required: ['title'], additionalProperties: false }
-  send({ id: 3, method: 'turn/start', params: { threadId, model: 'gpt-5.4-mini', outputSchema, input: [{ type: 'text', text: 'output schema check', text_elements: [] }] } })
+  const outputSchema = {
+    type: 'object',
+    properties: { title: { type: 'string' } },
+    required: ['title'],
+    additionalProperties: false,
+  }
+  send({
+    id: 3,
+    method: 'turn/start',
+    params: {
+      threadId,
+      model: 'gpt-5.4-mini',
+      outputSchema,
+      input: [{ type: 'text', text: 'output schema check', text_elements: [] }],
+    },
+  })
   await response(3)
   let titleText = ''
   for (;;) {
@@ -67,20 +104,41 @@ try {
   }
   assert.equal(typeof JSON.parse(titleText), 'object')
 
-  send({ id: 4, method: 'process/spawn', params: { processHandle: 'probe-process', command: 'printf process-ok', cwd: process.cwd() } })
+  send({
+    id: 4,
+    method: 'process/spawn',
+    params: { processHandle: 'probe-process', command: 'printf process-ok', cwd: process.cwd() },
+  })
   await response(4)
-  const processExit = await waitFor('process/exited', (params) => params.processHandle === 'probe-process')
+  const processExit = await waitFor(
+    'process/exited',
+    (params) => params.processHandle === 'probe-process',
+  )
   assert.equal(processExit.params.exitCode, 0)
   assert.equal(processExit.params.stdout, 'process-ok')
 
   send({ id: 5, method: 'thread/compact/start', params: { threadId } })
   await response(5)
-  await waitFor('item/completed', (params) => params.threadId === threadId && params.item?.type === 'contextCompaction')
+  await waitFor(
+    'item/completed',
+    (params) => params.threadId === threadId && params.item?.type === 'contextCompaction',
+  )
 
-  send({ id: 6, method: 'review/start', params: { threadId, delivery: 'inline', target: { type: 'custom', instructions: 'Review probe only.' } } })
+  send({
+    id: 6,
+    method: 'review/start',
+    params: {
+      threadId,
+      delivery: 'inline',
+      target: { type: 'custom', instructions: 'Review probe only.' },
+    },
+  })
   const review = await response(6)
   assert.equal(review.result.reviewThreadId, threadId)
-  await waitFor('turn/completed', (params) => params.threadId === threadId && params.turn?.id === review.result.turn.id)
+  await waitFor(
+    'turn/completed',
+    (params) => params.threadId === threadId && params.turn?.id === review.result.turn.id,
+  )
 
   console.log('capability probe passed')
 } finally {

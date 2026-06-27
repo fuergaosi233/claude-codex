@@ -34,7 +34,9 @@ process.on('uncaughtException', (error: unknown) => {
   // daemon keeps serving other peers. Anything else: re-throw on next tick to
   // preserve normal error semantics (and we already logged it).
   if (!isExpected) {
-    setImmediate(() => { throw error })
+    setImmediate(() => {
+      throw error
+    })
   }
 })
 process.on('unhandledRejection', (reason: unknown) => {
@@ -78,7 +80,9 @@ async function main(): Promise<void> {
   if (isUnixDaemon) {
     const recovered = store.recoverStaleInProgressTurns()
     if (recovered > 0) {
-      process.stderr.write(`[claude-codex-adapter] recovered ${recovered} stale in-progress turn(s)\n`)
+      process.stderr.write(
+        `[claude-codex-adapter] recovered ${recovered} stale in-progress turn(s)\n`,
+      )
     }
   }
   const runtime = createRuntime()
@@ -121,10 +125,19 @@ async function main(): Promise<void> {
     }
   }
   const armIdleExit = () => {
-    if (!idleExitEnabled || activePeers > 0 || !everConnected || idleTimer || server.hasActiveTurns()) return
+    if (
+      !idleExitEnabled ||
+      activePeers > 0 ||
+      !everConnected ||
+      idleTimer ||
+      server.hasActiveTurns()
+    )
+      return
     idleTimer = setTimeout(() => {
       debugLog('adapter.idleExit', { idleExitMs, pid: process.pid })
-      process.stderr.write(`[claude-codex-adapter] no active peers for ${idleExitMs}ms, shutting down\n`)
+      process.stderr.write(
+        `[claude-codex-adapter] no active peers for ${idleExitMs}ms, shutting down\n`,
+      )
       void shutdown('idleExit')
     }, idleExitMs)
     idleTimer.unref()
@@ -164,7 +177,9 @@ function ensureSingleUnixDaemon(listen: string): string {
   if (existsSync(pidFile)) {
     const pid = Number(readFileSync(pidFile, 'utf8'))
     if (Number.isFinite(pid) && processIsAlive(pid)) {
-      process.stderr.write(`[claude-codex-adapter] app-server already running at ${socketPath} (pid ${pid})\n`)
+      process.stderr.write(
+        `[claude-codex-adapter] app-server already running at ${socketPath} (pid ${pid})\n`,
+      )
       process.exit(0)
     }
   }
@@ -199,6 +214,8 @@ function usage(code: number): never {
 }
 
 main().catch((error) => {
-  process.stderr.write(`[claude-codex-adapter] ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`)
+  process.stderr.write(
+    `[claude-codex-adapter] ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`,
+  )
   process.exit(1)
 })

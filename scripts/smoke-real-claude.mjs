@@ -56,12 +56,27 @@ const timeout = setTimeout(() => {
 }, 120_000)
 
 try {
-  send({ id: 1, method: 'initialize', params: { clientInfo: { name: 'smoke', title: 'Smoke', version: '0' }, capabilities: null } })
+  send({
+    id: 1,
+    method: 'initialize',
+    params: { clientInfo: { name: 'smoke', title: 'Smoke', version: '0' }, capabilities: null },
+  })
   await nextResponse(1)
-  send({ id: 2, method: 'thread/start', params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false } })
+  send({
+    id: 2,
+    method: 'thread/start',
+    params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false },
+  })
   const started = await nextResponse(2)
   const threadId = started.result.thread.id
-  send({ id: 3, method: 'turn/start', params: { threadId, input: [{ type: 'text', text: 'Reply with exactly: claude-codex-ok', text_elements: [] }] } })
+  send({
+    id: 3,
+    method: 'turn/start',
+    params: {
+      threadId,
+      input: [{ type: 'text', text: 'Reply with exactly: claude-codex-ok', text_elements: [] }],
+    },
+  })
   await nextResponse(3)
   let text = ''
   for (;;) {

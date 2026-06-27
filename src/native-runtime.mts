@@ -27,7 +27,6 @@
 import type { Query } from '@anthropic-ai/claude-agent-sdk'
 import type {
   ClaudeRuntime,
-  ImageInput,
   PermissionDecision,
   RuntimeHandlers,
   RuntimeTurnContext,
@@ -129,9 +128,15 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       if (pending.context.threadId !== threadId) continue
       const q = pending.query as Query & { streamInput?: (it: AsyncIterable<unknown>) => void }
       if (typeof q.streamInput === 'function') {
-        q.streamInput((async function* () {
-          yield { type: 'user', message: { role: 'user', content: prompt }, parent_tool_use_id: null }
-        })())
+        q.streamInput(
+          (async function* () {
+            yield {
+              type: 'user',
+              message: { role: 'user', content: prompt },
+              parent_tool_use_id: null,
+            }
+          })(),
+        )
       }
       return
     }
@@ -202,7 +207,11 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     })()
   }
 
-  private buildOptions(sdk: ClaudeSdk, context: RuntimeTurnContext, abort: AbortController): Record<string, unknown> {
+  private buildOptions(
+    sdk: ClaudeSdk,
+    context: RuntimeTurnContext,
+    abort: AbortController,
+  ): Record<string, unknown> {
     const opts: Record<string, unknown> = {
       abortController: abort,
       includePartialMessages: true,
@@ -215,8 +224,10 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (resume) opts.resume = resume
     if (resume && context.forkSession) opts.forkSession = true
     if (context.addDirs && context.addDirs.length > 0) opts.additionalDirectories = context.addDirs
-    if (context.allowedTools && context.allowedTools.length > 0) opts.allowedTools = context.allowedTools
-    if (context.mcpServers && typeof context.mcpServers === 'object') opts.mcpServers = context.mcpServers
+    if (context.allowedTools && context.allowedTools.length > 0)
+      opts.allowedTools = context.allowedTools
+    if (context.mcpServers && typeof context.mcpServers === 'object')
+      opts.mcpServers = context.mcpServers
     if (context.outputFormat) opts.outputFormat = context.outputFormat
 
     // Codex App's pinned policies map onto Claude SDK's permissionMode. plan
@@ -260,7 +271,9 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       toolName: string,
       input: Record<string, unknown>,
       options: { toolUseID?: string; signal: AbortSignal },
-    ): Promise<{ behavior: 'allow'; updatedInput?: unknown } | { behavior: 'deny'; message: string }> => {
+    ): Promise<
+      { behavior: 'allow'; updatedInput?: unknown } | { behavior: 'deny'; message: string }
+    > => {
       const toolUseId = options.toolUseID || `tool-${newId()}`
       const pending = this.turns.get(context.turnId)
       if (!pending) return { behavior: 'deny', message: 'turn already finished' }
@@ -325,9 +338,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       })
 
       if (decision.decision === 'accept' || decision.decision === 'acceptForSession') {
-        return decision.updatedInput
-          ? { behavior: 'allow', updatedInput: decision.updatedInput }
-          : { behavior: 'allow' }
+        return { behavior: 'allow', updatedInput: decision.updatedInput ?? input }
       }
       return { behavior: 'deny', message: 'denied by user' }
     }
@@ -366,7 +377,10 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }
   }
 
-  private async handleMessage(pending: PendingTurn, message: Record<string, unknown>): Promise<void> {
+  private async handleMessage(
+    pending: PendingTurn,
+    message: Record<string, unknown>,
+  ): Promise<void> {
     const type = String(message.type ?? '')
     switch (type) {
       case 'system':
@@ -393,7 +407,10 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }
   }
 
-  private async handleSystem(pending: PendingTurn, message: Record<string, unknown>): Promise<void> {
+  private async handleSystem(
+    pending: PendingTurn,
+    message: Record<string, unknown>,
+  ): Promise<void> {
     const subtype = String(message.subtype ?? '')
     if (subtype === 'init') {
       const sessionId = String(message.session_id ?? '')
@@ -412,7 +429,10 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }
   }
 
-  private async handleStreamEvent(pending: PendingTurn, message: Record<string, unknown>): Promise<void> {
+  private async handleStreamEvent(
+    pending: PendingTurn,
+    message: Record<string, unknown>,
+  ): Promise<void> {
     const event = message.event as Record<string, unknown> | undefined
     if (!event) return
     const eventType = String(event.type ?? '')
@@ -455,7 +475,10 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }
   }
 
-  private async handleAssistant(pending: PendingTurn, message: Record<string, unknown>): Promise<void> {
+  private async handleAssistant(
+    pending: PendingTurn,
+    message: Record<string, unknown>,
+  ): Promise<void> {
     const inner = message.message as Record<string, unknown> | undefined
     if (!inner) return
     const content = (inner.content as Array<Record<string, unknown>>) || []
@@ -525,7 +548,10 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }
   }
 
-  private async handleResult(pending: PendingTurn, message: Record<string, unknown>): Promise<void> {
+  private async handleResult(
+    pending: PendingTurn,
+    message: Record<string, unknown>,
+  ): Promise<void> {
     const subtype = String(message.subtype ?? '')
     const success = subtype === 'success' && !message.is_error
     const resultText = message.result == null ? null : String(message.result)
@@ -566,7 +592,11 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }
   }
 
-  private async handleOther(pending: PendingTurn, type: string, message: Record<string, unknown>): Promise<void> {
+  private async handleOther(
+    pending: PendingTurn,
+    type: string,
+    message: Record<string, unknown>,
+  ): Promise<void> {
     if (type === 'rate_limit' || type === 'rate_limit_event') {
       const msg = String(message.message ?? 'rate limit')
       await pending.handlers.onEvent({ type: 'notice', level: 'warning', message: msg })
@@ -598,8 +628,14 @@ function derivePermissionMode(
 ): 'default' | 'acceptEdits' | 'bypassPermissions' | 'plan' | 'dontAsk' | 'auto' {
   // Env-level override always wins.
   const envOverride = process.env.CLAUDE_CODEX_PERMISSION_MODE
-  if (envOverride === 'default' || envOverride === 'acceptEdits' || envOverride === 'bypassPermissions' ||
-      envOverride === 'plan' || envOverride === 'dontAsk' || envOverride === 'auto') {
+  if (
+    envOverride === 'default' ||
+    envOverride === 'acceptEdits' ||
+    envOverride === 'bypassPermissions' ||
+    envOverride === 'plan' ||
+    envOverride === 'dontAsk' ||
+    envOverride === 'auto'
+  ) {
     return envOverride
   }
   if (planMode) return 'plan'
@@ -613,7 +649,9 @@ function derivePermissionMode(
 // TS isSubagentToolName in server.mts.
 function isSubagentTool(name: string): boolean {
   const n = name.trim().toLowerCase()
-  return n === 'task' || n === 'agent' || n === 'subagent' || n === 'spawn_agent' || n === 'spawnagent'
+  return (
+    n === 'task' || n === 'agent' || n === 'subagent' || n === 'spawn_agent' || n === 'spawnagent'
+  )
 }
 
 function numberOrNull(value: unknown): number | null {

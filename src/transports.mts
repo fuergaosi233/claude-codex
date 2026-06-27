@@ -32,8 +32,11 @@ class StdioPeer implements RpcPeer {
 
 class WebSocketPeer implements RpcPeer {
   readonly id = newId()
+  private readonly ws: WebSocket
 
-  constructor(private ws: WebSocket) {}
+  constructor(ws: WebSocket) {
+    this.ws = ws
+  }
 
   send(message: WireMessage): void {
     if (this.ws.readyState !== WebSocket.OPEN) return
@@ -57,7 +60,10 @@ export interface RunningTransport {
   close(): Promise<void>
 }
 
-export function startStdioTransport(onMessage: MessageHandler, onClose: CloseHandler): RunningTransport {
+export function startStdioTransport(
+  onMessage: MessageHandler,
+  onClose: CloseHandler,
+): RunningTransport {
   const peer = new StdioPeer()
   const rl = readline.createInterface({ input: process.stdin })
   rl.on('line', (line) => {
@@ -156,7 +162,8 @@ export async function runProxy(socketPath: string, timeoutMs = 10_000): Promise<
         // daemon's only client. Swallow expected disconnect codes, log
         // anything else, and let `socket.on('close')` handle the lifecycle.
         const swallow = (label: string) => (error: NodeJS.ErrnoException) => {
-          if (error.code === 'EPIPE' || error.code === 'ECONNRESET' || error.code === 'EBADF') return
+          if (error.code === 'EPIPE' || error.code === 'ECONNRESET' || error.code === 'EBADF')
+            return
           process.stderr.write(`[claude-codex-adapter] proxy ${label} error: ${error.message}\n`)
         }
         process.stdin.on('error', swallow('stdin'))
@@ -173,7 +180,9 @@ export async function runProxy(socketPath: string, timeoutMs = 10_000): Promise<
       await sleep(100)
     }
   }
-  throw new Error(`failed to connect to app-server control socket at ${socketPath}: ${String(lastError)}`)
+  throw new Error(
+    `failed to connect to app-server control socket at ${socketPath}: ${String(lastError)}`,
+  )
 }
 
 function connectUnix(socketPath: string): Promise<net.Socket> {
@@ -194,7 +203,9 @@ export function parseProxySockArg(args: string[]): string {
   return defaultSocketPath()
 }
 
-function parseListenUrl(listenUrl: string): { kind: 'unix'; path: string } | { kind: 'ws'; host: string; port: number } {
+function parseListenUrl(
+  listenUrl: string,
+): { kind: 'unix'; path: string } | { kind: 'ws'; host: string; port: number } {
   if (listenUrl === 'unix://') return { kind: 'unix', path: defaultSocketPath() }
   if (listenUrl.startsWith('unix://')) {
     const path = listenUrl.slice('unix://'.length)

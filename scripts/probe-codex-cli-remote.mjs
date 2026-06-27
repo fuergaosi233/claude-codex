@@ -27,7 +27,11 @@ try {
   adapterProc.stderr.on('data', (chunk) => {
     adapterStderr += chunk
   })
-  await waitFor(() => adapterStderr.includes(`listening on ${remote}`), 5000, `adapter did not listen on ${remote}`)
+  await waitFor(
+    () => adapterStderr.includes(`listening on ${remote}`),
+    5000,
+    `adapter did not listen on ${remote}`,
+  )
 
   const codex = which('codex')
   if (!codex) {
@@ -100,10 +104,18 @@ try {
   if (tty.status === 0 || /codex-remote-probe-ok/i.test(output)) {
     console.log('tty=status=passed')
     console.log('result=current codex CLI reached the remote adapter and completed a prompt')
-  } else if (tty.status === 20 || /Welcome to Codex|Sign in with ChatGPT|not authenticated|not logged in|login required/i.test(output)) {
+  } else if (
+    tty.status === 20 ||
+    /Welcome to Codex|Sign in with ChatGPT|not authenticated|not logged in|login required/i.test(
+      output,
+    )
+  ) {
     console.log('tty=status=blocked-login')
     console.log('reason=current codex CLI stops at local login before it can exercise --remote')
-  } else if (tty.status === 21 || /Refusing to start the interactive TUI|TERM is set to/i.test(output)) {
+  } else if (
+    tty.status === 21 ||
+    /Refusing to start the interactive TUI|TERM is set to/i.test(output)
+  ) {
     console.log('tty=status=blocked-no-tty')
   } else if (tty.error?.code === 'ETIMEDOUT' || tty.status === 22) {
     console.log('tty=status=blocked-timeout')

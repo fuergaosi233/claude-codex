@@ -26,138 +26,143 @@ let daemonStderr = ''
 let proxyStderr = ''
 
 async function main() {
-await mkdir(bin, { recursive: true })
-await mkdir(home, { recursive: true })
-await mkdir(workspace, { recursive: true })
-await copyFile(shimSource, shim)
-await chmod(shim, 0o755)
-await writeFile(join(workspace, 'README.md'), 'local remote acceptance workspace\n')
-initGitWorkspace(workspace)
+  await mkdir(bin, { recursive: true })
+  await mkdir(home, { recursive: true })
+  await mkdir(workspace, { recursive: true })
+  await copyFile(shimSource, shim)
+  await chmod(shim, 0o755)
+  await writeFile(join(workspace, 'README.md'), 'local remote acceptance workspace\n')
+  initGitWorkspace(workspace)
 
-const env = {
-  ...process.env,
-  PATH: `${bin}:${process.env.PATH ?? ''}`,
-  CODEX_HOME: home,
-  CLAUDE_CODEX_ADAPTER: adapter,
-  NODE_NO_WARNINGS: '1',
-}
-delete env.CLAUDE_CODEX_MOCK
-
-const version = run('codex', ['--version'], env)
-assert.match(version.stdout, /codex-cli/)
-
-daemon = spawn('codex', ['app-server', '--listen', 'unix://'], {
-  cwd: root,
-  env,
-  stdio: ['ignore', 'ignore', 'pipe'],
-})
-daemon.stderr.setEncoding('utf8')
-daemon.stderr.on('data', (chunk) => {
-  daemonStderr += chunk
-})
-
-proxy = spawn('codex', ['app-server', 'proxy'], {
-  cwd: root,
-  env,
-  stdio: ['pipe', 'pipe', 'pipe'],
-})
-proxy.stderr.setEncoding('utf8')
-proxy.stderr.on('data', (chunk) => {
-  proxyStderr += chunk
-})
-
-const timeout = setTimeout(() => {
-  console.error('local remote acceptance timed out')
-  cleanup()
-  process.exit(1)
-}, 180_000)
-
-try {
-  await waitForSocket(socketPath)
-  const rpc = await JsonRpcWebSocket.open(proxy)
-
-  const init = await rpc.request('initialize', {
-    clientInfo: { name: 'local-remote-acceptance', title: 'Local Remote Acceptance', version: '0' },
-    capabilities: null,
-  })
-  assert.equal(init.platformFamily, process.platform === 'win32' ? 'windows' : 'unix')
-
-  const started = await rpc.request('thread/start', {
-    cwd: workspace,
-    experimentalRawEvents: false,
-    persistExtendedHistory: false,
-  })
-  const threadId = started.thread.id
-
-  const turn = await rpc.request('turn/start', {
-    threadId,
-    input: [
-      {
-        type: 'text',
-        text: [
-          'Use Claude Code tools in the current working directory.',
-          `Create or overwrite a file named claude-codex-remote-acceptance.txt with exactly this content and no extra whitespace: ${expectedText}`,
-          `After the file is written, reply with exactly: ${expectedText}`,
-        ].join('\n'),
-        text_elements: [],
-      },
-    ],
-  })
-  assert.equal(turn.turn.status, 'inProgress')
-
-  const approvals = { command: 0, file: 0 }
-  let text = ''
-  let diff = ''
-  let sawRemoteStatus = false
-  let completed = null
-
-  while (!completed) {
-    const message = await rpc.nextNotification()
-    if (message.method === 'thread/status/changed') sawRemoteStatus = true
-    if (message.method === 'item/agentMessage/delta') text += message.params.delta
-    if (message.method === 'turn/diff/updated') diff = message.params.diff
-    if (message.method === 'item/commandExecution/requestApproval') {
-      approvals.command += 1
-      rpc.respond(message.id, { decision: 'accept' })
-    }
-    if (message.method === 'item/fileChange/requestApproval') {
-      approvals.file += 1
-      rpc.respond(message.id, { decision: 'accept' })
-    }
-    if (message.method === 'error') {
-      throw new Error(JSON.stringify(message.params))
-    }
-    if (message.method === 'turn/completed') {
-      completed = message.params.turn
-    }
+  const env = {
+    ...process.env,
+    PATH: `${bin}:${process.env.PATH ?? ''}`,
+    CODEX_HOME: home,
+    CLAUDE_CODEX_ADAPTER: adapter,
+    NODE_NO_WARNINGS: '1',
   }
+  delete env.CLAUDE_CODEX_MOCK
 
-  assert.equal(completed.status, 'completed')
-  assert.equal(sawRemoteStatus, true)
-  assert.match(text, new RegExp(expectedText, 'i'))
-  const fileText = await readFile(targetFile, 'utf8')
-  assert.equal(fileText.trim(), expectedText)
+  const version = run('codex', ['--version'], env)
+  assert.match(version.stdout, /codex-cli/)
 
-  rpc.close()
-  clearTimeout(timeout)
-  cleanup()
+  daemon = spawn('codex', ['app-server', '--listen', 'unix://'], {
+    cwd: root,
+    env,
+    stdio: ['ignore', 'ignore', 'pipe'],
+  })
+  daemon.stderr.setEncoding('utf8')
+  daemon.stderr.on('data', (chunk) => {
+    daemonStderr += chunk
+  })
 
-  console.log('local Codex Remote -> shim -> app-server proxy -> Claude Code acceptance passed')
-  console.log(`shim: ${shim}`)
-  console.log(`CODEX_HOME: ${home}`)
-  console.log(`workspace: ${workspace}`)
-  console.log(`thread: ${threadId}`)
-  console.log(`approvals: command=${approvals.command} file=${approvals.file}`)
-  console.log(`diffUpdated: ${diff.length > 0}`)
-  console.log(`created: ${targetFile}`)
-} catch (error) {
-  clearTimeout(timeout)
-  cleanup()
-  console.error(`acceptance artifacts kept at: ${base}`)
-  if (daemonStderr) console.error(`[daemon stderr]\n${daemonStderr}`)
-  if (proxyStderr) console.error(`[proxy stderr]\n${proxyStderr}`)
-  throw error
-}
+  proxy = spawn('codex', ['app-server', 'proxy'], {
+    cwd: root,
+    env,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  })
+  proxy.stderr.setEncoding('utf8')
+  proxy.stderr.on('data', (chunk) => {
+    proxyStderr += chunk
+  })
+
+  const timeout = setTimeout(() => {
+    console.error('local remote acceptance timed out')
+    cleanup()
+    process.exit(1)
+  }, 180_000)
+
+  try {
+    const daemonSocketPath = await waitForSocket(socketPath)
+    const rpc = await JsonRpcWebSocket.open(proxy)
+
+    const init = await rpc.request('initialize', {
+      clientInfo: {
+        name: 'local-remote-acceptance',
+        title: 'Local Remote Acceptance',
+        version: '0',
+      },
+      capabilities: null,
+    })
+    assert.equal(init.platformFamily, process.platform === 'win32' ? 'windows' : 'unix')
+
+    const started = await rpc.request('thread/start', {
+      cwd: workspace,
+      experimentalRawEvents: false,
+      persistExtendedHistory: false,
+    })
+    const threadId = started.thread.id
+
+    const turn = await rpc.request('turn/start', {
+      threadId,
+      input: [
+        {
+          type: 'text',
+          text: [
+            'Use Claude Code tools in the current working directory.',
+            `Create or overwrite a file named claude-codex-remote-acceptance.txt with exactly this content and no extra whitespace: ${expectedText}`,
+            `After the file is written, reply with exactly: ${expectedText}`,
+          ].join('\n'),
+          text_elements: [],
+        },
+      ],
+    })
+    assert.equal(turn.turn.status, 'inProgress')
+
+    const approvals = { command: 0, file: 0 }
+    let text = ''
+    let diff = ''
+    let sawRemoteStatus = false
+    let completed = null
+
+    while (!completed) {
+      const message = await rpc.nextNotification()
+      if (message.method === 'thread/status/changed') sawRemoteStatus = true
+      if (message.method === 'item/agentMessage/delta') text += message.params.delta
+      if (message.method === 'turn/diff/updated') diff = message.params.diff
+      if (message.method === 'item/commandExecution/requestApproval') {
+        approvals.command += 1
+        rpc.respond(message.id, { decision: 'accept' })
+      }
+      if (message.method === 'item/fileChange/requestApproval') {
+        approvals.file += 1
+        rpc.respond(message.id, { decision: 'accept' })
+      }
+      if (message.method === 'error') {
+        throw new Error(JSON.stringify(message.params))
+      }
+      if (message.method === 'turn/completed') {
+        completed = message.params.turn
+      }
+    }
+
+    assert.equal(completed.status, 'completed')
+    assert.equal(sawRemoteStatus, true)
+    assert.match(text, new RegExp(expectedText, 'i'))
+    const fileText = await readFile(targetFile, 'utf8')
+    assert.equal(fileText.trim(), expectedText)
+
+    rpc.close()
+    clearTimeout(timeout)
+    cleanup()
+
+    console.log('local Codex Remote -> shim -> app-server proxy -> Claude Code acceptance passed')
+    console.log(`shim: ${shim}`)
+    console.log(`CODEX_HOME: ${home}`)
+    console.log(`socket: ${daemonSocketPath}`)
+    console.log(`workspace: ${workspace}`)
+    console.log(`thread: ${threadId}`)
+    console.log(`approvals: command=${approvals.command} file=${approvals.file}`)
+    console.log(`diffUpdated: ${diff.length > 0}`)
+    console.log(`created: ${targetFile}`)
+  } catch (error) {
+    clearTimeout(timeout)
+    cleanup()
+    console.error(`acceptance artifacts kept at: ${base}`)
+    if (daemonStderr) console.error(`[daemon stderr]\n${daemonStderr}`)
+    if (proxyStderr) console.error(`[proxy stderr]\n${proxyStderr}`)
+    throw error
+  }
 }
 
 function cleanup() {
@@ -182,16 +187,37 @@ function initGitWorkspace(cwd) {
   const init = git(['init'])
   if (init.status !== 0) throw new Error((init.stderr || init.stdout || 'git init failed').trim())
   git(['add', 'README.md'])
-  git(['-c', 'user.name=Acceptance', '-c', 'user.email=acceptance@example.com', 'commit', '-m', 'init'])
+  git([
+    '-c',
+    'user.name=Acceptance',
+    '-c',
+    'user.email=acceptance@example.com',
+    'commit',
+    '-m',
+    'init',
+  ])
 }
 
 async function waitForSocket(path) {
   const started = Date.now()
   while (Date.now() - started < 10_000) {
-    if (existsSync(path) || daemonStderr.includes(`listening on ${path}`)) return
+    const daemonPath = daemonSocketPathFromStderr()
+    if (daemonPath) return daemonPath
+    if (existsSync(path)) return path
     await sleep(100)
   }
   throw new Error(`timed out waiting for ${path}`)
+}
+
+function daemonSocketPathFromStderr() {
+  const marker = '[claude-codex-adapter] listening on '
+  const index = daemonStderr.lastIndexOf(marker)
+  if (index < 0) return null
+  const line = daemonStderr
+    .slice(index + marker.length)
+    .split('\n')[0]
+    ?.trim()
+  return line && !line.startsWith('ws://') ? line : null
 }
 
 function sleep(ms) {
@@ -233,7 +259,7 @@ class JsonRpcWebSocket {
   static async open(proxyProc) {
     const stream = new ChildProcessDuplex(proxyProc)
     const ws = new WebSocket('ws://localhost/', {
-      createConnection: (() => stream),
+      createConnection: () => stream,
     })
     await new Promise((resolve, reject) => {
       ws.once('open', resolve)
