@@ -14,6 +14,9 @@
     "format": "biome format --write src test scripts",
     "check": "biome check src test scripts",
     "check:fix": "biome check --write src test scripts",
+    "docs:dev": "vitepress dev docs",
+    "docs:build": "vitepress build docs",
+    "docs:preview": "vitepress preview docs",
     "test": "npm run build && node --test dist/test/*.mjs",
     "doctor": "node scripts/doctor.mjs",
     "smoke:real": "npm run build && node scripts/smoke-real-claude.mjs",
@@ -34,7 +37,8 @@
     "@types/node": "^24.13.2",
     "@types/ws": "^8.18.1",
     "tsx": "^4.22.4",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vitepress": "^1.6.4"
   },
   "engines": {
     "node": ">=24"

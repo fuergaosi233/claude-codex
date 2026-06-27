@@ -9,3 +9,5 @@ generated/
 *.sqlite-*
 *.sock
 *.pid
+**/.vitepress/dist/
+**/.vitepress/cache/
