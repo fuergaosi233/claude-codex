@@ -29,7 +29,11 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - run: npm ci
+      # `npm install` (not `npm ci`): the runtime SDK ships per-platform native
+      # binaries as optionalDependencies, and a lockfile generated on one OS
+      # omits the others — which makes `npm ci` fail on Linux. The docs build
+      # only needs VitePress, so a tolerant install is the right tradeoff here.
+      - run: npm install --no-audit --no-fund
       - run: npm run docs:build
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
