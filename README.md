@@ -1,5 +1,9 @@
 # Claude Codex Adapter
 
+[![CI](https://github.com/fuergaosi233/claude-codex/actions/workflows/ci.yml/badge.svg)](https://github.com/fuergaosi233/claude-codex/actions/workflows/ci.yml)
+[![Docs](https://github.com/fuergaosi233/claude-codex/actions/workflows/deploy-docs.yml/badge.svg)](https://fuergaosi233.github.io/claude-codex/)
+[![Node](https://img.shields.io/badge/node-%3E%3D24-brightgreen)](https://nodejs.org)
+
 Remote-mode adapter that lets the **Codex desktop app** talk to **Claude Code**
 through the native Codex `app-server` protocol.
 
