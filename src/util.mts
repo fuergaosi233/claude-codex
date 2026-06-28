@@ -116,9 +116,19 @@ export function platformOs(): string {
   }
 }
 
+// Codex app-server protocol version the adapter advertises (codex --version /
+// initialize userAgent). Bump alongside the generated schema (`npm run
+// generate:schema`). The 0.130 -> 0.142 delta is additive/widening (new
+// optional methods + enum variants), so reporting 0.142 stays compatible with
+// older Codex App builds while satisfying newer ones' minimum-version probe.
+// Override per host with CLAUDE_CODEX_COMPAT_VERSION.
+const DEFAULT_CODEX_COMPAT_VERSION = '0.142.3'
+
 export function codexCompatVersion(): string {
   return (
-    process.env.CLAUDE_CODEX_COMPAT_VERSION || process.env.CODEX_SHIM_COMPAT_VERSION || '0.130.0'
+    process.env.CLAUDE_CODEX_COMPAT_VERSION ||
+    process.env.CODEX_SHIM_COMPAT_VERSION ||
+    DEFAULT_CODEX_COMPAT_VERSION
   )
 }
 

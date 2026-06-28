@@ -54,7 +54,10 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| MCP config/status/tools | Supported | Reads Claude MCP config, reports server status, calls stdio/HTTP tools directly, passes MCP servers into turns. |
+| MCP config/status/tools | Supported | Reads Claude MCP config, passes servers into turns, calls stdio/HTTP tools directly. `mcpServerStatus/list` enumerates real `tools`/`resources`/`resourceTemplates` per server (10s cache, graceful empty fallback on spawn/timeout). |
+| Turn-item paging | Supported | `thread/turns/list` honors `itemsView` — `summary` (default: first userMessage + final agentMessage), `full`, and `notLoaded` — instead of always shipping every item. |
+| Skills & hooks | Supported | `skills/list` reads `.claude/skills/*/SKILL.md` (user+repo scope); `hooks/list` reads `settings.json` hooks, mapping Claude events to Codex `HookEventName` (unmappable events dropped). |
+| Fuzzy file search | Supported | One-shot `fuzzyFileSearch` plus the stateful session API (`sessionStart/Update/Stop`) that streams `fuzzyFileSearch/sessionUpdated` results and a final `sessionCompleted`. |
 | Filesystem RPCs | Supported | `fs/readFile`, write, metadata, list, remove, copy, watch/unwatch (Codex v2-shaped). |
 | Command/process RPCs | Supported | `command/exec` and `process/spawn` implemented. |
 
@@ -63,12 +66,27 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 | Area | Status | Notes |
 | --- | --- | --- |
 | Realtime audio | Unsupported | No Claude audio channel; methods ack so capability probe doesn't error; listVoices returns empty. |
-| Plugins/marketplace/skills/hooks/apps | N/A | No Codex plugin marketplace; methods return empty schema-shaped responses. |
+| Plugins/marketplace/apps | N/A | No Codex plugin marketplace; methods return empty schema-shaped responses. (Claude skills/hooks are surfaced — see Utilities.) |
 | Account/rate limits/auth | N/A | Claude manages its own auth; account/OpenAI-auth panels report null/empty. |
 | External agent import | Stub | `externalAgentConfig/detect` and import return empty. |
 | Windows sandbox | Unsupported | Target deployment is Linux/macOS; methods return not configured. |
 
-## Wire conformance (codex v2 @ 0.130.0)
+## Protocol version
+
+The adapter advertises codex app-server protocol **v2 @ 0.142.3** (via
+`codex --version` and the `initialize` userAgent; override with
+`CLAUDE_CODEX_COMPAT_VERSION`). The 0.130 → 0.142 delta is additive and
+backward-compatible: new optional request methods (`thread/search`,
+`thread/delete`, `account/usage/read`, `plugin/*`, `remoteControl/*`,
+`environment/add`, …) plus widened enums (`ReasoningEffort` → free-form string,
+new `AuthMode` / `WebSearchMode` variants). The new methods are
+OpenAI-account / plugin / remote-control surfaces with no Claude Code
+equivalent; unimplemented methods return a JSON-RPC error, which Codex App
+treats as "unsupported" for these optional features. Regenerate the reference
+schema under `generated/` with `npm run generate:schema` (needs a matching
+`codex` on PATH).
+
+## Wire conformance
 
 - `turn/start` response and the `turn/started` / `turn/completed` notifications
   ship `items: []` with `itemsView: "notLoaded"`, matching the real app-server
