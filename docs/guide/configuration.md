@@ -70,6 +70,8 @@ export CLAUDE_CODEX_NODE="/absolute/path/to/node"
 | --- | --- |
 | `CLAUDE_CODEX_ADAPTER` | Path to `dist/src/adapter.mjs` (used by the shim). |
 | `CLAUDE_CODEX_NODE` | Node binary the shim launches. |
+| `CLAUDE_CODEX_COMPAT_VERSION` | Codex app-server version advertised (default `0.142.3`). |
+| `CLAUDE_CODEX_VERSION_SUFFIX` | Tag after the version to distinguish the adapter from real codex (default `claude-codex`; set `""` to behave exactly like upstream codex). |
 | `CODEX_REAL` | Real Codex CLI for non-app-server commands / `codex` passthrough. |
 | `CLAUDE_CODEX_RUNTIME_TYPE` | Active backend route. |
 | `CLAUDE_CODEX_DEFAULT_MODEL` / `_EFFORT` | Defaults for new threads. |

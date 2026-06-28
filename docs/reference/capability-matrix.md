@@ -86,6 +86,13 @@ treats as "unsupported" for these optional features. Regenerate the reference
 schema under `generated/` with `npm run generate:schema` (needs a matching
 `codex` on PATH).
 
+Because the adapter now reports the same version as a real `codex`, it appends a
+distinguishing suffix: `codex --version` prints `codex-cli 0.142.3
+(claude-codex)` and the `initialize` userAgent carries `claude-codex` in its
+originator field. The version number stays first so the App's semver probe still
+parses it. Set `CLAUDE_CODEX_VERSION_SUFFIX=""` to behave exactly like upstream
+codex.
+
 ## Wire conformance
 
 - `turn/start` response and the `turn/started` / `turn/completed` notifications

@@ -132,8 +132,20 @@ export function codexCompatVersion(): string {
   )
 }
 
+// Distinguishing tag appended after the (clean, probe-parseable) version so the
+// Claude adapter is identifiable next to a real `codex` that now reports the
+// same version. Set CLAUDE_CODEX_VERSION_SUFFIX="" to disable and behave exactly
+// like upstream codex.
+const DEFAULT_VERSION_SUFFIX = 'claude-codex'
+
+export function codexVersionSuffix(): string {
+  return process.env.CLAUDE_CODEX_VERSION_SUFFIX ?? DEFAULT_VERSION_SUFFIX
+}
+
 export function codexCliVersion(): string {
-  return `codex-cli ${codexCompatVersion()}`
+  const suffix = codexVersionSuffix()
+  // Number first so a semver probe still extracts the bare version.
+  return `codex-cli ${codexCompatVersion()}${suffix ? ` (${suffix})` : ''}`
 }
 
 export function codexUserAgent(clientName: string, clientVersion: string): string {
@@ -141,7 +153,9 @@ export function codexUserAgent(clientName: string, clientVersion: string): strin
   const version = clientVersion.trim() || 'unknown'
   const cpu =
     process.arch === 'x64' ? 'x86_64' : process.arch === 'arm64' ? 'aarch64' : process.arch
-  return `${name}/${codexCompatVersion()} (${platformOs()}; ${cpu}) unknown (${name}; ${version})`
+  // The originator field (real codex puts a build tag here) carries our marker.
+  const originator = codexVersionSuffix() || 'unknown'
+  return `${name}/${codexCompatVersion()} (${platformOs()}; ${cpu}) ${originator} (${name}; ${version})`
 }
 
 export function textFromInput(input: unknown): string {
