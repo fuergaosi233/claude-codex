@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { spawn } from 'node:child_process'
 
 const home = await mkdtemp(join(tmpdir(), 'claude-codex-real-smoke-'))
 const adapter = resolve('dist/src/adapter.mjs')

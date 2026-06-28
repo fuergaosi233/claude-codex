@@ -12,7 +12,7 @@
 // guidance. Any error exits 0 so a buggy hook never wedges the session.
 
 import { readFileSync, statSync } from 'node:fs'
-import { relative, isAbsolute, extname } from 'node:path'
+import { extname, isAbsolute, relative } from 'node:path'
 
 // Soft cap: server.mts is the known outlier (~3.4k lines). Files past this get
 // a nudge to split, not a block.

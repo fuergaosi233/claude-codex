@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { accessSync, constants, existsSync } from 'node:fs'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { Duplex } from 'node:stream'
 import WebSocket from 'ws'
@@ -235,8 +235,13 @@ function remoteShell(command) {
 }
 
 function remoteEnv(options = {}) {
+  // Keep the shim directory ($HOME/bin) ahead of the inherited PATH so `codex`
+  // resolves to the GUI Remote shim (-> adapter), exactly like the login-shell
+  // flow does via ~/.zshenv. Injecting the bare local PATH would let a
+  // Homebrew-installed real `codex` win and silently bypass the adapter.
+  const shimDir = join(process.env.HOME || '', 'bin')
   const exports = [
-    `export PATH=${shQuote(remotePath)}`,
+    `export PATH=${shQuote(shimDir)}:${shQuote(remotePath)}`,
     `export CODEX_HOME=${shQuote(home)}`,
     `export CLAUDE_CODEX_ADAPTER=${shQuote(adapter)}`,
     `export CLAUDE_CODEX_NODE=${shQuote(nodeBin)}`,

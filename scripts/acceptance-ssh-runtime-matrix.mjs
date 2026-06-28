@@ -11,8 +11,8 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
 import { setTimeout as delay } from 'node:timers/promises'
+import { fileURLToPath } from 'node:url'
 
 const DEFAULT_MODES = ['codex', 'agent-sdk-sidecar', 'agent-http', 'agentapi', 'claude-p']
 const TOKEN_FILE = '.claude-codex-mode-matrix-token'
