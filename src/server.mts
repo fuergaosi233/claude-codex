@@ -1,7 +1,9 @@
-import { execFile, spawn, type ChildProcess } from 'node:child_process'
-import { readFileSync, watch, writeFileSync, type FSWatcher } from 'node:fs'
+import { type ChildProcess, execFile, spawn } from 'node:child_process'
+import { type FSWatcher, readFileSync, watch, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
+import { callMcpTool, readMcpConfig, readMcpResource } from './mcp.mjs'
+import type { SessionStore } from './store.mjs'
 import type {
   ClaudeRuntime,
   FileUpdateChange,
@@ -22,32 +24,30 @@ import type {
   UserInputQuestion,
   WireMessage,
 } from './types.mjs'
-import { SessionStore } from './store.mjs'
-import { callMcpTool, readMcpConfig, readMcpResource } from './mcp.mjs'
-import { maybeCreateThreadWorktree } from './worktree.mjs'
 import {
+  adapterHome,
+  claudeModelOptions,
   claudeOutputFormat,
   codexCliVersion,
-  defaultAllowedTools,
-  debugLog,
-  claudeModelOptions,
-  codexProxyModelOptions,
-  isCodexOpenAiModel,
-  adapterHome,
   codexHome,
+  codexProxyModelOptions,
   codexUserAgent,
+  debugLog,
+  defaultAllowedTools,
   ensureParent,
   extractImageInputs,
+  isCodexOpenAiModel,
   newId,
+  normalizeCodexReasoningEffort,
   nowMillis,
   nowSeconds,
-  normalizeCodexReasoningEffort,
   platformFamily,
   platformOs,
   resolveClaudeEffort,
   resolveClaudeModel,
   textFromInput,
 } from './util.mjs'
+import { maybeCreateThreadWorktree } from './worktree.mjs'
 
 const execFileAsync = promisify(execFile)
 
@@ -621,7 +621,7 @@ export class CodexClaudeAppServer {
 
   private threadList(params: Record<string, unknown>): unknown {
     const threads = this.store.listThreads({
-      archived: params.archived as boolean | null | undefined,
+      archived: (params.archived as boolean | null | undefined) ?? null,
       limit: numberOr(params.limit, 50),
       cursor: typeof params.cursor === 'string' ? params.cursor : null,
       cwd:
@@ -3853,7 +3853,7 @@ function parseSubagentTrailer(text: string): SubagentTrailer {
 
   const agentMatch = cleanText.match(/\n?agentId:\s*([0-9a-f]{8,32})\b[^\n]*\s*$/i)
   if (agentMatch) {
-    agentId = agentMatch[1]
+    agentId = agentMatch[1] ?? null
     cleanText = cleanText.slice(0, agentMatch.index).replace(/\s+$/, '')
   }
 

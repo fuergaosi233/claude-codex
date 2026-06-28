@@ -248,12 +248,13 @@ export class HttpAgentRuntime implements ClaudeRuntime {
     type: 'user' | 'raw',
     signal?: AbortSignal,
   ): Promise<void> {
-    const response = await fetch(this.url(baseUrl, '/message'), {
+    const init: RequestInit = {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ content, type }),
-      signal,
-    })
+    }
+    if (signal) init.signal = signal
+    const response = await fetch(this.url(baseUrl, '/message'), init)
     if (!response.ok) {
       throw new Error(
         `${this.options.kind} POST /message failed ${response.status}: ${await response.text()}`,
@@ -262,7 +263,7 @@ export class HttpAgentRuntime implements ClaudeRuntime {
   }
 
   private async fetchMessages(baseUrl: string, signal?: AbortSignal): Promise<unknown> {
-    const response = await fetch(this.url(baseUrl, '/messages'), { signal })
+    const response = await fetch(this.url(baseUrl, '/messages'), signal ? { signal } : {})
     if (!response.ok) {
       throw new Error(
         `${this.options.kind} GET /messages failed ${response.status}: ${await response.text()}`,
@@ -275,7 +276,7 @@ export class HttpAgentRuntime implements ClaudeRuntime {
     baseUrl: string,
     signal?: AbortSignal,
   ): Promise<'running' | 'stable' | null> {
-    const response = await fetch(this.url(baseUrl, '/status'), { signal })
+    const response = await fetch(this.url(baseUrl, '/status'), signal ? { signal } : {})
     if (!response.ok) {
       throw new Error(
         `${this.options.kind} GET /status failed ${response.status}: ${await response.text()}`,

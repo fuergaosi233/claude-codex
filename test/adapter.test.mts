@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { execFileSync } from 'node:child_process'
+import { type ChildProcess, execFileSync, spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
@@ -8,7 +8,6 @@ import net from 'node:net'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { Duplex } from 'node:stream'
-import { spawn, type ChildProcess } from 'node:child_process'
 import test from 'node:test'
 import WebSocket from 'ws'
 
@@ -1940,7 +1939,7 @@ test('config/value/write persists arbitrary settings keys across restarts', asyn
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const env = { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' }
   // Round 1: write a custom key + a known typed key.
-  let proc1 = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+  const proc1 = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env,
   })
@@ -2263,8 +2262,8 @@ test('Task subagent emits Codex native spawnAgent → wait → closeAgent timeli
       if (message.method === 'item/started') {
         const item = message.params.item
         if (item.type === 'collabAgentToolCall') {
-          collabByTool[item.tool] = collabByTool[item.tool] ?? {}
-          collabByTool[item.tool].started = item
+          const bucket = (collabByTool[item.tool] ??= {})
+          bucket.started = item
         } else if (
           item.type === 'commandExecution' ||
           (item.type === 'mcpToolCall' && item.tool !== 'Task')
@@ -2275,8 +2274,8 @@ test('Task subagent emits Codex native spawnAgent → wait → closeAgent timeli
       if (message.method === 'item/completed') {
         const item = message.params.item
         if (item.type === 'collabAgentToolCall') {
-          collabByTool[item.tool] = collabByTool[item.tool] ?? {}
-          collabByTool[item.tool].completed = item
+          const bucket = (collabByTool[item.tool] ??= {})
+          bucket.completed = item
         }
       }
       if (message.method === 'item/agentMessage/delta')
@@ -2297,20 +2296,23 @@ test('Task subagent emits Codex native spawnAgent → wait → closeAgent timeli
         `${tool} should complete with status=completed`,
       )
     }
-    const spawnEnd = collabByTool.spawnAgent.completed
+    const spawnEnd = collabByTool.spawnAgent!.completed!
     assert.equal(spawnEnd.senderThreadId, threadId)
     assert.equal(
       spawnEnd.receiverThreadIds.length,
       1,
       'spawnAgent end should reference exactly one child thread',
     )
-    const childThreadId = spawnEnd.receiverThreadIds[0]
+    const childThreadId = spawnEnd.receiverThreadIds[0]!
     // After spawnAgent ends the subagent is now running; only wait/closeAgent
     // ends report the agent as completed.
-    assert.equal(spawnEnd.agentsStates[childThreadId].status, 'running')
-    assert.equal(collabByTool.wait.started.receiverThreadIds[0], childThreadId)
-    assert.equal(collabByTool.wait.completed.agentsStates[childThreadId].status, 'completed')
-    assert.equal(collabByTool.closeAgent.completed.agentsStates[childThreadId].status, 'completed')
+    assert.equal(spawnEnd.agentsStates[childThreadId]!.status, 'running')
+    assert.equal(collabByTool.wait!.started!.receiverThreadIds[0], childThreadId)
+    assert.equal(collabByTool.wait!.completed!.agentsStates[childThreadId]!.status, 'completed')
+    assert.equal(
+      collabByTool.closeAgent!.completed!.agentsStates[childThreadId]!.status,
+      'completed',
+    )
     // collabAgentToolCall.model carries the SDK model the subagent runs on,
     // NOT Claude's subagent_type — the App's "Agent · model" badge depends
     // on this. The mock runs without a subagent_type so the parent's model

@@ -12,10 +12,10 @@
 // app or `codex login`). We don't manage tokens for it — just forward what
 // the OS user has.
 
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
 import { createInterface, type Interface } from 'node:readline'
 import type { ClaudeRuntime, RuntimeHandlers, RuntimeTurnContext } from './types.mjs'
-import { resolveCodexBinary, debugLog } from './util.mjs'
+import { debugLog, resolveCodexBinary } from './util.mjs'
 
 interface PendingTurn {
   context: RuntimeTurnContext

@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
+import { appendFileSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync } from 'node:fs'
 import { homedir, platform, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
-import { appendFileSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync } from 'node:fs'
 import type { ImageInput } from './types.mjs'
 
 export function nowSeconds(): number {

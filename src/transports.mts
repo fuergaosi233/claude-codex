@@ -1,7 +1,7 @@
+import { existsSync, rmSync } from 'node:fs'
 import http from 'node:http'
 import net from 'node:net'
 import readline from 'node:readline'
-import { existsSync, rmSync } from 'node:fs'
 import { WebSocket, WebSocketServer } from 'ws'
 import type { RpcPeer, WireMessage } from './types.mjs'
 import { defaultSocketPath, ensureParent, newId, sleep } from './util.mjs'
@@ -199,7 +199,8 @@ export function normalizeListenUrl(value: string | null | undefined): string {
 
 export function parseProxySockArg(args: string[]): string {
   const index = args.indexOf('--sock')
-  if (index >= 0 && args[index + 1]) return args[index + 1]
+  const next = args[index + 1]
+  if (index >= 0 && next) return next
   return defaultSocketPath()
 }
 

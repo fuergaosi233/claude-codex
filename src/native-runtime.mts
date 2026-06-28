@@ -718,8 +718,7 @@ export function formatAskUserQuestionAnswers(
   const original = (input.questions as Array<Record<string, unknown>>) || []
   const answersByQuestion: Record<string, string> = {}
   const annotations: Record<string, { notes?: string; preview?: string }> = {}
-  for (let i = 0; i < questions.length; i++) {
-    const q = questions[i]
+  for (const [i, q] of questions.entries()) {
     const origQ = original[i] || {}
     const questionText = String(origQ.question ?? q.question)
     const slot = answers.answers[q.id]

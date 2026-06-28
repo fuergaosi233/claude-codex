@@ -1,5 +1,5 @@
-import { existsSync, readFileSync } from 'node:fs'
 import { spawn } from 'node:child_process'
+import { existsSync, readFileSync } from 'node:fs'
 
 export interface McpConfigSnapshot {
   sdkValue: unknown | null
