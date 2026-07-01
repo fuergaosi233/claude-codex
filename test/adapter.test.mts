@@ -3394,6 +3394,65 @@ test('mcpServerStatus/list enumerates tools and resources from the server', asyn
   }
 })
 
+test('fuzzyFileSearch session streams updated and completed notifications', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  await writeFile(join(home, 'findme-fixture.txt'), 'x')
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'fuzzyFileSearch/sessionStart',
+        params: { sessionId: 's1', roots: [home] },
+      }),
+    )
+    await reader.nextResponse(1)
+
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'fuzzyFileSearch/sessionUpdate',
+        params: { sessionId: 's1', query: 'findme' },
+      }),
+    )
+    const updated = await nextNotification(reader, 'fuzzyFileSearch/sessionUpdated')
+    assert.equal(updated.params.sessionId, 's1')
+    assert.equal(updated.params.query, 'findme')
+    const files = Array.isArray(updated.params.files) ? updated.params.files : []
+    assert.ok(
+      files.some((file: Record<string, unknown>) =>
+        String(file.path).endsWith('findme-fixture.txt'),
+      ),
+    )
+    await reader.nextResponse(2)
+
+    proc.stdin.write(
+      json({ id: 3, method: 'fuzzyFileSearch/sessionStop', params: { sessionId: 's1' } }),
+    )
+    const completed = await nextNotification(reader, 'fuzzyFileSearch/sessionCompleted')
+    assert.equal(completed.params.sessionId, 's1')
+    await reader.nextResponse(3)
+
+    proc.stdin.write(
+      json({
+        id: 4,
+        method: 'fuzzyFileSearch/sessionUpdate',
+        params: { sessionId: 's1', query: 'findme' },
+      }),
+    )
+    const afterStop = await reader.next()
+    assert.equal(afterStop.id, 4)
+    assert.equal(afterStop.method, undefined)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('direct MCP HTTP tool calls work', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const httpServer = http.createServer((req, res) => {
@@ -3630,6 +3689,23 @@ class ChildProcessDuplex extends Duplex {
 
 function json(message: Record<string, unknown>): string {
   return `${JSON.stringify({ jsonrpc: '2.0', ...message })}\n`
+}
+
+async function nextNotification(
+  reader: JsonLineReader,
+  method: string,
+): Promise<{ params: Record<string, unknown> }> {
+  for (let i = 0; i < 50; i += 1) {
+    const message = await reader.next()
+    if (message.method === method) return { params: asTestRecord(message.params) }
+  }
+  throw new Error(`missing notification: ${method}`)
+}
+
+function asTestRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {}
 }
 
 function delay(ms: number): Promise<void> {
