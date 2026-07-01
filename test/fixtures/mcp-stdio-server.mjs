@@ -14,6 +14,24 @@ rl.on('line', (line) => {
     })
     return
   }
+  if (request.method === 'tools/list') {
+    respond(request.id, {
+      tools: [
+        {
+          name: 'echo',
+          description: 'Echo back the provided value',
+          inputSchema: { type: 'object', properties: { value: { type: 'string' } } },
+        },
+      ],
+    })
+    return
+  }
+  if (request.method === 'resources/list') {
+    respond(request.id, {
+      resources: [{ uri: 'fixture://resource', name: 'fixture resource', mimeType: 'text/plain' }],
+    })
+    return
+  }
   if (request.method === 'tools/call') {
     respond(request.id, {
       content: [

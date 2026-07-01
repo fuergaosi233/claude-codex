@@ -2,7 +2,7 @@ import { type ChildProcess, execFile, spawn } from 'node:child_process'
 import { type FSWatcher, readFileSync, watch, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
-import { callMcpTool, readMcpConfig, readMcpResource } from './mcp.mjs'
+import { callMcpTool, listMcpServerStatuses, readMcpConfig, readMcpResource } from './mcp.mjs'
 import {
   addedFileDiff,
   asRecord,
@@ -413,7 +413,7 @@ export class CodexClaudeAppServer {
       case 'config/mcpServer/reload':
         return {}
       case 'mcpServerStatus/list':
-        return { data: readMcpConfig().listStatuses, nextCursor: null }
+        return listMcpServerStatuses().then((data) => ({ data, nextCursor: null }))
       case 'mcpServer/resource/read':
         return readMcpResource(
           stringOr(asRecord(params).server, ''),

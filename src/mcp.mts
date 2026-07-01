@@ -34,6 +34,74 @@ export function readMcpConfig(): McpConfigSnapshot {
   }
 }
 
+// Cache enumerated server statuses briefly: the App's MCP panel can poll
+// mcpServerStatus/list, and each miss spawns one child process per server.
+let statusCache: { key: string; at: number; data: Array<Record<string, unknown>> } | null = null
+const STATUS_CACHE_MS = 10_000
+
+// mcpServerStatus/list with real tools/resources enumerated from each server.
+// Falls back to the conformant empty shape per server on any error/timeout so a
+// single unreachable server never fails the whole list.
+export async function listMcpServerStatuses(): Promise<Array<Record<string, unknown>>> {
+  const snapshot = readMcpConfig()
+  const names = serverNames(snapshot.sdkValue)
+  const key = JSON.stringify(snapshot.sdkValue ?? null)
+  if (statusCache && statusCache.key === key && Date.now() - statusCache.at < STATUS_CACHE_MS) {
+    return statusCache.data
+  }
+  const data = await Promise.all(names.map((name) => enumerateServerStatus(name)))
+  statusCache = { key, at: Date.now(), data }
+  return data
+}
+
+async function enumerateServerStatus(name: string): Promise<Record<string, unknown>> {
+  const base = listStatusEntry(name)
+  const [tools, resources, resourceTemplates] = await Promise.all([
+    safeMcpList(name, 'tools/list', 'tools'),
+    safeMcpList(name, 'resources/list', 'resources'),
+    safeMcpList(name, 'resources/templates/list', 'resourceTemplates'),
+  ])
+  if (Array.isArray(tools)) base.tools = toolMap(tools)
+  if (Array.isArray(resources)) {
+    base.resources = resources.map((raw) => asRecord(raw)).filter((r) => typeof r.uri === 'string')
+  }
+  if (Array.isArray(resourceTemplates)) {
+    base.resourceTemplates = resourceTemplates
+      .map((raw) => asRecord(raw))
+      .filter((r) => typeof r.uriTemplate === 'string')
+  }
+  return base
+}
+
+function toolMap(tools: unknown[]): Record<string, Record<string, unknown>> {
+  const entries = tools
+    .map((raw) => asRecord(raw))
+    .filter((tool): tool is Record<string, unknown> & { name: string } => {
+      return typeof tool.name === 'string'
+    })
+    .map((tool) => [
+      tool.name,
+      {
+        name: tool.name,
+        ...(typeof tool.title === 'string' ? { title: tool.title } : {}),
+        ...(typeof tool.description === 'string' ? { description: tool.description } : {}),
+        inputSchema: tool.inputSchema ?? {},
+        ...(tool.outputSchema ? { outputSchema: tool.outputSchema } : {}),
+      },
+    ])
+  return Object.fromEntries(entries)
+}
+
+async function safeMcpList(name: string, method: string, key: string): Promise<unknown[] | null> {
+  const result = await runMcpRequest(name, method, {}).then(
+    (value) => asRecord(value),
+    () => null,
+  )
+  if (!result) return null
+  const value = result[key]
+  return Array.isArray(value) ? value : []
+}
+
 export async function callMcpTool(
   serverName: string,
   toolName: string,
@@ -89,6 +157,17 @@ async function runMcpRequest(
   let nextId = 1
   let buffer = ''
   let stderr = ''
+  let spawnError: Error | null = null
+  // Without an error handler a failed spawn (for example ENOENT for a missing
+  // server binary) emits an unhandled error and crashes the adapter.
+  child.on('error', (error) => {
+    spawnError = error
+    for (const wait of pending.values()) wait.reject(error)
+    pending.clear()
+  })
+  // child.stdin can emit EPIPE when spawn fails; the child error above carries
+  // the useful cause, so keep this stream from becoming an unhandled error too.
+  child.stdin.on('error', () => undefined)
   child.stderr.setEncoding('utf8')
   child.stderr.on('data', (chunk) => {
     stderr += String(chunk)
@@ -112,6 +191,7 @@ async function runMcpRequest(
   })
 
   const request = (requestMethod: string, requestParams: unknown): Promise<unknown> => {
+    if (spawnError) return Promise.reject(spawnError)
     const id = nextId++
     child.stdin.write(
       `${JSON.stringify({ jsonrpc: '2.0', id, method: requestMethod, params: requestParams })}\n`,
