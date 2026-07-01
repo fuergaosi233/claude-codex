@@ -113,6 +113,7 @@ export class CodexClaudeAppServer {
   >()
   private activePeerByThread = new Map<string, RpcPeer>()
   private activeTurnByThread = new Map<string, string>()
+  private fuzzySessions = new Map<string, { roots: string[] }>()
   private commandSessionAllow = new Map<string, Set<string>>()
   private commandProcesses = new Map<string, ChildProcess>()
   private processHandles = new Map<string, ChildProcess>()
@@ -495,12 +496,12 @@ export class CodexClaudeAppServer {
         return { authMethod: null, authToken: null, requiresOpenaiAuth: false }
       case 'fuzzyFileSearch':
         return this.fuzzyFileSearch(asRecord(params))
-      // Stateful fuzzy-search sessions are not implemented; the one-shot
-      // `fuzzyFileSearch` above already covers the App's file picker needs.
       case 'fuzzyFileSearch/sessionStart':
+        return this.fuzzySessionStart(asRecord(params))
       case 'fuzzyFileSearch/sessionUpdate':
+        return this.fuzzySessionUpdate(peer, asRecord(params))
       case 'fuzzyFileSearch/sessionStop':
-        return {}
+        return this.fuzzySessionStop(peer, asRecord(params))
       default:
         throw new Error(`method not implemented: ${method}`)
     }
@@ -3062,8 +3063,16 @@ export class CodexClaudeAppServer {
   }
 
   private async fuzzyFileSearch(params: Record<string, unknown>): Promise<unknown> {
-    const query = stringOr(params.query, '').toLowerCase()
+    const query = stringOr(params.query, '')
     const roots = Array.isArray(params.roots) ? params.roots.map(String) : [process.cwd()]
+    return { files: await this.fuzzySearchCore(query, roots) }
+  }
+
+  private async fuzzySearchCore(
+    rawQuery: string,
+    roots: string[],
+  ): Promise<Array<Record<string, unknown>>> {
+    const query = rawQuery.toLowerCase()
     const files: Array<Record<string, unknown>> = []
     for (const root of roots) {
       const paths = await listFiles(root)
@@ -3083,7 +3092,44 @@ export class CodexClaudeAppServer {
       }
       if (files.length >= 100) break
     }
-    return { files }
+    return files
+  }
+
+  private fuzzySessionStart(params: Record<string, unknown>): unknown {
+    const sessionId = stringOr(params.sessionId, '')
+    const roots = Array.isArray(params.roots) ? params.roots.map(String) : [process.cwd()]
+    if (sessionId) this.fuzzySessions.set(sessionId, { roots })
+    return {}
+  }
+
+  private async fuzzySessionUpdate(
+    peer: RpcPeer,
+    params: Record<string, unknown>,
+  ): Promise<unknown> {
+    const sessionId = stringOr(params.sessionId, '')
+    const query = stringOr(params.query, '')
+    const session = this.fuzzySessions.get(sessionId)
+    const roots = session?.roots ?? [process.cwd()]
+    const files = await this.fuzzySearchCore(query, roots)
+    if (sessionId && this.fuzzySessions.get(sessionId) === session) {
+      this.notify(peer, {
+        method: 'fuzzyFileSearch/sessionUpdated',
+        params: { sessionId, query, files },
+      })
+    }
+    return {}
+  }
+
+  private fuzzySessionStop(peer: RpcPeer, params: Record<string, unknown>): unknown {
+    const sessionId = stringOr(params.sessionId, '')
+    this.fuzzySessions.delete(sessionId)
+    if (sessionId) {
+      this.notify(peer, {
+        method: 'fuzzyFileSearch/sessionCompleted',
+        params: { sessionId },
+      })
+    }
+    return {}
   }
 
   private toolUseToItem(
