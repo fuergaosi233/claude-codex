@@ -16,4 +16,3 @@ Current scope:
 
 Proposed follow-up: derive these fixtures from the generated Codex app-server
 schema once a stable Rust or JSON-schema source is available.
-
