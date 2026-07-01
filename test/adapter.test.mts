@@ -3436,6 +3436,17 @@ test('fuzzyFileSearch session streams updated and completed notifications', asyn
     const completed = await nextNotification(reader, 'fuzzyFileSearch/sessionCompleted')
     assert.equal(completed.params.sessionId, 's1')
     await reader.nextResponse(3)
+
+    proc.stdin.write(
+      json({
+        id: 4,
+        method: 'fuzzyFileSearch/sessionUpdate',
+        params: { sessionId: 's1', query: 'findme' },
+      }),
+    )
+    const afterStop = await reader.next()
+    assert.equal(afterStop.id, 4)
+    assert.equal(afterStop.method, undefined)
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })

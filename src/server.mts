@@ -3111,7 +3111,7 @@ export class CodexClaudeAppServer {
     const session = this.fuzzySessions.get(sessionId)
     const roots = session?.roots ?? [process.cwd()]
     const files = await this.fuzzySearchCore(query, roots)
-    if (sessionId && this.fuzzySessions.get(sessionId) === session) {
+    if (session && this.fuzzySessions.get(sessionId) === session) {
       this.notify(peer, {
         method: 'fuzzyFileSearch/sessionUpdated',
         params: { sessionId, query, files },
