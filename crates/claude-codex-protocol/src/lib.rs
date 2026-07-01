@@ -73,6 +73,12 @@ mod tests {
             method: Some("thread/start"),
         },
         Fixture {
+            name: "config-read.request.json",
+            json: include_str!("../fixtures/config-read.request.json"),
+            kind: MessageKind::Request,
+            method: Some("config/read"),
+        },
+        Fixture {
             name: "turn-started.notification.json",
             json: include_str!("../fixtures/turn-started.notification.json"),
             kind: MessageKind::Notification,
@@ -87,6 +93,12 @@ mod tests {
         Fixture {
             name: "mcp-server-status-list.response.json",
             json: include_str!("../fixtures/mcp-server-status-list.response.json"),
+            kind: MessageKind::Response,
+            method: None,
+        },
+        Fixture {
+            name: "config-read.response.json",
+            json: include_str!("../fixtures/config-read.response.json"),
             kind: MessageKind::Response,
             method: None,
         },
@@ -142,6 +154,93 @@ mod tests {
             Some("unsupported")
         );
         assert!(entry.get("status").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn response_fixture_preserves_config_read_provider_loop_projection(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        const UNSUPPORTED_CREDENTIAL_SOURCES: &[&str] = &[
+            "personal-session",
+            "browser-cookie",
+            "session-token",
+            "personal-subscription",
+            "credential-sharing",
+            "credential-pooling",
+            "subscription-pooling",
+            "private-proxy",
+            "provider-bypass",
+            "oauth-session",
+            "cli-session-export",
+        ];
+
+        let envelope: JsonRpcEnvelope =
+            parse_envelope(include_str!("../fixtures/config-read.response.json"))?;
+        let serialized = serde_json::to_value(&envelope)?;
+        let Some(provider_loop_config) = serialized
+            .get("result")
+            .and_then(|result| result.get("config"))
+            .and_then(|config| config.get("provider_loop_config"))
+        else {
+            return Err("missing result.config.provider_loop_config".into());
+        };
+        let Some(providers) = provider_loop_config
+            .get("providers")
+            .and_then(Value::as_array)
+        else {
+            return Err("missing provider_loop_config.providers array".into());
+        };
+
+        let provider_ids: Vec<_> = providers
+            .iter()
+            .filter_map(|provider| provider.get("id").and_then(Value::as_str))
+            .collect();
+        assert_eq!(provider_ids, ["claude-code", "codex"]);
+        let Some(issues) = provider_loop_config.get("issues").and_then(Value::as_array) else {
+            return Err("missing provider_loop_config.issues array".into());
+        };
+        assert!(issues.is_empty());
+
+        let Some(claude_code) = providers
+            .iter()
+            .find(|provider| provider.get("id").and_then(Value::as_str) == Some("claude-code"))
+        else {
+            return Err("missing claude-code provider".into());
+        };
+        assert_eq!(
+            claude_code.get("providerFamily").and_then(Value::as_str),
+            Some("anthropic")
+        );
+        assert_eq!(
+            claude_code.get("loopId").and_then(Value::as_str),
+            Some("native-claude-code-sdk")
+        );
+        assert_eq!(
+            claude_code.get("status").and_then(Value::as_str),
+            Some("stable")
+        );
+        assert_eq!(
+            claude_code.get("supportsSteer").and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let Some(allowed_sources) = claude_code
+            .get("allowedCredentialSources")
+            .and_then(Value::as_array)
+        else {
+            return Err("missing claude-code allowedCredentialSources".into());
+        };
+        assert!(allowed_sources
+            .iter()
+            .any(|source| source.as_str() == Some("user-api-key")));
+        for unsupported in UNSUPPORTED_CREDENTIAL_SOURCES {
+            assert!(
+                allowed_sources
+                    .iter()
+                    .all(|source| source.as_str() != Some(unsupported)),
+                "unsupported credential source projected as allowed: {unsupported}"
+            );
+        }
         Ok(())
     }
 }

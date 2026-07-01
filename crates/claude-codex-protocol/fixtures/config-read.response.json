@@ -1,0 +1,56 @@
+{
+  "jsonrpc": "2.0",
+  "id": 5,
+  "result": {
+    "config": {
+      "provider_loop_config": {
+        "providers": [
+          {
+            "id": "claude-code",
+            "displayName": "Claude Code",
+            "status": "stable",
+            "providerFamily": "anthropic",
+            "loopId": "native-claude-code-sdk",
+            "eventFidelity": "rich",
+            "approvalFidelity": "native-file-diff",
+            "supportsSteer": true,
+            "supportsInterrupt": true,
+            "supportsResume": true,
+            "allowedCredentialSources": [
+              "user-api-key",
+              "cloud-provider",
+              "organization-gateway",
+              "local-cli-auth"
+            ],
+            "gatewayPolicy": "official-or-organization-managed",
+            "complianceNotes": [
+              "Credentials stay on the user host, cloud provider chain, or organization gateway.",
+              "Local CLI auth is local-only and not a productized credential distribution model."
+            ]
+          },
+          {
+            "id": "codex",
+            "displayName": "Codex proxy",
+            "status": "stable",
+            "providerFamily": "openai",
+            "loopId": "codex-jsonl-proxy",
+            "eventFidelity": "jsonl",
+            "approvalFidelity": "native-codex",
+            "supportsSteer": false,
+            "supportsInterrupt": true,
+            "supportsResume": true,
+            "allowedCredentialSources": [
+              "local-cli-auth"
+            ],
+            "gatewayPolicy": "none",
+            "complianceNotes": [
+              "Auth remains owned by the local Codex CLI on the user host.",
+              "The adapter does not collect or redistribute Codex subscription/session credentials."
+            ]
+          }
+        ],
+        "issues": []
+      }
+    }
+  }
+}
