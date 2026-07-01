@@ -2,6 +2,7 @@ import { type ChildProcess, execFile, spawn } from 'node:child_process'
 import { type FSWatcher, readFileSync, watch, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
+import { listClaudeHooks, listClaudeSkills } from './claude-capabilities.mjs'
 import { callMcpTool, listMcpServerStatuses, readMcpConfig, readMcpResource } from './mcp.mjs'
 import {
   addedFileDiff,
@@ -370,9 +371,9 @@ export class CodexClaudeAppServer {
           echoed: typeof asRecord(params).value === 'string' ? asRecord(params).value : null,
         }
       case 'skills/list':
-        return { data: [] }
+        return { data: listClaudeSkills(asRecord(params)) }
       case 'hooks/list':
-        return { data: [] }
+        return { data: listClaudeHooks(asRecord(params)) }
       case 'marketplace/add':
         return this.marketplaceAdd(asRecord(params))
       case 'marketplace/remove':

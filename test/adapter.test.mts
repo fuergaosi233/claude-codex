@@ -3509,6 +3509,95 @@ test('fuzzyFileSearch session streams updated and completed notifications', asyn
   }
 })
 
+test('skills/list and hooks/list surface Claude Code skills and settings hooks', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const workspace = join(home, 'ws')
+  await mkdir(join(home, '.claude', 'skills', 'user-skill'), { recursive: true })
+  await writeFile(
+    join(home, '.claude', 'skills', 'user-skill', 'SKILL.md'),
+    '---\nname: user-skill\ndescription: A user skill for tests\n---\nbody\n',
+  )
+  await writeFile(
+    join(home, '.claude', 'settings.json'),
+    JSON.stringify({
+      hooks: {
+        PostToolUse: [{ matcher: 'Edit', hooks: [{ type: 'command', command: 'echo user' }] }],
+      },
+    }),
+  )
+  await mkdir(join(workspace, '.claude', 'skills', 'demo-skill'), { recursive: true })
+  await writeFile(
+    join(workspace, '.claude', 'skills', 'demo-skill', 'SKILL.md'),
+    '---\nname: demo-skill\ndescription: A demo skill for tests\n---\nbody\n',
+  )
+  await writeFile(
+    join(workspace, '.claude', 'settings.json'),
+    JSON.stringify({
+      hooks: {
+        PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: 'echo hi' }] }],
+        Notification: [{ hooks: [{ type: 'command', command: 'ignored' }] }],
+      },
+    }),
+  )
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      CODEX_HOME: home,
+      HOME: home,
+      CLAUDE_CODEX_MOCK: '1',
+      NODE_NO_WARNINGS: '1',
+    },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'skills/list', params: { cwds: [workspace] } }))
+    const skills = await reader.nextResponse(1)
+    const entry = skills.result.data.find((item: Record<string, unknown>) => item.cwd === workspace)
+    assert.ok(entry, 'expected a skills entry for the workspace cwd')
+    const skillList = Array.isArray(entry.skills) ? entry.skills : []
+    const demo = skillList.find((skill: Record<string, unknown>) => skill.name === 'demo-skill')
+    assert.ok(demo, 'expected the demo skill enumerated from .claude/skills')
+    assert.equal(demo.description, 'A demo skill for tests')
+    assert.equal(demo.scope, 'repo')
+    assert.equal(demo.enabled, true)
+    const userSkill = skillList.find(
+      (skill: Record<string, unknown>) => skill.name === 'user-skill',
+    )
+    assert.ok(userSkill, 'expected the user skill enumerated from HOME/.claude/skills')
+    assert.equal(userSkill.description, 'A user skill for tests')
+    assert.equal(userSkill.scope, 'user')
+    assert.equal(userSkill.enabled, true)
+
+    proc.stdin.write(json({ id: 2, method: 'hooks/list', params: { cwds: [workspace] } }))
+    const hooks = await reader.nextResponse(2)
+    const hooksEntry = hooks.result.data.find(
+      (item: Record<string, unknown>) => item.cwd === workspace,
+    )
+    assert.ok(hooksEntry, 'expected a hooks entry for the workspace cwd')
+    const hookList = Array.isArray(hooksEntry.hooks) ? hooksEntry.hooks : []
+    const pre = hookList.find(
+      (hook: Record<string, unknown>) => hook.source === 'project' && hook.command === 'echo hi',
+    )
+    assert.ok(pre, 'expected the project PreToolUse hook mapped to preToolUse')
+    assert.equal(pre.eventName, 'preToolUse')
+    assert.equal(pre.matcher, 'Bash')
+    assert.equal(pre.handlerType, 'command')
+    assert.ok(typeof pre.currentHash === 'string' && pre.currentHash.length > 0)
+    const userHook = hookList.find(
+      (hook: Record<string, unknown>) => hook.source === 'user' && hook.command === 'echo user',
+    )
+    assert.ok(userHook, 'expected the user settings hook mapped from HOME/.claude/settings.json')
+    assert.equal(userHook.eventName, 'postToolUse')
+    assert.equal(userHook.matcher, 'Edit')
+    assert.equal(userHook.handlerType, 'command')
+    assert.ok(!hookList.some((hook: Record<string, unknown>) => hook.eventName === 'notification'))
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('direct MCP HTTP tool calls work', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const httpServer = http.createServer((req, res) => {
