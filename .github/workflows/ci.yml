@@ -23,3 +23,9 @@ jobs:
       - run: npm run check       # biome format + lint
       - run: npm run typecheck   # tsc --noEmit
       - run: npm test            # build + node --test (Node 24 has stable node:sqlite)
+
+  cargo-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo test --workspace

@@ -1,0 +1,10 @@
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "thread/start",
+  "params": {
+    "cwd": "/workspace/claude-codex",
+    "experimentalRawEvents": false,
+    "persistExtendedHistory": false
+  }
+}
