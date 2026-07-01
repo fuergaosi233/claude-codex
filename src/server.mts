@@ -6,6 +6,15 @@ import { listClaudeHooks, listClaudeSkills } from './claude-capabilities.mjs'
 import { callMcpTool, listMcpServerStatuses, readMcpConfig, readMcpResource } from './mcp.mjs'
 import { projectProviderLoopConfig } from './provider-loop-config.mjs'
 import {
+  hasProviderLoopSelectionInput,
+  isProviderLoopSelectionConfigKey,
+  type ProviderLoopSelectionInput,
+  providerLoopSelectionInputFromConfig,
+  providerLoopSelectionInputFromEnv,
+  resolveProviderLoopSelection,
+} from './provider-loop-selection.mjs'
+import { normalizeRuntimeType } from './runtime-config.mjs'
+import {
   addedFileDiff,
   asRecord,
   buildSystemPromptAddendum,
@@ -523,6 +532,7 @@ export class CodexClaudeAppServer {
     const cwd = maybeCreateThreadWorktree(id, requestedCwd).cwd
     const model = modelFromParams(params, this.configModel)
     const reasoningEffort = reasoningEffortFromParams(params, this.configReasoningEffort)
+    const selectedProviderLoop = resolveProviderLoopSelection(this.providerLoopSelectionInput())
     const thread: ThreadRecord = {
       id,
       sessionId: id,
@@ -559,7 +569,10 @@ export class CodexClaudeAppServer {
       // Pick the runtime backend from the chosen model — picking gpt-* in
       // the App's model dropdown flips the new thread to runtimeBackend
       // 'codex' so turns get forwarded to `codex exec`. Default 'claude'.
-      runtimeBackend: isCodexOpenAiModel(model) ? 'codex' : 'claude',
+      runtimeBackend:
+        selectedProviderLoop.runtimeType === 'codex-proxy' || isCodexOpenAiModel(model)
+          ? 'codex'
+          : 'claude',
       codexSessionId: null,
     }
     this.store.upsertThread(thread)
@@ -2392,7 +2405,7 @@ export class CodexClaudeAppServer {
     // applied via a stricter validator.
     return {
       config: {
-        ...this.configOverrides,
+        ...this.publicConfigOverrides(),
         model: this.configModel,
         review_model: null,
         model_context_window: null,
@@ -2418,7 +2431,10 @@ export class CodexClaudeAppServer {
         analytics: this.configOverrides.analytics ?? null,
         apps: this.configOverrides.apps ?? null,
         model_providers: this.exposedModelProviders(),
-        provider_loop_config: projectProviderLoopConfig(),
+        provider_loop_config: projectProviderLoopConfig(
+          undefined,
+          this.providerLoopSelectionInput(),
+        ),
       },
       origins: {
         model_provider: configLayerMetadata(),
@@ -2429,6 +2445,29 @@ export class CodexClaudeAppServer {
       },
       layers: null,
     }
+  }
+
+  private providerLoopSelectionInput(): ProviderLoopSelectionInput {
+    const legacyRuntimeType = normalizeRuntimeType(
+      process.env.CLAUDE_CODEX_RUNTIME_TYPE ??
+        process.env.CLAUDE_CODEX_RUNTIME ??
+        process.env.CLAUDE_CODEX_BACKEND,
+    )
+    const envInput = providerLoopSelectionInputFromEnv(process.env, legacyRuntimeType)
+    if (hasProviderLoopSelectionInput(envInput)) return envInput
+    return providerLoopSelectionInputFromConfig(
+      this.configOverrides,
+      legacyRuntimeType,
+      process.env.CLAUDE_CODEX_MOCK === '1',
+    )
+  }
+
+  private publicConfigOverrides(): Record<string, unknown> {
+    return Object.fromEntries(
+      Object.entries(this.configOverrides).filter(
+        ([key]) => !isProviderLoopSelectionConfigKey(key),
+      ),
+    )
   }
 
   // Build the model_providers map served by config/read. Always exposes

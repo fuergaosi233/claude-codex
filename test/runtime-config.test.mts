@@ -28,6 +28,14 @@ test('runtime config keeps legacy defaults and accepts explicit backends', () =>
   assert.equal(resolveRuntimeConfig({ CLAUDE_CODEX_RUNTIME_TYPE: 'channels' }).type, 'agent-http')
   assert.equal(resolveRuntimeConfig({ CLAUDE_CODEX_RUNTIME_TYPE: 'agentapi' }).type, 'agentapi')
   assert.equal(resolveRuntimeConfig({ CLAUDE_CODEX_RUNTIME_TYPE: 'claude-p' }).type, 'claude-p')
+  assert.equal(resolveRuntimeConfig({ CLAUDE_CODEX_PROVIDER: 'codex' }).type, 'codex-proxy')
+  assert.equal(
+    resolveRuntimeConfig({
+      CLAUDE_CODEX_PROVIDER: 'codex',
+      CLAUDE_CODEX_RUNTIME_TYPE: 'agent-http',
+    }).type,
+    'agent-http',
+  )
   assert.equal(
     resolveRuntimeConfig({ CLAUDE_CODEX_HTTP_MANAGE_BRIDGE: '1' }).http.manageBridge,
     true,
