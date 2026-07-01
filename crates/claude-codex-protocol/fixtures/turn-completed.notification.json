@@ -1,0 +1,17 @@
+{
+  "jsonrpc": "2.0",
+  "method": "turn/completed",
+  "params": {
+    "threadId": "thread_001",
+    "turn": {
+      "id": "turn_001",
+      "items": [],
+      "itemsView": "notLoaded",
+      "status": "completed",
+      "error": null,
+      "startedAt": 1710000000,
+      "completedAt": 1710000001,
+      "durationMs": 1000
+    }
+  }
+}
