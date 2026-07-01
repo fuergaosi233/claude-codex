@@ -250,6 +250,62 @@ test('turn lifecycle envelopes carry empty notLoaded items like the real app-ser
   }
 })
 
+test('thread/turns/list honors default summary and explicit itemsView', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const start = await reader.nextResponse(1)
+    const threadId = start.result.thread.id
+
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: [{ type: 'text', text: 'hello', text_elements: [] }] },
+      }),
+    )
+    await reader.nextResponse(2)
+    for (let i = 0; i < 200; i += 1) {
+      const message = await reader.next()
+      if (message.method === 'turn/completed') break
+    }
+
+    proc.stdin.write(json({ id: 3, method: 'thread/turns/list', params: { threadId } }))
+    const summary = await reader.nextResponse(3)
+    const summaryTurn = summary.result.data[0]
+    assert.equal(summaryTurn.itemsView, 'summary')
+    assert.deepEqual(
+      summaryTurn.items.map((item: Record<string, unknown>) => item.type),
+      ['userMessage', 'agentMessage'],
+    )
+
+    proc.stdin.write(
+      json({ id: 4, method: 'thread/turns/list', params: { threadId, itemsView: 'notLoaded' } }),
+    )
+    const notLoaded = await reader.nextResponse(4)
+    assert.equal(notLoaded.result.data[0].itemsView, 'notLoaded')
+    assert.deepEqual(notLoaded.result.data[0].items, [])
+
+    proc.stdin.write(
+      json({ id: 5, method: 'thread/turns/list', params: { threadId, itemsView: 'full' } }),
+    )
+    const full = await reader.nextResponse(5)
+    const fullTurn = full.result.data[0]
+    assert.equal(fullTurn.itemsView, 'full')
+    assert.ok(fullTurn.items.length >= summaryTurn.items.length)
+    assert.ok(fullTurn.items.some((item: Record<string, unknown>) => item.type === 'userMessage'))
+    assert.ok(fullTurn.items.some((item: Record<string, unknown>) => item.type === 'agentMessage'))
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('mcpServerStatus/list and startup notifications use conformant Codex v2 shapes', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {

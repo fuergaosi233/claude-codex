@@ -106,6 +106,13 @@ import { maybeCreateThreadWorktree } from './worktree.mjs'
 
 const execFileAsync = promisify(execFile)
 
+type TurnItemsView = 'full' | 'summary' | 'notLoaded'
+
+function turnItemsView(value: unknown): TurnItemsView {
+  if (value === 'full' || value === 'summary' || value === 'notLoaded') return value
+  return 'summary'
+}
+
 export class CodexClaudeAppServer {
   private pendingServerRequests = new Map<
     string,
@@ -705,8 +712,9 @@ export class CodexClaudeAppServer {
 
   private threadTurnsList(params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
+    const itemsView = turnItemsView(params.itemsView)
     return {
-      data: this.store.listTurns(threadId).map((turn) => this.toTurn(turn)),
+      data: this.store.listTurns(threadId).map((turn) => this.toTurnView(turn, itemsView)),
       nextCursor: null,
       backwardsCursor: null,
     }
@@ -3247,6 +3255,26 @@ export class CodexClaudeAppServer {
       id: turn.id,
       items: turn.items,
       itemsView: 'full',
+      status: turn.status,
+      error: turn.error,
+      startedAt: turn.startedAt,
+      completedAt: turn.completedAt,
+      durationMs: turn.durationMs,
+    }
+  }
+
+  private toTurnView(turn: TurnRecord, itemsView: TurnItemsView): unknown {
+    if (itemsView === 'full') return this.toTurn(turn)
+    if (itemsView === 'notLoaded') return this.toLifecycleTurn(turn)
+    const firstUser = turn.items.find((item) => item.type === 'userMessage')
+    const lastAgent = turn.items.findLast((item) => item.type === 'agentMessage')
+    const items: ThreadItem[] = []
+    if (firstUser) items.push(firstUser)
+    if (lastAgent && lastAgent.id !== firstUser?.id) items.push(lastAgent)
+    return {
+      id: turn.id,
+      items,
+      itemsView: 'summary',
       status: turn.status,
       error: turn.error,
       startedAt: turn.startedAt,
