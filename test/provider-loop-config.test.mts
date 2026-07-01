@@ -80,3 +80,36 @@ test('provider loop config projection redacts secret-like compliance notes', () 
     ['secret-like-value'],
   )
 })
+
+test('provider loop config projection redacts secret-like validation issues', () => {
+  const projected = projectProviderLoopConfig([
+    {
+      id: 'ANTHROPIC_API_KEY=sk-ant-fake000000000000000000000000000000',
+      displayName: 'Invalid Secret Provider',
+      status: 'experimental',
+      providerFamily: 'anthropic',
+      allowedCredentialSources: ['token=secret000000000000000000000000000000'],
+      gatewayPolicy: 'none',
+      loopId: 'invalid-secret-loop',
+      eventFidelity: 'transcript',
+      approvalFidelity: 'none',
+      supportsSteer: false,
+      supportsInterrupt: false,
+      supportsResume: false,
+      complianceNotes: ['fake descriptor for projection tests only'],
+      unsupportedCredentialSources: ['private-proxy'],
+    },
+  ])
+
+  assert.deepEqual(
+    projected.issues.map((issue) => issue.descriptorId),
+    ['ANTHROPIC_API_KEY=[redacted]', 'ANTHROPIC_API_KEY=[redacted]'],
+  )
+  assert.deepEqual(
+    projected.issues.map((issue) => issue.message),
+    [
+      'field contains a secret-like value',
+      'token=[redacted] is not a supported credential source label',
+    ],
+  )
+})

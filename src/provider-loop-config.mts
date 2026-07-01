@@ -50,7 +50,7 @@ export function projectProviderLoopConfig(
 ): ProviderLoopConfigProjectionResult {
   return {
     providers: descriptors.flatMap((descriptor) => projectDescriptor(descriptor)),
-    issues: validateProviderLoopDescriptors(descriptors),
+    issues: validateProviderLoopDescriptors(descriptors).map(projectValidationIssue),
   }
 }
 
@@ -99,4 +99,13 @@ function isProjectableDescriptor(
 
 function safeText(value: string): string {
   return redactSecretLikeText(value)
+}
+
+function projectValidationIssue(issue: DescriptorValidationIssue): DescriptorValidationIssue {
+  return {
+    descriptorId: safeText(issue.descriptorId),
+    field: issue.field,
+    code: issue.code,
+    message: safeText(issue.message),
+  }
 }
