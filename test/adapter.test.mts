@@ -3362,6 +3362,38 @@ test('direct MCP stdio resource and tool calls work', async () => {
   }
 })
 
+test('mcpServerStatus/list enumerates tools and resources from the server', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const fixture = resolve('test/fixtures/mcp-stdio-server.mjs')
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      CODEX_HOME: home,
+      CLAUDE_CODEX_MOCK: '1',
+      CLAUDE_CODEX_MCP_SERVERS: JSON.stringify({
+        fixture: { type: 'stdio', command: process.execPath, args: [fixture] },
+      }),
+      NODE_NO_WARNINGS: '1',
+    },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'mcpServerStatus/list', params: {} }))
+    const response = await reader.nextResponse(1)
+    const entry = response.result.data[0]
+    assert.equal(entry.name, 'fixture')
+    assert.ok(entry.tools.echo, 'expected the echo tool enumerated into the map')
+    assert.equal(entry.tools.echo.name, 'echo')
+    assert.ok(entry.tools.echo.inputSchema, 'tool must carry its inputSchema')
+    assert.equal(entry.resources[0].uri, 'fixture://resource')
+    assert.ok(['unsupported', 'notLoggedIn', 'bearerToken', 'oAuth'].includes(entry.authStatus))
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('direct MCP HTTP tool calls work', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const httpServer = http.createServer((req, res) => {
