@@ -92,6 +92,7 @@ function readSkillDir(
   return { skills, errors }
 }
 
+// Claude events without a Codex hook surface, such as Notification, are intentionally dropped.
 const HOOK_EVENT_MAP: Record<string, string> = {
   PreToolUse: 'preToolUse',
   PostToolUse: 'postToolUse',
