@@ -15,6 +15,7 @@ export default defineConfig({
     nav: [
       { text: 'Guide', link: '/guide/getting-started' },
       { text: 'Reference', link: '/reference/protocol-coverage' },
+      { text: 'RFCs', link: '/rfcs/rust-first-runtime' },
       { text: 'Contributing', link: '/contributing' },
     ],
     sidebar: {
@@ -38,6 +39,12 @@ export default defineConfig({
             { text: 'Capability matrix', link: '/reference/capability-matrix' },
             { text: 'Validation', link: '/reference/validation' },
           ],
+        },
+      ],
+      '/rfcs/': [
+        {
+          text: 'RFCs',
+          items: [{ text: 'Rust-first runtime boundaries', link: '/rfcs/rust-first-runtime' }],
         },
       ],
     },
