@@ -24,6 +24,12 @@ const fixtures = [
     schemaFile: 'ClientRequest.ts',
   },
   {
+    file: 'config-read.request.json',
+    kind: 'request',
+    method: 'config/read',
+    schemaFile: 'ClientRequest.ts',
+  },
+  {
     file: 'turn-started.notification.json',
     kind: 'notification',
     method: 'turn/started',
@@ -41,7 +47,18 @@ const fixtures = [
     requestMethod: 'mcpServerStatus/list',
     schemaFile: 'ClientRequest.ts',
   },
+  {
+    file: 'config-read.response.json',
+    kind: 'response',
+    requestMethod: 'config/read',
+    schemaFile: 'ClientRequest.ts',
+  },
 ]
+
+const unsupportedCredentialSources =
+  'personal-session browser-cookie session-token personal-subscription credential-sharing credential-pooling subscription-pooling private-proxy provider-bypass oauth-session cli-session-export'.split(
+    ' ',
+  )
 
 function fail(message) {
   console.error(`rust protocol fixture drift check failed: ${message}`)
@@ -78,17 +95,72 @@ function validateFixture(fixture) {
   if (fixture.kind === 'response') {
     if (body.id == null) fail(`${fixture.file} is missing response id`)
     if (!body.result || typeof body.result !== 'object') fail(`${fixture.file} is missing result`)
-    if (!Array.isArray(body.result.data)) fail(`${fixture.file} result.data is not an array`)
-    if (body.result.data.length === 0) fail(`${fixture.file} result.data is empty`)
-    const [entry] = body.result.data
-    for (const field of ['name', 'tools', 'resources', 'resourceTemplates', 'authStatus']) {
-      if (!Object.hasOwn(entry, field)) fail(`${fixture.file} entry is missing ${field}`)
-    }
-    if (Object.hasOwn(entry, 'status')) fail(`${fixture.file} entry must not contain status`)
+    validateResponseFixture(fixture, body)
     return
   }
 
   fail(`${fixture.file} has unknown fixture kind ${fixture.kind}`)
+}
+
+function validateResponseFixture(fixture, body) {
+  if (fixture.requestMethod === 'mcpServerStatus/list') {
+    validateMcpStatusResponse(fixture.file, body)
+    return
+  }
+  if (fixture.requestMethod === 'config/read') {
+    validateConfigReadResponse(fixture.file, body)
+    return
+  }
+  fail(`${fixture.file} has unknown response request method ${fixture.requestMethod}`)
+}
+
+function validateMcpStatusResponse(file, body) {
+  if (!Array.isArray(body.result.data)) fail(`${file} result.data is not an array`)
+  if (body.result.data.length === 0) fail(`${file} result.data is empty`)
+  const [entry] = body.result.data
+  for (const field of ['name', 'tools', 'resources', 'resourceTemplates', 'authStatus']) {
+    if (!Object.hasOwn(entry, field)) fail(`${file} entry is missing ${field}`)
+  }
+  if (Object.hasOwn(entry, 'status')) fail(`${file} entry must not contain status`)
+}
+
+function validateConfigReadResponse(file, body) {
+  const providerLoopConfig = body.result.config?.provider_loop_config
+  if (!providerLoopConfig || typeof providerLoopConfig !== 'object') {
+    fail(`${file} is missing result.config.provider_loop_config`)
+  }
+  if (!Array.isArray(providerLoopConfig.providers)) {
+    fail(`${file} provider_loop_config.providers is not an array`)
+  }
+  const providerIds = providerLoopConfig.providers.map((provider) => provider?.id)
+  if (JSON.stringify(providerIds) !== JSON.stringify(['claude-code', 'codex'])) {
+    fail(`${file} provider ids are not claude-code,codex in stable order`)
+  }
+  if (!Array.isArray(providerLoopConfig.issues) || providerLoopConfig.issues.length !== 0) {
+    fail(`${file} provider_loop_config.issues is not empty`)
+  }
+
+  const claudeCode = providerLoopConfig.providers.find((provider) => provider.id === 'claude-code')
+  if (!claudeCode) fail(`${file} is missing claude-code provider`)
+  if (claudeCode.providerFamily !== 'anthropic') {
+    fail(`${file} claude-code providerFamily is not anthropic`)
+  }
+  if (claudeCode.loopId !== 'native-claude-code-sdk') {
+    fail(`${file} claude-code loopId is not native-claude-code-sdk`)
+  }
+  if (claudeCode.status !== 'stable') fail(`${file} claude-code status is not stable`)
+  if (claudeCode.supportsSteer !== true) fail(`${file} claude-code supportsSteer is not true`)
+  if (!Array.isArray(claudeCode.allowedCredentialSources)) {
+    fail(`${file} claude-code allowedCredentialSources is not an array`)
+  }
+  if (!claudeCode.allowedCredentialSources.includes('user-api-key')) {
+    fail(`${file} claude-code allowedCredentialSources is missing user-api-key`)
+  }
+  for (const unsupported of unsupportedCredentialSources) {
+    if (claudeCode.allowedCredentialSources.includes(unsupported)) {
+      fail(`${file} projects unsupported credential source as allowed: ${unsupported}`)
+    }
+  }
 }
 
 function executableExists(path) {
