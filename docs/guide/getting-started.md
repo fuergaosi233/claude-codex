@@ -23,8 +23,10 @@ command-line Codex usage.
 - **Node.js 24+** — the thread store uses `node:sqlite`, which Node 22 hides
   behind `--experimental-sqlite`. The adapter does not pass that flag, so it
   crashes at runtime on 22. Pin a binary with `CLAUDE_CODEX_NODE` if needed.
-- **Claude Code auth** — either `ANTHROPIC_API_KEY` or a `claude /login`
-  (claude.ai OAuth) session. Bedrock/Vertex auth also works.
+- **Claude Code auth** — provide your own `ANTHROPIC_API_KEY`, supported
+  cloud-provider credentials, or a local `claude /login` session. Inject
+  credentials through your shell or secret manager; do not commit keys, OAuth
+  state, `.env` files, or acceptance-test transcripts.
 
 ## Build
 
