@@ -44,7 +44,13 @@ export default defineConfig({
       '/rfcs/': [
         {
           text: 'RFCs',
-          items: [{ text: 'Rust-first runtime boundaries', link: '/rfcs/rust-first-runtime' }],
+          items: [
+            { text: 'Rust-first runtime boundaries', link: '/rfcs/rust-first-runtime' },
+            {
+              text: 'Provider and multi-agent loop boundaries',
+              link: '/rfcs/provider-and-agent-loop-boundaries',
+            },
+          ],
         },
       ],
     },
