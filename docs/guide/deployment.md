@@ -17,21 +17,24 @@ so non-interactive SSH sees them too:
 
 ```bash
 export PATH="$HOME/bin:$PATH"
-export ANTHROPIC_API_KEY="..."                    # or sign in with `claude /login`
+export ANTHROPIC_API_KEY="<your-anthropic-api-key>" # or sign in with `claude /login`
 export CLAUDE_CODEX_ADAPTER="/opt/claude-codex-adapter/dist/src/adapter.mjs"
 export CLAUDE_CODEX_NODE="/absolute/path/to/node" # optional
 export CODEX_REAL="/usr/local/bin/codex.real"     # optional native-Codex fallback
-# export ANTHROPIC_BASE_URL="https://your-anthropic-reverse-proxy.example"  # if api.anthropic.com is region-blocked
 ```
+
+Keep credentials in the host environment or a secret manager. Do not commit
+real API keys, OAuth/session state, `.env` files, copied shell snippets with
+resolved secrets, or private infrastructure URLs.
 
 Codex App keeps using its native SSH flow: it probes `codex --version`, starts
 `codex app-server --listen unix://`, then connects via `codex app-server proxy`.
 The shim routes only those app-server calls to the adapter.
 
-::: tip Reverse proxy
-`ANTHROPIC_BASE_URL` is useful when the host's egress IP is region-blocked from
-`api.anthropic.com` but you still want the same `claude` auth (claude.ai OAuth or
-`ANTHROPIC_API_KEY`).
+::: tip Custom Anthropic endpoints
+If your organization uses a supported custom Anthropic endpoint, configure
+`ANTHROPIC_BASE_URL` in the host environment. Treat the endpoint value as
+deployment configuration and avoid committing private URLs.
 :::
 
 ## Bootstrapping a fresh host (no sudo / Homebrew)

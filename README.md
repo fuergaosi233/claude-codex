@@ -33,8 +33,11 @@ mkdir -p ~/bin
 cp scripts/codex-shim ~/bin/codex && chmod +x ~/bin/codex
 export PATH="$HOME/bin:$PATH"
 export CLAUDE_CODEX_ADAPTER="$PWD/dist/src/adapter.mjs"
-export ANTHROPIC_API_KEY="..."      # or `claude /login`
+export ANTHROPIC_API_KEY="<your-anthropic-api-key>" # or authenticate with `claude /login`
 ```
+
+Provide credentials only through your local shell or secret manager. Do not
+commit API keys, OAuth/session data, `.env` files, or acceptance-test logs.
 
 Full walkthrough → **[Getting started](https://fuergaosi233.github.io/claude-codex/guide/getting-started)**.
 
@@ -63,6 +66,8 @@ diffs. Backends are pluggable (default in-process Agent SDK, plus `agent-http`,
 | Backends | <https://fuergaosi233.github.io/claude-codex/guide/backends> |
 | Capability matrix | <https://fuergaosi233.github.io/claude-codex/reference/capability-matrix> |
 | Contributing / toolchain | <https://fuergaosi233.github.io/claude-codex/contributing> |
+| Security policy | [SECURITY.md](SECURITY.md) |
+| Safe examples | [examples/](examples/) |
 
 Docs source lives in [`docs/`](docs/) and is published with VitePress. For
 contributors, the repo also ships progressive `AGENTS.md` files (root + `src/` +
