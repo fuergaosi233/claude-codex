@@ -1,3 +1,8 @@
+import {
+  providerLoopSelectionInputFromEnv,
+  resolveProviderLoopSelection,
+} from './provider-loop-selection.mjs'
+
 export type RuntimeBackendType =
   | 'mock'
   | 'agent-sdk-sidecar'
@@ -33,7 +38,8 @@ export function resolveRuntimeConfig(env: NodeJS.ProcessEnv = process.env): Runt
   const explicit = normalizeRuntimeType(
     env.CLAUDE_CODEX_RUNTIME_TYPE ?? env.CLAUDE_CODEX_RUNTIME ?? env.CLAUDE_CODEX_BACKEND,
   )
-  const type = env.CLAUDE_CODEX_MOCK === '1' ? 'mock' : (explicit ?? 'agent-sdk-sidecar')
+  const selection = resolveProviderLoopSelection(providerLoopSelectionInputFromEnv(env, explicit))
+  const type = selection.runtimeType
 
   return {
     type,

@@ -113,3 +113,41 @@ test('provider loop config projection redacts secret-like validation issues', ()
     ],
   )
 })
+
+test('provider loop config projection includes selected runtime metadata', () => {
+  const projected = projectProviderLoopConfig(undefined, {
+    providerId: 'codex',
+    loopId: 'codex-jsonl-proxy',
+    source: 'environment',
+  })
+
+  assert.deepEqual(projected.selection, {
+    providerId: 'codex',
+    loopId: 'codex-jsonl-proxy',
+    runtimeType: 'codex-proxy',
+    source: 'environment',
+  })
+  assert.deepEqual(projected.issues, [])
+})
+
+test('provider loop config projection redacts secret-like selection issues', () => {
+  const projected = projectProviderLoopConfig(undefined, {
+    providerId: 'ANTHROPIC_API_KEY=sk-ant-fake000000000000000000000000000000',
+    source: 'config',
+  })
+
+  assert.deepEqual(projected.selection, {
+    providerId: 'claude-code',
+    loopId: 'native-claude-code-sdk',
+    runtimeType: 'agent-sdk-sidecar',
+    source: 'config',
+  })
+  assert.deepEqual(projected.issues, [
+    {
+      descriptorId: 'provider-loop-selection',
+      field: 'provider',
+      code: 'unknown-provider',
+      message: 'unknown provider selection: ANTHROPIC_API_KEY=[redacted]',
+    },
+  ])
+})

@@ -521,6 +521,127 @@ test('model/list exposes Claude model aliases and Codex-safe reasoning efforts',
   }
 })
 
+test('config/read exposes sanitized provider loop selection over stdio', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      CODEX_HOME: home,
+      CLAUDE_CODEX_PROVIDER: 'codex',
+      CLAUDE_CODEX_AGENT_LOOP: 'codex-jsonl-proxy',
+      CLAUDE_CODEX_RUNTIME_TYPE: '',
+      CLAUDE_CODEX_RUNTIME: '',
+      CLAUDE_CODEX_BACKEND: '',
+      CLAUDE_CODEX_MOCK: '',
+      CLAUDE_CODEX_DISABLE_CODEX_PROXY: '1',
+      NODE_NO_WARNINGS: '1',
+    },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'config/read', params: {} }))
+    const config = await reader.nextResponse(1)
+    const providerLoopConfig = config.result.config
+      .provider_loop_config as ProviderLoopConfigProjectionResult
+
+    assert.deepEqual(
+      providerLoopConfig.providers.map((provider) => provider.id),
+      ['claude-code', 'codex'],
+    )
+    assert.deepEqual(providerLoopConfig.selection, {
+      providerId: 'codex',
+      loopId: 'codex-jsonl-proxy',
+      runtimeType: 'codex-proxy',
+      source: 'environment',
+    })
+    assert.deepEqual(providerLoopConfig.issues, [])
+    assert.deepEqual(Object.keys(providerLoopConfig.providers[0] ?? {}).sort(), [
+      'allowedCredentialSources',
+      'approvalFidelity',
+      'complianceNotes',
+      'displayName',
+      'eventFidelity',
+      'gatewayPolicy',
+      'id',
+      'loopId',
+      'providerFamily',
+      'status',
+      'supportsInterrupt',
+      'supportsResume',
+      'supportsSteer',
+    ])
+    assert.equal(JSON.stringify(providerLoopConfig).includes('personal-session'), false)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('config/read resolves saved provider loop selection without projecting raw keys', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      CODEX_HOME: home,
+      CLAUDE_CODEX_PROVIDER: '',
+      CLAUDE_CODEX_AGENT_LOOP: '',
+      CLAUDE_CODEX_RUNTIME_TYPE: '',
+      CLAUDE_CODEX_RUNTIME: '',
+      CLAUDE_CODEX_BACKEND: '',
+      CLAUDE_CODEX_MOCK: '',
+      CLAUDE_CODEX_DISABLE_CODEX_PROXY: '1',
+      NODE_NO_WARNINGS: '1',
+    },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'config/value/write',
+        params: { keyPath: 'provider_loop_provider', value: 'codex' },
+      }),
+    )
+    await reader.nextResponse(1)
+
+    proc.stdin.write(json({ id: 2, method: 'config/read', params: {} }))
+    const config = await reader.nextResponse(2)
+    const providerLoopConfig = config.result.config
+      .provider_loop_config as ProviderLoopConfigProjectionResult
+
+    assert.deepEqual(providerLoopConfig.selection, {
+      providerId: 'codex',
+      loopId: 'codex-jsonl-proxy',
+      runtimeType: 'codex-proxy',
+      source: 'config',
+    })
+    assert.equal('provider_loop_provider' in config.result.config, false)
+
+    proc.stdin.write(
+      json({
+        id: 3,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), model: 'sonnet' },
+      }),
+    )
+    const started = await reader.nextResponse(3)
+    proc.stdin.write(
+      json({
+        id: 4,
+        method: 'thread/resume',
+        params: { threadId: started.result.thread.id, model: 'opus' },
+      }),
+    )
+    const resumed = await reader.nextResponse(4)
+    assert.equal(resumed.result.model, 'sonnet')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('config writes persist across adapter restarts', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   try {

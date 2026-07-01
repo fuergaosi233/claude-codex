@@ -7,6 +7,14 @@ import {
   redactSecretLikeText,
   validateProviderLoopDescriptors,
 } from './provider-loop-descriptors.mjs'
+import {
+  type ProviderLoopSelectionInput,
+  type ProviderLoopSelectionIssue,
+  type ProviderLoopSelectionSource,
+  resolveProviderLoopSelection,
+} from './provider-loop-selection.mjs'
+
+export type ProviderLoopConfigIssue = DescriptorValidationIssue | ProviderLoopSelectionIssue
 
 export interface ProviderLoopConfigProjection {
   readonly id: string
@@ -26,7 +34,15 @@ export interface ProviderLoopConfigProjection {
 
 export interface ProviderLoopConfigProjectionResult {
   readonly providers: readonly ProviderLoopConfigProjection[]
-  readonly issues: readonly DescriptorValidationIssue[]
+  readonly selection: ProviderLoopConfigSelection
+  readonly issues: readonly ProviderLoopConfigIssue[]
+}
+
+export interface ProviderLoopConfigSelection {
+  readonly providerId: string
+  readonly loopId: string
+  readonly runtimeType: string
+  readonly source: ProviderLoopSelectionSource
 }
 
 interface ProjectableProviderLoopDescriptor extends ProviderLoopDescriptorDraft {
@@ -47,10 +63,21 @@ interface ProjectableProviderLoopDescriptor extends ProviderLoopDescriptorDraft 
 
 export function projectProviderLoopConfig(
   descriptors: readonly ProviderLoopDescriptorDraft[] = PROVIDER_LOOP_DESCRIPTORS,
+  selectionInput: ProviderLoopSelectionInput = {},
 ): ProviderLoopConfigProjectionResult {
+  const selection = resolveProviderLoopSelection(selectionInput)
   return {
     providers: descriptors.flatMap((descriptor) => projectDescriptor(descriptor)),
-    issues: validateProviderLoopDescriptors(descriptors).map(projectValidationIssue),
+    selection: {
+      providerId: safeText(selection.providerId),
+      loopId: safeText(selection.loopId),
+      runtimeType: selection.runtimeType,
+      source: selection.source,
+    },
+    issues: [
+      ...validateProviderLoopDescriptors(descriptors).map(projectValidationIssue),
+      ...selection.issues.map(projectSelectionIssue),
+    ],
   }
 }
 
@@ -104,6 +131,15 @@ function safeText(value: string): string {
 function projectValidationIssue(issue: DescriptorValidationIssue): DescriptorValidationIssue {
   return {
     descriptorId: safeText(issue.descriptorId),
+    field: issue.field,
+    code: issue.code,
+    message: safeText(issue.message),
+  }
+}
+
+function projectSelectionIssue(issue: ProviderLoopSelectionIssue): ProviderLoopSelectionIssue {
+  return {
+    descriptorId: 'provider-loop-selection',
     field: issue.field,
     code: issue.code,
     message: safeText(issue.message),
