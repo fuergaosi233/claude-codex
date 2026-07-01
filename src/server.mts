@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { listClaudeHooks, listClaudeSkills } from './claude-capabilities.mjs'
 import { callMcpTool, listMcpServerStatuses, readMcpConfig, readMcpResource } from './mcp.mjs'
+import { projectProviderLoopConfig } from './provider-loop-config.mjs'
 import {
   addedFileDiff,
   asRecord,
@@ -2417,6 +2418,7 @@ export class CodexClaudeAppServer {
         analytics: this.configOverrides.analytics ?? null,
         apps: this.configOverrides.apps ?? null,
         model_providers: this.exposedModelProviders(),
+        provider_loop_config: projectProviderLoopConfig(),
       },
       origins: {
         model_provider: configLayerMetadata(),

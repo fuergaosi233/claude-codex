@@ -10,6 +10,7 @@ import { join, resolve } from 'node:path'
 import { Duplex } from 'node:stream'
 import test from 'node:test'
 import WebSocket from 'ws'
+import type { ProviderLoopConfigProjectionResult } from '../src/provider-loop-config.mjs'
 
 const adapter = resolve('dist/src/adapter.mjs')
 const shim = resolve('scripts/codex-shim')
@@ -434,6 +435,25 @@ test('model/list exposes Claude model aliases and Codex-safe reasoning efforts',
     assert.equal(config.result.config.model_provider, 'claude-code')
     assert.equal(config.result.config.model_providers['claude-code'].name, 'Claude Code')
     assert.equal(config.result.config.model_providers['claude-code'].requires_openai_auth, false)
+    const providerLoopConfig = config.result.config
+      .provider_loop_config as ProviderLoopConfigProjectionResult
+    assert.deepEqual(
+      providerLoopConfig.providers.map((provider) => provider.id),
+      ['claude-code', 'codex'],
+    )
+    assert.deepEqual(providerLoopConfig.issues, [])
+    const claudeCodeProvider = providerLoopConfig.providers.find(
+      (provider) => provider.id === 'claude-code',
+    )
+    assert.ok(claudeCodeProvider)
+    assert.equal(claudeCodeProvider.loopId, 'native-claude-code-sdk')
+    assert.equal(claudeCodeProvider.providerFamily, 'anthropic')
+    assert.equal(claudeCodeProvider.status, 'stable')
+    assert.equal(claudeCodeProvider.supportsSteer, true)
+    const allowedCredentialSources = new Set<string>(claudeCodeProvider.allowedCredentialSources)
+    assert.equal(allowedCredentialSources.has('user-api-key'), true)
+    assert.equal(allowedCredentialSources.has('personal-session'), false)
+    assert.equal(allowedCredentialSources.has('browser-cookie'), false)
 
     proc.stdin.write(json({ id: 7, method: 'account/read', params: {} }))
     const account = await reader.nextResponse(7)
