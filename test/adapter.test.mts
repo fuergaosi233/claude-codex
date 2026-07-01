@@ -534,6 +534,7 @@ test('config/read exposes sanitized provider loop selection over stdio', async (
       CLAUDE_CODEX_RUNTIME: '',
       CLAUDE_CODEX_BACKEND: '',
       CLAUDE_CODEX_MOCK: '',
+      CLAUDE_CODEX_DISABLE_CODEX_PROXY: '1',
       NODE_NO_WARNINGS: '1',
     },
   })
@@ -590,6 +591,7 @@ test('config/read resolves saved provider loop selection without projecting raw 
       CLAUDE_CODEX_RUNTIME: '',
       CLAUDE_CODEX_BACKEND: '',
       CLAUDE_CODEX_MOCK: '',
+      CLAUDE_CODEX_DISABLE_CODEX_PROXY: '1',
       NODE_NO_WARNINGS: '1',
     },
   })
