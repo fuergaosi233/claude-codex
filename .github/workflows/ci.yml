@@ -20,6 +20,8 @@ jobs:
       # binaries as optionalDependencies, and a lockfile generated on one OS
       # omits the others, so `npm ci` fails on the Linux runner.
       - run: npm install --no-audit --no-fund
+      - run: npm install --global @openai/codex@0.142.3 --no-audit --no-fund
+      - run: CODEX_REAL="$(command -v codex)" npm run check:rust-protocol-fixtures
       - run: npm run check       # biome format + lint
       - run: npm run typecheck   # tsc --noEmit
       - run: npm test            # build + node --test (Node 24 has stable node:sqlite)
