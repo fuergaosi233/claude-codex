@@ -16,6 +16,9 @@ versioning or publishing metadata.
 - Expanded Codex App Remote coverage across thread lifecycle, turn envelopes,
   item streaming, approvals, MCP status, fuzzy file search sessions, Claude
   skills/hooks, and `thread/turns/list` item views.
+- Added protocol fixture coverage for `config/read`, including the sanitized
+  `config.provider_loop_config` shape, so the Rust fixture drift gate covers
+  provider-loop config projection behavior.
 - Kept compatibility-only account, plugin, marketplace, realtime, and other
   OpenAI-specific surfaces inert or schema-shaped where Claude Code has no
   equivalent.
@@ -29,6 +32,11 @@ versioning or publishing metadata.
   unsupported credential source labels.
 - Added sanitized provider-loop projection helpers and exposed the read-only
   `config.provider_loop_config` field through `config/read`.
+- Added explicit provider/agent-loop selection for known descriptor ids and loop
+  ids. Selection maps only to existing runtime backends, preserves legacy
+  runtime environment overrides and `CLAUDE_CODEX_MOCK=1` precedence, filters
+  raw saved selection keys from public `config/read`, and exposes sanitized
+  selection metadata through `config.provider_loop_config.selection`.
 - Added tests proving built-in descriptors validate cleanly, unsupported
   credential labels are not projected as allowed, and secret-like descriptor
   text is redacted from public projection results.
@@ -43,11 +51,21 @@ versioning or publishing metadata.
 - Added Rust parse/reserialize tests for the covered fixtures.
 - Added a pinned fixture drift check against the configured Codex CLI version
   and made it part of CI alongside `cargo test --workspace`.
+- Extended fixture coverage to include config projection data without claiming a
+  Rust production runtime, transport, store, or provider execution path.
 
 ### Release readiness and compliance docs
 
 - Added open-source compliance documentation and release-readiness reference
   material for maintainers and reviewers.
+- Clarified the README and documentation homepage around the TypeScript
+  production path, Rust-first experimental boundaries, provider/agent-loop
+  descriptor and selection boundaries, supported credential ownership models,
+  unsupported subscription/session/private endpoint/bypass behavior, and release
+  verification expectations.
+- Documented provider selection configuration for `CLAUDE_CODEX_PROVIDER`,
+  `CLAUDE_CODEX_AGENT_LOOP`, saved provider-loop config keys, precedence rules,
+  and sanitized `config.provider_loop_config.selection` projection.
 - Documented the current shippable baseline: TypeScript remains the production
   path; Rust pieces are opt-in protocol boundary work; provider/loop descriptors
   are read-only metadata, not runtime dispatch.
