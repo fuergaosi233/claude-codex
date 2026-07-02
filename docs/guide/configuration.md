@@ -17,6 +17,42 @@ export CLAUDE_CODEX_RUNTIME_TYPE="agent-sdk-sidecar"
 
 See [Backends](/guide/backends) for what each route supports.
 
+## Provider and agent-loop selection
+
+Provider selection is descriptor metadata plus routing to existing runtime
+backends. It does not add a new provider runtime, auth flow, subscription model,
+gateway, or entitlement.
+
+```bash
+# Known provider descriptor ids.
+export CLAUDE_CODEX_PROVIDER="claude-code" # or "codex"
+
+# Known agent-loop ids.
+export CLAUDE_CODEX_AGENT_LOOP="native-claude-code-sdk" # or "codex-jsonl-proxy"
+```
+
+Current mappings:
+
+| Provider / loop | Existing runtime behavior |
+| --- | --- |
+| `claude-code` / `native-claude-code-sdk` | `agent-sdk-sidecar` |
+| `codex` / `codex-jsonl-proxy` | `codex-proxy` |
+
+Backward compatibility rules:
+
+- `CLAUDE_CODEX_RUNTIME_TYPE`, `CLAUDE_CODEX_RUNTIME`, and
+  `CLAUDE_CODEX_BACKEND` still override provider selection when set.
+- `CLAUDE_CODEX_MOCK=1` still forces the `mock` runtime.
+- Saved config can set `provider_loop_provider` and
+  `provider_loop_agent_loop` through `config/value/write`.
+- Raw saved selection keys are filtered out of public `config/read`; the safe
+  projection appears under `config.provider_loop_config.selection`, with
+  redacted validation issues when a selection is unknown or mismatched.
+
+Selection must stay within supported credential ownership models. It does not
+collect or share credentials, pool personal subscriptions, reuse browser cookies
+or session tokens, configure private endpoints, or bypass provider terms.
+
 ## Models & effort
 
 ```bash
@@ -66,7 +102,7 @@ export CLAUDE_CODEX_NODE="/absolute/path/to/node"
 
 ## Reference table
 
-| Variable | Purpose |
+| Setting | Purpose |
 | --- | --- |
 | `CLAUDE_CODEX_ADAPTER` | Path to `dist/src/adapter.mjs` (used by the shim). |
 | `CLAUDE_CODEX_NODE` | Node binary the shim launches. |
@@ -74,6 +110,10 @@ export CLAUDE_CODEX_NODE="/absolute/path/to/node"
 | `CLAUDE_CODEX_VERSION_SUFFIX` | Tag after the version to distinguish the adapter from real codex (default `claude-codex`; set `""` to behave exactly like upstream codex). |
 | `CODEX_REAL` | Real Codex CLI for non-app-server commands / `codex` passthrough. |
 | `CLAUDE_CODEX_RUNTIME_TYPE` | Active backend route. |
+| `CLAUDE_CODEX_PROVIDER` | Provider descriptor id (`claude-code` or `codex`) mapped only to existing runtime behavior. |
+| `CLAUDE_CODEX_AGENT_LOOP` | Agent-loop id (`native-claude-code-sdk` or `codex-jsonl-proxy`) mapped only to existing runtime behavior. |
+| `provider_loop_provider` | Saved config key for provider descriptor selection via `config/value/write`. |
+| `provider_loop_agent_loop` | Saved config key for agent-loop selection via `config/value/write`. |
 | `CLAUDE_CODEX_DEFAULT_MODEL` / `_EFFORT` | Defaults for new threads. |
 | `CLAUDE_CODEX_MODELS` | Codex App model picker list. |
 | `CLAUDE_CODEX_MODEL_ALIASES` / `_EFFORT_ALIASES` | Id remapping. |
