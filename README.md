@@ -4,8 +4,8 @@
 [![Docs](https://github.com/fuergaosi233/claude-codex/actions/workflows/deploy-docs.yml/badge.svg)](https://fuergaosi233.github.io/claude-codex/)
 [![Node](https://img.shields.io/badge/node-%3E%3D24-brightgreen)](https://nodejs.org)
 
-Remote-mode adapter that lets the **Codex desktop app** talk to **Claude Code**
-through the native Codex `app-server` protocol.
+Production TypeScript adapter that lets the **Codex desktop app** talk to
+**Claude Code** through the native Codex `app-server` protocol in Remote mode.
 
 Codex App still runs its normal SSH version probe, bootstrap, and `app-server
 proxy` flow — but `codex app-server` is handled by this adapter instead of the
@@ -52,8 +52,35 @@ Codex App ──SSH──▶ login shell ──▶ codex (shim, earlier in PATH)
 
 Agent text and reasoning stream into the conversation; `Bash` becomes command
 approvals; `Edit`/`Write`/`MultiEdit` become file-change approvals with live
-diffs. Backends are pluggable (default in-process Agent SDK, plus `agent-http`,
-`agentapi`, `claude-p`, and native `codex` passthrough).
+diffs. Runtime selection maps only to existing backend paths today: default
+in-process Claude Agent SDK, `agent-http`, `agentapi`, `claude-p`, `codex-proxy`,
+and `mock`.
+
+## Current release boundaries
+
+- **Production path:** the TypeScript app-server adapter remains the shipping
+  path for Codex desktop Remote mode and Claude Code.
+- **Rust-first work:** RFCs, a workspace scaffold, protocol fixtures, parse /
+  reserialize tests, and pinned fixture drift checks are present. Rust does not
+  replace the production runtime, transport, store, or launcher yet.
+- **Provider and agent-loop work:** descriptors, sanitized `config/read`
+  projection, and explicit provider/loop selection are implemented. Selection
+  is metadata and routing for known descriptors only; it maps to existing
+  runtime backends and does not add a new executable provider loop.
+- **Credential model:** use local user-owned API keys, official cloud-provider
+  credential chains, local CLI auth on the same host, or organization-managed
+  gateways that own billing, policy, audit, and provider compliance.
+- **Unsupported:** personal subscription pooling, browser cookie or session-token
+  reuse, credential sharing, private endpoint use, provider bypass behavior, and
+  claims of unavailable entitlements.
+- **Release checks:** CI runs `npm run check`, `npm run typecheck`, `npm test`,
+  `cargo test --workspace`, and the pinned Rust fixture drift check. Docs changes
+  should run `npm run docs:build`; credentialed smoke and acceptance checks stay
+  opt-in with user- or organization-owned credentials.
+
+See the
+**[release readiness reference](https://fuergaosi233.github.io/claude-codex/reference/release-readiness)**
+for the verification matrix and reviewer checklist.
 
 ## Documentation
 
@@ -65,6 +92,7 @@ diffs. Backends are pluggable (default in-process Agent SDK, plus `agent-http`,
 | Configuration | <https://fuergaosi233.github.io/claude-codex/guide/configuration> |
 | Backends | <https://fuergaosi233.github.io/claude-codex/guide/backends> |
 | Capability matrix | <https://fuergaosi233.github.io/claude-codex/reference/capability-matrix> |
+| Release readiness | <https://fuergaosi233.github.io/claude-codex/reference/release-readiness> |
 | Contributing / toolchain | <https://fuergaosi233.github.io/claude-codex/contributing> |
 | Security policy | [SECURITY.md](SECURITY.md) |
 | Safe examples | [examples/](examples/) |
