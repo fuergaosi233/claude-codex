@@ -4,9 +4,11 @@ import { spawn } from 'node:child_process'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { codexCompatVersion } from '../dist/src/util.mjs'
 
 const home = await mkdtemp(join(tmpdir(), 'claude-codex-capability-probe-'))
 const adapter = resolve('dist/src/adapter.mjs')
+const expectedCompatVersion = codexCompatVersion()
 const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
   stdio: ['pipe', 'pipe', 'pipe'],
   env: {
@@ -38,7 +40,7 @@ proc.stderr.setEncoding('utf8')
 proc.stderr.on('data', (chunk) => process.stderr.write(chunk))
 
 function send(message) {
-  proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n')
+  proc.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', ...message })}\n`)
 }
 function next() {
   const existing = queue.shift()
@@ -73,7 +75,8 @@ try {
     },
   })
   const init = await response(1)
-  assert.match(init.result.userAgent, /0\.130\.0/)
+  assert.equal(typeof init.result.userAgent, 'string')
+  assert.ok(init.result.userAgent.includes(expectedCompatVersion))
 
   send({ id: 2, method: 'thread/start', params: { cwd: process.cwd(), model: 'sonnet' } })
   const started = await response(2)
