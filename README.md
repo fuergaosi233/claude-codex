@@ -92,6 +92,7 @@ for the verification matrix and reviewer checklist.
 | Configuration | <https://fuergaosi233.github.io/claude-codex/guide/configuration> |
 | Backends | <https://fuergaosi233.github.io/claude-codex/guide/backends> |
 | Capability matrix | <https://fuergaosi233.github.io/claude-codex/reference/capability-matrix> |
+| Workflow operations | <https://fuergaosi233.github.io/claude-codex/reference/workflow-operations> |
 | Release readiness | <https://fuergaosi233.github.io/claude-codex/reference/release-readiness> |
 | Contributing / toolchain | <https://fuergaosi233.github.io/claude-codex/contributing> |
 | Security policy | [SECURITY.md](SECURITY.md) |
@@ -113,6 +114,53 @@ npm run docs:dev     # preview this documentation site
 
 See **[Contributing](https://fuergaosi233.github.io/claude-codex/contributing)**
 for the full toolchain and conventions.
+
+## Workflow operations
+
+The adapter includes a small workflow control plane for long-running Codex
+maintenance loops. It is intentionally file-backed and explicit: the scheduler
+tracks tasks in `~/.codex/claude-codex-adapter/workflow-state.json`, and a task
+only runs after it has been queued and leased.
+
+```bash
+npm run workflow -- status
+npm run workflow -- health
+npm run workflow -- enqueue --id task-id --prompt "Do one concrete task"
+npm run workflow -- schedule --worker codex-heartbeat
+npm run workflow -- heartbeat --task task-id --worker codex-heartbeat
+npm run workflow -- complete --task task-id
+```
+
+Use `health` from recurring heartbeats before doing more work. A healthy loop
+has no stale leases, no failed tasks, and either no running task or one running
+task with an active lease. If a lease is still active, continue that task or
+renew the heartbeat only when more time is needed. Do not enqueue duplicates.
+
+Run events are appended to
+`~/.codex/claude-codex-adapter/runs.jsonl` by default. The registry redacts
+prompt-like fields, model responses, and secret-like values before writing. Set
+`CLAUDE_CODEX_RUN_LOG=0` to disable it, or set `CLAUDE_CODEX_RUN_LOG=/path/log`
+to choose a different JSONL file.
+
+Optional per-thread worktree isolation is controlled with
+`CLAUDE_CODEX_WORKTREE_ROOT`. Thread ids are mapped to root-confined,
+collision-resistant labels, and an existing worktree is reused when present.
+If worktree setup fails, the adapter logs the failure and keeps the original
+cwd so the app-server session can continue.
+
+GitHub issue or PR automation must go through the trust-boundary queue. Export
+only trusted metadata to local JSON, then ingest it:
+
+```bash
+gh issue list --json number,title,state,url > /tmp/github-issues.json
+npm run workflow -- ingest-github --github-json /tmp/github-issues.json
+```
+
+The ingestion step creates explicit workflow tasks from `number`, `title`,
+`state`, `url`, and item kind only. Body text, comments, reviews, and other
+external instructions are intentionally omitted from generated prompts, so a
+later agent must inspect external text through the project trust-boundary
+workflow before changing code.
 
 ## License
 

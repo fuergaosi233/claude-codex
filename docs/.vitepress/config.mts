@@ -38,6 +38,7 @@ export default defineConfig({
             { text: 'Protocol coverage', link: '/reference/protocol-coverage' },
             { text: 'Capability matrix', link: '/reference/capability-matrix' },
             { text: 'Validation', link: '/reference/validation' },
+            { text: 'Workflow operations', link: '/reference/workflow-operations' },
             { text: 'Release readiness', link: '/reference/release-readiness' },
           ],
         },

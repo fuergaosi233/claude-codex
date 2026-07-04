@@ -38,6 +38,8 @@
     "docs:preview": "vitepress preview docs",
     "test": "npm run build && node --test dist/test/*.mjs",
     "doctor": "node scripts/doctor.mjs",
+    "workflow": "npm run build && node dist/src/workflow-cli.mjs",
+    "workflow:schedule": "npm run workflow -- schedule",
     "smoke:real": "npm run build && node scripts/smoke-real-claude.mjs",
     "probe:capabilities": "npm run build && node scripts/probe-capabilities.mjs",
     "acceptance:local-remote": "npm run build && node scripts/acceptance-local-remote.mjs",

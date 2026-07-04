@@ -13,6 +13,7 @@ import {
   providerLoopSelectionInputFromEnv,
   resolveProviderLoopSelection,
 } from './provider-loop-selection.mjs'
+import { recordRunEvent } from './run-registry.mjs'
 import { normalizeRuntimeType } from './runtime-config.mjs'
 import {
   addedFileDiff,
@@ -576,6 +577,14 @@ export class CodexClaudeAppServer {
       codexSessionId: null,
     }
     this.store.upsertThread(thread)
+    recordRunEvent('thread.started', {
+      threadId: thread.id,
+      cwd: thread.cwd,
+      model: thread.model,
+      runtimeBackend: thread.runtimeBackend,
+      threadSource: thread.threadSource,
+      ephemeral: thread.ephemeral,
+    })
     this.activePeerByThread.set(id, peer)
     this.notify(peer, { method: 'thread/started', params: { thread: this.toThread(thread, []) } })
     return this.threadEnvelope(thread)
@@ -620,6 +629,14 @@ export class CodexClaudeAppServer {
     if (typeof params.personality === 'string')
       thread.personality = normalizePersonality(params.personality)
     this.store.upsertThread(thread)
+    recordRunEvent('thread.resumed', {
+      threadId,
+      cwd: thread.cwd,
+      model: thread.model,
+      runtimeBackend: thread.runtimeBackend,
+      threadSource: thread.threadSource,
+      ephemeral: thread.ephemeral,
+    })
     this.activePeerByThread.set(threadId, peer)
     return this.threadEnvelope(
       thread,
@@ -689,6 +706,15 @@ export class CodexClaudeAppServer {
       codexSessionId: null,
     }
     this.store.upsertThread(thread)
+    recordRunEvent('thread.forked', {
+      threadId: thread.id,
+      parentThreadId: parent.id,
+      cwd: thread.cwd,
+      model: thread.model,
+      runtimeBackend: thread.runtimeBackend,
+      threadSource: thread.threadSource,
+      ephemeral: thread.ephemeral,
+    })
     this.activePeerByThread.set(id, peer)
     this.notify(peer, { method: 'thread/started', params: { thread: this.toThread(thread, []) } })
     return this.threadEnvelope(
@@ -1021,6 +1047,14 @@ export class CodexClaudeAppServer {
       error: null,
     }
     this.store.upsertTurn(turn)
+    recordRunEvent('turn.started', {
+      threadId,
+      turnId,
+      cwd: thread.cwd,
+      model: thread.model,
+      runtimeBackend: thread.runtimeBackend,
+      purpose: params.outputSchema == null ? 'normal' : 'summary',
+    })
     this.activeTurnByThread.set(threadId, turnId)
     this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
     // The review/start RESPONSE carries the synthesized userMessage item (the
@@ -1043,6 +1077,12 @@ export class CodexClaudeAppServer {
       }).catch((error) => {
         const completed =
           this.store.completeTurn(turnId, 'failed', { message: error.message }) ?? turn
+        recordRunEvent('turn.failed', {
+          threadId,
+          turnId,
+          runtimeBackend: thread.runtimeBackend,
+          error: { message: error.message },
+        })
         this.notify(peer, {
           method: 'error',
           params: { threadId, turnId, willRetry: false, error: { message: error.message } },
@@ -1076,6 +1116,14 @@ export class CodexClaudeAppServer {
       error: null,
     }
     this.store.upsertTurn(turn)
+    recordRunEvent('turn.started', {
+      threadId,
+      turnId,
+      cwd: thread.cwd,
+      model: thread.model,
+      runtimeBackend: thread.runtimeBackend,
+      purpose: params.outputSchema == null ? 'normal' : 'summary',
+    })
     this.activeTurnByThread.set(threadId, turnId)
     this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
     setImmediate(() => {
@@ -1280,6 +1328,14 @@ export class CodexClaudeAppServer {
       error: null,
     }
     this.store.upsertTurn(turn)
+    recordRunEvent('turn.started', {
+      threadId,
+      turnId,
+      cwd: thread.cwd,
+      model: thread.model,
+      runtimeBackend: thread.runtimeBackend,
+      purpose: params.outputSchema == null ? 'normal' : 'summary',
+    })
     this.activeTurnByThread.set(threadId, turnId)
     this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
     const publicTurn = this.toLifecycleTurn(turn)
@@ -1579,6 +1635,14 @@ export class CodexClaudeAppServer {
               codexSessionId: null,
             }
             this.store.upsertThread(childThread)
+            recordRunEvent('subagent.spawned', {
+              parentThreadId: thread.id,
+              parentTurnId: turn.id,
+              childThreadId,
+              model: subagentModel,
+              agentRole,
+              agentNickname,
+            })
 
             // Stage 1 — spawnAgent (begin + end emitted together; the agent is
             // already created so there's no real latency here).
@@ -1719,6 +1783,14 @@ export class CodexClaudeAppServer {
               costUsd: null,
             }
             this.store.upsertTurn(childTurn)
+            recordRunEvent('subagent.completed', {
+              parentThreadId: thread.id,
+              parentTurnId: turn.id,
+              childThreadId: ctx.childThreadId,
+              childTurnId: childTurn.id,
+              status: childTurn.status,
+              agentRole: ctx.subType ?? 'general-purpose',
+            })
             const childThread = this.store.getThread(ctx.childThreadId)
             if (childThread) {
               childThread.status = { type: 'idle' }
@@ -2239,6 +2311,15 @@ export class CodexClaudeAppServer {
         })
     }
     const completed: TurnRecord = this.store.completeTurn(turn.id, 'completed') ?? turn
+    recordRunEvent('turn.completed', {
+      threadId: thread.id,
+      turnId: turn.id,
+      runtimeBackend: thread.runtimeBackend,
+      durationMs: completed.durationMs,
+      apiDurationMs: collectedMetrics.apiDurationMs,
+      numTurns: collectedMetrics.numTurns,
+      costUsd: collectedMetrics.costUsd,
+    })
     if (collectedMetrics.set) {
       completed.apiDurationMs = collectedMetrics.apiDurationMs
       completed.numTurns = collectedMetrics.numTurns
