@@ -181,6 +181,71 @@ test('stdio initialize -> thread/start -> turn/start streams mock response', asy
   }
 })
 
+test('run registry records thread and turn lifecycle without raw prompt or response text', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const runLog = join(home, 'runs.jsonl')
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      CODEX_HOME: home,
+      CLAUDE_CODEX_MOCK: '1',
+      CLAUDE_CODEX_RUN_LOG: runLog,
+      NODE_NO_WARNINGS: '1',
+    },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'initialize',
+        params: { clientInfo: { name: 'test', title: 'Test', version: '0' }, capabilities: null },
+      }),
+    )
+    await reader.nextResponse(1)
+    proc.stdin.write(json({ id: 2, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const start = await reader.nextResponse(2)
+    const threadId = start.result.thread.id
+
+    proc.stdin.write(
+      json({
+        id: 3,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'secret prompt token=secret123456789', text_elements: [] }],
+        },
+      }),
+    )
+    await reader.nextResponse(3)
+    for (let i = 0; i < 500; i += 1) {
+      const message = await reader.next()
+      if (message.method === 'turn/completed') break
+    }
+
+    const logText = await readFile(runLog, 'utf8')
+    const entries = logText
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+
+    assert.deepEqual(
+      entries.map((entry) => entry.event),
+      ['thread.started', 'turn.started', 'turn.completed'],
+    )
+    assert.equal(logText.includes('secret prompt'), false)
+    assert.equal(logText.includes('Claude Code adapter mock response'), false)
+    assert.equal(
+      entries.every((entry) => entry.threadId === threadId),
+      true,
+    )
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('turn lifecycle envelopes carry empty notLoaded items like the real app-server', async () => {
   // The real codex app-server ships `items: [], itemsView: "notLoaded"` in the
   // turn/start response and the turn/started + turn/completed notifications; the
@@ -1372,7 +1437,7 @@ test('unix daemon recovers stale in-progress turns after process restart', async
     ws2.close()
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
