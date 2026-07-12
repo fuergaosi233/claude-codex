@@ -54,11 +54,11 @@
     "ws": "^8.21.0"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.5.2",
-    "@types/node": "^26.1.0",
+    "@biomejs/biome": "^2.5.3",
+    "@types/node": "^26.1.1",
     "@types/ws": "^8.18.1",
     "tsx": "^4.23.0",
-    "typescript": "^6.0.3",
+    "typescript": "^7.0.2",
     "vitepress": "^1.6.4"
   },
   "engines": {
