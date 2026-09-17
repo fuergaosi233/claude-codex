@@ -1925,7 +1925,6 @@ export class CodexClaudeAppServer {
     // CodexProxyRuntime consumes it as the resume id. In mock mode the
     // mock runtime handles everything regardless of model id — bypass the
     // codex-proxy override so unit tests stay deterministic.
-    const isCodexThread = thread.runtimeBackend === 'codex' && process.env.CLAUDE_CODEX_MOCK !== '1'
     this.subagentStateByTurn.set(turn.id, {
       thread,
       turn,

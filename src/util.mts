@@ -269,16 +269,25 @@ export function modelDisplayName(model: string): string {
   if (model === 'default') return 'Claude Default'
   if (model === 'sonnet') return 'Claude Sonnet'
   if (model === 'opus') return 'Claude Opus'
+  if (model === 'fable') return 'Claude Fable'
   if (model === 'haiku') return 'Claude Haiku'
   if (model === 'sonnet-1m') return 'Claude Sonnet 1M'
-  if (model === 'opus-plan') return 'Claude Opus Plan'
+  if (model === 'opus-plan') return 'Claude Opus Plan / Sonnet Execute'
   return model
+}
+
+function modelDescription(model: string): string {
+  if (model === 'opus-plan' || model === 'claude-opus-plan' || model === 'opusplan') {
+    return 'Uses Opus in plan mode and Sonnet for execution; selecting this model does not enable plan mode.'
+  }
+  return 'Claude Code runtime model'
 }
 
 function scanDiscoveredRouterModels(): Set<string> {
   const models = new Set<string>()
   models.add('sonnet')
   models.add('opus')
+  models.add('fable')
   models.add('haiku')
   models.add('sonnet-1m')
   models.add('opus-plan')
@@ -351,9 +360,7 @@ export function claudeModelOptions(): Array<{
               displayName:
                 typeof record.displayName === 'string' ? record.displayName : modelDisplayName(id),
               description:
-                typeof record.description === 'string'
-                  ? record.description
-                  : 'Claude Code runtime model',
+                typeof record.description === 'string' ? record.description : modelDescription(id),
               isDefault: record.isDefault === true,
             }
           }
@@ -374,6 +381,7 @@ export function claudeModelOptions(): Array<{
   const models = new Set<string>()
   models.add('sonnet')
   models.add('opus')
+  models.add('fable')
   models.add('haiku')
   models.add('sonnet-1m')
   models.add('opus-plan')
@@ -428,6 +436,7 @@ export function resolveClaudeModel(
   const aliases: Record<string, string> = {
     'claude-sonnet': 'sonnet',
     'claude-opus': 'opus',
+    'claude-fable': 'fable',
     'claude-haiku': 'haiku',
     'sonnet-1m': 'sonnet[1m]',
     'claude-sonnet-1m': 'sonnet[1m]',
@@ -502,7 +511,7 @@ export function resolveClaudeEffort(
 function modelOption(
   id: string,
   isDefault = false,
-  description = 'Claude Code runtime model',
+  description = modelDescription(id),
 ): {
   id: string
   sdkModel: string | null

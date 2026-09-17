@@ -608,8 +608,15 @@ test('model/list exposes Claude model aliases and Codex-safe reasoning efforts',
     const ids = models.result.data.map((model: any) => model.id)
     assert.equal(ids.includes('sonnet'), true)
     assert.equal(ids.includes('opus'), true)
+    assert.equal(ids.includes('fable'), true)
     assert.equal(ids.includes('sonnet-1m'), true)
     assert.equal(ids.includes('opus-plan'), true)
+    const fable = models.result.data.find((model: any) => model.id === 'fable')
+    assert.equal(fable.displayName, 'Claude Fable')
+    const opusPlan = models.result.data.find((model: any) => model.id === 'opus-plan')
+    assert.match(opusPlan.displayName, /Opus.*Sonnet/)
+    assert.match(opusPlan.description, /plan/i)
+    assert.match(opusPlan.description, /Sonnet/)
     assert.equal(
       ids.some((id: string) => id.startsWith('runtime-')),
       false,
@@ -899,6 +906,108 @@ test('invalid persisted model selections are repaired to a selectable model', as
     await rm(home, { recursive: true, force: true })
   }
 })
+
+test('Fable and Opus picker aliases reach the runtime without changing plan mode', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      CODEX_HOME: home,
+      CLAUDE_CODEX_MOCK: '1',
+      CLAUDE_CODEX_MODELS: '',
+      CLAUDE_CODEX_MODEL_ALIASES: '',
+      NODE_NO_WARNINGS: '1',
+    },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(
+      json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), model: 'sonnet' } }),
+    )
+    const start = await reader.nextResponse(1)
+    const threadId = start.result.thread.id
+    let id = 2
+    for (const [model, expected] of [
+      ['fable', 'fable'],
+      ['claude-fable', 'fable'],
+      ['opus', 'opus'],
+      ['opus-plan', 'opusplan'],
+    ]) {
+      proc.stdin.write(
+        json({
+          id,
+          method: 'turn/start',
+          params: {
+            threadId,
+            model,
+            effort: 'high',
+            input: [{ type: 'text', text: 'model effort check', text_elements: [] }],
+          },
+        }),
+      )
+      await reader.nextResponse(id++)
+      let text = ''
+      for (;;) {
+        const message = await reader.next()
+        if (message.method === 'item/agentMessage/delta') text += message.params.delta
+        if (message.method === 'turn/completed') break
+      }
+      assert.equal(text, `model=${expected} effort=high`)
+    }
+    proc.stdin.write(
+      json({
+        id,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'plan mode check', text_elements: [] }],
+        },
+      }),
+    )
+    await reader.nextResponse(id)
+    let text = ''
+    for (;;) {
+      const message = await reader.next()
+      if (message.method === 'item/agentMessage/delta') text += message.params.delta
+      if (message.method === 'turn/completed') break
+    }
+    assert.equal(text, 'planMode=false')
+  } finally {
+    proc.kill()
+    await once(proc, 'exit')
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+for (const configuredModels of ['sonnet', '["sonnet"]', '[{"id":"sonnet"}]']) {
+  test(`explicit model list remains authoritative: ${configuredModels}`, async () => {
+    const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+    const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        CODEX_HOME: home,
+        CLAUDE_CODEX_MOCK: '1',
+        CLAUDE_CODEX_MODELS: configuredModels,
+        NODE_NO_WARNINGS: '1',
+      },
+    })
+    const reader = new JsonLineReader(proc)
+    try {
+      proc.stdin.write(json({ id: 1, method: 'model/list', params: {} }))
+      const models = await reader.nextResponse(1)
+      const ids = models.result.data.map((model: any) => model.id)
+      assert.equal(ids.includes('sonnet'), true)
+      assert.equal(ids.includes('fable'), false)
+      assert.equal(ids.includes('opus-plan'), false)
+    } finally {
+      proc.kill()
+      await once(proc, 'exit')
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+}
 
 test('Codex++ model and effort selections map into Claude runtime context', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))

@@ -17,9 +17,20 @@ Once the shim and exports are installed and the adapter is built:
 ## Picking a model
 
 Codex App's model menu stays a **model selector** only — pick `Claude Sonnet`,
-`Claude Opus`, `Claude Haiku`, etc. The active Claude Code **route** (which
-backend serves the turn) is chosen outside the App with the shim mode; see
+`Claude Opus`, `Claude Fable`, `Claude Haiku`, etc. The active Claude Code **route**
+(which backend serves the turn) is chosen outside the App with the shim mode; see
 [Backends](/guide/backends).
+
+The default picker exposes Claude Code aliases; model availability and the version
+an alias selects depend on your account, provider, and Claude Code version. The
+list is not an account entitlement check. `CLAUDE_CODEX_MODELS` replaces the
+default Claude list when you need to customize it.
+
+**Claude Opus Plan / Sonnet Execute** keeps the `opus-plan` option ID and maps to Claude
+Code's `opusplan` hybrid mode: Opus during planning, Sonnet during execution.
+Selecting it does not itself enable plan mode, so an ordinary conversation may
+correctly run on Sonnet. Choose **Claude Opus** to use Opus throughout. See the
+[Claude Code model configuration](https://code.claude.com/docs/en/model-config#opusplan-model-setting).
 
 ## Localhost GUI testing on macOS
 
