@@ -32,6 +32,11 @@ test('server dispatch covers current Codex app-server client method surface', as
     'thread/goal/get',
     'thread/goal/clear',
     'thread/metadata/update',
+    'thread/section/move',
+    'threadSection/list',
+    'threadSection/create',
+    'threadSection/update',
+    'threadSection/delete',
     'thread/settings/update',
     'thread/memoryMode/set',
     'memory/reset',
@@ -1426,7 +1431,7 @@ test('default runtime tool policy leaves Claude Code tools unrestricted unless e
   }
 })
 
-test('unix websocket app-server accepts initialize', async () => {
+test('unix websocket app-server accepts initialize', { timeout: 15_000 }, async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   // Keep the socket path short — a mkdtemp dir nested under macOS tmpdir blows
   // past the ~104-byte sockaddr_un limit, which surfaced as a bind EINVAL.
@@ -1435,11 +1440,13 @@ test('unix websocket app-server accepts initialize', async () => {
     stdio: ['ignore', 'ignore', 'pipe'],
     env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
   })
+  let ws: WebSocket | null = null
   try {
     await waitForStderr(proc, /listening on/)
-    const ws = new WebSocket('ws://localhost/', {
+    ws = new WebSocket('ws://localhost/', {
       createConnection: (() => net.createConnection(sock)) as typeof net.createConnection,
     })
+    const reader = new WebSocketJsonReader(ws)
     await once(ws, 'open')
     ws.send(
       JSON.stringify({
@@ -1449,23 +1456,13 @@ test('unix websocket app-server accepts initialize', async () => {
         params: { clientInfo: { name: 'test', title: 'Test', version: '0' }, capabilities: null },
       }),
     )
-    // adapter now also pushes account/updated + mcpServer/startupStatus/updated
-    // notifications after handshake; filter by id rather than grabbing the
-    // first frame off the wire.
-    let response: any = null
-    for (let i = 0; i < 5; i += 1) {
-      const [data] = (await once(ws, 'message')) as [Buffer]
-      const msg = JSON.parse(data.toString('utf8'))
-      if (msg.id === 1) {
-        response = msg
-        break
-      }
-    }
+    const response = await reader.nextResponse(1)
     assert.equal(response.id, 1)
     assert.equal(response.result.codexHome, home)
-    ws.close()
   } finally {
-    proc.kill()
+    terminateWebSocket(ws)
+    await stopProcess(proc)
+    await rm(sock, { force: true })
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
@@ -1958,7 +1955,10 @@ test('startup recovery removes legacy activity markers from completed subagent t
     assert.equal(store.recoverStaleInProgressTurns(), 1)
     const recovered = store.getTurn(turnId)
     assert.ok(recovered)
-    assert.equal(recovered.items.some((item) => item.type === 'subAgentActivity'), false)
+    assert.equal(
+      recovered.items.some((item) => item.type === 'subAgentActivity'),
+      false,
+    )
     assert.equal(store.getThread(threadId)?.status.type, 'idle')
     assert.equal(store.recoverStaleInProgressTurns(), 0)
   } finally {
@@ -1967,7 +1967,9 @@ test('startup recovery removes legacy activity markers from completed subagent t
   }
 })
 
-test('app-server proxy forwards websocket handshake bytes to unix daemon', async () => {
+test('app-server proxy forwards websocket handshake bytes to unix daemon', {
+  timeout: 15_000,
+}, async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   // Keep the socket path short — a mkdtemp dir nested under macOS tmpdir blows
   // past the ~104-byte sockaddr_un limit, which surfaced as a bind EINVAL.
@@ -1997,13 +1999,16 @@ test('app-server proxy forwards websocket handshake bytes to unix daemon', async
     )
     await stdout.waitFor(/101 Switching Protocols/)
   } finally {
-    proxy.kill()
-    daemon.kill()
+    proxy.stdin?.end()
+    await Promise.all([stopProcess(proxy), stopProcess(daemon)])
+    await rm(sock, { force: true })
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
-test('app-server proxy carries websocket JSON-RPC traffic over stdio', async () => {
+test('app-server proxy carries websocket JSON-RPC traffic over stdio', {
+  timeout: 15_000,
+}, async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   // Keep the socket path short — a mkdtemp dir nested under macOS tmpdir blows
   // past the ~104-byte sockaddr_un limit, which surfaced as a bind EINVAL.
@@ -2016,12 +2021,14 @@ test('app-server proxy carries websocket JSON-RPC traffic over stdio', async () 
     stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
   })
+  let ws: WebSocket | null = null
   try {
     await waitForStderr(daemon, /listening on/)
     const stream = new ChildProcessDuplex(proxy)
-    const ws = new WebSocket('ws://localhost/', {
+    ws = new WebSocket('ws://localhost/', {
       createConnection: (() => stream) as unknown as typeof net.createConnection,
     })
+    const reader = new WebSocketJsonReader(ws)
     await once(ws, 'open')
     ws.send(
       JSON.stringify({
@@ -2034,27 +2041,21 @@ test('app-server proxy carries websocket JSON-RPC traffic over stdio', async () 
         },
       }),
     )
-    // adapter pushes notifications post-handshake; filter for the response.
-    let response: any = null
-    for (let i = 0; i < 5; i += 1) {
-      const [data] = (await once(ws, 'message')) as [Buffer]
-      const msg = JSON.parse(data.toString('utf8'))
-      if (msg.id === 1) {
-        response = msg
-        break
-      }
-    }
+    const response = await reader.nextResponse(1)
     assert.equal(response.id, 1)
     assert.equal(response.result.codexHome, home)
-    ws.close()
   } finally {
-    proxy.kill()
-    daemon.kill()
+    terminateWebSocket(ws)
+    proxy.stdin?.end()
+    await Promise.all([stopProcess(proxy), stopProcess(daemon)])
+    await rm(sock, { force: true })
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
-test('remote shim launches daemon and proxy with Codex-compatible commands', async () => {
+test('remote shim launches daemon and proxy with Codex-compatible commands', {
+  timeout: 15_000,
+}, async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   // Keep the socket path short — a mkdtemp dir nested under macOS tmpdir blows
   // past the ~104-byte sockaddr_un limit, which surfaced as a bind EINVAL.
@@ -2079,12 +2080,14 @@ test('remote shim launches daemon and proxy with Codex-compatible commands', asy
       NODE_NO_WARNINGS: '1',
     },
   })
+  let ws: WebSocket | null = null
   try {
     await waitForStderr(daemon, /listening on/)
     const stream = new ChildProcessDuplex(proxy)
-    const ws = new WebSocket('ws://localhost/', {
+    ws = new WebSocket('ws://localhost/', {
       createConnection: (() => stream) as unknown as typeof net.createConnection,
     })
+    const reader = new WebSocketJsonReader(ws)
     await once(ws, 'open')
     ws.send(
       JSON.stringify({
@@ -2097,24 +2100,13 @@ test('remote shim launches daemon and proxy with Codex-compatible commands', asy
         },
       }),
     )
-    // The adapter now also pushes account/updated + mcpServer/startupStatus/updated
-    // notifications right after handshake; the response can land in any order
-    // relative to those. Filter for the matching id rather than grabbing the
-    // first frame off the wire.
-    let response: any = null
-    for (let i = 0; i < 5; i += 1) {
-      const [data] = (await once(ws, 'message')) as [Buffer]
-      const msg = JSON.parse(data.toString('utf8'))
-      if (msg.id === 1) {
-        response = msg
-        break
-      }
-    }
+    const response = await reader.nextResponse(1)
     assert.equal(response?.result?.codexHome, home)
-    ws.close()
   } finally {
-    proxy.kill()
-    daemon.kill()
+    terminateWebSocket(ws)
+    proxy.stdin?.end()
+    await Promise.all([stopProcess(proxy), stopProcess(daemon)])
+    await rm(sock, { force: true })
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
@@ -4043,7 +4035,9 @@ test('defaultSocketPath stays within the platform sun_path limit', async () => {
   }
 })
 
-test('approval requests round-trip through Codex server requests', async () => {
+test('approval requests round-trip through Codex server requests', {
+  timeout: 15_000,
+}, async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -4055,7 +4049,12 @@ test('approval requests round-trip through Codex server requests', async () => {
       json({
         id: 1,
         method: 'thread/start',
-        params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false },
+        params: {
+          cwd: process.cwd(),
+          experimentalRawEvents: false,
+          persistExtendedHistory: false,
+          permissions: ':workspace',
+        },
       }),
     )
     const start = await reader.nextResponse(1)
@@ -4107,7 +4106,7 @@ test('approval requests round-trip through Codex server requests', async () => {
     assert.equal(sawResolved, true)
     assert.equal(sawOutput, true)
   } finally {
-    proc.kill()
+    await stopProcess(proc)
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
@@ -4152,7 +4151,7 @@ test('generic Claude tools complete as Codex mcpToolCall items', async () => {
         completedTool = message.params.item
       if (message.method === 'turn/completed') break
     }
-    assert.equal(completedTool?.tool, 'Read')
+    assert.equal(completedTool?.tool, 'Read README.md')
     assert.equal(completedTool?.status, 'completed')
     // Result must be wrapped in Codex v2 McpToolCallResult shape — {content[], structuredContent, _meta}.
     // The mock runtime returns {text:'mock read result'} as the raw content, which we wrap as:
@@ -4408,7 +4407,7 @@ test('compatibility-only UI methods return schema-shaped responses', async () =>
   }
 })
 
-test('file change approval emits patch and git diff updates', async () => {
+test('file change approval emits patch and git diff updates', { timeout: 15_000 }, async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const repo = join(home, 'repo')
   execFileSync('mkdir', ['-p', repo])
@@ -4431,7 +4430,12 @@ test('file change approval emits patch and git diff updates', async () => {
       json({
         id: 1,
         method: 'thread/start',
-        params: { cwd: repo, experimentalRawEvents: false, persistExtendedHistory: false },
+        params: {
+          cwd: repo,
+          experimentalRawEvents: false,
+          persistExtendedHistory: false,
+          permissions: ':workspace',
+        },
       }),
     )
     const start = await reader.nextResponse(1)
@@ -4472,7 +4476,7 @@ test('file change approval emits patch and git diff updates', async () => {
     assert.match(diff, /README.md/)
     assert.match(diff, /changed by mock runtime/)
   } finally {
-    proc.kill()
+    await stopProcess(proc)
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
@@ -5766,12 +5770,24 @@ class TextCollector {
   }
 
   async waitFor(pattern: RegExp): Promise<void> {
-    const started = Date.now()
+    const deadline = Date.now() + 5000
     while (!pattern.test(this.text)) {
-      if (Date.now() - started > 5000) {
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) {
         throw new Error(`timed out waiting for ${pattern}; saw: ${this.text}`)
       }
-      await new Promise<void>((resolve) => this.waiters.push(resolve))
+      await new Promise<void>((resolve, reject) => {
+        const waiter = () => {
+          clearTimeout(timeout)
+          resolve()
+        }
+        const timeout = setTimeout(() => {
+          const index = this.waiters.indexOf(waiter)
+          if (index >= 0) this.waiters.splice(index, 1)
+          reject(new Error(`timed out waiting for ${pattern}; saw: ${this.text}`))
+        }, remaining)
+        this.waiters.push(waiter)
+      })
     }
   }
 }
@@ -5837,6 +5853,28 @@ async function waitForExit(proc: ChildProcess, timeoutMs: number): Promise<numbe
   ])
 }
 
+function terminateWebSocket(ws: WebSocket | null): void {
+  if (!ws || ws.readyState === WebSocket.CLOSED) return
+  ws.on('error', () => {})
+  ws.terminate()
+}
+
+async function stopProcess(proc: ChildProcess, timeoutMs = 2000): Promise<void> {
+  const exited = (): boolean => proc.exitCode !== null || proc.signalCode !== null
+  const wait = async (): Promise<boolean> => {
+    if (exited()) return true
+    return await Promise.race([
+      once(proc, 'exit').then(() => true),
+      delay(timeoutMs).then(() => false),
+    ])
+  }
+  if (exited()) return
+  proc.kill()
+  if (await wait()) return
+  proc.kill('SIGKILL')
+  await wait()
+}
+
 async function waitForStderr(proc: ChildProcess, pattern: RegExp): Promise<void> {
   if (!proc.stderr) throw new Error('test process has no stderr')
   proc.stderr.setEncoding('utf8')
@@ -5867,3 +5905,210 @@ async function waitForStderr(proc: ChildProcess, pattern: RegExp): Promise<void>
     proc.once('exit', onExit)
   })
 }
+
+test('thread/list honors isPinned and metadata updates persist the pin state', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const env = { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' }
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env,
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const first = await reader.nextResponse(1)
+    const firstId = first.result.thread.id
+    proc.stdin.write(json({ id: 2, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const second = await reader.nextResponse(2)
+    const secondId = second.result.thread.id
+
+    proc.stdin.write(
+      json({
+        id: 3,
+        method: 'thread/metadata/update',
+        params: { threadId: firstId, isPinned: true },
+      }),
+    )
+    const updated = await reader.nextResponse(3)
+    assert.equal(updated.result.thread.isPinned, true)
+
+    proc.stdin.write(json({ id: 4, method: 'thread/list', params: { isPinned: true } }))
+    const pinned = await reader.nextResponse(4)
+    assert.deepEqual(
+      pinned.result.data.map((thread: any) => thread.id),
+      [firstId],
+    )
+
+    proc.stdin.write(json({ id: 5, method: 'thread/list', params: { isPinned: false } }))
+    const unpinned = await reader.nextResponse(5)
+    assert.deepEqual(
+      unpinned.result.data.map((thread: any) => thread.id),
+      [secondId],
+    )
+
+    proc.stdin.write(json({ id: 6, method: 'thread/list', params: {} }))
+    const all = await reader.nextResponse(6)
+    assert.deepEqual(
+      new Set(all.result.data.map((thread: any) => thread.id)),
+      new Set([firstId, secondId]),
+    )
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('Codex section pin RPC moves a thread into and out of the reserved pinned section', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const start = await reader.nextResponse(1)
+    const threadId = start.result.thread.id
+
+    proc.stdin.write(json({ id: 2, method: 'threadSection/list', params: { limit: 100 } }))
+    const sections = await reader.nextResponse(2)
+    assert.equal(sections.error, undefined)
+    const pinnedSection = sections.result.data.find(
+      (section: any) => section.id === '01984de2-8f74-7c91-a3b2-5c5e937cf318',
+    )
+    assert.ok(pinnedSection)
+
+    proc.stdin.write(
+      json({
+        id: 3,
+        method: 'thread/section/move',
+        params: { threadId, sectionId: pinnedSection.id, beforeThreadId: null },
+      }),
+    )
+    const moved = await reader.nextResponse(3)
+    assert.equal(moved.error, undefined)
+    assert.deepEqual(moved.result, {})
+
+    proc.stdin.write(json({ id: 4, method: 'thread/read', params: { threadId } }))
+    const pinned = await reader.nextResponse(4)
+    assert.equal(pinned.result.thread.isPinned, true)
+    assert.equal(pinned.result.thread.section.id, pinnedSection.id)
+
+    proc.stdin.write(
+      json({
+        id: 5,
+        method: 'thread/list',
+        params: { sectionId: pinnedSection.id, sortKey: 'section_position' },
+      }),
+    )
+    const pinnedList = await reader.nextResponse(5)
+    assert.deepEqual(
+      pinnedList.result.data.map((thread: any) => thread.id),
+      [threadId],
+    )
+
+    proc.stdin.write(
+      json({ id: 6, method: 'thread/section/move', params: { threadId, sectionId: null } }),
+    )
+    const unpinned = await reader.nextResponse(6)
+    assert.equal(unpinned.error, undefined)
+
+    proc.stdin.write(json({ id: 7, method: 'thread/read', params: { threadId } }))
+    const afterUnpin = await reader.nextResponse(7)
+    assert.equal(afterUnpin.result.thread.isPinned, false)
+    assert.equal(afterUnpin.result.thread.section, null)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('thread/settings/update preserves model and effort compatibility', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const started = await reader.nextResponse(1)
+    const threadId = started.result.thread.id
+
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'thread/settings/update',
+        params: {
+          threadId,
+          model: 'haiku',
+          effort: 'xhigh',
+          personality: 'friendly',
+          collaborationMode: {
+            mode: 'default',
+            settings: { developer_instructions: 'keep settings compatibility' },
+          },
+        },
+      }),
+    )
+    let updated: any = null
+    let settingsNotification: any = null
+    for (let attempt = 0; attempt < 20 && (!updated || !settingsNotification); attempt += 1) {
+      const message = await reader.next()
+      if (message.id === 2 && message.method == null) updated = message
+      if (message.method === 'thread/settings/updated') settingsNotification = message
+    }
+    assert.ok(updated)
+    assert.deepEqual(updated.result, {})
+    assert.ok(settingsNotification)
+    assert.equal(settingsNotification.params.threadSettings.model, 'haiku')
+    assert.equal(settingsNotification.params.threadSettings.effort, 'xhigh')
+    assert.equal(settingsNotification.params.threadSettings.personality, 'friendly')
+
+    proc.stdin.write(json({ id: 3, method: 'thread/resume', params: { threadId } }))
+    const read = await reader.nextResponse(3)
+    assert.equal(read.result.model, 'haiku')
+    assert.equal(read.result.reasoningEffort, 'xhigh')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('thread sections paginate without losing entries at page boundaries', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  let id = 0
+  const request = async (method: string, params: unknown) => {
+    proc.stdin.write(json({ id: ++id, method, params }))
+    const response = await reader.nextResponse(id)
+    assert.equal(response.error, undefined)
+    return response.result
+  }
+  try {
+    for (let i = 0; i < 201; i++) await request('threadSection/create', { name: `Section ${i}` })
+    for (const limit of [1, 100, 200, 500]) {
+      const seen = new Set<string>()
+      let cursor: string | null = null
+      let pages = 0
+      do {
+        assert.ok(++pages <= 202, 'pagination must make progress')
+        const result = await request('threadSection/list', { limit, cursor })
+        for (const section of result.data) {
+          assert.equal(seen.has(section.id), false)
+          seen.add(section.id)
+        }
+        cursor = result.nextCursor
+      } while (cursor !== null)
+      assert.equal(seen.size, 202)
+    }
+  } finally {
+    proc.kill()
+    await once(proc, 'exit')
+    await rm(home, { recursive: true, force: true })
+  }
+})

@@ -1,10 +1,21 @@
 import { mkdirSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
-import type { ThreadItem, ThreadRecord, ThreadStatus, TurnRecord, TurnStatus } from './types.mjs'
+import type {
+  ThreadItem,
+  ThreadRecord,
+  ThreadSectionAppearance,
+  ThreadSectionRecord,
+  ThreadStatus,
+  TurnRecord,
+  TurnStatus,
+} from './types.mjs'
 import { adapterHome, jsonClone, nowSeconds } from './util.mjs'
 
 const require = createRequire(import.meta.url)
+
+export const PINNED_SECTION_ID = '01984de2-8f74-7c91-a3b2-5c5e937cf318'
+export const PINNED_SECTION_NAME = 'Pinned'
 
 type DatabaseSync = any
 
@@ -28,6 +39,10 @@ export class SessionStore {
         id TEXT PRIMARY KEY,
         session_id TEXT NOT NULL,
         forked_from_id TEXT,
+        is_pinned INTEGER NOT NULL DEFAULT 0,
+        section_id TEXT,
+        section_entered_at INTEGER,
+        section_position INTEGER,
         preview TEXT NOT NULL,
         name TEXT,
         archived INTEGER NOT NULL DEFAULT 0,
@@ -55,7 +70,22 @@ export class SessionStore {
       );
       CREATE INDEX IF NOT EXISTS idx_threads_updated ON threads(updated_at DESC);
       CREATE INDEX IF NOT EXISTS idx_turns_thread ON turns(thread_id, started_at);
+      CREATE TABLE IF NOT EXISTS thread_sections (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        appearance_json TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_thread_sections_created ON thread_sections(created_at, id);
     `)
+    this.ensureColumn('threads', 'is_pinned', 'INTEGER NOT NULL DEFAULT 0')
+    this.ensureColumn('threads', 'section_id', 'TEXT')
+    this.ensureColumn('threads', 'section_entered_at', 'INTEGER')
+    this.ensureColumn('threads', 'section_position', 'INTEGER')
+    this.db.exec(
+      'CREATE INDEX IF NOT EXISTS idx_threads_section_position ON threads(section_id, section_position, id)',
+    )
     this.ensureColumn('threads', 'reasoning_effort', 'TEXT')
     this.ensureColumn('threads', 'approval_policy', 'TEXT')
     this.ensureColumn('threads', 'sandbox_mode', 'TEXT')
@@ -74,7 +104,44 @@ export class SessionStore {
     // Real Codex session id for runtime_backend='codex' threads (returned
     // by `codex exec` as thread.started.thread_id). NULL until first turn.
     this.ensureColumn('threads', 'codex_session_id', 'TEXT')
+    this.ensurePinnedSection()
+    this.migrateLegacyPinState()
     this.sanitizeLegacyEnumColumns()
+  }
+
+  private ensurePinnedSection(): void {
+    const now = nowSeconds()
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO thread_sections
+         (id, name, appearance_json, created_at, updated_at)
+         VALUES (?, ?, NULL, ?, ?)`,
+      )
+      .run(PINNED_SECTION_ID, PINNED_SECTION_NAME, now, now)
+  }
+
+  private migrateLegacyPinState(): void {
+    this.db
+      .prepare(
+        `UPDATE threads
+         SET section_id = ?,
+             section_entered_at = COALESCE(section_entered_at, updated_at),
+             section_position = COALESCE(section_position, rowid)
+         WHERE is_pinned = 1 AND (section_id IS NULL OR section_id = '')`,
+      )
+      .run(PINNED_SECTION_ID)
+    this.db
+      .prepare(
+        `UPDATE threads
+         SET is_pinned = CASE WHEN section_id = ? THEN 1 ELSE 0 END
+         WHERE section_id IS NOT NULL OR is_pinned = 1`,
+      )
+      .run(PINNED_SECTION_ID)
+    this.db.exec(
+      `UPDATE threads
+       SET section_entered_at = NULL, section_position = NULL
+       WHERE section_id IS NULL`,
+    )
   }
 
   // Older versions of the adapter stored empty strings (and a snake_case
@@ -108,17 +175,35 @@ export class SessionStore {
   }
 
   upsertThread(thread: ThreadRecord): void {
+    const sectionId =
+      thread.sectionId === undefined
+        ? thread.isPinned === true
+          ? PINNED_SECTION_ID
+          : null
+        : thread.sectionId
+    const isPinned = sectionId === PINNED_SECTION_ID
+    const sectionEnteredAt =
+      sectionId == null ? null : (thread.sectionEnteredAt ?? thread.updatedAt)
+    const sectionPosition = sectionId == null ? null : (thread.sectionPosition ?? null)
     this.db
       .prepare(`
         INSERT INTO threads (
-          id, session_id, forked_from_id, preview, name, archived, cwd, model, reasoning_effort,
-          model_provider, claude_session_id, source, created_at, updated_at, status_json,
+          id, session_id, forked_from_id, is_pinned, section_id, section_entered_at, section_position,
+          preview, name, archived, cwd, model, reasoning_effort, model_provider, claude_session_id,
+          source, created_at, updated_at, status_json,
           approval_policy, sandbox_mode, permission_profile_id, ephemeral, thread_source, agent_role, agent_nickname,
           base_instructions, developer_instructions, personality, runtime_backend, codex_session_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        )
         ON CONFLICT(id) DO UPDATE SET
           session_id=excluded.session_id,
           forked_from_id=excluded.forked_from_id,
+          is_pinned=excluded.is_pinned,
+          section_id=excluded.section_id,
+          section_entered_at=excluded.section_entered_at,
+          section_position=excluded.section_position,
           preview=excluded.preview,
           name=excluded.name,
           archived=excluded.archived,
@@ -147,6 +232,10 @@ export class SessionStore {
         thread.id,
         thread.sessionId,
         thread.forkedFromId,
+        isPinned ? 1 : 0,
+        sectionId,
+        sectionEnteredAt,
+        sectionPosition,
         thread.preview,
         thread.name,
         thread.archived ? 1 : 0,
@@ -184,30 +273,49 @@ export class SessionStore {
       archived?: boolean | null
       limit?: number | null
       cursor?: string | null
+      isPinned?: boolean | null
       cwd?: string | string[] | null
       includeEphemeral?: boolean
       parentThreadId?: string | null
       ancestorThreadId?: string | null
       sourceKinds?: string[]
-      sortKey?: 'created_at' | 'updated_at' | 'recency_at'
+      sectionId?: string | null | undefined
+      sortKey?: 'created_at' | 'updated_at' | 'recency_at' | 'section_position'
       sortDirection?: 'asc' | 'desc'
     } = {},
   ): ThreadRecord[] {
     const limit = Math.max(1, Math.min(Number(options.limit ?? 50), 200))
     const archived = options.archived === true ? 1 : 0
     const sortKey =
-      options.sortKey === 'updated_at' || options.sortKey === 'recency_at'
+      options.sortKey === 'updated_at' ||
+      options.sortKey === 'recency_at' ||
+      options.sortKey === 'section_position'
         ? options.sortKey
         : 'created_at'
-    const sortColumn = sortKey === 'created_at' ? 'created_at' : 'updated_at'
+    const sortExpression =
+      sortKey === 'section_position'
+        ? 'COALESCE(t.section_position, t.created_at)'
+        : `t.${sortKey === 'created_at' ? 'created_at' : 'updated_at'}`
     const sortDirection = options.sortDirection === 'asc' ? 'ASC' : 'DESC'
     const cursor = options.cursor
       ? Number(options.cursor)
       : sortDirection === 'ASC'
         ? -1
         : Number.MAX_SAFE_INTEGER
-    const where = ['t.archived = ?', `t.${sortColumn} ${sortDirection === 'ASC' ? '>' : '<'} ?`]
+    const where = ['t.archived = ?', `${sortExpression} ${sortDirection === 'ASC' ? '>' : '<'} ?`]
     const args: unknown[] = [archived, cursor]
+    if (options.isPinned != null) {
+      where.push('t.is_pinned = ?')
+      args.push(options.isPinned ? 1 : 0)
+    }
+    if (options.sectionId !== undefined) {
+      if (options.sectionId === null) {
+        where.push('t.section_id IS NULL')
+      } else {
+        where.push('t.section_id = ?')
+        args.push(options.sectionId)
+      }
+    }
     const parentThreadId = options.parentThreadId ?? null
     const ancestorThreadId = options.ancestorThreadId ?? null
     const sourceKinds = options.sourceKinds ?? []
@@ -279,10 +387,184 @@ export class SessionStore {
     const queryArgs = ancestorThreadId == null ? args : [ancestorThreadId, ...args]
     const rows = this.db
       .prepare(
-        `${cte} SELECT t.* FROM threads t WHERE ${where.join(' AND ')} ORDER BY t.${sortColumn} ${sortDirection}, t.id ${sortDirection} LIMIT ?`,
+        `${cte} SELECT t.* FROM threads t WHERE ${where.join(' AND ')} ORDER BY ${sortExpression} ${sortDirection}, t.id ${sortDirection} LIMIT ?`,
       )
       .all(...queryArgs, limit)
     return rows.map((row: unknown) => this.rowToThread(row))
+  }
+
+  listSections(limit = 100, cursor: string | null = null): ThreadSectionRecord[] {
+    const boundedLimit = Math.max(1, Math.min(Number(limit || 100), 200))
+    const offset = cursor == null ? 0 : Math.max(0, Number(cursor) || 0)
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM thread_sections
+         ORDER BY CASE WHEN id = ? THEN 0 ELSE 1 END, created_at ASC, id ASC
+         LIMIT ? OFFSET ?`,
+      )
+      .all(PINNED_SECTION_ID, boundedLimit, offset)
+    return rows.map((row: unknown) => this.rowToSection(row))
+  }
+
+  getSection(id: string): ThreadSectionRecord | null {
+    const row = this.db.prepare('SELECT * FROM thread_sections WHERE id = ?').get(id)
+    if (row) return this.rowToSection(row)
+    // Keep the reserved section available even if a hand-created legacy DB was
+    // opened before the migration seed ran.
+    if (id === PINNED_SECTION_ID) {
+      return { id: PINNED_SECTION_ID, name: PINNED_SECTION_NAME, appearance: null }
+    }
+    return null
+  }
+
+  createSection(
+    id: string,
+    name: string,
+    appearance: ThreadSectionAppearance | null = null,
+  ): ThreadSectionRecord {
+    const normalizedName = name.trim()
+    if (!normalizedName) throw new Error('section name must not be empty')
+    if (id === PINNED_SECTION_ID) throw new Error('the pinned section is reserved')
+    const now = nowSeconds()
+    this.db
+      .prepare(
+        `INSERT INTO thread_sections
+         (id, name, appearance_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(id, normalizedName, appearance == null ? null : JSON.stringify(appearance), now, now)
+    return this.getSection(id) as ThreadSectionRecord
+  }
+
+  updateSection(
+    id: string,
+    name: string,
+    appearance: ThreadSectionAppearance | null = null,
+  ): ThreadSectionRecord {
+    if (!this.getSection(id)) throw new Error(`unknown section: ${id}`)
+    const normalizedName = id === PINNED_SECTION_ID ? PINNED_SECTION_NAME : name.trim()
+    if (!normalizedName) throw new Error('section name must not be empty')
+    this.db
+      .prepare(
+        `UPDATE thread_sections
+         SET name = ?, appearance_json = ?, updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(normalizedName, appearance == null ? null : JSON.stringify(appearance), nowSeconds(), id)
+    return this.getSection(id) as ThreadSectionRecord
+  }
+
+  deleteSection(id: string): void {
+    if (id === PINNED_SECTION_ID) throw new Error('the pinned section is reserved')
+    if (!this.getSection(id)) throw new Error(`unknown section: ${id}`)
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      this.db
+        .prepare(
+          `UPDATE threads
+           SET section_id = NULL,
+               section_entered_at = NULL,
+               section_position = NULL,
+               is_pinned = 0
+           WHERE section_id = ?`,
+        )
+        .run(id)
+      this.db.prepare('DELETE FROM thread_sections WHERE id = ?').run(id)
+      this.db.exec('COMMIT')
+    } catch (error) {
+      try {
+        this.db.exec('ROLLBACK')
+      } catch {}
+      throw error
+    }
+  }
+
+  moveThreadToSection(
+    threadId: string,
+    sectionId: string | null,
+    beforeThreadId: string | null = null,
+  ): ThreadRecord {
+    const thread = this.getThread(threadId)
+    if (!thread) throw new Error(`unknown thread: ${threadId}`)
+    if (sectionId != null && !this.getSection(sectionId))
+      throw new Error(`unknown section: ${sectionId}`)
+
+    const oldSectionId =
+      thread.sectionId === undefined
+        ? thread.isPinned === true
+          ? PINNED_SECTION_ID
+          : null
+        : (thread.sectionId ?? null)
+    const oldIds = this.sectionThreadIds(oldSectionId, threadId)
+    const targetIds = sectionId == null ? [] : this.sectionThreadIds(sectionId, threadId)
+    let targetPosition: number | null = null
+    if (sectionId != null) {
+      const beforeIndex = beforeThreadId == null ? -1 : targetIds.indexOf(beforeThreadId)
+      targetPosition = beforeIndex >= 0 ? beforeIndex : targetIds.length
+      targetIds.splice(targetPosition, 0, threadId)
+    }
+
+    const enteredAt =
+      sectionId == null
+        ? null
+        : oldSectionId === sectionId
+          ? (thread.sectionEnteredAt ?? nowSeconds())
+          : nowSeconds()
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      if (oldSectionId !== sectionId && oldSectionId != null) this.renumberSection(oldIds)
+      if (sectionId != null) this.renumberSection(targetIds)
+      this.db
+        .prepare(
+          `UPDATE threads
+           SET section_id = ?,
+               section_entered_at = ?,
+               section_position = ?,
+               is_pinned = ?
+           WHERE id = ?`,
+        )
+        .run(
+          sectionId,
+          enteredAt,
+          targetPosition,
+          sectionId === PINNED_SECTION_ID ? 1 : 0,
+          threadId,
+        )
+      this.db.exec('COMMIT')
+    } catch (error) {
+      try {
+        this.db.exec('ROLLBACK')
+      } catch {}
+      throw error
+    }
+    const moved = this.getThread(threadId)
+    if (!moved) throw new Error(`unknown thread: ${threadId}`)
+    return moved
+  }
+
+  private sectionThreadIds(sectionId: string | null, excludeThreadId: string): string[] {
+    const rows =
+      sectionId == null
+        ? this.db
+            .prepare(
+              `SELECT id FROM threads
+               WHERE section_id IS NULL AND id <> ?
+               ORDER BY COALESCE(section_position, created_at), updated_at, id`,
+            )
+            .all(excludeThreadId)
+        : this.db
+            .prepare(
+              `SELECT id FROM threads
+               WHERE section_id = ? AND id <> ?
+               ORDER BY COALESCE(section_position, created_at), updated_at, id`,
+            )
+            .all(sectionId, excludeThreadId)
+    return rows.map((row: any) => String(row.id))
+  }
+
+  private renumberSection(threadIds: string[]): void {
+    const update = this.db.prepare('UPDATE threads SET section_position = ? WHERE id = ?')
+    for (const [position, threadId] of threadIds.entries()) update.run(position, threadId)
   }
 
   updateThreadStatus(threadId: string, status: ThreadStatus): void {
@@ -607,6 +889,11 @@ export class SessionStore {
       id: String(row.id),
       sessionId: String(row.session_id),
       forkedFromId: row.forked_from_id == null ? null : String(row.forked_from_id),
+      isPinned:
+        String(row.section_id ?? '') === PINNED_SECTION_ID || Number(row.is_pinned ?? 0) === 1,
+      sectionId: row.section_id == null ? null : String(row.section_id),
+      sectionEnteredAt: row.section_entered_at == null ? null : Number(row.section_entered_at),
+      sectionPosition: row.section_position == null ? null : Number(row.section_position),
       preview: String(row.preview ?? ''),
       name: row.name == null ? null : String(row.name),
       archived: Number(row.archived) === 1,
@@ -633,6 +920,27 @@ export class SessionStore {
       personality: row.personality == null ? null : String(row.personality),
       runtimeBackend: row.runtime_backend === 'codex' ? 'codex' : 'claude',
       codexSessionId: row.codex_session_id == null ? null : String(row.codex_session_id),
+    }
+  }
+
+  private rowToSection(row: any): ThreadSectionRecord {
+    let appearance: ThreadSectionAppearance | null = null
+    if (row.appearance_json != null) {
+      try {
+        const parsed: unknown = JSON.parse(String(row.appearance_json))
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          const value = parsed as Record<string, unknown>
+          appearance = {
+            color: typeof value.color === 'string' ? value.color : null,
+            icon: typeof value.icon === 'string' ? value.icon : null,
+          }
+        }
+      } catch {}
+    }
+    return {
+      id: String(row.id),
+      name: String(row.name ?? ''),
+      appearance,
     }
   }
 

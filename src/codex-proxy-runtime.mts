@@ -81,7 +81,10 @@ export class CodexProxyRuntime implements ClaudeRuntime {
         args.push('--json', '--skip-git-repo-check')
         if (context.sandboxMode === 'danger-full-access') {
           args.push('--dangerously-bypass-approvals-and-sandbox')
-        } else if (context.sandboxMode === 'read-only' || context.sandboxMode === 'workspace-write') {
+        } else if (
+          context.sandboxMode === 'read-only' ||
+          context.sandboxMode === 'workspace-write'
+        ) {
           args.push('-s', context.sandboxMode)
         } else {
           args.push('--dangerously-bypass-approvals-and-sandbox')

@@ -1,5 +1,14 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync } from 'node:fs'
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+} from 'node:fs'
 import { homedir, platform, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import type { ImageInput } from './types.mjs'
@@ -334,7 +343,7 @@ function getDiscoveredRouterModelsCached(): Set<string> {
 }
 
 let cachedClaudeModelOptions: { expiresAt: number; data: Array<any> } | null = null
-let cachedCodexProxyModelOptions: { expiresAt: number; data: Array<any> } | null = null
+const cachedCodexProxyModelOptions: { expiresAt: number; data: Array<any> } | null = null
 
 export function claudeModelOptions(): Array<{
   id: string
@@ -449,7 +458,10 @@ export function resolveClaudeModel(
   // Case-insensitive match against configured models (e.g. GLM-5.3 -> glm-5.3)
   const configured = process.env.CLAUDE_CODEX_MODELS
   if (configured) {
-    const list = configured.split(',').map((s) => s.trim()).filter(Boolean)
+    const list = configured
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
     const matched = list.find((m) => m.toLowerCase() === raw.toLowerCase())
     if (matched) return matched
   }
@@ -580,7 +592,10 @@ export function codexProxyModelOptions(): Array<{
   const env = process.env.CLAUDE_CODEX_CODEX_MODELS
   let ids: string[] = []
   if (env && env.trim()) {
-    ids = env.split(',').map((s) => s.trim()).filter(Boolean)
+    ids = env
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
   } else {
     const catalogCandidates = [
       '/data00/home/zhengyongchuan/.codex/model_catalog.json',
@@ -618,7 +633,10 @@ export function resolveCodexBinary(): string | null {
   if (explicit && explicit.trim()) return explicit.trim()
   const knownCandidates = [
     '/data00/home/zhengyongchuan/.local/node/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex.real',
-    join(homedir(), '.local/node/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex.real'),
+    join(
+      homedir(),
+      '.local/node/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex.real',
+    ),
   ]
   for (const c of knownCandidates) {
     if (existsSync(c)) return c
@@ -626,7 +644,7 @@ export function resolveCodexBinary(): string | null {
   // PATH walk is mostly for dev — production deployments should set
   // CODEX_REAL explicitly in the shim env (~/.zshenv).
   const paths = (process.env.PATH ?? '').split(':').filter(Boolean)
-  
+
   for (const dir of paths) {
     const candidate = `${dir}/codex`
     try {
