@@ -61,7 +61,7 @@ export CLAUDE_CODEX_DEFAULT_MODEL="sonnet"
 export CLAUDE_CODEX_DEFAULT_EFFORT="medium"
 
 # Codex App model picker list (comma-separated ids or JSON array of ids/objects).
-export CLAUDE_CODEX_MODELS="sonnet,opus,haiku,sonnet-1m,opus-plan"
+export CLAUDE_CODEX_MODELS="sonnet,opus,fable,haiku,sonnet-1m,opus-plan"
 
 # Map Codex UI ids -> Claude SDK aliases/full names, and effort values.
 export CLAUDE_CODEX_MODEL_ALIASES='{"my-long-context":"sonnet[1m]"}'
