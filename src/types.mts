@@ -48,6 +48,16 @@ export interface ThreadRecord {
   id: string
   sessionId: string
   forkedFromId: string | null
+  // Legacy Codex App clients use this flag to partition the thread list into
+  // pinned and work-directory views. Keep it optional for older test fixtures
+  // and normalize missing values to false at the persistence boundary.
+  isPinned?: boolean | undefined
+  // Newer Codex clients represent pinning as membership in a reserved thread
+  // section. Keep the raw section metadata alongside the legacy flag so both
+  // protocol generations can share the same persisted state.
+  sectionId?: string | null | undefined
+  sectionEnteredAt?: number | null | undefined
+  sectionPosition?: number | null | undefined
   preview: string
   name: string | null
   archived: boolean
@@ -102,6 +112,17 @@ export interface ThreadRecord {
   baseInstructions: string | null
   developerInstructions: string | null
   personality: string | null
+}
+
+export interface ThreadSectionAppearance {
+  color: string | null
+  icon: string | null
+}
+
+export interface ThreadSectionRecord {
+  id: string
+  name: string
+  appearance: ThreadSectionAppearance | null
 }
 
 export type ThreadStatus =
