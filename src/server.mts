@@ -928,11 +928,16 @@ export class CodexClaudeAppServer {
   }
 
   private threadSectionList(params: Record<string, unknown>): unknown {
-    const sections = this.store.listSections(
-      numberOr(params.limit, 100),
-      typeof params.cursor === 'string' ? params.cursor : null,
-    )
-    return { data: sections, nextCursor: null }
+    const requestedLimit = numberOr(params.limit, 100)
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.max(1, Math.min(Math.floor(requestedLimit), 200))
+      : 100
+    const offset = typeof params.cursor === 'string' ? Number(params.cursor) : 0
+    if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('invalid section cursor')
+    const sections = this.store.listSections(limit, String(offset))
+    const nextOffset = offset + sections.length
+    const hasMore = this.store.listSections(1, String(nextOffset)).length > 0
+    return { data: sections, nextCursor: hasMore ? String(nextOffset) : null }
   }
 
   private threadSectionCreate(params: Record<string, unknown>): unknown {

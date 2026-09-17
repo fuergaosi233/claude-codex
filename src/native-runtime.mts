@@ -326,12 +326,15 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
 
     // Project + developer + personality instructions ride along as a system
     // prompt append, preserving Claude Code's built-in preset.
-    if (context.systemPromptAddendum && context.systemPromptAddendum.trim()) {
-      opts.systemPrompt = {
-        type: 'preset',
-        preset: 'claude_code',
-        append: context.systemPromptAddendum.trim(),
-      }
+    // Re-render on resume so settings changes (including clearing an append)
+    // take effect on the next turn instead of waiting for SDK compaction.
+    opts.systemPrompt = {
+      type: 'preset',
+      preset: 'claude_code',
+      snapshot: false,
+      ...(context.systemPromptAddendum?.trim()
+        ? { append: context.systemPromptAddendum.trim() }
+        : {}),
     }
 
     // CLI binary override (for users pinning a specific claude-code build).

@@ -2628,3 +2628,23 @@ async function waitForCondition(read: () => number, expected: number): Promise<v
   }
   assert.equal(read(), expected)
 }
+
+test('native SDK keeps changed and cleared system instructions live on resume', () => {
+  const runtime = new NativeClaudeRuntime()
+  const buildOptions = Reflect.get(runtime, 'buildOptions')
+  for (const append of ['First instructions', 'Changed instructions', '']) {
+    const options = buildOptions.call(
+      runtime,
+      {},
+      nativeTurnContext({ cwd: '', claudeSessionId: 'sdk-session', systemPromptAddendum: append }),
+      new AbortController(),
+    )
+    assert.equal(options.resume, 'sdk-session')
+    assert.deepEqual(options.systemPrompt, {
+      type: 'preset',
+      preset: 'claude_code',
+      snapshot: false,
+      ...(append ? { append } : {}),
+    })
+  }
+})

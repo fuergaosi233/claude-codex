@@ -6074,3 +6074,41 @@ test('thread/settings/update preserves model and effort compatibility', async ()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
+
+test('thread sections paginate without losing entries at page boundaries', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  let id = 0
+  const request = async (method: string, params: unknown) => {
+    proc.stdin.write(json({ id: ++id, method, params }))
+    const response = await reader.nextResponse(id)
+    assert.equal(response.error, undefined)
+    return response.result
+  }
+  try {
+    for (let i = 0; i < 201; i++) await request('threadSection/create', { name: `Section ${i}` })
+    for (const limit of [1, 100, 200, 500]) {
+      const seen = new Set<string>()
+      let cursor: string | null = null
+      let pages = 0
+      do {
+        assert.ok(++pages <= 202, 'pagination must make progress')
+        const result = await request('threadSection/list', { limit, cursor })
+        for (const section of result.data) {
+          assert.equal(seen.has(section.id), false)
+          seen.add(section.id)
+        }
+        cursor = result.nextCursor
+      } while (cursor !== null)
+      assert.equal(seen.size, 202)
+    }
+  } finally {
+    proc.kill()
+    await once(proc, 'exit')
+    await rm(home, { recursive: true, force: true })
+  }
+})

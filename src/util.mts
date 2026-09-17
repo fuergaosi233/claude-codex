@@ -343,7 +343,7 @@ function getDiscoveredRouterModelsCached(): Set<string> {
 }
 
 let cachedClaudeModelOptions: { expiresAt: number; data: Array<any> } | null = null
-let cachedCodexProxyModelOptions: { expiresAt: number; data: Array<any> } | null = null
+const cachedCodexProxyModelOptions: { expiresAt: number; data: Array<any> } | null = null
 
 export function claudeModelOptions(): Array<{
   id: string
