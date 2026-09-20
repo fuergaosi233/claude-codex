@@ -597,10 +597,7 @@ export function codexProxyModelOptions(): Array<{
       .map((s) => s.trim())
       .filter(Boolean)
   } else {
-    const catalogCandidates = [
-      '/data00/home/zhengyongchuan/.codex/model_catalog.json',
-      join(homedir(), '.codex/model_catalog.json'),
-    ]
+    const catalogCandidates = [join(homedir(), '.codex/model_catalog.json')]
     for (const p of catalogCandidates) {
       if (existsSync(p)) {
         try {
@@ -632,7 +629,6 @@ export function resolveCodexBinary(): string | null {
   const explicit = process.env.CODEX_REAL
   if (explicit && explicit.trim()) return explicit.trim()
   const knownCandidates = [
-    '/data00/home/zhengyongchuan/.local/node/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex.real',
     join(
       homedir(),
       '.local/node/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex.real',
