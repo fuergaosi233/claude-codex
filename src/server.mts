@@ -1867,6 +1867,8 @@ export class CodexClaudeAppServer {
     const itemIds = new Map<string, string>()
     let agentItemId: string | null = null
     let reasoningItemId: string | null = null
+    let hasTextOutput = false
+    const noticesSeen = new Set<string>()
     const commandOutputSeen = new Set<string>()
     // MultiAgent V2 uses subAgentActivity for display/liveness and the
     // spawnAgent/wait tool calls for the structured timeline. A naturally
@@ -1947,7 +1949,7 @@ export class CodexClaudeAppServer {
       const item: ThreadItem = {
         type: 'reasoning',
         id: reasoningItemId,
-        summary: [''],
+        summary: [],
         content: [''],
       }
       this.store.appendItem(turn.id, item)
@@ -1956,6 +1958,33 @@ export class CodexClaudeAppServer {
         params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: nowMillis() },
       })
       return reasoningItemId
+    }
+    const completeReasoningItem = (): void => {
+      if (!reasoningItemId) return
+      const item = this.store.getTurn(turn.id)?.items.find((item) => item.id === reasoningItemId)
+      if (item)
+        this.notify(peer, {
+          method: 'item/completed',
+          params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
+        })
+      reasoningItemId = null
+    }
+    const completeAgentItem = (phase: 'commentary' | 'final_answer'): void => {
+      if (!agentItemId) return
+      const updated = this.store.updateItem(turn.id, agentItemId, (item) =>
+        item.type === 'agentMessage' ? { ...item, phase } : item,
+      )
+      const item = updated?.items.find((item) => item.id === agentItemId)
+      if (item)
+        this.notify(peer, {
+          method: 'item/completed',
+          params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
+        })
+      agentItemId = null
+    }
+    const completeMessage = (phase: 'commentary' | 'final_answer' = 'commentary'): void => {
+      completeReasoningItem()
+      completeAgentItem(phase)
     }
 
     // Allow per-turn override of policy (Codex App may attach updated values
@@ -2129,7 +2158,12 @@ export class CodexClaudeAppServer {
             return
           }
           if (activeSubagents.size > 0) {
-            if (event.type === 'text_delta' || event.type === 'reasoning_delta') return
+            if (
+              event.type === 'text_delta' ||
+              event.type === 'reasoning_delta' ||
+              event.type === 'message_boundary'
+            )
+              return
             if (event.type === 'tool_use' && !isSubagentToolName(event.toolName)) return
             if (event.type === 'tool_output_delta' && !itemIds.has(event.toolUseId)) return
             if (
@@ -2139,6 +2173,11 @@ export class CodexClaudeAppServer {
             )
               return
           }
+          if (event.type === 'message_boundary') {
+            completeMessage()
+            return
+          }
+          if (event.type === 'tool_use' && !itemIds.has(event.toolUseId)) completeMessage()
           if (event.type === 'tool_use' && isSubagentToolName(event.toolName)) {
             // Spawn the ephemeral child, then mirror MultiAgent V2: a
             // subAgentActivity started item plus spawnAgent/wait tool state.
@@ -2511,6 +2550,9 @@ export class CodexClaudeAppServer {
             return
           }
           if (event.type === 'text_delta') {
+            if (event.delta.length === 0) return
+            completeReasoningItem()
+            hasTextOutput = true
             // In plan mode, text is the plan body — route to a Plan item +
             // item/plan/delta + (later) turn/plan/updated so the App's
             // Plan-mode UI lights up natively. Outside plan mode it's a
@@ -2540,26 +2582,16 @@ export class CodexClaudeAppServer {
           }
           if (event.type === 'reasoning_delta') {
             if (event.delta.length === 0) return
+            completeAgentItem('commentary')
             const itemId = ensureReasoningItem()
             this.store.updateItem(turn.id, itemId, (item) => {
               if (item.type === 'reasoning') {
                 return {
                   ...item,
-                  summary: [(item.summary[0] ?? '') + event.delta],
                   content: [(item.content[0] ?? '') + event.delta],
                 }
               }
               return item
-            })
-            this.notify(peer, {
-              method: 'item/reasoning/summaryTextDelta',
-              params: {
-                threadId: thread.id,
-                turnId: turn.id,
-                itemId,
-                delta: event.delta,
-                summaryIndex: 0,
-              },
             })
             this.notify(peer, {
               method: 'item/reasoning/textDelta',
@@ -2708,22 +2740,16 @@ export class CodexClaudeAppServer {
             return
           }
           if (event.type === 'notice') {
-            const itemId = ensureAgentItem()
-            const prefix =
-              event.level === 'warning'
-                ? '[Claude warning] '
-                : event.level === 'error'
-                  ? '[Claude error] '
-                  : '[Claude event] '
-            const delta = prefix + event.message + '\n'
-            this.store.updateItem(turn.id, itemId, (item) => {
-              if (item.type === 'agentMessage') return { ...item, text: item.text + delta }
-              return item
-            })
-            this.notify(peer, {
-              method: 'item/agentMessage/delta',
-              params: { threadId: thread.id, turnId: turn.id, itemId, delta },
-            })
+            debugLog('turn.runtime.notice', { threadId: thread.id, turnId: turn.id, ...event })
+            // Runtime status is not assistant prose. Keep genuine warnings
+            // visible in the native warning surface without breaking Markdown.
+            if (event.level !== 'info' && !noticesSeen.has(event.message)) {
+              noticesSeen.add(event.message)
+              this.notify(peer, {
+                method: 'warning',
+                params: { threadId: thread.id, message: event.message },
+              })
+            }
             return
           }
           if (event.type === 'usage') {
@@ -2731,9 +2757,7 @@ export class CodexClaudeAppServer {
             return
           }
           if (event.type === 'hook') {
-            // Render the hook event as a Codex hookPrompt item alongside the
-            // (still-emitted) notice line, so the user sees structured hook
-            // activity in the timeline instead of just a one-liner warning.
+            // Render hook activity once as a structured Codex hookPrompt item.
             // All fragments of the same hook run share one hookRunId so App
             // groups them under a single execution; the format matches
             // Codex's own hookprompt items (one synthetic run id per emit).
@@ -2795,6 +2819,7 @@ export class CodexClaudeAppServer {
         },
         onPermissionRequest: async (event) => {
           if (!turnIsActive()) return { decision: 'cancel' }
+          completeMessage()
           let itemId = itemIds.get(event.toolUseId)
           if (!itemId) {
             const item = this.toolUseToItem(
@@ -2839,6 +2864,7 @@ export class CodexClaudeAppServer {
         },
         onUserInputRequest: async (event) => {
           if (!turnIsActive()) return { answers: {} }
+          completeMessage()
           // Render AskUserQuestion as Codex's native dynamicToolCall item +
           // item/tool/requestUserInput reverse RPC. The App pops its
           // structured choice card; we wait for the answers, finalise the
@@ -2916,6 +2942,7 @@ export class CodexClaudeAppServer {
       const timeoutUnit = timeoutSeconds === 1 ? 'second' : 'seconds'
       const message = `Subagent did not publish a terminal result within ${timeoutSeconds} ${timeoutUnit}.`
       if (this.store.getTurn(turn.id)?.status === 'inProgress') {
+        completeMessage()
         this.finalizeOrphanedSubagents(
           peer,
           thread,
@@ -2934,6 +2961,7 @@ export class CodexClaudeAppServer {
     }
     if (outcome.kind === 'rejected') {
       if (this.store.getTurn(turn.id)?.status === 'inProgress') {
+        completeMessage()
         this.finalizeOrphanedSubagents(peer, thread, turn, subagentContexts, activeSubagents)
       }
       this.subagentStateByTurn.delete(turn.id)
@@ -2955,7 +2983,7 @@ export class CodexClaudeAppServer {
         params: { threadId: thread.id, turnId: turn.id, diff: finalDiff },
       })
     }
-    if (params.outputSchema != null && agentItemId == null) {
+    if (params.outputSchema != null && !hasTextOutput) {
       const text = fallbackStructuredText(params.outputSchema, prompt)
       const itemId = ensureAgentItem()
       this.store.updateItem(turn.id, itemId, (item) => {
@@ -2967,15 +2995,18 @@ export class CodexClaudeAppServer {
         params: { threadId: thread.id, turnId: turn.id, itemId, delta: text },
       })
     }
-    const latestTurn = this.store.getTurn(turn.id)
-    for (const completedItemId of [reasoningItemId, agentItemId, planItemId]) {
-      const item = latestTurn?.items.find((candidate) => candidate.id === completedItemId)
-      if (item)
-        this.notify(peer, {
-          method: 'item/completed',
-          params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
-        })
-    }
+    completeMessage('final_answer')
+    const planItem = this.store.getTurn(turn.id)?.items.find((item) => item.id === planItemId)
+    if (planItem)
+      this.notify(peer, {
+        method: 'item/completed',
+        params: {
+          threadId: thread.id,
+          turnId: turn.id,
+          item: planItem,
+          completedAtMs: nowMillis(),
+        },
+      })
     const completed: TurnRecord = this.store.completeTurn(turn.id, 'completed') ?? turn
     recordRunEvent('turn.completed', {
       threadId: thread.id,
