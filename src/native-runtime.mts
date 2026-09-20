@@ -18,9 +18,8 @@ if (!process.env.ANTHROPIC_BETAS) {
 //
 // What this file preserves from the Python sidecar:
 //   * subagent suppression state machine (active_subagent_ids)
-//   * per-turn text/thinking stream-vs-block dedup (streamed_text_turns /
-//     streamed_thinking_turns) — JS SDK still re-delivers each TextBlock /
-//     ThinkingBlock at end-of-turn even when streamed, same as Python
+//   * text/thinking stream-vs-block dedup — JS SDK re-delivers completed
+//     content blocks after their streaming deltas
 //   * ToolUseBlock double-delivery dedup (skip start, take from AssistantMessage)
 //   * StructuredOutput synthetic-tool coercion
 //   * derive_permission_mode mapping for (approvalPolicy, sandbox, planMode)
@@ -63,9 +62,11 @@ interface PendingTurn {
   resolved: boolean
   resolve: () => void
   reject: (error: Error) => void
-  // Per-turn dedup guards (same shape as Python's streamed_*_turns sets).
-  streamedText: boolean
-  streamedThinking: boolean
+  // SDK assistant envelopes can deliver one content block at a time. Keep
+  // dedup scoped to a model response, preserving unstreamed blocks alongside
+  // streamed ones and emitting a boundary only when the message id changes.
+  assistantMessageId: string | null
+  streamedBlocks: Map<number, { type: string; text: string }>
   // Subagent suppression — when a Task/Agent tool_use opens a subagent, all
   // nested tool_use / text / thinking events should be hidden from the App
   // timeline until the matching tool_result closes the parent Task.
@@ -112,11 +113,6 @@ interface PendingPermission {
   resolve: (value: PermissionDecision) => void
 }
 
-// Discriminator for the per-turn streamed delta map. We track text vs.
-// thinking separately because the SDK delivers both via the same
-// content_block_delta envelope but distinguishes via delta.type.
-const STREAMED_TEXT = 'text'
-const STREAMED_THINKING = 'thinking'
 const WORKFLOW_TERMINAL_FLUSH_TIMEOUT_MS = 500
 const WORKFLOW_JOURNAL_SETTLE_TIMEOUT_MS = 3_000
 
@@ -145,8 +141,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         resolved: false,
         resolve,
         reject,
-        streamedText: false,
-        streamedThinking: false,
+        assistantMessageId: null,
+        streamedBlocks: new Map(),
         activeSubagents: new Set(),
         completedWorkflowTasks: new Set(),
         workflowToolUseIds: new Set(),
@@ -722,7 +718,13 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   ): Promise<void> {
     const event = message.event as Record<string, unknown> | undefined
     if (!event) return
+    if (message.parent_tool_use_id || pending.activeSubagents.size > 0) return
     const eventType = String(event.type ?? '')
+    if (eventType === 'message_start') {
+      const inner = event.message as Record<string, unknown> | undefined
+      await this.beginAssistantMessage(pending, stringOrNull(inner?.id), true)
+      return
+    }
     if (eventType === 'content_block_start') {
       const block = event.content_block as Record<string, unknown> | undefined
       if (block && String(block.type) === 'tool_use') {
@@ -741,25 +743,55 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       if (deltaType === 'text_delta') {
         const text = String(delta.text ?? '')
         if (!text) return
+        this.recordStreamedBlock(pending, event.index, 'text', text)
         // Special-case: StructuredOutput synthetic tool buffers text and emits
         // only the final coerced JSON; suppress raw deltas while it's active.
         if (pending.context.outputFormat) {
           pending.structuredBuffer += text
           return
         }
-        // Subagent suppression — if any subagent is running, hide its prose
-        // from the parent timeline.
-        if (pending.activeSubagents.size > 0) return
-        pending.streamedText = true
         await pending.handlers.onEvent({ type: 'text_delta', delta: text })
       } else if (deltaType === 'thinking_delta') {
         const thinking = String(delta.thinking ?? '')
         if (!thinking) return
-        if (pending.activeSubagents.size > 0) return
-        pending.streamedThinking = true
+        this.recordStreamedBlock(pending, event.index, 'thinking', thinking)
         await pending.handlers.onEvent({ type: 'reasoning_delta', delta: thinking })
       }
     }
+  }
+
+  private async beginAssistantMessage(
+    pending: PendingTurn,
+    messageId: string | null,
+    streamStart = false,
+  ): Promise<void> {
+    if (messageId ? messageId === pending.assistantMessageId : !streamStart) return
+    pending.assistantMessageId = messageId
+    pending.streamedBlocks = new Map()
+    if (!pending.context?.outputFormat) {
+      await pending.handlers.onEvent({ type: 'message_boundary' })
+    }
+  }
+
+  private recordStreamedBlock(
+    pending: PendingTurn,
+    index: unknown,
+    type: string,
+    text: string,
+  ): void {
+    const blockIndex = typeof index === 'number' ? index : 0
+    const blocks = (pending.streamedBlocks ??= new Map())
+    const previous = blocks.get(blockIndex)
+    blocks.set(blockIndex, { type, text: (previous?.type === type ? previous.text : '') + text })
+  }
+
+  private unstreamedBlockText(pending: PendingTurn, type: string, text: string): string {
+    for (const [index, block] of pending.streamedBlocks ?? []) {
+      if (block.type !== type || !text.startsWith(block.text)) continue
+      pending.streamedBlocks.delete(index)
+      return text.slice(block.text.length)
+    }
+    return text
   }
 
   private async handleAssistant(
@@ -768,19 +800,24 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   ): Promise<void> {
     const inner = message.message as Record<string, unknown> | undefined
     if (!inner) return
+    const nestedMessage = Boolean(message.parent_tool_use_id)
+    if (!nestedMessage && pending.activeSubagents.size === 0) {
+      await this.beginAssistantMessage(pending, stringOrNull(inner.id))
+    }
     const content = (inner.content as Array<Record<string, unknown>>) || []
     for (const block of content) {
       const blockType = String(block.type ?? '')
       if (blockType === 'text') {
-        // Skip if we already streamed this text via content_block_delta.
-        if (pending.streamedText) continue
-        if (pending.activeSubagents.size > 0) continue
-        const text = String(block.text ?? '')
-        if (text) await pending.handlers.onEvent({ type: 'text_delta', delta: text })
+        if (nestedMessage || pending.activeSubagents.size > 0) continue
+        const text = this.unstreamedBlockText(pending, 'text', String(block.text ?? ''))
+        if (pending.context?.outputFormat) {
+          pending.structuredBuffer += text
+        } else if (text) {
+          await pending.handlers.onEvent({ type: 'text_delta', delta: text })
+        }
       } else if (blockType === 'thinking') {
-        if (pending.streamedThinking) continue
-        if (pending.activeSubagents.size > 0) continue
-        const thinking = String(block.thinking ?? '')
+        if (nestedMessage || pending.activeSubagents.size > 0) continue
+        const thinking = this.unstreamedBlockText(pending, 'thinking', String(block.thinking ?? ''))
         if (thinking) await pending.handlers.onEvent({ type: 'reasoning_delta', delta: thinking })
       } else if (blockType === 'tool_use') {
         const id = String(block.id ?? '')
@@ -788,7 +825,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         const input = (block.input as Record<string, unknown>) || {}
         if (!id) continue
         // Suppress nested tool uses while a subagent is in flight.
-        const parentSubagent = pending.activeSubagents.size > 0
+        const parentSubagent = nestedMessage || pending.activeSubagents.size > 0
         if (isSubagentTool(name)) {
           pending.activeSubagents.add(id)
         }
@@ -1188,8 +1225,19 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     message: Record<string, unknown>,
   ): Promise<void> {
     if (type === 'rate_limit' || type === 'rate_limit_event') {
-      const msg = String(message.message ?? 'rate limit')
-      await pending.handlers.onEvent({ type: 'notice', level: 'warning', message: msg })
+      const info = message.rate_limit_info as Record<string, unknown> | undefined
+      // Subscription usage updates also arrive when requests are allowed.
+      // Those are bookkeeping, not warnings about a failed model request.
+      if (info?.status === 'allowed') return
+      const explicit = stringOrNull(message.message)
+      if (!explicit && info?.status !== 'allowed_warning' && info?.status !== 'rejected') {
+        if (type === 'rate_limit_event') return
+      }
+      await pending.handlers.onEvent({
+        type: 'notice',
+        level: 'warning',
+        message: explicit ?? rateLimitNotice(info),
+      })
       return
     }
     if (type === 'hook' || type === 'hook_event' || type === 'system_hook_event') {
@@ -1206,6 +1254,20 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       })
     }
   }
+}
+
+function rateLimitNotice(info: Record<string, unknown> | undefined): string {
+  const window = String(info?.rateLimitType ?? 'usage').replaceAll('_', ' ')
+  const status =
+    info?.status === 'allowed_warning'
+      ? `Claude usage is nearing the ${window} limit`
+      : `Claude ${window} limit reached`
+  const utilization = typeof info?.utilization === 'number' ? info.utilization : null
+  const used = utilization == null ? '' : ` (${Math.round(utilization * 100)}% used)`
+  const resetsAt = typeof info?.resetsAt === 'number' ? new Date(info.resetsAt * 1000) : null
+  const reset =
+    resetsAt && Number.isFinite(resetsAt.getTime()) ? ` Resets at ${resetsAt.toISOString()}.` : ''
+  return `${status}${used}.${reset}`
 }
 
 // Codex's (approvalPolicy, sandbox, planMode) tri-state → Claude SDK
@@ -1384,9 +1446,6 @@ export function sdkResumeSessionId(value: string | null, cwd?: string): string |
   }
   return value
 }
-
-void STREAMED_TEXT
-void STREAMED_THINKING
 
 // ── AskUserQuestion bridging helpers ──
 

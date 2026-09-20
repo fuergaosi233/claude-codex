@@ -346,6 +346,8 @@ export interface ImageInput {
 
 export type RuntimeEvent =
   | { type: 'session'; claudeSessionId: string }
+  // A new top-level model response is beginning, not a streamed content block.
+  | { type: 'message_boundary' }
   | { type: 'text_delta'; delta: string }
   | { type: 'reasoning_delta'; delta: string }
   | { type: 'tool_use'; toolUseId: string; toolName: string; input: Record<string, unknown> }

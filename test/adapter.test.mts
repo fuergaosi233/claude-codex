@@ -2292,23 +2292,26 @@ test('review/start and thread/compact/start emit real turn items', async () => {
     )
 
     let reviewText = ''
+    let reviewWarning: any = null
     let sawEnteredReviewMode = false
     for (let i = 0; i < 500; i += 1) {
       const message = await reader.next()
       if (message.method === 'item/started' && message.params.item.type === 'enteredReviewMode')
         sawEnteredReviewMode = true
       if (message.method === 'item/agentMessage/delta') reviewText += message.params.delta
+      if (message.method === 'warning') reviewWarning = message.params
       if (message.method === 'turn/completed') break
     }
     assert.equal(sawEnteredReviewMode, true)
-    assert.match(reviewText, /Claude Code adapter mock response|Claude warning/)
+    assert.equal(reviewText, '')
+    assert.deepEqual(reviewWarning, { threadId, message: 'mock rate limit notice' })
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
-test('Claude thinking maps to Codex reasoning summary and content deltas', async () => {
+test('Claude thinking maps to Codex reasoning content without a duplicate summary', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -2346,9 +2349,9 @@ test('Claude thinking maps to Codex reasoning summary and content deltas', async
         completedReasoning = message.params.item
       if (message.method === 'turn/completed') break
     }
-    assert.equal(sawSummary, true)
+    assert.equal(sawSummary, false)
     assert.equal(sawContent, true)
-    assert.deepEqual(completedReasoning.summary, ['mock thinking'])
+    assert.deepEqual(completedReasoning.summary, [])
     assert.deepEqual(completedReasoning.content, ['mock thinking'])
   } finally {
     proc.kill()
