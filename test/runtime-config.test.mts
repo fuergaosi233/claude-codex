@@ -24,6 +24,7 @@ import {
 } from '../src/http-agent-runtime.mjs'
 import { NativeClaudeRuntime, sdkResumeSessionId } from '../src/native-runtime.mjs'
 import { resolveRuntimeConfig } from '../src/runtime-config.mjs'
+import { buildSystemPromptAddendum } from '../src/server-helpers.mjs'
 import type { RuntimeTurnContext } from '../src/types.mjs'
 import { parseWorkflowCommand, workflowRuntimePrompt } from '../src/workflow-command.mjs'
 import {
@@ -2646,5 +2647,33 @@ test('native SDK keeps changed and cleared system instructions live on resume', 
       snapshot: false,
       ...(append ? { append } : {}),
     })
+  }
+})
+
+test('native SDK sends desktop presentation guidance on fresh and resumed turns', () => {
+  const runtime = new NativeClaudeRuntime()
+  const buildOptions = Reflect.get(runtime, 'buildOptions')
+  const append = buildSystemPromptAddendum({
+    baseInstructions: 'Answer in Chinese.',
+    developerInstructions: null,
+    personality: null,
+    desktopPresentation: true,
+  })
+  assert.ok(append)
+  for (const claudeSessionId of [null, 'sdk-session']) {
+    const options: { systemPrompt: { append: string } } = buildOptions.call(
+      runtime,
+      {},
+      nativeTurnContext({ cwd: '', claudeSessionId, systemPromptAddendum: append }),
+      new AbortController(),
+    )
+    assert.deepEqual(options.systemPrompt, {
+      type: 'preset',
+      preset: 'claude_code',
+      snapshot: false,
+      append,
+    })
+    assert.match(options.systemPrompt.append, /fenced Mermaid diagrams/)
+    assert.match(options.systemPrompt.append, /Answer in Chinese\./)
   }
 })
