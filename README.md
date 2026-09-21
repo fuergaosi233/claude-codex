@@ -56,6 +56,20 @@ diffs. Runtime selection maps only to existing backend paths today: default
 in-process Claude Agent SDK, `agent-http`, `agentapi`, `claude-p`, `codex-proxy`,
 and `mock`.
 
+### Diagrams and rich Markdown
+
+The native Claude Agent SDK backend is told that replies appear in Codex desktop,
+with Markdown and Mermaid rendering. For explanations that benefit from a diagram,
+Claude is encouraged to use a fenced `mermaid` flowchart or sequence diagram, while
+keeping simple answers brief and respecting requested formats. No global
+`~/.claude/CLAUDE.md` changes are needed; schema-constrained turns do not receive
+this presentation guidance.
+
+Rendering is provided by the Codex app version you use. The adapter preserves the
+Markdown in streaming and history; it does not bundle a diagram renderer or a
+Claude Desktop Artifacts runtime. Arbitrary HTML/React code fences do not become
+interactive apps. Older clients may show Mermaid source instead of a diagram.
+
 ### `/workflows` compatibility
 
 With the native Claude Agent SDK backend, `/workflows <task>` is translated to Claude's

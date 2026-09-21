@@ -526,6 +526,14 @@ export function nullIfEmpty(value: string | null | undefined): string | null {
   return value === '' ? null : value
 }
 
+const desktopPresentationPrompt = [
+  '# Codex desktop presentation',
+  'Your replies appear in Codex desktop, which renders rich Markdown and fenced Mermaid diagrams.',
+  'When a flow, architecture, relationship, or sequence is clearer visually, include a compact Mermaid diagram with a concise explanation. Use a lowercase mermaid code-fence language and close the fence. Prefer simple syntax and ASCII node identifiers; double-quote node labels containing Chinese or special characters.',
+  'Keep prose readable and tool progress concise. Skip diagrams for trivial replies, and follow the requested language, text-only preference, and output format.',
+  'Existing generated images can be embedded with Markdown image syntax and an absolute file path. Raw HTML, SVG, and React code are not automatically executable artifacts; do not promise an interactive artifact merely by emitting its source.',
+].join('\n')
+
 // Assemble the per-thread system prompt addendum from Codex App's instruction
 // surface. Sidecar concatenates this onto Claude's default system prompt so
 // the user's project / developer / personality settings actually take effect.
@@ -533,8 +541,10 @@ export function buildSystemPromptAddendum(input: {
   baseInstructions: string | null
   developerInstructions: string | null
   personality: string | null
+  desktopPresentation?: boolean
 }): string | null {
   const sections: string[] = []
+  if (input.desktopPresentation) sections.push(desktopPresentationPrompt)
   const base = (input.baseInstructions ?? '').trim()
   if (base) sections.push(`# Project instructions\n${base}`)
   const dev = (input.developerInstructions ?? '').trim()

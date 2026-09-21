@@ -139,6 +139,39 @@ test('progress, tools and final Markdown remain separate in streaming and replay
   assert.deepEqual(replay.items, turn.items)
 })
 
+test('fragmented Mermaid fences and image paths survive streaming and replay unchanged', async () => {
+  const fragments = [
+    '请求先经过路由，再由模型处理。\n\n`',
+    '``mer',
+    'maid\nflowchart LR\n  A["用户请求"] --> B{"匹配路由？"}\n',
+    '  B -->|是| C["Claude Code"]\n  B -->|否| D["默认工具链"]\n``',
+    '`\n\n![架构图](/home/tiger/output/architecture.png)',
+  ]
+  const markdown = fragments.join('')
+  const { messages, turn, replay } = await present(
+    emit([
+      { type: 'message_boundary' },
+      ...fragments.flatMap((delta): RuntimeEvent[] => [
+        { type: 'text_delta', delta },
+        { type: 'notice', level: 'info', message: 'Working' },
+      ]),
+      { type: 'completed', success: true },
+    ]),
+  )
+  const items = assistantItems(turn.items)
+  assert.equal(items.length, 1)
+  assert.equal(items[0]?.text, markdown)
+  assert.equal(items[0]?.phase, 'final_answer')
+  assert.equal(
+    messages
+      .filter((message) => message.method === 'item/agentMessage/delta')
+      .map((message) => message.params.delta)
+      .join(''),
+    markdown,
+  )
+  assert.deepEqual(replay.items, turn.items)
+})
+
 test('message boundaries split independent responses even without a tool', async () => {
   const { turn } = await present(
     emit([
