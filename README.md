@@ -56,12 +56,20 @@ diffs. Runtime selection maps only to existing backend paths today: default
 in-process Claude Agent SDK, `agent-http`, `agentapi`, `claude-p`, `codex-proxy`,
 and `mock`.
 
-### Diagrams and rich Markdown
+### Desktop conversation and visual explanations
 
-The native Claude Agent SDK backend is told that replies appear in Codex desktop,
-with Markdown and Mermaid rendering. For explanations that benefit from a diagram,
-Claude is encouraged to use a fenced `mermaid` flowchart or sequence diagram, while
-keeping simple answers brief and respecting requested formats. No global
+The native Claude Agent SDK backend receives presentation guidance modeled on
+Claude Desktop's conversational style: natural explanations, enough detail for
+complex questions, and formatting chosen for the content instead of a fixed
+engineering report. Questions invite discussion; requests for action still use
+and verify tools. Progress updates explain meaningful transitions while native
+tool events retain execution details.
+
+The guidance describes Codex desktop's Markdown and Mermaid rendering. For
+explanations that benefit from a diagram, Claude is encouraged to use a fenced
+`mermaid` flowchart or sequence diagram, while keeping simple answers brief and
+respecting requested language and formats. This supplements the Claude Code
+preset and preserves explicit project/developer/personality preferences. No global
 `~/.claude/CLAUDE.md` changes are needed; schema-constrained turns do not receive
 this presentation guidance.
 
