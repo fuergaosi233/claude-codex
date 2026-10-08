@@ -68,9 +68,12 @@ export class TurnInput implements AsyncIterable<SDKUserMessage> {
       // result ends the turn.
       return 'final'
     }
+    if (this.unanswered.size === 0) return 'final'
     // A steer either folds into the running turn (and is echoed with it) or
     // queues behind it as a turn of its own whose result is still coming.
-    return this.unanswered.size > 0 ? 'pending' : 'final'
+    // Producers without user_message_uuids cannot report a fold, so waiting
+    // on them could hang the turn; keep the first-result rule there.
+    return Array.isArray(result.user_message_uuids) ? 'pending' : 'final'
   }
 
   async *[Symbol.asyncIterator](): AsyncGenerator<SDKUserMessage, void> {

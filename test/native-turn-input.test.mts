@@ -147,6 +147,16 @@ test('turn input keeps the first-result rule for producers without echoes', () =
   assert.equal(input.classifyResult(result({ origin: { kind: 'human' } })), 'final')
 })
 
+test('turn input does not wait on a steer a single-uuid producer cannot report', async () => {
+  const input = new TurnInput()
+  const reader = input[Symbol.asyncIterator]()
+  const prompt = await sentUuid(input, reader, 'prompt')
+  await sentUuid(input, reader, 'steer')
+  // Without user_message_uuids a folded steer is indistinguishable from a
+  // queued one, and no later result may come for it.
+  assert.equal(input.classifyResult(result({ user_message_uuid: prompt })), 'final')
+})
+
 test('a resumed native turn waits past results for work it did not send', async () => {
   let promptEnded = false
   let promptEndedBeforeAnswer: boolean | null = null
