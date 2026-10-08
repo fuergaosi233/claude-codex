@@ -35,6 +35,7 @@ if (!process.env.ANTHROPIC_BETAS) {
 // installed via optionalDependencies.
 
 import type { Query } from '@anthropic-ai/claude-agent-sdk'
+import { TurnInput, type TurnInputMessage } from './native-turn-input.mjs'
 import type {
   ClaudeRuntime,
   PermissionDecision,
@@ -58,6 +59,9 @@ interface PendingTurn {
   context: RuntimeTurnContext
   handlers: RuntimeHandlers
   query: Query
+  // Open for the whole turn; steer() pushes into it and results are
+  // attributed against what it sent (see native-turn-input.mts).
+  input: TurnInput
   abort: AbortController
   resolved: boolean
   resolve: () => void
@@ -127,16 +131,19 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     return new Promise<void>((resolve, reject) => {
       // The SDK accepts either a plain string prompt OR an AsyncIterable of
       // SDKUserMessage envelopes. Always feed the iterable form so we have
-      // room to attach image blocks alongside the text and the door is open
-      // for mid-turn steer() calls.
-      const promptIterable = this.buildPromptIterable(context)
+      // room to attach image blocks alongside the text, and keep it open for
+      // the whole turn so mid-turn steer() calls and control round trips
+      // still reach the CLI.
+      const input = new TurnInput()
+      input.send(this.buildPromptMessage(context))
       const options = this.buildOptions(sdk, context, abort)
 
-      const query = sdk.query({ prompt: promptIterable, options })
+      const query = sdk.query({ prompt: input, options })
       const pending: PendingTurn = {
         context,
         handlers,
         query,
+        input,
         abort,
         resolved: false,
         resolve,
@@ -173,22 +180,11 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   async steer(threadId: string, prompt: string): Promise<void> {
     // Find an in-flight turn for this thread (we don't index by threadId so
     // walk the map — there's usually only one active turn per thread). The
-    // SDK exposes streamInput on the Query for this purpose.
+    // CLI either folds the message into the running turn between tool rounds
+    // or queues it as a follow-up turn; the turn stays open until it answers.
     for (const pending of this.turns.values()) {
       if (pending.context.threadId !== threadId) continue
-      const q = pending.query as Query & { streamInput?: (it: AsyncIterable<unknown>) => void }
-      if (typeof q.streamInput === 'function') {
-        q.streamInput(
-          (async function* () {
-            yield {
-              type: 'user',
-              message: { role: 'user', content: workflowRuntimePrompt(prompt) },
-              parent_tool_use_id: null,
-              origin: { kind: 'human' },
-            }
-          })(),
-        )
-      }
+      pending.input.send(humanUserMessage(workflowRuntimePrompt(prompt)))
       return
     }
   }
@@ -222,44 +218,29 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     return this.sdk
   }
 
-  private buildPromptIterable(context: RuntimeTurnContext): AsyncIterable<any> {
+  private buildPromptMessage(context: RuntimeTurnContext): TurnInputMessage {
     const text = workflowRuntimePrompt(context.prompt)
     const images = context.imageInputs
-    return (async function* () {
-      if (!images || images.length === 0) {
-        // Pure text — keep the simple string form so the SDK doesn't have to
-        // re-stitch content blocks.
-        yield {
-          type: 'user' as const,
-          message: { role: 'user' as const, content: text },
-          parent_tool_use_id: null,
-          origin: { kind: 'human' as const },
-        }
-        return
+    // Pure text — keep the simple string form so the SDK doesn't have to
+    // re-stitch content blocks.
+    if (!images || images.length === 0) return humanUserMessage(text)
+    // Multimodal — assemble the Anthropic MessageParam content array.
+    const content: unknown[] = []
+    if (text) content.push({ type: 'text', text })
+    for (const img of images) {
+      if (img.kind === 'base64') {
+        content.push({
+          type: 'image',
+          source: { type: 'base64', media_type: img.mediaType, data: img.data },
+        })
+      } else {
+        content.push({
+          type: 'image',
+          source: { type: 'url', url: img.data },
+        })
       }
-      // Multimodal — assemble the Anthropic MessageParam content array.
-      const content: unknown[] = []
-      if (text) content.push({ type: 'text', text })
-      for (const img of images) {
-        if (img.kind === 'base64') {
-          content.push({
-            type: 'image',
-            source: { type: 'base64', media_type: img.mediaType, data: img.data },
-          })
-        } else {
-          content.push({
-            type: 'image',
-            source: { type: 'url', url: img.data },
-          })
-        }
-      }
-      yield {
-        type: 'user' as const,
-        message: { role: 'user' as const, content },
-        parent_tool_use_id: null,
-        origin: { kind: 'human' as const },
-      }
-    })()
+    }
+    return humanUserMessage(content as TurnInputMessage['message']['content'])
   }
 
   private buildOptions(
@@ -460,6 +441,9 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         } catch {}
         pending.reject(error)
       }
+    } finally {
+      // Release the CLI's stdin once the turn is over (see TurnInput).
+      pending.input.close()
     }
   }
 
@@ -1192,17 +1176,23 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     message: Record<string, unknown>,
   ): Promise<void> {
     if (pending.deferredResult || pending.resolved) return
+    const usage = (message.usage as Record<string, unknown>) || {}
+    // Push usage + metrics before completed so server can roll them into the
+    // turn before emitting turn/completed. Usage is per result, so record it
+    // for every result the session spent tokens on, including ones that
+    // don't end this turn.
+    if (Object.keys(usage).length > 0) {
+      await pending.handlers.onEvent({ type: 'usage', usage })
+    }
+    // A resumed session can answer queued work of its own first, and a
+    // queued steer gets a result of its own; only the result that answers
+    // everything this turn sent completes it.
+    if (pending.input.classifyResult(message) !== 'final') return
     const subtype = String(message.subtype ?? '')
     const success = subtype === 'success' && !message.is_error && pending.workflowFailure == null
     const resultText =
       pending.workflowFailure ?? (message.result == null ? null : String(message.result))
     const claudeSessionId = message.session_id == null ? null : String(message.session_id)
-    const usage = (message.usage as Record<string, unknown>) || {}
-    // Push usage + metrics before completed so server can roll them into the
-    // turn before emitting turn/completed.
-    if (Object.keys(usage).length > 0) {
-      await pending.handlers.onEvent({ type: 'usage', usage })
-    }
     await pending.handlers.onEvent({
       type: 'metrics',
       durationMs: numberOrNull(message.duration_ms),
@@ -1268,6 +1258,15 @@ function rateLimitNotice(info: Record<string, unknown> | undefined): string {
   const reset =
     resetsAt && Number.isFinite(resetsAt.getTime()) ? ` Resets at ${resetsAt.toISOString()}.` : ''
   return `${status}${used}.${reset}`
+}
+
+function humanUserMessage(content: TurnInputMessage['message']['content']): TurnInputMessage {
+  return {
+    type: 'user',
+    message: { role: 'user', content },
+    parent_tool_use_id: null,
+    origin: { kind: 'human' },
+  }
 }
 
 // Codex's (approvalPolicy, sandbox, planMode) tri-state → Claude SDK

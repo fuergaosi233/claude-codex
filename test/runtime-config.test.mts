@@ -23,6 +23,7 @@ import {
   sanitizeAgentapiTerminalContent,
 } from '../src/http-agent-runtime.mjs'
 import { NativeClaudeRuntime, sdkResumeSessionId } from '../src/native-runtime.mjs'
+import { TurnInput } from '../src/native-turn-input.mjs'
 import { resolveRuntimeConfig } from '../src/runtime-config.mjs'
 import { buildSystemPromptAddendum } from '../src/server-helpers.mjs'
 import type { RuntimeTurnContext } from '../src/types.mjs'
@@ -110,9 +111,8 @@ test('native SDK runtime maps manual /workflows prompts to the human workflow tr
     approvalPolicy: 'never',
     sandboxMode: 'danger-full-access',
   })
-  const buildPromptIterable = Reflect.get(runtime, 'buildPromptIterable')
-  const messages: any[] = []
-  for await (const message of buildPromptIterable.call(runtime, context)) messages.push(message)
+  const buildPromptMessage = Reflect.get(runtime, 'buildPromptMessage')
+  const messages: any[] = [buildPromptMessage.call(runtime, context)]
 
   assert.equal(
     messages[0].message.content,
@@ -208,7 +208,7 @@ test('workflow transcript roots follow CLAUDE_CONFIG_DIR and HOME deterministica
 
 test('manual workflow normalization preserves attached image blocks', async () => {
   const runtime = new NativeClaudeRuntime()
-  const buildPromptIterable = Reflect.get(runtime, 'buildPromptIterable')
+  const buildPromptMessage = Reflect.get(runtime, 'buildPromptMessage')
   const context = nativeTurnContext({
     prompt: '/workflows inspect this image',
     imageInputs: [
@@ -220,8 +220,7 @@ test('manual workflow normalization preserves attached image blocks', async () =
       },
     ],
   })
-  const messages: any[] = []
-  for await (const message of buildPromptIterable.call(runtime, context)) messages.push(message)
+  const messages: any[] = [buildPromptMessage.call(runtime, context)]
   assert.match(messages[0].message.content[0].text, /^ultracode: inspect this image/)
   assert.deepEqual(messages[0].message.content[1], {
     type: 'image',
@@ -521,6 +520,7 @@ test('native SDK parent result does not cap workflow runtime at three seconds', 
   let resolved = false
   const pending = {
     context: nativeTurnContext({ turnId: 'parent-result-workflow-turn' }),
+    input: new TurnInput(),
     activeSubagents: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowToolUseIds: new Set(['parent-result-workflow-launch']),
