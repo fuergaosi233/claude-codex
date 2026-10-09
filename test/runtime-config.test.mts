@@ -125,30 +125,26 @@ test('native SDK runtime maps manual /workflows prompts to the human workflow tr
   assert.deepEqual(messages[0].origin, { kind: 'human' })
 
   const buildOptions = Reflect.get(runtime, 'buildOptions')
-  const options = buildOptions.call(runtime, {}, context, new AbortController())
+  const session = { current: { context, handlers: {}, resolved: false }, lastContext: context }
+  const options = buildOptions.call(runtime, {}, context, new AbortController(), () => session)
   // Pinned launchers reject --settings, so workflows are enabled by env alone.
   assert.equal(options.settings, undefined)
   assert.equal(options.env.CLAUDE_CODE_WORKFLOWS, '1')
+  assert.equal(options.env.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS, '1')
   assert.equal(options.permissionMode, 'default')
   assert.equal(options.allowDangerouslySkipPermissions, undefined)
   assert.equal(typeof options.canUseTool, 'function')
-  const turns = Reflect.get(runtime, 'turns') as Map<string, unknown>
-  turns.set(context.turnId, { handlers: {} })
-  try {
-    assert.deepEqual(
-      await options.canUseTool(
-        'Bash',
-        { command: 'true' },
-        {
-          toolUseID: 'tool',
-          signal: new AbortController().signal,
-        },
-      ),
-      { behavior: 'allow' },
-    )
-  } finally {
-    turns.delete(context.turnId)
-  }
+  assert.deepEqual(
+    await options.canUseTool(
+      'Bash',
+      { command: 'true' },
+      {
+        toolUseID: 'tool',
+        signal: new AbortController().signal,
+      },
+    ),
+    { behavior: 'allow' },
+  )
 })
 
 test('explicit native SDK bypass includes the required dangerous opt-in flag', () => {
@@ -1857,32 +1853,54 @@ test('workflow journal monitor does not commit started bookkeeping after stop', 
 
 test('native SDK permission allow result carries original input for SDK validation', async () => {
   const runtime = new NativeClaudeRuntime()
-  const turns = Reflect.get(runtime, 'turns')
-  assert.ok(turns instanceof Map)
   const input = { command: 'printf ok' }
   const requests: unknown[] = []
-  turns.set('turn', {
+  const context = { threadId: 'thread', turnId: 'turn' }
+  const current = {
+    context,
+    resolved: false,
     handlers: {
       onPermissionRequest: async (event: unknown) => {
         requests.push(event)
         return { decision: 'accept' }
       },
     },
-  })
-
-  try {
-    const makeCanUseTool = Reflect.get(runtime, 'makeCanUseTool')
-    assert.equal(typeof makeCanUseTool, 'function')
-    const canUseTool = makeCanUseTool.call(runtime, { threadId: 'thread', turnId: 'turn' }, false)
-    const result = await canUseTool('Bash', input, {
-      toolUseID: 'tool',
-      signal: new AbortController().signal,
-    })
-    assert.deepEqual(result, { behavior: 'allow', updatedInput: input })
-    assert.equal(requests.length, 1)
-  } finally {
-    turns.delete('turn')
   }
+
+  const makeCanUseTool = Reflect.get(runtime, 'makeCanUseTool')
+  assert.equal(typeof makeCanUseTool, 'function')
+  const canUseTool = makeCanUseTool.call(runtime, () => ({ current, lastContext: context }))
+  const result = await canUseTool('Bash', input, {
+    toolUseID: 'tool',
+    signal: new AbortController().signal,
+  })
+  assert.deepEqual(result, { behavior: 'allow', updatedInput: input })
+  assert.equal(requests.length, 1)
+})
+
+test('native SDK permission request between turns falls back to the standing policy', async () => {
+  const runtime = new NativeClaudeRuntime()
+  const makeCanUseTool = Reflect.get(runtime, 'makeCanUseTool')
+  const options = { toolUseID: 'tool', signal: new AbortController().signal }
+  const ask = (lastContext: RuntimeTurnContext) =>
+    makeCanUseTool.call(runtime, () => ({ current: null, lastContext }))
+  assert.deepEqual(
+    await ask(nativeTurnContext({ approvalPolicy: 'never' }))('Bash', { command: 'true' }, options),
+    { behavior: 'allow' },
+  )
+  assert.equal(
+    (
+      await ask(
+        nativeTurnContext({ approvalPolicy: 'on-request', sandboxMode: 'workspace-write' }),
+      )('Bash', { command: 'true' }, options)
+    ).behavior,
+    'deny',
+  )
+  assert.equal(
+    (await ask(nativeTurnContext({ approvalPolicy: 'never' }))('AskUserQuestion', {}, options))
+      .behavior,
+    'deny',
+  )
 })
 
 test('HTTP agent runtime streams agentapi-compatible message updates', async () => {

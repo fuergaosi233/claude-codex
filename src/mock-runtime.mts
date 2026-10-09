@@ -1,10 +1,21 @@
 import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import type { ClaudeRuntime, RuntimeHandlers, RuntimeTurnContext } from './types.mjs'
+import type {
+  ClaudeRuntime,
+  RuntimeBackgroundListener,
+  RuntimeHandlers,
+  RuntimeTurnContext,
+} from './types.mjs'
 import { sleep } from './util.mjs'
+
+const MOCK_BACKGROUND_AGENT_ID = 'a0b1c2d3e4f5a6b7'
 
 export class MockRuntime implements ClaudeRuntime {
   private interrupted = new Set<string>()
+  private listener: RuntimeBackgroundListener | null = null
+  private backgroundTasks = new Map<string, { threadId: string; timer: NodeJS.Timeout }>()
+  // What Claude says, unprompted, once a background agent reports back.
+  private continuations = new Map<string, string>()
 
   async runTurn(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void> {
     this.interrupted.delete(context.threadId)
@@ -12,6 +23,14 @@ export class MockRuntime implements ClaudeRuntime {
       type: 'session',
       claudeSessionId: context.claudeSessionId ?? `mock-${context.threadId}`,
     })
+
+    if (context.continuation) {
+      const text = this.continuations.get(context.threadId) ?? null
+      this.continuations.delete(context.threadId)
+      if (text) await handlers.onEvent({ type: 'text_delta', delta: text })
+      await handlers.onEvent({ type: 'completed', success: true, result: text })
+      return
+    }
 
     if (/approval|permission|bash/i.test(context.prompt)) {
       const toolUseId = `tool-${Date.now()}`
@@ -248,6 +267,83 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    if (/background subagent check/i.test(context.prompt)) {
+      // Claude Code's run_in_background Agent: the call returns at once with
+      // `async_launched`; the agent reports later through a task
+      // notification, which also makes Claude answer on its own.
+      const toolUseId = `task-${Date.now()}`
+      const agentId = MOCK_BACKGROUND_AGENT_ID
+      const prompt = 'survey the repo'
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId,
+        toolName: 'Agent',
+        input: { description: 'mock background agent', prompt, run_in_background: true },
+      })
+      await this.listener?.onTaskEvent(context.threadId, {
+        type: 'task_started',
+        taskId: agentId,
+        toolUseId,
+        taskType: 'local_agent',
+        description: 'mock background agent',
+        subagentType: null,
+        prompt,
+        backgrounded: true,
+      })
+      await handlers.onEvent({
+        type: 'tool_result',
+        toolUseId,
+        content: `Async agent launched successfully.\nagentId: ${agentId}`,
+        structured: { isAsync: true, status: 'async_launched', agentId, prompt },
+      })
+      this.scheduleBackgroundReport(
+        context.threadId,
+        agentId,
+        toolUseId,
+        'background report body',
+        backgroundDelayMs(context.prompt),
+      )
+      await handlers.onEvent({ type: 'text_delta', delta: 'agent launched in background' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'launched' })
+      return
+    }
+
+    if (/background message check/i.test(context.prompt)) {
+      const toolUseId = `send-${Date.now()}`
+      const agentId = MOCK_BACKGROUND_AGENT_ID
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId,
+        toolName: 'SendMessage',
+        input: { to: agentId, message: 'dig deeper' },
+      })
+      await this.listener?.onTaskEvent(context.threadId, {
+        type: 'task_started',
+        taskId: agentId,
+        toolUseId,
+        taskType: 'local_agent',
+        description: 'mock background agent',
+        subagentType: null,
+        prompt: 'dig deeper',
+        backgrounded: true,
+      })
+      await handlers.onEvent({
+        type: 'tool_result',
+        toolUseId,
+        content: `Agent "${agentId}" was resumed in the background.`,
+      })
+      this.scheduleBackgroundReport(
+        context.threadId,
+        agentId,
+        toolUseId,
+        'follow-up report',
+        backgroundDelayMs(context.prompt),
+      )
+      await handlers.onEvent({ type: 'text_delta', delta: 'message sent' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'sent' })
+      return
+    }
+
     if (/orphan subagent check/i.test(context.prompt)) {
       const taskId = `task-${Date.now()}`
       await handlers.onEvent({
@@ -393,7 +489,83 @@ export class MockRuntime implements ClaudeRuntime {
 
   async steer(_threadId: string, _prompt: string): Promise<void> {}
 
-  async stop(): Promise<void> {}
+  async stop(): Promise<void> {
+    for (const { timer } of this.backgroundTasks.values()) clearTimeout(timer)
+    this.backgroundTasks.clear()
+  }
+
+  setBackgroundListener(listener: RuntimeBackgroundListener): void {
+    this.listener = listener
+  }
+
+  async stopTask(threadId: string, taskId: string): Promise<boolean> {
+    const task = this.backgroundTasks.get(taskId)
+    if (!task || task.threadId !== threadId) return false
+    clearTimeout(task.timer)
+    this.backgroundTasks.delete(taskId)
+    // Claude reports the stop asynchronously, and passively: no wakeup.
+    setImmediate(() => {
+      void this.listener?.onTaskEvent(threadId, {
+        type: 'task_notification',
+        taskId,
+        toolUseId: null,
+        status: 'stopped',
+        summary: 'Agent stopped',
+        result: null,
+        usage: null,
+      })
+    })
+    return true
+  }
+
+  hasBackgroundWork(): boolean {
+    return this.backgroundTasks.size > 0 || this.continuations.size > 0
+  }
+
+  hasPendingContinuation(threadId: string): boolean {
+    return this.continuations.has(threadId)
+  }
+
+  private scheduleBackgroundReport(
+    threadId: string,
+    taskId: string,
+    toolUseId: string,
+    report: string,
+    delayMs: number,
+  ): void {
+    const timer = setTimeout(async () => {
+      this.backgroundTasks.delete(taskId)
+      const listener = this.listener
+      if (!listener) return
+      await listener.onTaskEvent(threadId, {
+        type: 'task_progress',
+        taskId,
+        toolUseId,
+        description: 'mock background agent',
+        summary: null,
+        lastToolName: 'Read',
+        usage: { totalTokens: 1200, toolUses: 3, durationMs: delayMs },
+      })
+      await listener.onTaskEvent(threadId, {
+        type: 'task_notification',
+        taskId,
+        toolUseId,
+        status: 'completed',
+        summary: 'Agent "mock background agent" completed',
+        result: report,
+        usage: { totalTokens: 2400, toolUses: 5, durationMs: delayMs },
+      })
+      this.continuations.set(threadId, `Background agent reported: ${report}`)
+      listener.onAutonomousTurn(threadId)
+    }, delayMs)
+    this.backgroundTasks.set(taskId, { threadId, timer })
+  }
+}
+
+// `... check delay=5000` keeps the agent running long enough to interact.
+function backgroundDelayMs(prompt: string): number {
+  const match = prompt.match(/\bdelay=(\d+)/)
+  return match ? Number(match[1]) : 150
 }
 
 function fileChangeFromPrompt(context: RuntimeTurnContext): {

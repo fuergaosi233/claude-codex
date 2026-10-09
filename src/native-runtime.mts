@@ -36,15 +36,18 @@ if (!process.env.ANTHROPIC_BETAS) {
 
 import type { Query } from '@anthropic-ai/claude-agent-sdk'
 import { TurnInput, type TurnInputMessage } from './native-turn-input.mjs'
+import { readTaskResult } from './task-output.mjs'
 import type {
   ClaudeRuntime,
   PermissionDecision,
+  RuntimeBackgroundListener,
   RuntimeHandlers,
+  RuntimeTaskUsage,
   RuntimeTurnContext,
   UserInputAnswers,
   UserInputQuestion,
 } from './types.mjs'
-import { newId } from './util.mjs'
+import { debugLog, newId } from './util.mjs'
 import { parseWorkflowCommand, workflowRuntimePrompt } from './workflow-command.mjs'
 import {
   defaultWorkflowTranscriptRoots,
@@ -58,7 +61,10 @@ type ClaudeSdk = typeof import('@anthropic-ai/claude-agent-sdk')
 interface PendingTurn {
   context: RuntimeTurnContext
   handlers: RuntimeHandlers
-  query: Query
+  session: LiveSession
+  // Claude started this turn itself (a background task reported back); the
+  // turn only listens and sent no prompt of its own.
+  autonomous: boolean
   // Open for the whole turn; steer() pushes into it and results are
   // attributed against what it sent (see native-turn-input.mts).
   input: TurnInput
@@ -117,64 +123,91 @@ interface PendingPermission {
   resolve: (value: PermissionDecision) => void
 }
 
+// One Claude Code process. It normally lives exactly as long as its turn, but
+// a background task (an Agent the CLI backgrounded, a background shell) runs
+// inside that process: closing it after the turn kills the task and drops the
+// notification Claude would have answered. While such work is live the session
+// stays open between turns. A user turn attaches to it instead of starting a
+// new process, and a turn Claude starts on its own (answering a task
+// notification) is buffered until the server attaches a continuation turn.
+interface LiveSession {
+  threadId: string
+  query: Query
+  input: TurnInput
+  abort: AbortController
+  // Registered for reuse by later turns of the thread. Structured-output,
+  // summary and compaction turns run in sessions of their own.
+  reusable: boolean
+  signature: string
+  lastContext: RuntimeTurnContext
+  model: string | null
+  permissionMode: string
+  // The turn currently receiving the session's messages.
+  current: PendingTurn | null
+  // Messages of a turn Claude started without a prompt from us, held until a
+  // continuation turn attaches.
+  backlog: Record<string, unknown>[]
+  autonomousRequested: boolean
+  // Live background tasks (non-ambient). background_tasks_changed is the
+  // authoritative level; task_* edges keep it current on CLIs without it.
+  liveTasks: Set<string>
+  levelSeen: boolean
+  tasks: Map<string, SessionTask>
+  // A task ended and Claude may still start a turn to answer it.
+  unsettled: boolean
+  settleObservedRunning: boolean
+  cliState: string | null
+  // Interrupted while background work stays alive: the aborted turn's tail
+  // has no turn to land in.
+  sinkUntilResult: boolean
+  settleTimer: NodeJS.Timeout | null
+  idleTimer: NodeJS.Timeout | null
+  // Serializes message routing with turn attachment so a turn never misses
+  // or reorders the messages that precede it.
+  chain: Promise<void>
+  closed: boolean
+}
+
+interface SessionTask {
+  taskType: string | null
+  toolUseId: string | null
+  outputFile: string | null
+}
+
 const WORKFLOW_TERMINAL_FLUSH_TIMEOUT_MS = 500
 const WORKFLOW_JOURNAL_SETTLE_TIMEOUT_MS = 3_000
+// How long an idle session waits for Claude to answer a task that just ended
+// when the CLI does not report session state.
+const SESSION_SETTLE_MS = 15_000
+// How long an idle session keeps background tasks alive without any message.
+const BACKGROUND_IDLE_MS = 2 * 60 * 60 * 1000
+const SESSION_CONTROL_TIMEOUT_MS = 5_000
+const TERMINAL_TASK_STATUSES = new Set(['completed', 'failed', 'killed', 'stopped'])
+// A parked agent keeps its progress but does no work until sent a message.
+const IDLE_TASK_STATUSES = new Set([...TERMINAL_TASK_STATUSES, 'paused'])
 
 export class NativeClaudeRuntime implements ClaudeRuntime {
   private sdk: ClaudeSdk | null = null
   private turns = new Map<string, PendingTurn>()
   private permissions = new Map<string, PendingPermission>()
+  private sessions = new Map<string, LiveSession>()
+  private listener: RuntimeBackgroundListener | null = null
+
+  setBackgroundListener(listener: RuntimeBackgroundListener): void {
+    this.listener = listener
+  }
 
   async runTurn(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void> {
     const sdk = await this.loadSdk()
-    const abort = new AbortController()
-    return new Promise<void>((resolve, reject) => {
-      // The SDK accepts either a plain string prompt OR an AsyncIterable of
-      // SDKUserMessage envelopes. Always feed the iterable form so we have
-      // room to attach image blocks alongside the text, and keep it open for
-      // the whole turn so mid-turn steer() calls and control round trips
-      // still reach the CLI.
-      const input = new TurnInput()
-      input.send(this.buildPromptMessage(context))
-      const options = this.buildOptions(sdk, context, abort)
-
-      const query = sdk.query({ prompt: input, options })
-      const pending: PendingTurn = {
-        context,
-        handlers,
-        query,
-        input,
-        abort,
-        resolved: false,
-        resolve,
-        reject,
-        assistantMessageId: null,
-        streamedBlocks: new Map(),
-        activeSubagents: new Set(),
-        completedWorkflowTasks: new Set(),
-        workflowToolUseIds: new Set(),
-        workflowLaunches: new Map(),
-        workflowTranscriptRoots: defaultWorkflowTranscriptRoots(process.env, context.cwd),
-        skippedWorkflowTaskIds: new Set(),
-        workflowTasks: new Map(),
-        toolStartSeen: new Set(),
-        structuredBuffer: '',
-        pendingUserMessage: null,
-        deferredResult: null,
-        workflowFailure: null,
+    if (context.continuation) return this.attachContinuation(context, handlers)
+    const live = this.sessions.get(context.threadId)
+    if (live && !live.closed && this.isReusable(context)) {
+      if (live.signature === sessionSignature(context) || this.hasLiveWork(live)) {
+        return this.attachTurn(live, context, handlers, false)
       }
-      this.turns.set(context.turnId, pending)
-      // Kick off the receive loop in the background. We don't await it here
-      // because runTurn() must resolve when the result message arrives — the
-      // receive loop will call resolve/reject on `pending` once the SDK ends.
-      void this.consume(pending).catch((err: unknown) => {
-        if (!pending.resolved) {
-          pending.resolved = true
-          this.turns.delete(context.turnId)
-          reject(err instanceof Error ? err : new Error(String(err)))
-        }
-      })
-    })
+      this.closeSession(live)
+    }
+    return this.openSession(sdk, context, handlers)
   }
 
   async steer(threadId: string, prompt: string): Promise<void> {
@@ -190,13 +223,63 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   }
 
   async interrupt(threadId: string): Promise<void> {
-    for (const pending of this.turns.values()) {
-      if (pending.context.threadId === threadId) {
-        await this.stopWorkflowTasks(pending)
-        pending.abort.abort()
-        await pending.query.interrupt().catch(() => {})
-      }
+    const live = this.sessions.get(threadId)
+    if (live && !live.closed && live.liveTasks.size > 0) {
+      // Aborting would kill the process and every background task with it.
+      // Stop only the running turn; the tasks keep going and report back.
+      await this.serialize(live, async () => {
+        const current = live.current
+        if (current) {
+          await this.stopWorkflowTasks(current)
+          this.releaseTurn(current)
+          live.current = null
+        }
+        live.backlog.length = 0
+        live.autonomousRequested = false
+        live.sinkUntilResult = live.cliState !== 'idle'
+        await settlesWithin(
+          live.query.interrupt().catch(() => {}),
+          SESSION_CONTROL_TIMEOUT_MS,
+        )
+        this.maybeRelease(live)
+      })
     }
+    for (const pending of [...this.turns.values()]) {
+      if (pending.context.threadId !== threadId) continue
+      await this.stopWorkflowTasks(pending)
+      pending.abort.abort()
+      await pending.session.query.interrupt().catch(() => {})
+    }
+  }
+
+  async stopTask(threadId: string, taskId: string): Promise<boolean> {
+    const live = this.sessions.get(threadId)
+    if (!live || live.closed) return false
+    const query = live.query as Query & { stopTask?: (taskId: string) => Promise<void> }
+    if (typeof query.stopTask !== 'function') return false
+    try {
+      await query.stopTask(taskId)
+      return true
+    } catch (error) {
+      debugLog('native.task.stop_failed', {
+        threadId,
+        taskId,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      return false
+    }
+  }
+
+  hasBackgroundWork(): boolean {
+    for (const session of this.sessions.values()) {
+      if (!session.closed && this.hasLiveWork(session)) return true
+    }
+    return false
+  }
+
+  hasPendingContinuation(threadId: string): boolean {
+    const live = this.sessions.get(threadId)
+    return live != null && !live.closed && live.current == null && live.backlog.length > 0
   }
 
   async stop(): Promise<void> {
@@ -204,6 +287,13 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       await this.stopWorkflowTasks(pending)
       pending.abort.abort()
     }
+    for (const session of this.sessions.values()) {
+      this.clearSessionTimers(session)
+      session.closed = true
+      session.abort.abort()
+      session.input.close()
+    }
+    this.sessions.clear()
     this.turns.clear()
     this.permissions.clear()
   }
@@ -247,6 +337,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     sdk: ClaudeSdk,
     context: RuntimeTurnContext,
     abort: AbortController,
+    sessionRef: () => LiveSession | null,
   ): Record<string, unknown> {
     const opts: Record<string, unknown> = {
       abortController: abort,
@@ -264,6 +355,9 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (!process.env.ANTHROPIC_BETAS) {
       process.env.ANTHROPIC_BETAS = 'extended-cache-ttl-2025-04-11'
     }
+    // session_state_changed tells a session that outlives its turn when the
+    // CLI has finished answering everything queued (see maybeRelease).
+    opts.env = { ...process.env, CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1' }
     if (context.addDirs && context.addDirs.length > 0) opts.additionalDirectories = context.addDirs
     if (context.allowedTools && context.allowedTools.length > 0)
       opts.allowedTools = context.allowedTools
@@ -276,7 +370,6 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     // flag outside a recognized container sandbox, so App-level Full Access
     // stays in default mode and auto-allows through canUseTool below. An
     // explicit env override can still opt into bypassPermissions.
-    const permissionModeOverride = configuredPermissionMode()
     const mode = derivePermissionMode(context.approvalPolicy, context.sandboxMode, context.planMode)
     opts.permissionMode = mode
     if (mode === 'bypassPermissions') opts.allowDangerouslySkipPermissions = true
@@ -293,11 +386,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     // prompt. Explicit SDK bypass omits the callback because Claude never calls
     // it in that mode.
     if (mode !== 'plan' && mode !== 'bypassPermissions') {
-      const appFullAccess =
-        permissionModeOverride === null &&
-        (context.approvalPolicy === 'never' || context.sandboxMode === 'danger-full-access')
-      const autoAllow = appFullAccess || mode === 'dontAsk'
-      opts.canUseTool = this.makeCanUseTool(context, autoAllow)
+      opts.canUseTool = this.makeCanUseTool(sessionRef)
     }
 
     // Project + developer + personality instructions ride along as a system
@@ -320,7 +409,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     return opts
   }
 
-  private makeCanUseTool(context: RuntimeTurnContext, autoAllow: boolean) {
+  private makeCanUseTool(sessionRef: () => LiveSession | null) {
     return async (
       toolName: string,
       input: Record<string, unknown>,
@@ -329,8 +418,18 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       { behavior: 'allow'; updatedInput?: unknown } | { behavior: 'deny'; message: string }
     > => {
       const toolUseId = options.toolUseID || `tool-${newId()}`
-      const pending = this.turns.get(context.turnId)
-      if (!pending) return { behavior: 'deny', message: 'turn already finished' }
+      const session = sessionRef()
+      const pending = session?.current
+      if (!session || !pending || pending.resolved) {
+        // A background task asked between turns. There is no turn to surface
+        // an approval in, so only the thread's standing policy can answer.
+        if (session && toolName !== 'AskUserQuestion' && autoAllowsTools(session.lastContext)) {
+          return { behavior: 'allow' }
+        }
+        return { behavior: 'deny', message: 'no active turn to ask the user for approval' }
+      }
+      const context = pending.context
+      const autoAllow = autoAllowsTools(context)
 
       // AskUserQuestion is a CLI built-in that, in SDK mode, has no TUI to
       // render the question. Bridge it to Codex's native request_user_input
@@ -398,52 +497,547 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }
   }
 
-  private async consume(pending: PendingTurn): Promise<void> {
-    const { context, handlers, query } = pending
-    try {
-      for await (const message of query as AsyncIterable<Record<string, unknown>>) {
-        await this.handleMessage(pending, message)
-        if (pending.resolved) break
+  private openSession(
+    sdk: ClaudeSdk,
+    context: RuntimeTurnContext,
+    handlers: RuntimeHandlers,
+  ): Promise<void> {
+    const abort = new AbortController()
+    return new Promise<void>((resolve, reject) => {
+      // The SDK accepts either a plain string prompt OR an AsyncIterable of
+      // SDKUserMessage envelopes. Always feed the iterable form so we have
+      // room to attach image blocks alongside the text, and keep it open for
+      // the whole session so mid-turn steer() calls, control round trips and
+      // later turns still reach the CLI.
+      const input = new TurnInput()
+      input.send(this.buildPromptMessage(context))
+      const reusable = this.isReusable(context) && this.listener != null
+      // canUseTool reaches the session only once Claude asks for a tool.
+      let session: LiveSession | null = null
+      const options = this.buildOptions(sdk, context, abort, () => session)
+      const opened: LiveSession = {
+        threadId: context.threadId,
+        query: sdk.query({ prompt: input, options }),
+        input,
+        abort,
+        reusable,
+        signature: sessionSignature(context),
+        lastContext: context,
+        model: context.model,
+        permissionMode: derivePermissionMode(
+          context.approvalPolicy,
+          context.sandboxMode,
+          context.planMode,
+        ),
+        current: null,
+        backlog: [],
+        autonomousRequested: false,
+        liveTasks: new Set(),
+        levelSeen: false,
+        tasks: new Map(),
+        unsettled: false,
+        settleObservedRunning: false,
+        cliState: null,
+        sinkUntilResult: false,
+        settleTimer: null,
+        idleTimer: null,
+        chain: Promise.resolve(),
+        closed: false,
       }
-      if (!pending.resolved && pending.deferredResult) {
-        // The SDK iterator is the authoritative lifetime of a turn. If it
-        // closes while a workflow journal still has an unresolved task, there
-        // will be no later task_notification to unblock the deferred result.
-        // Close those projected agents as failed and finish the parent turn
-        // rather than leaving Codex cc's spinner alive forever.
-        if (this.hasPendingWorkflowTasks(pending)) await this.stopWorkflowTasks(pending)
-        await this.finishDeferredResult(pending, true)
-        if (!pending.resolved) return
+      session = opened
+      const pending = this.createPendingTurn(opened, context, handlers, false, resolve, reject)
+      opened.current = pending
+      this.turns.set(context.turnId, pending)
+      if (reusable) {
+        const previous = this.sessions.get(context.threadId)
+        if (previous && previous !== opened) this.closeSession(previous)
+        this.sessions.set(context.threadId, opened)
       }
-      // The async iterator finished without a 'result' message — treat as
-      // successful empty turn (claude-agent-sdk does occasionally end without
-      // a SDKResultMessage when interrupted cleanly).
-      if (!pending.resolved) {
-        await this.stopWorkflowTasks(pending)
+      // Run the receive loop in the background. runTurn() resolves when this
+      // turn's result arrives; the loop itself runs for the session.
+      void this.consumeSession(opened)
+    })
+  }
+
+  private attachContinuation(
+    context: RuntimeTurnContext,
+    handlers: RuntimeHandlers,
+  ): Promise<void> {
+    const live = this.sessions.get(context.threadId)
+    if (!live || live.closed || (live.backlog.length === 0 && !live.autonomousRequested)) {
+      // Nothing left to receive (a user turn already took it, or the session
+      // ended): an empty turn completes immediately.
+      return Promise.resolve(
+        handlers.onEvent({ type: 'completed', success: true, result: null }),
+      ).then(() => {})
+    }
+    return this.attachTurn(live, context, handlers, true)
+  }
+
+  private attachTurn(
+    session: LiveSession,
+    context: RuntimeTurnContext,
+    handlers: RuntimeHandlers,
+    autonomous: boolean,
+  ): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const pending = this.createPendingTurn(
+        session,
+        context,
+        handlers,
+        autonomous,
+        resolve,
+        reject,
+      )
+      void this.serialize(session, async () => {
+        if (session.closed) {
+          pending.resolved = true
+          if (autonomous) {
+            await handlers.onEvent({ type: 'completed', success: true, result: null })
+            resolve()
+          } else {
+            reject(new Error('Claude session ended before the turn could start'))
+          }
+          return
+        }
+        this.clearSessionTimers(session)
+        // A turn the server has given up on (or never claimed) yields.
+        if (session.current) this.releaseTurn(session.current)
+        session.current = pending
+        session.lastContext = context
+        session.autonomousRequested = false
+        session.sinkUntilResult = false
+        this.turns.set(context.turnId, pending)
+        session.input.beginTurn()
+        if (!autonomous) {
+          await this.applySessionSettings(session, context)
+          session.input.send(this.buildPromptMessage(context))
+        }
+        // Replay what Claude already produced on its own. Anything after the
+        // result that ends this turn stays queued for the next one.
+        while (session.backlog.length > 0 && !pending.resolved) {
+          const message = session.backlog.shift() as Record<string, unknown>
+          await this.deliver(session, pending, message)
+        }
+        if (pending.resolved) {
+          this.detach(session, pending)
+          // The replay may have been everything Claude had to say; no later
+          // message is coming to schedule the release.
+          this.maybeRelease(session)
+        }
+      }).catch((error: unknown) => {
+        if (pending.resolved) return
         pending.resolved = true
         this.turns.delete(context.turnId)
-        try {
-          await handlers.onEvent({ type: 'completed', success: true, result: null })
-          pending.resolve()
-        } catch (err) {
-          pending.reject(err instanceof Error ? err : new Error(String(err)))
-        }
+        if (session.current === pending) session.current = null
+        reject(error instanceof Error ? error : new Error(String(error)))
+      })
+    })
+  }
+
+  private createPendingTurn(
+    session: LiveSession,
+    context: RuntimeTurnContext,
+    handlers: RuntimeHandlers,
+    autonomous: boolean,
+    resolve: () => void,
+    reject: (error: Error) => void,
+  ): PendingTurn {
+    return {
+      context,
+      handlers,
+      session,
+      autonomous,
+      input: session.input,
+      abort: session.abort,
+      resolved: false,
+      resolve,
+      reject,
+      assistantMessageId: null,
+      streamedBlocks: new Map(),
+      activeSubagents: new Set(),
+      completedWorkflowTasks: new Set(),
+      workflowToolUseIds: new Set(),
+      workflowLaunches: new Map(),
+      workflowTranscriptRoots: defaultWorkflowTranscriptRoots(process.env, context.cwd),
+      skippedWorkflowTaskIds: new Set(),
+      workflowTasks: new Map(),
+      toolStartSeen: new Set(),
+      structuredBuffer: '',
+      pendingUserMessage: null,
+      deferredResult: null,
+      workflowFailure: null,
+    }
+  }
+
+  private async applySessionSettings(
+    session: LiveSession,
+    context: RuntimeTurnContext,
+  ): Promise<void> {
+    const query = session.query as Query & {
+      setModel?: (model?: string) => Promise<void>
+      setPermissionMode?: (mode: string) => Promise<void>
+    }
+    if (context.model && context.model !== session.model && query.setModel) {
+      session.model = context.model
+      await settlesWithin(
+        query.setModel(context.model).catch(() => {}),
+        SESSION_CONTROL_TIMEOUT_MS,
+      )
+    }
+    const mode = derivePermissionMode(context.approvalPolicy, context.sandboxMode, context.planMode)
+    if (
+      mode !== session.permissionMode &&
+      mode !== 'bypassPermissions' &&
+      session.permissionMode !== 'bypassPermissions' &&
+      query.setPermissionMode
+    ) {
+      session.permissionMode = mode
+      await settlesWithin(
+        query.setPermissionMode(mode).catch(() => {}),
+        SESSION_CONTROL_TIMEOUT_MS,
+      )
+    }
+  }
+
+  private serialize(session: LiveSession, task: () => Promise<void> | void): Promise<void> {
+    const run = session.chain.then(task)
+    session.chain = run.catch(() => {})
+    return run
+  }
+
+  private async consumeSession(session: LiveSession): Promise<void> {
+    let failure: Error | null = null
+    try {
+      for await (const message of session.query as AsyncIterable<Record<string, unknown>>) {
+        await this.serialize(session, () => this.routeMessage(session, message))
+        if (session.closed) break
       }
     } catch (err) {
-      if (!pending.resolved) {
-        await this.stopWorkflowTasks(pending)
-        pending.resolved = true
-        this.turns.delete(context.turnId)
-        const error = err instanceof Error ? err : new Error(String(err))
-        try {
-          await handlers.onEvent({ type: 'error', message: error.message })
-        } catch {}
-        pending.reject(error)
-      }
-    } finally {
-      // Release the CLI's stdin once the turn is over (see TurnInput).
-      pending.input.close()
+      failure = err instanceof Error ? err : new Error(String(err))
     }
+    await this.serialize(session, () => this.endSession(session, failure))
+  }
+
+  private async routeMessage(
+    session: LiveSession,
+    message: Record<string, unknown>,
+  ): Promise<void> {
+    if (session.closed) return
+    this.clearSessionTimers(session)
+    const type = String(message.type ?? '')
+    if (type === 'system') await this.trackSessionSystem(session, message)
+    if (session.sinkUntilResult) {
+      if (type === 'result') session.sinkUntilResult = false
+    } else if (session.current) {
+      await this.deliver(session, session.current, message)
+      if (session.current?.resolved) this.detach(session, session.current)
+    } else if (this.startsAutonomousTurn(session, type, message)) {
+      session.backlog.push(message)
+      if (!session.autonomousRequested) {
+        session.autonomousRequested = true
+        this.listener?.onAutonomousTurn(session.threadId)
+      }
+    }
+    this.maybeRelease(session)
+  }
+
+  // Between turns, only Claude's own top-level output means it started a
+  // turn. Nested output belongs to a running task, a bare result has nothing
+  // left to show, and bookkeeping frames (rate limits, hooks) come and go.
+  private startsAutonomousTurn(
+    session: LiveSession,
+    type: string,
+    message: Record<string, unknown>,
+  ): boolean {
+    if (!session.reusable || !this.listener) return false
+    if (message.parent_tool_use_id) return false
+    if (type === 'result') return session.backlog.length > 0
+    return type === 'stream_event' || type === 'assistant' || type === 'user'
+  }
+
+  private async deliver(
+    session: LiveSession,
+    pending: PendingTurn,
+    message: Record<string, unknown>,
+  ): Promise<void> {
+    try {
+      await this.handleMessage(pending, message)
+    } catch (err) {
+      if (pending.resolved) return
+      await this.stopWorkflowTasks(pending).catch(() => {})
+      pending.resolved = true
+      this.turns.delete(pending.context.turnId)
+      const error = err instanceof Error ? err : new Error(String(err))
+      try {
+        await pending.handlers.onEvent({ type: 'error', message: error.message })
+      } catch {}
+      pending.reject(error)
+    }
+    void session
+  }
+
+  private detach(session: LiveSession, pending: PendingTurn): void {
+    if (session.current === pending) session.current = null
+    this.turns.delete(pending.context.turnId)
+    if (session.closed || session.backlog.length === 0 || !session.reusable || !this.listener)
+      return
+    // Claude already began its next turn while this one was finishing.
+    session.autonomousRequested = true
+    this.listener.onAutonomousTurn(session.threadId)
+  }
+
+  // Resolve a turn without a terminal event: the server already settled it
+  // (interrupt) or a newer turn took the session over.
+  private releaseTurn(pending: PendingTurn): void {
+    if (pending.resolved) return
+    pending.resolved = true
+    this.turns.delete(pending.context.turnId)
+    pending.resolve()
+  }
+
+  private maybeRelease(session: LiveSession): void {
+    if (session.closed || session.current || session.backlog.length > 0) return
+    if (!session.reusable) {
+      this.closeSession(session)
+      return
+    }
+    if (session.liveTasks.size > 0) {
+      session.idleTimer = setTimeout(() => {
+        session.idleTimer = null
+        debugLog('native.session.idle_timeout', {
+          threadId: session.threadId,
+          liveTasks: [...session.liveTasks],
+        })
+        if (!session.current && session.backlog.length === 0) this.closeSession(session)
+      }, backgroundIdleMs())
+      session.idleTimer.unref?.()
+      return
+    }
+    if (session.unsettled) {
+      session.settleTimer = setTimeout(() => {
+        session.settleTimer = null
+        if (!session.current && session.backlog.length === 0 && session.liveTasks.size === 0)
+          this.closeSession(session)
+      }, sessionSettleMs())
+      session.settleTimer.unref?.()
+      return
+    }
+    this.closeSession(session)
+  }
+
+  private closeSession(session: LiveSession): void {
+    if (session.closed) return
+    session.closed = true
+    this.clearSessionTimers(session)
+    session.input.close()
+    try {
+      ;(session.query as Query & { close?: () => void }).close?.()
+    } catch {}
+  }
+
+  private clearSessionTimers(session: LiveSession): void {
+    if (session.settleTimer) clearTimeout(session.settleTimer)
+    if (session.idleTimer) clearTimeout(session.idleTimer)
+    session.settleTimer = null
+    session.idleTimer = null
+  }
+
+  private async endSession(session: LiveSession, failure: Error | null): Promise<void> {
+    this.clearSessionTimers(session)
+    session.closed = true
+    // A superseded session winds down after its replacement registered; the
+    // thread's background work now belongs to the replacement.
+    const registered = this.sessions.get(session.threadId)
+    const superseded = registered != null && registered !== session
+    if (registered === session) this.sessions.delete(session.threadId)
+    // Release the CLI's stdin (see TurnInput).
+    session.input.close()
+    const pending = session.current
+    session.current = null
+    if (pending && !pending.resolved) await this.finishTurnAtSessionEnd(pending, failure)
+    session.backlog.length = 0
+    const liveTasks = [...session.liveTasks]
+    session.liveTasks.clear()
+    if (session.reusable && !superseded) {
+      this.listener?.onSessionReleased(session.threadId, liveTasks)
+    }
+  }
+
+  private async finishTurnAtSessionEnd(pending: PendingTurn, failure: Error | null): Promise<void> {
+    const { context, handlers } = pending
+    if (failure) {
+      await this.stopWorkflowTasks(pending)
+      pending.resolved = true
+      this.turns.delete(context.turnId)
+      try {
+        await handlers.onEvent({ type: 'error', message: failure.message })
+      } catch {}
+      pending.reject(failure)
+      return
+    }
+    if (pending.deferredResult) {
+      // The SDK iterator is the authoritative lifetime of a turn. If it
+      // closes while a workflow journal still has an unresolved task, there
+      // will be no later task_notification to unblock the deferred result.
+      // Close those projected agents as failed and finish the parent turn
+      // rather than leaving Codex cc's spinner alive forever.
+      if (this.hasPendingWorkflowTasks(pending)) await this.stopWorkflowTasks(pending)
+      await this.finishDeferredResult(pending, true)
+      if (!pending.resolved) return
+    }
+    // The async iterator finished without a 'result' message — treat as
+    // successful empty turn (claude-agent-sdk does occasionally end without
+    // a SDKResultMessage when interrupted cleanly).
+    if (!pending.resolved) {
+      await this.stopWorkflowTasks(pending)
+      pending.resolved = true
+      this.turns.delete(context.turnId)
+      try {
+        await handlers.onEvent({ type: 'completed', success: true, result: null })
+        pending.resolve()
+      } catch (err) {
+        pending.reject(err instanceof Error ? err : new Error(String(err)))
+      }
+    }
+  }
+
+  private isReusable(context: RuntimeTurnContext): boolean {
+    return (context.purpose ?? 'normal') === 'normal' && !context.outputFormat
+  }
+
+  private hasLiveWork(session: LiveSession): boolean {
+    return (
+      session.current != null ||
+      session.liveTasks.size > 0 ||
+      session.unsettled ||
+      session.backlog.length > 0
+    )
+  }
+
+  // Background task bookkeeping. Every system frame passes through here
+  // before the current turn (if any) sees it; workflow tasks keep their own
+  // projection in handleSystem and are only counted for liveness here.
+  private async trackSessionSystem(
+    session: LiveSession,
+    message: Record<string, unknown>,
+  ): Promise<void> {
+    const subtype = String(message.subtype ?? '')
+    if (subtype === 'session_state_changed') {
+      const state = String(message.state ?? '')
+      if (state === 'idle') {
+        if (session.unsettled && session.settleObservedRunning) session.unsettled = false
+        session.sinkUntilResult = false
+      } else if (session.unsettled) {
+        session.settleObservedRunning = true
+      }
+      session.cliState = state || null
+      return
+    }
+    if (subtype === 'background_tasks_changed') {
+      const next = new Set<string>()
+      for (const entry of Array.isArray(message.tasks) ? message.tasks : []) {
+        const task = recordOrNull(entry)
+        const taskId = stringOrNull(task?.task_id)
+        if (taskId && task?.ambient !== true) next.add(taskId)
+      }
+      for (const taskId of session.liveTasks) if (!next.has(taskId)) this.markTaskEnded(session)
+      session.liveTasks = next
+      session.levelSeen = true
+      return
+    }
+    if (
+      subtype !== 'task_started' &&
+      subtype !== 'task_progress' &&
+      subtype !== 'task_updated' &&
+      subtype !== 'task_notification'
+    )
+      return
+    const taskId = stringOrNull(message.task_id)
+    if (!taskId) return
+    const known = session.tasks.get(taskId)
+    const toolUseId = stringOrNull(message.tool_use_id) ?? known?.toolUseId ?? null
+    const taskType = stringOrNull(message.task_type) ?? known?.taskType ?? null
+    const workflow = taskType === 'local_workflow'
+    const listener = session.reusable && !workflow ? this.listener : null
+
+    if (subtype === 'task_started') {
+      session.tasks.set(taskId, { taskType, toolUseId, outputFile: known?.outputFile ?? null })
+      const backgrounded =
+        typeof message.is_backgrounded === 'boolean' ? message.is_backgrounded : null
+      if (!session.levelSeen && backgrounded === true && message.ambient !== true)
+        session.liveTasks.add(taskId)
+      await listener?.onTaskEvent(session.threadId, {
+        type: 'task_started',
+        taskId,
+        toolUseId,
+        taskType,
+        description: String(message.description ?? ''),
+        subagentType: stringOrNull(message.subagent_type),
+        prompt: stringOrNull(message.prompt),
+        backgrounded,
+      })
+      return
+    }
+    if (subtype === 'task_progress') {
+      await listener?.onTaskEvent(session.threadId, {
+        type: 'task_progress',
+        taskId,
+        toolUseId,
+        description: String(message.description ?? ''),
+        summary: stringOrNull(message.summary),
+        lastToolName: stringOrNull(message.last_tool_name),
+        usage: taskUsage(message.usage),
+      })
+      return
+    }
+    if (subtype === 'task_updated') {
+      const patch = recordOrNull(message.patch) ?? {}
+      const status = stringOrNull(patch.status)
+      const backgrounded = typeof patch.is_backgrounded === 'boolean' ? patch.is_backgrounded : null
+      if (!session.levelSeen) {
+        if (status && IDLE_TASK_STATUSES.has(status)) {
+          if (session.liveTasks.delete(taskId)) this.markTaskEnded(session)
+        } else if (backgrounded === true) {
+          session.liveTasks.add(taskId)
+        }
+      }
+      await listener?.onTaskEvent(session.threadId, {
+        type: 'task_updated',
+        taskId,
+        status,
+        backgrounded,
+        error: stringOrNull(patch.error),
+      })
+      return
+    }
+    // task_notification: the task is over and Claude is told about it.
+    if (!session.levelSeen) session.liveTasks.delete(taskId)
+    this.markTaskEnded(session)
+    const rawStatus = String(message.status ?? '')
+    const status =
+      rawStatus === 'failed' ? 'failed' : rawStatus === 'stopped' ? 'stopped' : 'completed'
+    const outputFile = stringOrNull(message.output_file) ?? known?.outputFile ?? null
+    const result =
+      listener && outputFile && (taskType === 'local_agent' || taskType == null)
+        ? await readTaskResult(outputFile)
+        : null
+    await listener?.onTaskEvent(session.threadId, {
+      type: 'task_notification',
+      taskId,
+      toolUseId,
+      status,
+      summary: String(message.summary ?? ''),
+      result,
+      usage: taskUsage(message.usage),
+    })
+  }
+
+  private markTaskEnded(session: LiveSession): void {
+    session.unsettled = true
+    // A CLI already busy reports idle only once it has drained its queue,
+    // notification included. An idle one must first be seen running again.
+    session.settleObservedRunning = session.cliState != null && session.cliState !== 'idle'
   }
 
   private async handleMessage(
@@ -841,6 +1435,9 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (!inner) return
     const content = (inner.content as Array<Record<string, unknown>>) || []
     const toolResultCount = content.filter((block) => String(block.type) === 'tool_result').length
+    // The structured result describes the message's only tool result (e.g.
+    // an Agent call's `async_launched` when Claude backgrounded it).
+    const structured = toolResultCount === 1 ? recordOrNull(workflowLaunchResult) : null
     for (const block of content) {
       if (String(block.type) !== 'tool_result') continue
       const toolUseId = String(block.tool_use_id ?? '')
@@ -856,6 +1453,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         toolUseId,
         content: bodyContent,
         isError,
+        ...(structured ? { structured } : {}),
       })
       if (!workflowLaunchAttached && isWorkflowLaunch && toolResultCount === 1) {
         workflowLaunchAttached = true
@@ -1186,7 +1784,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     // A resumed session can answer queued work of its own first, and a
     // queued steer gets a result of its own; only the result that answers
     // everything this turn sent completes it.
-    if (pending.input.classifyResult(message) !== 'final') return
+    if (
+      (pending.autonomous
+        ? pending.input.classifyAutonomousResult(message)
+        : pending.input.classifyResult(message)) !== 'final'
+    )
+      return
     const subtype = String(message.subtype ?? '')
     const success = subtype === 'success' && !message.is_error && pending.workflowFailure == null
     const resultText =
@@ -1347,11 +1950,7 @@ async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Prom
   }
 }
 
-function workflowTaskUsage(value: unknown): {
-  totalTokens: number
-  toolUses: number
-  durationMs: number
-} | null {
+function workflowTaskUsage(value: unknown): RuntimeTaskUsage | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
   const usage = value as Record<string, unknown>
   const totalTokens = numberOrNull(usage.total_tokens)
@@ -1359,6 +1958,54 @@ function workflowTaskUsage(value: unknown): {
   const durationMs = numberOrNull(usage.duration_ms)
   if (totalTokens === null || toolUses === null || durationMs === null) return null
   return { totalTokens, toolUses, durationMs }
+}
+
+const taskUsage = workflowTaskUsage
+
+// Codex's approval policy says "never ask" (or the sandbox is wide open) and
+// no explicit permission mode overrides it: tools run without a prompt.
+function autoAllowsTools(context: RuntimeTurnContext): boolean {
+  const mode = derivePermissionMode(context.approvalPolicy, context.sandboxMode, context.planMode)
+  return (
+    (configuredPermissionMode() === null &&
+      (context.approvalPolicy === 'never' || context.sandboxMode === 'danger-full-access')) ||
+    mode === 'dontAsk'
+  )
+}
+
+// Options a live CLI process cannot change in place. A turn whose signature
+// differs needs a fresh process (unless background work pins the old one).
+function sessionSignature(context: RuntimeTurnContext): string {
+  return JSON.stringify([
+    context.cwd,
+    context.effort ?? null,
+    context.systemPromptAddendum ?? '',
+    context.mcpServers ?? null,
+    context.addDirs ?? [],
+    context.allowedTools ?? [],
+    parseWorkflowCommand(context.prompt)?.type === 'run',
+    context.planMode === true,
+    configuredPermissionMode(),
+  ])
+}
+
+function sessionSettleMs(): number {
+  return positiveEnvMs('CLAUDE_CODEX_SESSION_SETTLE_MS') ?? SESSION_SETTLE_MS
+}
+
+function backgroundIdleMs(): number {
+  return positiveEnvMs('CLAUDE_CODEX_BACKGROUND_IDLE_MS') ?? BACKGROUND_IDLE_MS
+}
+
+function positiveEnvMs(name: string): number | null {
+  const value = Number(process.env[name])
+  return Number.isFinite(value) && value > 0 ? value : null
+}
+
+function recordOrNull(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null
 }
 
 function numberOrNull(value: unknown): number | null {

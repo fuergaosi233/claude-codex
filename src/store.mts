@@ -674,6 +674,16 @@ export class SessionStore {
     return turn
   }
 
+  removeItem(turnId: string, itemId: string): TurnRecord | null {
+    const turn = this.getTurn(turnId)
+    if (!turn) return null
+    const items = turn.items.filter((item) => item.id !== itemId)
+    if (items.length === turn.items.length) return turn
+    turn.items = items
+    this.upsertTurn(turn)
+    return turn
+  }
+
   updateItemAndMoveToEnd(
     turnId: string,
     itemId: string,

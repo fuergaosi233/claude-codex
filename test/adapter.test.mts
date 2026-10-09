@@ -3704,6 +3704,347 @@ test('subagent without a terminal result emits interrupted activity and failed w
   }
 })
 
+test('server stop keeps a background report from opening a parent turn after it', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  try {
+    const result = execFileSync(
+      process.execPath,
+      [
+        '--no-warnings',
+        '--input-type=module',
+        '-e',
+        `
+      import { join } from 'node:path'
+      import { CodexClaudeAppServer } from './dist/src/server.mjs'
+      import { SessionStore } from './dist/src/store.mjs'
+
+      process.env.CLAUDE_CODEX_HOME = ${JSON.stringify(home)}
+      let listener
+      let launches = 0
+      const server = new CodexClaudeAppServer(
+        new SessionStore(join(${JSON.stringify(home)}, 'state.sqlite')),
+        {
+          setBackgroundListener: (value) => {
+            listener = value
+          },
+          hasPendingContinuation: () => true,
+          runTurn: async (context) => {
+            launches += 1
+            if (launches > 1) return new Promise(() => {})
+            // A background agent reports while this turn runs, so its
+            // continuation waits for the turn to clear.
+            listener.onAutonomousTurn(context.threadId)
+            throw new Error('turn failed')
+          },
+          async steer() {},
+          async interrupt() {},
+          async stop() {},
+        },
+      )
+      const messages = []
+      let stopping
+      const peer = {
+        id: 'peer',
+        send: (message) => {
+          messages.push(message)
+          // The adapter stops the moment the turn ends, before the
+          // continuation's tick.
+          if (message.method === 'turn/completed') stopping ??= server.stop()
+        },
+        close() {},
+      }
+      await server.handle(peer, {
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), persistExtendedHistory: false },
+      })
+      const threadId = messages.find((message) => message.id === 1).result.thread.id
+      await server.handle(peer, {
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: [{ type: 'text', text: 'go', text_elements: [] }] },
+      })
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      await stopping
+      process.stdout.write(JSON.stringify({ stopped: Boolean(stopping), launches }))
+    `,
+      ],
+      { cwd: resolve('.'), encoding: 'utf8', stdio: 'pipe' },
+    )
+    assert.deepEqual(JSON.parse(result), { stopped: true, launches: 1 })
+  } finally {
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('background Agent outlives the parent turn, wakes the parent, and resumes on SendMessage', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  const parentTurnCompleted = (threadId: string) => (message: any) =>
+    message.method === 'turn/completed' && message.params.threadId === threadId
+  try {
+    proc.stdin.write(json(codex930Initialize(0)))
+    await reader.nextResponse(0)
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const threadId = (await reader.nextResponse(1)).result.thread.id
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'background subagent check delay=600', text_elements: [] }],
+        },
+      }),
+    )
+    const firstTurnId = (await reader.nextResponse(2)).result.turn.id
+
+    // The launching turn settles while the child keeps running.
+    const launch = await readUntil(reader, parentTurnCompleted(threadId))
+    const spawned = launch.find(
+      (m) => m.method === 'item/completed' && m.params.item.tool === 'spawnAgent',
+    )
+    const childThreadId = String(spawned?.params.item.receiverThreadIds[0] ?? '')
+    assert.ok(childThreadId)
+    assert.equal(
+      launch.some((m) => m.method === 'item/completed' && m.params.item.tool === 'wait'),
+      false,
+      'a background agent must not complete its wait when the Agent call returns',
+    )
+    assert.equal(launch.some(parentTurnCompleted(childThreadId)), false)
+    assert.deepEqual(activityKinds(launch, threadId), ['started'])
+
+    // The report completes the child, then Claude answers in a turn of its own.
+    const report = await readUntil(reader, parentTurnCompleted(threadId))
+    const childDone = report.findIndex(parentTurnCompleted(childThreadId))
+    assert.ok(childDone >= 0)
+    assert.equal(report[childDone].params.turn.status, 'completed')
+    assert.ok(
+      report.some(
+        (m) =>
+          m.method === 'item/agentMessage/delta' &&
+          m.params.threadId === childThreadId &&
+          m.params.delta === 'background report body',
+      ),
+    )
+    const wake = report.findIndex(
+      (m) => m.method === 'turn/started' && m.params.threadId === threadId,
+    )
+    assert.ok(wake > childDone, 'Claude answering the report opens a new parent turn')
+    const wakeTurnId = report[wake].params.turn.id
+    assert.notEqual(wakeTurnId, firstTurnId)
+    const wakeItems = report
+      .filter(
+        (m) =>
+          m.method === 'item/completed' &&
+          m.params.threadId === threadId &&
+          m.params.turnId === wakeTurnId,
+      )
+      .map((m) => m.params.item)
+    assert.ok(
+      wakeItems.some(
+        (item) =>
+          item.type === 'subAgentActivity' &&
+          item.kind === 'completed' &&
+          item.agentThreadId === childThreadId,
+      ),
+    )
+    assert.ok(
+      wakeItems.some(
+        (item) =>
+          item.type === 'agentMessage' &&
+          /Background agent reported: background report body/.test(item.text),
+      ),
+    )
+    assert.equal(report.at(-1).params.turn.status, 'completed')
+
+    proc.stdin.write(json({ id: 3, method: 'thread/read', params: { threadId } }))
+    const parent = (await reader.nextResponse(3)).result.thread
+    assert.equal(parent.turns.length, 2)
+    assert.equal(
+      parent.turns[0].items.some(
+        (item: any) => item.type === 'collabAgentToolCall' && item.tool === 'wait',
+      ),
+      false,
+      'no dangling wait in persisted history',
+    )
+    proc.stdin.write(json({ id: 4, method: 'thread/read', params: { threadId: childThreadId } }))
+    const child = (await reader.nextResponse(4)).result.thread
+    assert.equal(child.agentNickname, 'a0b1c2d3e4f5a6b7')
+    assert.equal(child.turns[0].status, 'completed')
+
+    // SendMessage to the agent is Codex's sendInput and reopens the child.
+    proc.stdin.write(
+      json({
+        id: 5,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'background message check delay=600', text_elements: [] }],
+        },
+      }),
+    )
+    await reader.nextResponse(5)
+    const sent = await readUntil(reader, parentTurnCompleted(threadId))
+    const sendInput = sent.find(
+      (m) => m.method === 'item/completed' && m.params.item.tool === 'sendInput',
+    )?.params.item
+    assert.ok(sendInput)
+    assert.deepEqual(sendInput.receiverThreadIds, [childThreadId])
+    assert.equal(sendInput.prompt, 'dig deeper')
+    assert.equal(sendInput.agentsStates[childThreadId].status, 'running')
+    assert.equal(
+      sent.some((m) => m.method === 'item/started' && m.params.item.type === 'mcpToolCall'),
+      false,
+      'SendMessage must not render as a generic tool call',
+    )
+    const resumed = sent.find(
+      (m) => m.method === 'turn/started' && m.params.threadId === childThreadId,
+    )
+    assert.ok(resumed)
+    assert.ok(
+      sent.some(
+        (m) =>
+          m.method === 'item/completed' &&
+          m.params.threadId === childThreadId &&
+          m.params.item.type === 'userMessage' &&
+          m.params.item.content[0].text === 'dig deeper',
+      ),
+    )
+    assert.deepEqual(activityKinds(sent, threadId), ['interacted'])
+
+    const followUp = await readUntil(reader, parentTurnCompleted(threadId))
+    const resumedDone = followUp.find(parentTurnCompleted(childThreadId))
+    assert.equal(resumedDone?.params.turn.id, resumed.params.turn.id)
+    assert.equal(resumedDone?.params.turn.status, 'completed')
+    assert.ok(
+      followUp.some(
+        (m) =>
+          m.method === 'item/completed' &&
+          m.params.threadId === threadId &&
+          m.params.item.type === 'agentMessage' &&
+          /follow-up report/.test(m.params.item.text),
+      ),
+    )
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('stopping a background child interrupts it without waking the parent', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json(codex930Initialize(0)))
+    await reader.nextResponse(0)
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const threadId = (await reader.nextResponse(1)).result.thread.id
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [
+            { type: 'text', text: 'background subagent check delay=30000', text_elements: [] },
+          ],
+        },
+      }),
+    )
+    await reader.nextResponse(2)
+    const launch = await readUntil(
+      reader,
+      (m) => m.method === 'turn/completed' && m.params.threadId === threadId,
+    )
+    const childStarted = launch.find(
+      (m) => m.method === 'turn/started' && m.params.threadId !== threadId,
+    )
+    const childThreadId = childStarted.params.threadId
+
+    // Codex sends turn/interrupt to every child with an in-progress turn.
+    proc.stdin.write(
+      json({
+        id: 3,
+        method: 'turn/interrupt',
+        params: { threadId: childThreadId, turnId: childStarted.params.turn.id },
+      }),
+    )
+    const stopped = await readUntil(reader, (m) => m.id === 3 && m.method == null)
+    const childDone = stopped.find(
+      (m) => m.method === 'turn/completed' && m.params.threadId === childThreadId,
+    )
+    assert.equal(childDone?.params.turn.status, 'interrupted')
+
+    // The parent had no turn to carry the activity; the next one does.
+    proc.stdin.write(
+      json({
+        id: 4,
+        method: 'turn/start',
+        params: { threadId, input: [{ type: 'text', text: 'hello', text_elements: [] }] },
+      }),
+    )
+    await reader.nextResponse(4)
+    const next = await readUntil(
+      reader,
+      (m) => m.method === 'turn/completed' && m.params.threadId === threadId,
+    )
+    assert.deepEqual(activityKinds(next, threadId), ['interrupted'])
+    assert.equal(
+      next.filter((m) => m.method === 'turn/started' && m.params.threadId === threadId).length,
+      1,
+      'only the user turn runs; a stopped agent does not wake Claude',
+    )
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+function codex930Initialize(id: number) {
+  return {
+    id,
+    method: 'initialize',
+    params: {
+      clientInfo: { name: 'Codex Desktop', title: 'Codex Desktop', version: '26.930.21537' },
+      capabilities: { experimentalApi: true },
+    },
+  }
+}
+
+async function readUntil(
+  reader: JsonLineReader,
+  stop: (message: any) => boolean,
+  limit = 800,
+): Promise<any[]> {
+  const seen: any[] = []
+  for (let i = 0; i < limit; i += 1) {
+    const message = await reader.next()
+    seen.push(message)
+    if (stop(message)) return seen
+  }
+  throw new Error('readUntil: condition not met')
+}
+
+function activityKinds(messages: any[], threadId: string): string[] {
+  return messages
+    .filter(
+      (m) =>
+        m.method === 'item/completed' &&
+        m.params.threadId === threadId &&
+        m.params.item.type === 'subAgentActivity',
+    )
+    .map((m) => m.params.item.kind)
+}
+
 test('bare /workflows lists prior workflow runs without invoking the model', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {

@@ -10,6 +10,7 @@ export type RunRegistryEventName =
   | 'turn.completed'
   | 'turn.failed'
   | 'subagent.spawned'
+  | 'subagent.backgrounded'
   | 'subagent.completed'
 
 export interface RunRegistryWriteResult {

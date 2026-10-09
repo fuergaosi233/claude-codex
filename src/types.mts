@@ -333,6 +333,10 @@ export interface RuntimeTurnContext {
   // encoded; image (URL) is passed through as-is. Sidecar reshapes the
   // Claude SDK query into a multimodal user message when this is non-empty.
   imageInputs: ImageInput[]
+  // Attach to a turn Claude already started on its own (a background task
+  // reported back) instead of sending `prompt`. Only meaningful after the
+  // runtime called RuntimeBackgroundListener.onAutonomousTurn for the thread.
+  continuation?: boolean
 }
 
 export interface ImageInput {
@@ -352,7 +356,15 @@ export type RuntimeEvent =
   | { type: 'reasoning_delta'; delta: string }
   | { type: 'tool_use'; toolUseId: string; toolName: string; input: Record<string, unknown> }
   | { type: 'tool_output_delta'; toolUseId: string; delta: string }
-  | { type: 'tool_result'; toolUseId: string; content: unknown; isError?: boolean }
+  | {
+      type: 'tool_result'
+      toolUseId: string
+      content: unknown
+      isError?: boolean
+      // Claude Code's structured tool result (e.g. Agent `async_launched`,
+      // SendMessage `resumedAgentId`) when the backend exposes it.
+      structured?: Record<string, unknown> | null
+    }
   | {
       type: 'permission_request'
       requestId: string
@@ -440,9 +452,78 @@ export interface RuntimeHandlers {
   ): Promise<UserInputAnswers>
 }
 
+export interface RuntimeTaskUsage {
+  totalTokens: number
+  toolUses: number
+  durationMs: number
+}
+
+// Claude Code task lifecycle (background agents, background shells, ...).
+// A background task outlives the turn that launched it, so these events are
+// routed per thread rather than through a turn's handlers.
+export type RuntimeTaskEvent =
+  | {
+      type: 'task_started'
+      taskId: string
+      toolUseId: string | null
+      taskType: string | null
+      description: string
+      subagentType: string | null
+      prompt: string | null
+      backgrounded: boolean | null
+    }
+  | {
+      type: 'task_progress'
+      taskId: string
+      toolUseId: string | null
+      description: string
+      summary: string | null
+      lastToolName: string | null
+      usage: RuntimeTaskUsage | null
+    }
+  | {
+      type: 'task_updated'
+      taskId: string
+      status: string | null
+      backgrounded: boolean | null
+      error: string | null
+    }
+  | {
+      type: 'task_notification'
+      taskId: string
+      toolUseId: string | null
+      status: 'completed' | 'failed' | 'stopped'
+      summary: string
+      // The task's final report when the backend can recover it (for local
+      // agents: the last assistant message of the sidechain transcript).
+      result: string | null
+      usage: RuntimeTaskUsage | null
+    }
+
+export interface RuntimeBackgroundListener {
+  onTaskEvent(threadId: string, event: RuntimeTaskEvent): Promise<void> | void
+  // Claude began a turn without a user prompt (a background task reported
+  // back). The server opens a parent turn and calls runTurn with
+  // `continuation: true` to receive it.
+  onAutonomousTurn(threadId: string): void
+  // The thread's live session ended. `liveTaskIds` are the background tasks
+  // it still tracked as running; nothing will report on them any more.
+  onSessionReleased(threadId: string, liveTaskIds: string[]): void
+}
+
 export interface ClaudeRuntime {
   runTurn(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void>
   steer(threadId: string, prompt: string): Promise<void>
   interrupt(threadId: string): Promise<void>
   stop(): Promise<void>
+  setBackgroundListener?(listener: RuntimeBackgroundListener): void
+  // Stop one background task of the thread's live session. Resolves false
+  // when no live session owns the task.
+  stopTask?(threadId: string, taskId: string): Promise<boolean>
+  // True while a session outlives its turns: background tasks are running or
+  // Claude may still answer one that just reported back.
+  hasBackgroundWork?(): boolean
+  // True when Claude already produced output for a turn nobody has claimed
+  // yet; the server answers it with a `continuation: true` turn.
+  hasPendingContinuation?(threadId: string): boolean
 }

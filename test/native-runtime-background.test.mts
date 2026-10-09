@@ -1,0 +1,503 @@
+import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import test from 'node:test'
+import { NativeClaudeRuntime } from '../src/native-runtime.mjs'
+import { readTaskResult } from '../src/task-output.mjs'
+import type {
+  RuntimeBackgroundListener,
+  RuntimeEvent,
+  RuntimeHandlers,
+  RuntimeTaskEvent,
+  RuntimeTurnContext,
+} from '../src/types.mjs'
+
+const context: RuntimeTurnContext = {
+  threadId: 'thread',
+  turnId: 'turn-1',
+  prompt: 'start a background agent',
+  cwd: process.cwd(),
+  runtimeType: null,
+  model: null,
+  effort: null,
+  claudeSessionId: null,
+  forkSession: false,
+  mcpServers: null,
+  allowedTools: null,
+  addDirs: [],
+  enableFileCheckpointing: false,
+  outputFormat: null,
+  approvalPolicy: 'never',
+  sandboxMode: 'danger-full-access',
+  systemPromptAddendum: null,
+  planMode: false,
+  imageInputs: [],
+}
+
+// A Claude session the test drives by hand: it records what the runtime sends
+// and yields whatever the test pushes, until closed.
+class FakeQuery implements AsyncIterable<Record<string, unknown>> {
+  prompts: Record<string, unknown>[] = []
+  interrupts = 0
+  stoppedTasks: string[] = []
+  closed = false
+  private queue: Record<string, unknown>[] = []
+  private wake: (() => void) | null = null
+
+  constructor(prompt: AsyncIterable<Record<string, unknown>>) {
+    void (async () => {
+      for await (const message of prompt) this.prompts.push(message)
+    })()
+  }
+
+  push(...messages: Record<string, unknown>[]): void {
+    this.queue.push(...messages)
+    this.notify()
+  }
+
+  async interrupt(): Promise<void> {
+    this.interrupts += 1
+  }
+
+  async stopTask(taskId: string): Promise<void> {
+    this.stoppedTasks.push(taskId)
+  }
+
+  async setModel(): Promise<void> {}
+
+  async setPermissionMode(): Promise<void> {}
+
+  close(): void {
+    this.closed = true
+    this.notify()
+  }
+
+  async *[Symbol.asyncIterator](): AsyncGenerator<Record<string, unknown>, void> {
+    while (true) {
+      const next = this.queue.shift()
+      if (next) {
+        yield next
+        continue
+      }
+      if (this.closed) return
+      await new Promise<void>((resolve) => {
+        this.wake = resolve
+      })
+    }
+  }
+
+  private notify(): void {
+    const wake = this.wake
+    this.wake = null
+    wake?.()
+  }
+}
+
+interface RecordingListener extends RuntimeBackgroundListener {
+  tasks: RuntimeTaskEvent[]
+  autonomous: string[]
+  released: { threadId: string; liveTaskIds: string[] }[]
+}
+
+function fakeRuntime(): { runtime: NativeClaudeRuntime; queries: FakeQuery[] } {
+  const runtime = new NativeClaudeRuntime()
+  const queries: FakeQuery[] = []
+  Reflect.set(runtime, 'sdk', {
+    query: ({ prompt }: { prompt: AsyncIterable<Record<string, unknown>> }) => {
+      const query = new FakeQuery(prompt)
+      queries.push(query)
+      return query
+    },
+  })
+  return { runtime, queries }
+}
+
+function recordingListener(): RecordingListener {
+  const listener: RecordingListener = {
+    tasks: [],
+    autonomous: [],
+    released: [],
+    onTaskEvent: async (_threadId, event) => {
+      listener.tasks.push(event)
+    },
+    onAutonomousTurn: (threadId) => {
+      listener.autonomous.push(threadId)
+    },
+    onSessionReleased: (threadId, liveTaskIds) => {
+      listener.released.push({ threadId, liveTaskIds })
+    },
+  }
+  return listener
+}
+
+function handlers(events: RuntimeEvent[]): RuntimeHandlers {
+  return {
+    onEvent: async (event) => {
+      events.push(event)
+    },
+    onPermissionRequest: async () => ({ decision: 'accept' }),
+    onUserInputRequest: async () => ({ answers: {} }),
+  }
+}
+
+async function waitFor<T>(
+  probe: () => T,
+  label: string,
+  timeoutMs = 2_000,
+): Promise<NonNullable<T>> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const value = probe()
+    if (value) return value as NonNullable<T>
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  throw new Error(`timed out waiting for ${label}`)
+}
+
+function withSettleMs<T>(ms: number, run: () => Promise<T>): Promise<T> {
+  const previous = process.env.CLAUDE_CODEX_SESSION_SETTLE_MS
+  process.env.CLAUDE_CODEX_SESSION_SETTLE_MS = String(ms)
+  return run().finally(() => {
+    if (previous === undefined) delete process.env.CLAUDE_CODEX_SESSION_SETTLE_MS
+    else process.env.CLAUDE_CODEX_SESSION_SETTLE_MS = previous
+  })
+}
+
+function assistant(id: string, content: Record<string, unknown>[]) {
+  return { type: 'assistant', message: { id, content } }
+}
+
+function text(value: string) {
+  return { type: 'text', text: value }
+}
+
+function launchBackgroundAgent(taskId: string, toolUseId = 'agent-use') {
+  return [
+    assistant('launch', [
+      {
+        type: 'tool_use',
+        id: toolUseId,
+        name: 'Agent',
+        input: { description: 'investigate', prompt: 'investigate', run_in_background: true },
+      },
+    ]),
+    {
+      type: 'system',
+      subtype: 'task_started',
+      task_id: taskId,
+      tool_use_id: toolUseId,
+      task_type: 'local_agent',
+      description: 'investigate',
+      is_backgrounded: true,
+    },
+    {
+      type: 'user',
+      message: {
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: toolUseId,
+            content: `Async agent launched successfully.\nagentId: ${taskId}`,
+          },
+        ],
+      },
+      tool_use_result: { isAsync: true, status: 'async_launched', agentId: taskId },
+    },
+    assistant('ack', [text('The agent is running in the background.')]),
+    { type: 'result', subtype: 'success', result: 'The agent is running in the background.' },
+  ]
+}
+
+function textDeltas(events: RuntimeEvent[]): string[] {
+  return events.flatMap((event) => (event.type === 'text_delta' ? [event.delta] : []))
+}
+
+test('native session outlives its turn while a background agent runs and hands the report to a continuation turn', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'claude-codex-bg-'))
+  const outputFile = join(dir, 'agent-a1.jsonl')
+  writeFileSync(
+    outputFile,
+    [
+      { type: 'user', message: { role: 'user', content: 'investigate' } },
+      { type: 'assistant', message: { role: 'assistant', id: 'm1', content: [text('Looking.')] } },
+      { type: 'user', message: { role: 'user', content: [{ type: 'tool_result' }] } },
+      { type: 'assistant', message: { role: 'assistant', id: 'm2', content: [text('Found it')] } },
+      {
+        type: 'assistant',
+        message: { role: 'assistant', id: 'm2', content: [text('in parser.ts')] },
+      },
+    ]
+      .map((line) => JSON.stringify(line))
+      .join('\n'),
+  )
+  try {
+    await withSettleMs(40, async () => {
+      const { runtime, queries } = fakeRuntime()
+      const listener = recordingListener()
+      runtime.setBackgroundListener(listener)
+
+      const firstEvents: RuntimeEvent[] = []
+      const first = runtime.runTurn(context, handlers(firstEvents))
+      const query = await waitFor(() => queries[0], 'session')
+      query.push(...launchBackgroundAgent('a1'))
+      await first
+
+      const launch = firstEvents.find((event) => event.type === 'tool_result')
+      assert.equal(launch?.type === 'tool_result' && launch.structured?.status, 'async_launched')
+      assert.equal(query.closed, false, 'the session must outlive the turn')
+      assert.equal(runtime.hasBackgroundWork(), true)
+      assert.equal(runtime.hasPendingContinuation('thread'), false)
+      assert.deepEqual(
+        listener.tasks.map((event) => event.type),
+        ['task_started'],
+      )
+      const started = listener.tasks[0]
+      assert.equal(started?.type === 'task_started' && started.toolUseId, 'agent-use')
+
+      // The agent finishes and Claude answers its notification on its own.
+      query.push(
+        {
+          type: 'system',
+          subtype: 'task_notification',
+          task_id: 'a1',
+          status: 'completed',
+          output_file: outputFile,
+          summary: 'Agent "investigate" completed',
+          usage: { total_tokens: 1234, tool_uses: 3, duration_ms: 5000 },
+        },
+        {
+          type: 'stream_event',
+          parent_tool_use_id: null,
+          event: { type: 'message_start', message: { id: 'reply' } },
+        },
+        assistant('reply', [text('The agent found the bug in parser.ts.')]),
+        {
+          type: 'result',
+          subtype: 'success',
+          result: 'The agent found the bug in parser.ts.',
+          origin: { kind: 'task-notification' },
+        },
+      )
+      await waitFor(() => listener.autonomous.length === 1, 'autonomous turn request')
+      const notification = await waitFor(
+        () => listener.tasks.find((event) => event.type === 'task_notification'),
+        'task notification',
+      )
+      assert.deepEqual(notification, {
+        type: 'task_notification',
+        taskId: 'a1',
+        toolUseId: 'agent-use',
+        status: 'completed',
+        summary: 'Agent "investigate" completed',
+        result: 'Found it\nin parser.ts',
+        usage: { totalTokens: 1234, toolUses: 3, durationMs: 5000 },
+      })
+      await waitFor(() => runtime.hasPendingContinuation('thread'), 'pending continuation')
+
+      const wakeEvents: RuntimeEvent[] = []
+      await runtime.runTurn(
+        { ...context, turnId: 'turn-2', prompt: '', continuation: true },
+        handlers(wakeEvents),
+      )
+      assert.deepEqual(textDeltas(wakeEvents), ['The agent found the bug in parser.ts.'])
+      const completed = wakeEvents.find((event) => event.type === 'completed')
+      assert.equal(completed?.type === 'completed' && completed.success, true)
+      assert.equal(query.prompts.length, 1, 'a continuation sends nothing to Claude')
+
+      // Nothing is left running, so the session closes once it settles, even
+      // though the continuation consumed the last message Claude sent.
+      await waitFor(() => listener.released.length === 1, 'session release')
+      assert.deepEqual(listener.released, [{ threadId: 'thread', liveTaskIds: [] }])
+      assert.equal(query.closed, true)
+      assert.equal(runtime.hasBackgroundWork(), false)
+      assert.equal(listener.autonomous.length, 1)
+      await runtime.stop()
+    })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('native user turn reuses the live session and receives a report that lands mid-turn', async () => {
+  await withSettleMs(40, async () => {
+    const { runtime, queries } = fakeRuntime()
+    const listener = recordingListener()
+    runtime.setBackgroundListener(listener)
+
+    const first = runtime.runTurn(context, handlers([]))
+    const query = await waitFor(() => queries[0], 'session')
+    query.push(...launchBackgroundAgent('a2'))
+    await first
+
+    const secondEvents: RuntimeEvent[] = []
+    const second = runtime.runTurn(
+      { ...context, turnId: 'turn-2', prompt: 'anything new?' },
+      handlers(secondEvents),
+    )
+    await waitFor(() => query.prompts.length === 2, 'second prompt')
+    assert.equal(queries.length, 1, 'the second turn must reuse the live session')
+    query.push(
+      {
+        type: 'system',
+        subtype: 'task_notification',
+        task_id: 'a2',
+        status: 'failed',
+        summary: 'Agent failed',
+      },
+      assistant('answer', [text('The agent failed.')]),
+      { type: 'result', subtype: 'success', result: 'The agent failed.' },
+    )
+    await second
+    assert.deepEqual(textDeltas(secondEvents), ['The agent failed.'])
+    const notification = listener.tasks.find((event) => event.type === 'task_notification')
+    assert.equal(notification?.type === 'task_notification' && notification.status, 'failed')
+    assert.equal(listener.autonomous.length, 0, 'a report inside a user turn needs no wake-up')
+    await waitFor(() => listener.released.length === 1, 'session release')
+    await runtime.stop()
+  })
+})
+
+test('native interrupt with live background work stops only the turn and keeps the session', async () => {
+  const { runtime, queries } = fakeRuntime()
+  const listener = recordingListener()
+  runtime.setBackgroundListener(listener)
+
+  const first = runtime.runTurn(context, handlers([]))
+  const query = await waitFor(() => queries[0], 'session')
+  query.push(...launchBackgroundAgent('a3'))
+  await first
+
+  const secondEvents: RuntimeEvent[] = []
+  const second = runtime.runTurn(
+    { ...context, turnId: 'turn-2', prompt: 'long task' },
+    handlers(secondEvents),
+  )
+  await waitFor(() => query.prompts.length === 2, 'second prompt')
+  query.push(assistant('partial', [text('Working on it')]))
+  await waitFor(() => textDeltas(secondEvents).length === 1, 'partial output')
+  await runtime.interrupt('thread')
+  await second
+
+  assert.equal(query.interrupts, 1)
+  assert.equal(query.closed, false, 'interrupting must not kill the background agent')
+  assert.equal(runtime.hasBackgroundWork(), true)
+  assert.equal(
+    secondEvents.some((event) => event.type === 'completed'),
+    false,
+    'the server settles an interrupted turn itself',
+  )
+
+  // The aborted turn's tail is swallowed rather than starting a turn.
+  query.push(assistant('tail', [text('...stopped')]), {
+    type: 'result',
+    subtype: 'error_during_execution',
+  })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(listener.autonomous.length, 0)
+  assert.equal(runtime.hasPendingContinuation('thread'), false)
+
+  assert.equal(await runtime.stopTask('thread', 'a3'), true)
+  assert.deepEqual(query.stoppedTasks, ['a3'])
+  await runtime.stop()
+})
+
+test('native parked agent stops holding the session open', async () => {
+  await withSettleMs(40, async () => {
+    const { runtime, queries } = fakeRuntime()
+    const listener = recordingListener()
+    runtime.setBackgroundListener(listener)
+
+    const first = runtime.runTurn(context, handlers([]))
+    const query = await waitFor(() => queries[0], 'session')
+    query.push(...launchBackgroundAgent('a4'))
+    await first
+    assert.equal(runtime.hasBackgroundWork(), true)
+
+    query.push({
+      type: 'system',
+      subtype: 'task_updated',
+      task_id: 'a4',
+      patch: { status: 'paused' },
+    })
+    const updated = await waitFor(
+      () => listener.tasks.find((event) => event.type === 'task_updated'),
+      'task update',
+    )
+    assert.equal(updated.type === 'task_updated' && updated.status, 'paused')
+    await waitFor(() => listener.released.length === 1, 'session release')
+    assert.deepEqual(listener.released, [{ threadId: 'thread', liveTaskIds: [] }])
+    await runtime.stop()
+  })
+})
+
+test('native background level replaces task edges and reports tasks still alive at release', async () => {
+  const { runtime, queries } = fakeRuntime()
+  const listener = recordingListener()
+  runtime.setBackgroundListener(listener)
+
+  const first = runtime.runTurn(context, handlers([]))
+  const query = await waitFor(() => queries[0], 'session')
+  query.push(
+    ...launchBackgroundAgent('a5').slice(0, 3),
+    {
+      type: 'system',
+      subtype: 'background_tasks_changed',
+      tasks: [{ task_id: 'a5' }, { task_id: 'monitor', ambient: true }, { task_id: 'b1' }],
+    },
+    // An edge must not override the level once a level has been seen.
+    { type: 'system', subtype: 'task_updated', task_id: 'a5', patch: { status: 'paused' } },
+    ...launchBackgroundAgent('a5').slice(3),
+  )
+  await first
+  assert.equal(runtime.hasBackgroundWork(), true)
+
+  // The CLI process goes away with work still running.
+  query.close()
+  await waitFor(() => listener.released.length === 1, 'session release')
+  assert.deepEqual(listener.released, [{ threadId: 'thread', liveTaskIds: ['a5', 'b1'] }])
+  await runtime.stop()
+})
+
+test('native runtime without a background listener keeps closing the session per turn', async () => {
+  const { runtime, queries } = fakeRuntime()
+  const first = runtime.runTurn(context, handlers([]))
+  const query = await waitFor(() => queries[0], 'session')
+  query.push(...launchBackgroundAgent('a6'))
+  await first
+  await waitFor(() => query.closed, 'session close')
+  assert.equal(runtime.hasBackgroundWork(), false)
+  await runtime.stop()
+})
+
+test('readTaskResult returns the final response of a subagent transcript', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'claude-codex-task-'))
+  try {
+    const file = join(dir, 'agent.jsonl')
+    writeFileSync(
+      file,
+      [
+        '{"partial line from a truncated tail',
+        JSON.stringify({ message: { role: 'assistant', id: 'a', content: [text('Earlier')] } }),
+        JSON.stringify({ message: { role: 'user', content: 'tool output' } }),
+        JSON.stringify({
+          message: {
+            role: 'assistant',
+            id: 'b',
+            content: [{ type: 'thinking', thinking: 'hidden' }, text('Final')],
+          },
+        }),
+        JSON.stringify({ message: { role: 'assistant', id: 'b', content: [text('answer')] } }),
+        '',
+      ].join('\n'),
+    )
+    assert.equal(await readTaskResult(file), 'Final\nanswer')
+
+    const empty = join(dir, 'empty.jsonl')
+    writeFileSync(empty, '')
+    assert.equal(await readTaskResult(empty), null)
+    assert.equal(await readTaskResult(join(dir, 'missing.jsonl')), null)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

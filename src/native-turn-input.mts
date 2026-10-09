@@ -50,6 +50,26 @@ export class TurnInput implements AsyncIterable<SDKUserMessage> {
     this.notify()
   }
 
+  get isClosed(): boolean {
+    return this.closed
+  }
+
+  // A live session outlives its turns (background tasks keep it open). A new
+  // turn owns the channel from here; earlier turns' sends no longer concern it.
+  beginTurn(): void {
+    this.sent.clear()
+    this.unanswered.clear()
+  }
+
+  // Claude started this turn itself (a task notification), so it answers
+  // nothing we sent: its first result is final unless a steer sent meanwhile
+  // is still queued behind it.
+  classifyAutonomousResult(result: Record<string, unknown>): TurnResultKind {
+    for (const uuid of echoedUuids(result)) this.unanswered.delete(uuid)
+    if (this.unanswered.size === 0) return 'final'
+    return Array.isArray(result.user_message_uuids) ? 'pending' : 'final'
+  }
+
   classifyResult(result: Record<string, unknown>): TurnResultKind {
     const echoed = echoedUuids(result)
     let answered = false
