@@ -307,6 +307,9 @@ export class CodexClaudeAppServer {
   private goalTurns = new Set<string>()
   private goalIdleStreaks = new Map<string, number>()
   private goalClockByThread = new Map<string, number>()
+  // The turn each goal's tokens accrue to: one that ran while the goal was
+  // active, even if the goal settles before the turn's usage arrives.
+  private goalTurnByThread = new Map<string, string>()
   private goalToolHandlers = new Map<string, GoalToolHandlers>()
   private elicitationCounts = new Map<string, number>()
   private tokenUsageByThread = new Map<string, TokenUsageBreakdown>()
@@ -1189,6 +1192,7 @@ export class CodexClaudeAppServer {
     this.tokenUsageByThread.delete(threadId)
     this.goalIdleStreaks.delete(threadId)
     this.goalClockByThread.delete(threadId)
+    this.goalTurnByThread.delete(threadId)
     this.goalToolHandlers.delete(threadId)
     this.elicitationCounts.delete(threadId)
   }
@@ -1357,6 +1361,7 @@ export class CodexClaudeAppServer {
     const cleared = this.store.deleteGoal(threadId)
     this.goalIdleStreaks.delete(threadId)
     this.goalClockByThread.delete(threadId)
+    this.goalTurnByThread.delete(threadId)
     if (cleared)
       this.notifyThread(threadId, { method: 'thread/goal/cleared', params: { threadId } })
     return { cleared }
@@ -1384,9 +1389,13 @@ export class CodexClaudeAppServer {
 
   // Goal time runs while the goal is active and the thread has a turn.
   private syncGoalClock(threadId: string, goal: ThreadGoal | null): void {
-    if (goal?.status !== 'active' || !this.activeTurnByThread.has(threadId))
+    const turnId = this.activeTurnByThread.get(threadId)
+    if (goal?.status !== 'active' || !turnId) {
       this.goalClockByThread.delete(threadId)
-    else if (!this.goalClockByThread.has(threadId)) this.goalClockByThread.set(threadId, Date.now())
+      return
+    }
+    this.goalTurnByThread.set(threadId, turnId)
+    if (!this.goalClockByThread.has(threadId)) this.goalClockByThread.set(threadId, Date.now())
   }
 
   private accrueGoalTime(goal: ThreadGoal): void {
@@ -1399,12 +1408,16 @@ export class CodexClaudeAppServer {
   }
 
   // Codex counts goal tokens while the goal is active; cache reads are free.
+  // Claude reports usage per result, so a turn that completed or paused the
+  // goal midway still owes it the tokens it spent.
   private accrueGoalTokens(threadId: string, usage: TokenUsageBreakdown): void {
     const goal = this.store.getGoal(threadId)
-    if (goal?.status !== 'active') return
+    if (!goal) return
+    const goalTurn = this.goalTurnByThread.get(threadId)
+    if (goal.status !== 'active' && goalTurn !== this.activeTurnByThread.get(threadId)) return
     this.accrueGoalTime(goal)
     goal.tokensUsed += usage.inputTokens + usage.outputTokens
-    if (goalBudgetExhausted(goal)) goal.status = 'budgetLimited'
+    if (goal.status === 'active' && goalBudgetExhausted(goal)) goal.status = 'budgetLimited'
     goal.updatedAt = nowSeconds()
     this.commitGoal(goal)
   }
@@ -1413,6 +1426,7 @@ export class CodexClaudeAppServer {
   // and track whether hidden continuation turns still make progress.
   private settleGoalTurn(threadId: string, settled: TurnRecord | null): void {
     const goalTurn = settled ? this.goalTurns.delete(settled.id) : false
+    this.goalTurnByThread.delete(threadId)
     const goal = this.store.getGoal(threadId)
     if (!goal) {
       this.goalClockByThread.delete(threadId)

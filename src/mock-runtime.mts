@@ -47,15 +47,6 @@ export class MockRuntime implements ClaudeRuntime {
     // would trip the keyword branches below, so answer it first: report usage,
     // and finish the goal when the objective asks for it.
     if (context.prompt.includes('<codex_internal_context>')) {
-      await handlers.onEvent({
-        type: 'usage',
-        usage: {
-          input_tokens: 100,
-          output_tokens: 40,
-          cache_read_input_tokens: 10,
-          cache_creation_input_tokens: 5,
-        },
-      })
       if (/goal complete check/i.test(context.prompt) && context.goalTools) {
         const toolUseId = `goal-${Date.now()}`
         await handlers.onEvent({
@@ -68,6 +59,16 @@ export class MockRuntime implements ClaudeRuntime {
         await handlers.onEvent({ type: 'tool_result', toolUseId, content: result })
       }
       await handlers.onEvent({ type: 'text_delta', delta: 'goal continuation' })
+      // Like the CLI, usage arrives with the result, after any goal tool call.
+      await handlers.onEvent({
+        type: 'usage',
+        usage: {
+          input_tokens: 100,
+          output_tokens: 40,
+          cache_read_input_tokens: 10,
+          cache_creation_input_tokens: 5,
+        },
+      })
       await handlers.onEvent({ type: 'completed', success: true, result: 'goal continuation' })
       return
     }

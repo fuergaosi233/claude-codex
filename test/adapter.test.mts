@@ -4955,8 +4955,11 @@ test('thread/goal/set keeps the thread working until the model completes the goa
     assert.equal(finished.goal.status, 'complete')
     assert.equal(finished.goal.tokensUsed, 145)
     assert.equal(finished.turnId, turnId)
-    assert.ok(
-      updates.some((update) => update.goal.status === 'active' && update.goal.tokensUsed === 145),
+    // Claude reports usage with the result, after update_goal already marked
+    // the goal complete; the turn's tokens still land on the goal.
+    assert.equal(
+      updates.filter((update) => update.goal.status === 'complete')[0].goal.tokensUsed,
+      0,
     )
 
     // A completed goal ends the run; nothing else starts.

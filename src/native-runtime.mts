@@ -448,16 +448,13 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       opts.allowedTools = context.allowedTools
     if (context.mcpServers && typeof context.mcpServers === 'object')
       opts.mcpServers = context.mcpServers
+    let goalServer = false
     if (context.goalTools && this.zod && typeof sdk.createSdkMcpServer === 'function') {
+      goalServer = true
       opts.mcpServers = {
         ...((opts.mcpServers as Record<string, unknown> | undefined) ?? {}),
         [GOAL_MCP_SERVER]: goalToolServer(sdk, this.zod, context.goalTools),
       }
-      // Goal bookkeeping never needs the user's approval.
-      opts.allowedTools = [
-        ...((opts.allowedTools as string[] | undefined) ?? []),
-        `mcp__${GOAL_MCP_SERVER}`,
-      ]
     }
     if (context.outputFormat) opts.outputFormat = context.outputFormat
 
@@ -469,6 +466,15 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     const mode = derivePermissionMode(context.approvalPolicy, context.sandboxMode, context.planMode)
     opts.permissionMode = mode
     if (mode === 'bypassPermissions') opts.allowDangerouslySkipPermissions = true
+    // Goal bookkeeping never needs the user's approval. canUseTool allows it
+    // where installed; a bare allowedTools entry there would shadow the
+    // callback and make the SDK warn on every session.
+    if (goalServer && mode === 'plan') {
+      opts.allowedTools = [
+        ...((opts.allowedTools as string[] | undefined) ?? []),
+        `mcp__${GOAL_MCP_SERVER}`,
+      ]
+    }
 
     // Workflows are on by default except on Pro plans; the env switch turns
     // them on there too. It deliberately avoids --settings, which pinned
@@ -513,6 +519,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     ): Promise<
       { behavior: 'allow'; updatedInput?: unknown } | { behavior: 'deny'; message: string }
     > => {
+      if (toolName.startsWith(`mcp__${GOAL_MCP_SERVER}__`)) return { behavior: 'allow' }
       const toolUseId = options.toolUseID || `tool-${newId()}`
       const session = sessionRef()
       const pending = session?.current

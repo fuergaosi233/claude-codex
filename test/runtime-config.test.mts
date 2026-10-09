@@ -16,6 +16,7 @@ import http from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
+import * as z from 'zod'
 import { ClaudePTranscriptRuntime } from '../src/claude-p-runtime.mjs'
 import {
   HttpAgentRuntime,
@@ -145,6 +146,46 @@ test('native SDK runtime maps manual /workflows prompts to the human workflow tr
     ),
     { behavior: 'allow' },
   )
+})
+
+test('native SDK runtime approves goal tools without shadowing canUseTool', async () => {
+  const runtime = new NativeClaudeRuntime()
+  Reflect.set(runtime, 'zod', z)
+  const sdk = {
+    tool: (...args: unknown[]) => args,
+    createSdkMcpServer: (config: Record<string, unknown>) => ({ type: 'sdk', ...config }),
+  }
+  const goalTools = {
+    getGoal: async () => '{}',
+    createGoal: async () => '{}',
+    updateGoal: async () => '{}',
+  }
+  const buildOptions = Reflect.get(runtime, 'buildOptions')
+  const build = (overrides: Partial<RuntimeTurnContext>) =>
+    buildOptions.call(
+      runtime,
+      sdk,
+      nativeTurnContext({ prompt: 'work on the goal', goalTools, ...overrides }),
+      new AbortController(),
+      () => null,
+    )
+
+  const options = build({ approvalPolicy: 'on-request', sandboxMode: 'workspace-write' })
+  assert.ok(options.mcpServers.codex_goal)
+  assert.equal(options.allowedTools?.includes('mcp__codex_goal') ?? false, false)
+  const signal = new AbortController().signal
+  // Even with no turn to ask in, goal bookkeeping is allowed while other
+  // tools still need the user.
+  assert.deepEqual(
+    await options.canUseTool('mcp__codex_goal__update_goal', { status: 'complete' }, { signal }),
+    { behavior: 'allow' },
+  )
+  assert.equal((await options.canUseTool('Bash', { command: 'true' }, { signal })).behavior, 'deny')
+
+  // Plan mode installs no callback, so the server rides on allowedTools.
+  const plan = build({ planMode: true })
+  assert.equal(plan.canUseTool, undefined)
+  assert.ok(plan.allowedTools.includes('mcp__codex_goal'))
 })
 
 test('explicit native SDK bypass includes the required dangerous opt-in flag', () => {
