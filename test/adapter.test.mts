@@ -3811,9 +3811,13 @@ test('background Agent outlives the parent turn, wakes the parent, and resumes o
     const childThreadId = String(spawned?.params.item.receiverThreadIds[0] ?? '')
     assert.ok(childThreadId)
     assert.equal(
-      launch.some((m) => m.method === 'item/completed' && m.params.item.tool === 'wait'),
+      launch.some(
+        (m) =>
+          (m.method === 'item/started' || m.method === 'item/completed') &&
+          m.params.item.tool === 'wait',
+      ),
       false,
-      'a background agent must not complete its wait when the Agent call returns',
+      'a run_in_background agent gets no wait: nothing waits on it, and closing one marks it done',
     )
     assert.equal(launch.some(parentTurnCompleted(childThreadId)), false)
     assert.deepEqual(activityKinds(launch, threadId), ['started'])

@@ -2468,28 +2468,33 @@ export class CodexClaudeAppServer {
             // Wait begins after the activity item; this is the long phase that
             // gives Codex App its "agent is working" indicator while the
             // subagent runs. It closes when the Task tool_result arrives.
-            const waitBegin: ThreadItem = {
-              type: 'collabAgentToolCall',
-              id: waitId,
-              tool: 'wait',
-              status: 'inProgress',
-              senderThreadId: thread.id,
-              receiverThreadIds: [childThreadId],
-              prompt: null,
-              model: null,
-              reasoningEffort: null,
-              agentsStates: {},
+            // A run_in_background agent has nothing waiting on it (Codex only
+            // waits when asked), and a wait it could never close would stay
+            // inProgress in the App, so it gets none.
+            if (event.input.run_in_background !== true) {
+              const waitBegin: ThreadItem = {
+                type: 'collabAgentToolCall',
+                id: waitId,
+                tool: 'wait',
+                status: 'inProgress',
+                senderThreadId: thread.id,
+                receiverThreadIds: [childThreadId],
+                prompt: null,
+                model: null,
+                reasoningEffort: null,
+                agentsStates: {},
+              }
+              this.store.appendItem(turn.id, waitBegin)
+              this.notify(peer, {
+                method: 'item/started',
+                params: {
+                  threadId: thread.id,
+                  turnId: turn.id,
+                  item: waitBegin,
+                  startedAtMs: nowMillis(),
+                },
+              })
             }
-            this.store.appendItem(turn.id, waitBegin)
-            this.notify(peer, {
-              method: 'item/started',
-              params: {
-                threadId: thread.id,
-                turnId: turn.id,
-                item: waitBegin,
-                startedAtMs: nowMillis(),
-              },
-            })
 
             itemIds.set(event.toolUseId, waitId)
             subagentContexts.set(event.toolUseId, subagentContext)
