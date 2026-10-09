@@ -470,6 +470,183 @@ test('native runtime without a background listener keeps closing the session per
   await runtime.stop()
 })
 
+// Frames the real CLI brackets every turn and every send with.
+const init = { type: 'system', subtype: 'init', session_id: 'session' }
+
+function lifecycle(uuid: unknown, state: 'queued' | 'started' | 'completed') {
+  return { type: 'command_lifecycle', command_uuid: uuid, state, uuid: `frame-${state}` }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+test('native notification turn survives a long model wait after its init', async () => {
+  await withSettleMs(30, async () => {
+    const { runtime, queries } = fakeRuntime()
+    const listener = recordingListener()
+    runtime.setBackgroundListener(listener)
+
+    const first = runtime.runTurn(context, handlers([]))
+    const query = await waitFor(() => queries[0], 'session')
+    query.push(...launchBackgroundAgent('a7'))
+    await first
+
+    query.push(
+      { type: 'system', subtype: 'background_tasks_changed', tasks: [] },
+      { type: 'system', subtype: 'task_notification', task_id: 'a7', status: 'completed' },
+      init,
+    )
+    await waitFor(() => listener.autonomous.length === 1, 'wake-up on init')
+    // The model is unreachable for a while; nothing but retries arrives for
+    // far longer than the settle window.
+    query.push({ type: 'system', subtype: 'api_retry', attempt: 1 })
+    await sleep(120)
+    assert.equal(query.closed, false, 'a running CLI turn keeps its session')
+
+    const events: RuntimeEvent[] = []
+    const wake = runtime.runTurn(
+      { ...context, turnId: 'turn-2', prompt: '', continuation: true },
+      handlers(events),
+    )
+    query.push(assistant('reply', [text('Done.')]), {
+      type: 'result',
+      subtype: 'success',
+      result: 'Done.',
+      origin: { kind: 'task-notification' },
+    })
+    await wake
+    assert.deepEqual(textDeltas(events), ['Done.'])
+    await waitFor(() => listener.released.length === 1, 'session release')
+    await runtime.stop()
+  })
+})
+
+test('native interrupt cancels a queued prompt the CLI starts later and holds the next one', async () => {
+  const { runtime, queries } = fakeRuntime()
+  const listener = recordingListener()
+  runtime.setBackgroundListener(listener)
+
+  const first = runtime.runTurn(context, handlers([]))
+  const query = await waitFor(() => queries[0], 'session')
+  query.push(...launchBackgroundAgent('a8'))
+  await first
+
+  const second = runtime.runTurn(
+    { ...context, turnId: 'turn-2', prompt: 'long task' },
+    handlers([]),
+  )
+  await waitFor(() => query.prompts.length === 2, 'second prompt')
+  const cancelled = query.prompts[1]?.uuid
+  query.push(lifecycle(cancelled, 'queued'))
+  await sleep(10)
+  await runtime.interrupt('thread')
+  await second
+  assert.equal(query.interrupts, 1)
+
+  const thirdEvents: RuntimeEvent[] = []
+  const third = runtime.runTurn(
+    { ...context, turnId: 'turn-3', prompt: 'next' },
+    handlers(thirdEvents),
+  )
+  await sleep(20)
+  assert.equal(query.prompts.length, 2, 'the next prompt waits for the cancelled one')
+
+  // interrupt() does not reach a queued send: the CLI starts it anyway.
+  query.push(lifecycle(cancelled, 'started'))
+  await waitFor(() => query.interrupts === 2, 'the cancelled prompt interrupted as it starts')
+  query.push(
+    init,
+    assistant('stale', [text('stale')]),
+    { type: 'result', subtype: 'error_during_execution', user_message_uuids: [cancelled] },
+    lifecycle(cancelled, 'completed'),
+  )
+  await waitFor(() => query.prompts.length === 3, 'next prompt sent once drained')
+  const next = query.prompts[2]?.uuid
+  query.push(
+    lifecycle(next, 'queued'),
+    lifecycle(next, 'started'),
+    init,
+    assistant('fresh', [text('fresh')]),
+    { type: 'result', subtype: 'success', result: 'fresh', user_message_uuids: [next] },
+    lifecycle(next, 'completed'),
+  )
+  await third
+  assert.deepEqual(textDeltas(thirdEvents), ['fresh'])
+  assert.equal(listener.autonomous.length, 0, 'the cancelled turn must not wake the thread')
+  await runtime.stop()
+})
+
+test('native steer is accepted once the CLI starts consuming it', async () => {
+  const { runtime, queries } = fakeRuntime()
+  const first = runtime.runTurn(context, handlers([]))
+  const query = await waitFor(() => queries[0], 'session')
+  const prompt = query.prompts[0]?.uuid
+  query.push(lifecycle(prompt, 'queued'), lifecycle(prompt, 'started'), init)
+  query.push(
+    assistant('m1', [
+      { type: 'tool_use', id: 'bash-1', name: 'Bash', input: { command: 'sleep 8' } },
+    ]),
+  )
+
+  let accepted = 0
+  assert.equal(
+    await runtime.steer('thread', 'also this', { onAccepted: () => (accepted += 1) }),
+    true,
+  )
+  await waitFor(() => query.prompts.length === 2, 'steer sent')
+  const steer = query.prompts[1]?.uuid
+  query.push(lifecycle(steer, 'queued'))
+  await sleep(10)
+  assert.equal(accepted, 0, 'queued behind the running tool is not accepted yet')
+
+  query.push(
+    { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'bash-1' }] } },
+    lifecycle(steer, 'started'),
+  )
+  await waitFor(() => accepted === 1, 'accepted at the tool-round boundary')
+  query.push(
+    assistant('m2', [text('done')]),
+    lifecycle(steer, 'completed'),
+    { type: 'result', subtype: 'success', result: 'done', user_message_uuids: [prompt, steer] },
+    lifecycle(prompt, 'completed'),
+  )
+  await first
+  assert.equal(accepted, 1)
+  assert.equal(await runtime.steer('thread', 'late'), false, 'no turn left to steer')
+  await runtime.stop()
+})
+
+test('native drops the turn Claude starts only to acknowledge a task the user stopped', async () => {
+  await withSettleMs(30, async () => {
+    const { runtime, queries } = fakeRuntime()
+    const listener = recordingListener()
+    runtime.setBackgroundListener(listener)
+
+    const first = runtime.runTurn(context, handlers([]))
+    const query = await waitFor(() => queries[0], 'session')
+    query.push(...launchBackgroundAgent('a9'))
+    await first
+
+    assert.equal(await runtime.stopTask('thread', 'a9'), true)
+    query.push(
+      { type: 'system', subtype: 'background_tasks_changed', tasks: [] },
+      { type: 'system', subtype: 'task_updated', task_id: 'a9', patch: { status: 'killed' } },
+      { type: 'system', subtype: 'task_notification', task_id: 'a9', status: 'stopped' },
+      init,
+    )
+    await waitFor(() => query.interrupts === 1, 'acknowledgement interrupted')
+    query.push(assistant('ack', [text('The agent was stopped.')]), {
+      type: 'result',
+      subtype: 'error_during_execution',
+      origin: { kind: 'task-notification' },
+    })
+    await waitFor(() => listener.released.length === 1, 'session release')
+    assert.equal(listener.autonomous.length, 0, 'a user stop must not wake the thread')
+    await runtime.stop()
+  })
+})
+
 test('readTaskResult returns the final response of a subagent transcript', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'claude-codex-task-'))
   try {

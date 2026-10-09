@@ -35,13 +35,21 @@ if (!process.env.ANTHROPIC_BETAS) {
 // installed via optionalDependencies.
 
 import type { Query } from '@anthropic-ai/claude-agent-sdk'
-import { TurnInput, type TurnInputMessage } from './native-turn-input.mjs'
+import {
+  CREATE_GOAL_DESCRIPTION,
+  GET_GOAL_DESCRIPTION,
+  UPDATE_GOAL_DESCRIPTION,
+} from './goal-prompts.mjs'
+import { echoedUuids, TurnInput, type TurnInputMessage } from './native-turn-input.mjs'
 import { readTaskResult } from './task-output.mjs'
 import type {
   ClaudeRuntime,
+  GoalToolHandlers,
+  ImageInput,
   PermissionDecision,
   RuntimeBackgroundListener,
   RuntimeHandlers,
+  RuntimeSteerOptions,
   RuntimeTaskUsage,
   RuntimeTurnContext,
   UserInputAnswers,
@@ -57,6 +65,10 @@ import {
 } from './workflow-subagents.mjs'
 
 type ClaudeSdk = typeof import('@anthropic-ai/claude-agent-sdk')
+type Zod = typeof import('zod')
+
+// In-process MCP server carrying Codex's thread-goal tools.
+const GOAL_MCP_SERVER = 'codex_goal'
 
 interface PendingTurn {
   context: RuntimeTurnContext
@@ -157,15 +169,42 @@ interface LiveSession {
   unsettled: boolean
   settleObservedRunning: boolean
   cliState: string | null
-  // Interrupted while background work stays alive: the aborted turn's tail
-  // has no turn to land in.
-  sinkUntilResult: boolean
+  // A top-level CLI turn is running: its system/init arrived, its result has
+  // not. Every CLI turn, ours or Claude's own, is bracketed this way.
+  cliRunning: boolean
+  // The CLI reports command_lifecycle frames for the messages we send.
+  lifecycleSeen: boolean
+  // Sends the CLI has not finished yet (no lifecycle `completed`).
+  openCommands: Set<string>
+  // Steers waiting for the CLI to start consuming them, by send uuid.
+  steers: Map<string, () => void>
+  // Tasks the user stopped, and tasks that ended while the CLI was idle:
+  // Claude starts a turn to answer those, which is pointless when the user
+  // stopped every one of them.
+  stoppedTasks: Set<string>
+  endedWhileIdle: string[]
+  // Interrupted while the process stays alive (see SessionSink).
+  sink: SessionSink | null
   settleTimer: NodeJS.Timeout | null
   idleTimer: NodeJS.Timeout | null
   // Serializes message routing with turn attachment so a turn never misses
   // or reorders the messages that precede it.
   chain: Promise<void>
   closed: boolean
+}
+
+// What a soft interrupt left behind in a live session. The interrupted turn's
+// tail has no turn to land in, and sends the CLI had queued but not started
+// still run once it gets to them (interrupt() only stops the running turn):
+// each is interrupted again as it starts and its output dropped. A new turn
+// waits for the sink to drain so the CLI never batches a cancelled send with
+// the new prompt.
+interface SessionSink {
+  pending: Set<string>
+  // A CLI turn that answers cancelled input is running; drop until its result.
+  turn: boolean
+  drained: Promise<void>
+  drain: () => void
 }
 
 interface SessionTask {
@@ -182,12 +221,18 @@ const SESSION_SETTLE_MS = 15_000
 // How long an idle session keeps background tasks alive without any message.
 const BACKGROUND_IDLE_MS = 2 * 60 * 60 * 1000
 const SESSION_CONTROL_TIMEOUT_MS = 5_000
+// How long a new turn waits for an interrupted session to drain before it
+// gives up on the sink and goes ahead.
+const SINK_DRAIN_TIMEOUT_MS = 30_000
 const TERMINAL_TASK_STATUSES = new Set(['completed', 'failed', 'killed', 'stopped'])
 // A parked agent keeps its progress but does no work until sent a message.
 const IDLE_TASK_STATUSES = new Set([...TERMINAL_TASK_STATUSES, 'paused'])
 
 export class NativeClaudeRuntime implements ClaudeRuntime {
   private sdk: ClaudeSdk | null = null
+  // zod builds the goal tools' input schemas. It ships with the SDK's MCP
+  // dependency; without it the goal tools are left out.
+  private zod: Zod | null = null
   private turns = new Map<string, PendingTurn>()
   private permissions = new Map<string, PendingPermission>()
   private sessions = new Map<string, LiveSession>()
@@ -200,6 +245,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   async runTurn(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void> {
     const sdk = await this.loadSdk()
     if (context.continuation) return this.attachContinuation(context, handlers)
+    const draining = this.sessions.get(context.threadId)
+    if (draining && !draining.closed && draining.sink) await this.drainSink(draining)
     const live = this.sessions.get(context.threadId)
     if (live && !live.closed && this.isReusable(context)) {
       if (live.signature === sessionSignature(context) || this.hasLiveWork(live)) {
@@ -210,33 +257,49 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     return this.openSession(sdk, context, handlers)
   }
 
-  async steer(threadId: string, prompt: string): Promise<void> {
-    // Find an in-flight turn for this thread (we don't index by threadId so
-    // walk the map — there's usually only one active turn per thread). The
-    // CLI either folds the message into the running turn between tool rounds
-    // or queues it as a follow-up turn; the turn stays open until it answers.
-    for (const pending of this.turns.values()) {
-      if (pending.context.threadId !== threadId) continue
-      pending.input.send(humanUserMessage(workflowRuntimePrompt(prompt)))
-      return
+  async steer(
+    threadId: string,
+    prompt: string,
+    options: RuntimeSteerOptions = {},
+  ): Promise<boolean> {
+    // The CLI either folds the message into the running turn between tool
+    // rounds or queues it as a follow-up turn; the turn stays open until it
+    // answers. A continuation turn may still be attaching: let it finish.
+    let pending = this.activeTurn(threadId)
+    const live = this.sessions.get(threadId)
+    if (!pending && live && !live.closed) {
+      await this.serialize(live, () => {})
+      pending = this.activeTurn(threadId)
     }
+    if (!pending) return false
+    const session = pending.session
+    const uuid = this.send(session, this.buildUserMessage(prompt, options.imageInputs ?? []))
+    if (!uuid) return false
+    // Accepted once the CLI starts consuming it (command_lifecycle `started`)
+    // or, on CLIs without lifecycle frames, once a result echoes it.
+    if (options.onAccepted) session.steers.set(uuid, options.onAccepted)
+    return true
   }
 
   async interrupt(threadId: string): Promise<void> {
     const live = this.sessions.get(threadId)
-    if (live && !live.closed && live.liveTasks.size > 0) {
+    const soft = live != null && !live.closed && live.liveTasks.size > 0
+    if (soft && live) {
       // Aborting would kill the process and every background task with it.
       // Stop only the running turn; the tasks keep going and report back.
       await this.serialize(live, async () => {
         const current = live.current
+        const cancelled = current ? this.cancelSends(live) : []
         if (current) {
           await this.stopWorkflowTasks(current)
           this.releaseTurn(current)
           live.current = null
         }
+        live.steers.clear()
         live.backlog.length = 0
         live.autonomousRequested = false
-        live.sinkUntilResult = live.cliState !== 'idle'
+        if (live.cliRunning || cancelled.length > 0)
+          this.beginSink(live, cancelled, live.cliRunning)
         await settlesWithin(
           live.query.interrupt().catch(() => {}),
           SESSION_CONTROL_TIMEOUT_MS,
@@ -246,7 +309,13 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }
     for (const pending of [...this.turns.values()]) {
       if (pending.context.threadId !== threadId) continue
+      if (soft && pending.session === live) continue
       await this.stopWorkflowTasks(pending)
+      // The server already settled the turn. Nothing in the process is worth
+      // keeping, so end it; a dying session must not take the next turn.
+      this.releaseTurn(pending)
+      pending.session.steers.clear()
+      this.closeSession(pending.session)
       pending.abort.abort()
       await pending.session.query.interrupt().catch(() => {})
     }
@@ -257,10 +326,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (!live || live.closed) return false
     const query = live.query as Query & { stopTask?: (taskId: string) => Promise<void> }
     if (typeof query.stopTask !== 'function') return false
+    live.stoppedTasks.add(taskId)
     try {
       await query.stopTask(taskId)
       return true
     } catch (error) {
+      live.stoppedTasks.delete(taskId)
       debugLog('native.task.stop_failed', {
         threadId,
         taskId,
@@ -268,6 +339,16 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       })
       return false
     }
+  }
+
+  // Background tasks of the thread's live session that are still running.
+  liveTasks(threadId: string): Array<{ taskId: string; taskType: string | null }> {
+    const live = this.sessions.get(threadId)
+    if (!live || live.closed) return []
+    return [...live.liveTasks].map((taskId) => ({
+      taskId,
+      taskType: live.tasks.get(taskId)?.taskType ?? null,
+    }))
   }
 
   hasBackgroundWork(): boolean {
@@ -305,12 +386,16 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     // Dynamic import keeps the heavy native binary out of the require graph
     // until a real runtime turn is requested (mocked tests don't pay for it).
     this.sdk = await import('@anthropic-ai/claude-agent-sdk')
+    this.zod = await import('zod').catch(() => null)
     return this.sdk
   }
 
   private buildPromptMessage(context: RuntimeTurnContext): TurnInputMessage {
-    const text = workflowRuntimePrompt(context.prompt)
-    const images = context.imageInputs
+    return this.buildUserMessage(context.prompt, context.imageInputs)
+  }
+
+  private buildUserMessage(prompt: string, images: ImageInput[] | undefined): TurnInputMessage {
+    const text = workflowRuntimePrompt(prompt)
     // Pure text — keep the simple string form so the SDK doesn't have to
     // re-stitch content blocks.
     if (!images || images.length === 0) return humanUserMessage(text)
@@ -363,6 +448,17 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       opts.allowedTools = context.allowedTools
     if (context.mcpServers && typeof context.mcpServers === 'object')
       opts.mcpServers = context.mcpServers
+    if (context.goalTools && this.zod && typeof sdk.createSdkMcpServer === 'function') {
+      opts.mcpServers = {
+        ...((opts.mcpServers as Record<string, unknown> | undefined) ?? {}),
+        [GOAL_MCP_SERVER]: goalToolServer(sdk, this.zod, context.goalTools),
+      }
+      // Goal bookkeeping never needs the user's approval.
+      opts.allowedTools = [
+        ...((opts.allowedTools as string[] | undefined) ?? []),
+        `mcp__${GOAL_MCP_SERVER}`,
+      ]
+    }
     if (context.outputFormat) opts.outputFormat = context.outputFormat
 
     // Codex App's pinned policies map onto Claude SDK's permissionMode. plan
@@ -510,7 +606,6 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       // the whole session so mid-turn steer() calls, control round trips and
       // later turns still reach the CLI.
       const input = new TurnInput()
-      input.send(this.buildPromptMessage(context))
       const reusable = this.isReusable(context) && this.listener != null
       // canUseTool reaches the session only once Claude asks for a tool.
       let session: LiveSession | null = null
@@ -538,13 +633,20 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         unsettled: false,
         settleObservedRunning: false,
         cliState: null,
-        sinkUntilResult: false,
+        cliRunning: false,
+        lifecycleSeen: false,
+        openCommands: new Set(),
+        steers: new Map(),
+        stoppedTasks: new Set(),
+        endedWhileIdle: [],
+        sink: null,
         settleTimer: null,
         idleTimer: null,
         chain: Promise.resolve(),
         closed: false,
       }
       session = opened
+      this.send(opened, this.buildPromptMessage(context))
       const pending = this.createPendingTurn(opened, context, handlers, false, resolve, reject)
       opened.current = pending
       this.turns.set(context.turnId, pending)
@@ -606,12 +708,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         session.current = pending
         session.lastContext = context
         session.autonomousRequested = false
-        session.sinkUntilResult = false
+        session.steers.clear()
         this.turns.set(context.turnId, pending)
         session.input.beginTurn()
         if (!autonomous) {
           await this.applySessionSettings(session, context)
-          session.input.send(this.buildPromptMessage(context))
+          this.send(session, this.buildPromptMessage(context))
         }
         // Replay what Claude already produced on its own. Anything after the
         // result that ends this turn stays queued for the next one.
@@ -726,12 +828,50 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (session.closed) return
     this.clearSessionTimers(session)
     const type = String(message.type ?? '')
+    if (type === 'command_lifecycle') {
+      this.trackCommand(session, message)
+      this.maybeRelease(session)
+      return
+    }
     if (type === 'system') await this.trackSessionSystem(session, message)
-    if (session.sinkUntilResult) {
-      if (type === 'result') session.sinkUntilResult = false
+    const init = type === 'system' && message.subtype === 'init' && !message.parent_tool_use_id
+    const result = type === 'result'
+    let endedWhileIdle: string[] = []
+    if (init) {
+      // Claude started a turn: whatever just ended is being answered now.
+      endedWhileIdle = session.endedWhileIdle
+      session.endedWhileIdle = []
+      session.cliRunning = true
+      session.unsettled = false
+    }
+    const sink = session.sink
+    if (
+      sink &&
+      !sink.turn &&
+      sink.pending.size > 0 &&
+      !session.lifecycleSeen &&
+      (init || result || isTurnOutput(type, message))
+    ) {
+      // Without lifecycle frames, the next turn is the cancelled input's:
+      // the CLI runs queued input in order.
+      sink.turn = true
+      this.reinterrupt(session)
+    }
+    if (result) for (const uuid of echoedUuids(message)) this.acceptSteer(session, uuid)
+    if (session.sink?.turn) {
+      if (result) this.endSinkTurn(session, message)
     } else if (session.current) {
       await this.deliver(session, session.current, message)
       if (session.current?.resolved) this.detach(session, session.current)
+    } else if (init && this.answersOnlyStoppedTasks(session, endedWhileIdle)) {
+      // The user stopped these tasks; Codex does not wake the parent for
+      // that, so neither does a turn Claude starts only to acknowledge it.
+      debugLog('native.session.stopped_task_turn', {
+        threadId: session.threadId,
+        taskIds: endedWhileIdle,
+      })
+      this.beginSink(session, [], true)
+      this.reinterrupt(session)
     } else if (this.startsAutonomousTurn(session, type, message)) {
       session.backlog.push(message)
       if (!session.autonomousRequested) {
@@ -739,12 +879,19 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         this.listener?.onAutonomousTurn(session.threadId)
       }
     }
+    if (result) {
+      session.cliRunning = false
+      if (!session.lifecycleSeen)
+        for (const uuid of echoedUuids(message)) session.openCommands.delete(uuid)
+    }
     this.maybeRelease(session)
   }
 
   // Between turns, only Claude's own top-level output means it started a
-  // turn. Nested output belongs to a running task, a bare result has nothing
-  // left to show, and bookkeeping frames (rate limits, hooks) come and go.
+  // turn: its system/init, then the response (an api_retry while the model
+  // is still unreachable). Nested output belongs to a running task, a bare
+  // result has nothing left to show, and bookkeeping frames (rate limits,
+  // hooks, task progress) come and go.
   private startsAutonomousTurn(
     session: LiveSession,
     type: string,
@@ -753,7 +900,130 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (!session.reusable || !this.listener) return false
     if (message.parent_tool_use_id) return false
     if (type === 'result') return session.backlog.length > 0
-    return type === 'stream_event' || type === 'assistant' || type === 'user'
+    if (type === 'system') {
+      return message.subtype === 'init' || (message.subtype === 'api_retry' && session.cliRunning)
+    }
+    return isTurnOutput(type, message)
+  }
+
+  private answersOnlyStoppedTasks(session: LiveSession, ended: string[]): boolean {
+    return ended.length > 0 && ended.every((taskId) => session.stoppedTasks.has(taskId))
+  }
+
+  private activeTurn(threadId: string): PendingTurn | null {
+    const live = this.sessions.get(threadId)
+    if (live?.current && !live.current.resolved) return live.current
+    for (const pending of this.turns.values()) {
+      if (pending.context.threadId === threadId && !pending.resolved) return pending
+    }
+    return null
+  }
+
+  private send(session: LiveSession, message: TurnInputMessage): string | null {
+    const uuid = session.input.send(message)
+    if (uuid) session.openCommands.add(uuid)
+    return uuid
+  }
+
+  // command_lifecycle: queued → started → (the turn) → completed, keyed by
+  // the uuid we stamped on the send.
+  private trackCommand(session: LiveSession, message: Record<string, unknown>): void {
+    session.lifecycleSeen = true
+    const uuid = stringOrNull(message.command_uuid)
+    if (!uuid) return
+    const state = stringOrNull(message.state)
+    if (state === 'started') {
+      this.acceptSteer(session, uuid)
+      const sink = session.sink
+      if (sink?.pending.has(uuid)) {
+        // Interrupted before it started; it is starting now. Stop it too.
+        sink.turn = true
+        this.reinterrupt(session)
+      }
+    } else if (state === 'completed') {
+      session.openCommands.delete(uuid)
+      if (session.sink?.pending.delete(uuid)) this.settleSink(session)
+    }
+  }
+
+  private acceptSteer(session: LiveSession, uuid: string): void {
+    const accept = session.steers.get(uuid)
+    if (!accept) return
+    session.steers.delete(uuid)
+    try {
+      accept()
+    } catch (error) {
+      debugLog('native.steer.accept_failed', {
+        threadId: session.threadId,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
+
+  // The current turn's sends the CLI has not finished. Those still in our
+  // queue never reached it and are dropped outright.
+  private cancelSends(session: LiveSession): string[] {
+    const unanswered = session.input.unansweredUuids()
+    const dropped = new Set(session.input.discard(unanswered))
+    for (const uuid of dropped) session.openCommands.delete(uuid)
+    return unanswered.filter(
+      (uuid) => !dropped.has(uuid) && (!session.lifecycleSeen || session.openCommands.has(uuid)),
+    )
+  }
+
+  private beginSink(session: LiveSession, pending: string[], turn: boolean): void {
+    const previous = session.sink
+    let resolve: () => void = () => {}
+    const drained = new Promise<void>((done) => {
+      resolve = done
+    })
+    session.sink = {
+      pending: new Set([...(previous?.pending ?? []), ...pending]),
+      turn: turn || (previous?.turn ?? false),
+      drained,
+      drain: () => {
+        resolve()
+        previous?.drain()
+      },
+    }
+    this.settleSink(session)
+  }
+
+  private endSinkTurn(session: LiveSession, result: Record<string, unknown>): void {
+    const sink = session.sink
+    if (!sink) return
+    sink.turn = false
+    for (const uuid of echoedUuids(result)) sink.pending.delete(uuid)
+    // Older producers echo nothing and report no lifecycle: the result is
+    // all there is to go by.
+    if (!session.lifecycleSeen && !Array.isArray(result.user_message_uuids)) sink.pending.clear()
+    this.settleSink(session)
+  }
+
+  private settleSink(session: LiveSession): void {
+    const sink = session.sink
+    if (!sink || sink.turn || sink.pending.size > 0) return
+    session.sink = null
+    sink.drain()
+  }
+
+  private reinterrupt(session: LiveSession): void {
+    // Not awaited: routing must keep draining the stream meanwhile.
+    void session.query.interrupt().catch(() => {})
+  }
+
+  private async drainSink(session: LiveSession): Promise<void> {
+    const sink = session.sink
+    if (!sink) return
+    if (await settlesWithin(sink.drained, SINK_DRAIN_TIMEOUT_MS)) return
+    if (session.sink !== sink) return
+    debugLog('native.session.sink_timeout', {
+      threadId: session.threadId,
+      pending: [...sink.pending],
+      turn: sink.turn,
+    })
+    session.sink = null
+    sink.drain()
   }
 
   private async deliver(
@@ -802,18 +1072,23 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       this.closeSession(session)
       return
     }
-    if (session.liveTasks.size > 0) {
+    // Background tasks, a CLI turn nobody has claimed yet (the model can be
+    // unreachable for a while: api_retry backs off for tens of seconds), or
+    // an interrupted turn still draining: all need the process.
+    if (session.liveTasks.size > 0 || session.cliRunning || session.sink) {
       session.idleTimer = setTimeout(() => {
         session.idleTimer = null
         debugLog('native.session.idle_timeout', {
           threadId: session.threadId,
           liveTasks: [...session.liveTasks],
+          cliRunning: session.cliRunning,
         })
         if (!session.current && session.backlog.length === 0) this.closeSession(session)
       }, backgroundIdleMs())
       session.idleTimer.unref?.()
       return
     }
+    // A task just ended: Claude starts its turn to answer it within moments.
     if (session.unsettled) {
       session.settleTimer = setTimeout(() => {
         session.settleTimer = null
@@ -911,6 +1186,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       session.current != null ||
       session.liveTasks.size > 0 ||
       session.unsettled ||
+      session.cliRunning ||
+      session.sink != null ||
       session.backlog.length > 0
     )
   }
@@ -927,7 +1204,6 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       const state = String(message.state ?? '')
       if (state === 'idle') {
         if (session.unsettled && session.settleObservedRunning) session.unsettled = false
-        session.sinkUntilResult = false
       } else if (session.unsettled) {
         session.settleObservedRunning = true
       }
@@ -1011,9 +1287,10 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       })
       return
     }
-    // task_notification: the task is over and Claude is told about it.
-    if (!session.levelSeen) session.liveTasks.delete(taskId)
-    this.markTaskEnded(session)
+    // task_notification: the task is over and Claude is told about it. A
+    // foreground task ends inside its turn and leaves nothing to answer.
+    if (!session.levelSeen && session.liveTasks.delete(taskId)) this.markTaskEnded(session)
+    if (!session.cliRunning) session.endedWhileIdle.push(taskId)
     const rawStatus = String(message.status ?? '')
     const status =
       rawStatus === 'failed' ? 'failed' : rawStatus === 'stopped' ? 'stopped' : 'completed'
@@ -1935,6 +2212,12 @@ function workflowAgentToolUseId(taskId: string, agentId: string): string {
   return `workflow-agent:${taskId}:${agentId}`
 }
 
+// Claude's own top-level response output (not a running task's).
+function isTurnOutput(type: string, message: Record<string, unknown>): boolean {
+  if (message.parent_tool_use_id) return false
+  return type === 'stream_event' || type === 'assistant' || type === 'user'
+}
+
 async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
   if (timeoutMs <= 0) return false
   let timer: NodeJS.Timeout | null = null
@@ -1962,6 +2245,54 @@ function workflowTaskUsage(value: unknown): RuntimeTaskUsage | null {
 
 const taskUsage = workflowTaskUsage
 
+function goalToolServer(sdk: ClaudeSdk, z: Zod, goal: GoalToolHandlers) {
+  const run = async (call: () => Promise<string>) => {
+    try {
+      return { content: [{ type: 'text' as const, text: await call() }] }
+    } catch (error) {
+      const text = error instanceof Error ? error.message : String(error)
+      return { content: [{ type: 'text' as const, text }], isError: true }
+    }
+  }
+  return sdk.createSdkMcpServer({
+    name: GOAL_MCP_SERVER,
+    version: '1.0.0',
+    tools: [
+      sdk.tool('get_goal', GET_GOAL_DESCRIPTION, {}, () => run(() => goal.getGoal())),
+      sdk.tool(
+        'create_goal',
+        CREATE_GOAL_DESCRIPTION,
+        {
+          objective: z
+            .string()
+            .describe(
+              'Required. The concrete objective to start pursuing. This starts a new active goal when no goal exists or replaces the current goal when it is complete.',
+            ),
+          token_budget: z
+            .number()
+            .int()
+            .positive()
+            .optional()
+            .describe('Positive token budget for the new goal. Omit unless explicitly requested.'),
+        },
+        (args) => run(() => goal.createGoal(args.objective, args.token_budget ?? null)),
+      ),
+      sdk.tool(
+        'update_goal',
+        UPDATE_GOAL_DESCRIPTION,
+        {
+          status: z
+            .enum(['complete', 'blocked', 'paused'])
+            .describe(
+              'Required. `paused` requires an explicit user request. Set to `complete` only when the objective is achieved and no required work remains. Set to `blocked` only after the same blocking condition has recurred for at least three consecutive goal turns and the agent is at an impasse.',
+            ),
+        },
+        (args) => run(() => goal.updateGoal(args.status)),
+      ),
+    ],
+  })
+}
+
 // Codex's approval policy says "never ask" (or the sandbox is wide open) and
 // no explicit permission mode overrides it: tools run without a prompt.
 function autoAllowsTools(context: RuntimeTurnContext): boolean {
@@ -1981,6 +2312,7 @@ function sessionSignature(context: RuntimeTurnContext): string {
     context.effort ?? null,
     context.systemPromptAddendum ?? '',
     context.mcpServers ?? null,
+    context.goalTools ? GOAL_MCP_SERVER : null,
     context.addDirs ?? [],
     context.allowedTools ?? [],
     parseWorkflowCommand(context.prompt)?.type === 'run',

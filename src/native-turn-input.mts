@@ -32,14 +32,35 @@ export class TurnInput implements AsyncIterable<SDKUserMessage> {
   private sent = new Set<string>()
   private unanswered = new Set<string>()
 
-  send(message: TurnInputMessage): boolean {
-    if (this.closed) return false
+  // Returns the uuid stamped on the message (the CLI reports it back as the
+  // command_uuid of its command_lifecycle frames), or null once closed.
+  send(message: TurnInputMessage): string | null {
+    if (this.closed) return null
     const uuid = randomUUID()
     this.sent.add(uuid)
     this.unanswered.add(uuid)
     this.queue.push({ ...message, uuid })
     this.notify()
-    return true
+    return uuid
+  }
+
+  // Sends of the current turn the CLI has not answered yet.
+  unansweredUuids(): string[] {
+    return [...this.unanswered]
+  }
+
+  // Drops sends still waiting here, never written to the CLI. Returns the
+  // uuids it dropped.
+  discard(uuids: Iterable<string>): string[] {
+    const wanted = new Set(uuids)
+    const dropped: string[] = []
+    this.queue = this.queue.filter((message) => {
+      if (!message.uuid || !wanted.has(message.uuid)) return true
+      dropped.push(message.uuid)
+      this.unanswered.delete(message.uuid)
+      return false
+    })
+    return dropped
   }
 
   // The turn has settled: end the prompt stream so the SDK can release the
@@ -117,7 +138,7 @@ export class TurnInput implements AsyncIterable<SDKUserMessage> {
   }
 }
 
-function echoedUuids(result: Record<string, unknown>): string[] {
+export function echoedUuids(result: Record<string, unknown>): string[] {
   const uuids = Array.isArray(result.user_message_uuids)
     ? result.user_message_uuids.filter((uuid): uuid is string => typeof uuid === 'string')
     : []

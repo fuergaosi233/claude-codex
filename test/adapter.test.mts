@@ -1,5 +1,10 @@
 import assert from 'node:assert/strict'
-import { type ChildProcess, execFileSync, spawn } from 'node:child_process'
+import {
+  type ChildProcess,
+  type ChildProcessWithoutNullStreams,
+  execFileSync,
+  spawn,
+} from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
@@ -31,6 +36,12 @@ test('server dispatch covers current Codex app-server client method surface', as
     'thread/goal/set',
     'thread/goal/get',
     'thread/goal/clear',
+    'thread/queue/add',
+    'thread/queue/list',
+    'thread/queue/update',
+    'thread/queue/delete',
+    'thread/queue/reorder',
+    'thread/queue/start',
     'thread/metadata/update',
     'thread/section/move',
     'threadSection/list',
@@ -4627,71 +4638,382 @@ test('generic Claude tools complete as Codex mcpToolCall items', async () => {
   }
 })
 
-test('turn/steer appends user input to an active Claude turn', async () => {
-  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
-  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+function spawnMockAdapter(home: string): ChildProcessWithoutNullStreams {
+  return spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
   })
+}
+
+async function awaitMessage(
+  reader: JsonLineReader,
+  done: (message: any) => boolean,
+  seen: any[] = [],
+): Promise<any> {
+  for (let i = 0; i < 5000; i += 1) {
+    const message = await reader.next()
+    seen.push(message)
+    if (done(message)) return message
+  }
+  throw new Error('expected message never arrived')
+}
+
+// Collects everything that arrives until the adapter stays quiet for `ms`.
+async function readQuiet(reader: JsonLineReader, ms: number): Promise<any[]> {
+  const seen: any[] = []
+  for (;;) {
+    const message = await reader.nextWithin(ms)
+    if (message == null) return seen
+    seen.push(message)
+  }
+}
+
+// Waits for `turns` turns to complete, then reads until the adapter stays quiet
+// for `ms`: a slow runner still sees every expected turn, and a turn too many
+// still shows up.
+async function readTurns(reader: JsonLineReader, turns: number, ms: number): Promise<any[]> {
+  const seen: any[] = []
+  for (let i = 0; i < turns; i += 1) {
+    await awaitMessage(reader, (message) => message.method === 'turn/completed', seen)
+  }
+  seen.push(...(await readQuiet(reader, ms)))
+  return seen
+}
+
+async function startMockThread(
+  reader: JsonLineReader,
+  proc: ChildProcessWithoutNullStreams,
+): Promise<string> {
+  proc.stdin.write(
+    json({
+      id: 1,
+      method: 'thread/start',
+      params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false },
+    }),
+  )
+  const start = await reader.nextResponse(1)
+  return start.result.thread.id
+}
+
+function textInput(text: string): unknown[] {
+  return [{ type: 'text', text, text_elements: [] }]
+}
+
+function isUserMessageItem(message: any, method: string, clientId: string): boolean {
+  return (
+    message.method === method &&
+    message.params.item.type === 'userMessage' &&
+    message.params.item.clientId === clientId
+  )
+}
+
+test('turn/steer appends user input to an active Claude turn', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
   const reader = new JsonLineReader(proc)
   try {
-    proc.stdin.write(
-      json({
-        id: 1,
-        method: 'thread/start',
-        params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false },
-      }),
-    )
-    const start = await reader.nextResponse(1)
-    const threadId = start.result.thread.id
+    const threadId = await startMockThread(reader, proc)
 
     proc.stdin.write(
-      json({
-        id: 2,
-        method: 'turn/start',
-        params: {
-          threadId,
-          input: [{ type: 'text', text: 'slow turn for steering', text_elements: [] }],
-        },
-      }),
+      json({ id: 2, method: 'turn/steer', params: { threadId, input: textInput('too early') } }),
     )
-    const started = await reader.nextResponse(2)
-    const turnId = started.result.turn.id
+    const early = await reader.nextResponse(2)
+    assert.equal(early.error.message, 'no active turn to steer')
 
     proc.stdin.write(
       json({
         id: 3,
+        method: 'turn/start',
+        params: { threadId, input: textInput('slow turn for steering') },
+      }),
+    )
+    const turnId = (await reader.nextResponse(3)).result.turn.id
+    await awaitMessage(reader, (message) => message.method === 'item/agentMessage/delta')
+
+    proc.stdin.write(
+      json({
+        id: 4,
+        method: 'turn/steer',
+        params: { threadId, expectedTurnId: 'stale-turn', input: textInput('mismatch') },
+      }),
+    )
+    const mismatch = await reader.nextResponse(4)
+    assert.equal(
+      mismatch.error.message,
+      `expected active turn id \`stale-turn\` but found \`${turnId}\``,
+    )
+
+    proc.stdin.write(
+      json({
+        id: 5,
         method: 'turn/steer',
         params: {
           threadId,
           expectedTurnId: turnId,
-          input: [{ type: 'text', text: 'steered input', text_elements: [] }],
+          clientUserMessageId: 'client-steer-1',
+          input: textInput('steered input'),
         },
       }),
     )
-    const steer = await reader.nextResponse(3)
+    const seen: any[] = []
+    const steer = await awaitMessage(reader, (message) => message.id === 5, seen)
     assert.equal(steer.result.turnId, turnId)
-
-    let completed = false
-    for (let i = 0; i < 500; i += 1) {
-      const message = await reader.next()
-      if (message.method === 'turn/completed') {
-        completed = true
-        break
-      }
-    }
-    assert.equal(completed, true)
+    await awaitMessage(reader, (message) => message.method === 'turn/completed', seen)
+    // The accepted steer surfaces as a userMessage carrying the App's id, so
+    // the App can settle its pending steering bubble.
+    const started = seen.find((message) =>
+      isUserMessageItem(message, 'item/started', 'client-steer-1'),
+    )
+    assert.equal(started?.params.turnId, turnId)
+    assert.equal(started?.params.item.content[0].text, 'steered input')
+    assert.ok(
+      seen.some((message) => isUserMessageItem(message, 'item/completed', 'client-steer-1')),
+    )
 
     proc.stdin.write(
-      json({ id: 4, method: 'thread/turns/items/list', params: { threadId, turnId } }),
+      json({ id: 6, method: 'thread/turns/items/list', params: { threadId, turnId } }),
     )
-    const items = await reader.nextResponse(4)
+    const items = await reader.nextResponse(6)
     assert.equal(
       items.result.data.some(
         (item: any) => item.type === 'userMessage' && item.content?.[0]?.text === 'steered input',
       ),
       true,
     )
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('thread/queue holds follow-ups during a turn and dispatches them in order', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  const call = async (id: number, method: string, params: Record<string, unknown>) => {
+    proc.stdin.write(json({ id, method, params }))
+    return reader.nextResponse(id)
+  }
+  try {
+    const threadId = await startMockThread(reader, proc)
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: textInput('slow turn before the queue drains') },
+      }),
+    )
+    await awaitMessage(reader, (message) => message.method === 'item/agentMessage/delta')
+
+    const add = (id: number, text: string, clientUserMessageId: string) =>
+      call(id, 'thread/queue/add', { threadId, input: textInput(text), clientUserMessageId })
+    const first = (await add(3, 'queued one', 'client-1')).result.queuedSubmission
+    const second = (await add(4, 'queued two', 'client-2')).result.queuedSubmission
+    const third = (await add(5, 'queued three', 'client-3')).result.queuedSubmission
+    assert.equal(first.clientUserMessageId, 'client-1')
+    assert.deepEqual(first.input, textInput('queued one'))
+
+    const empty = await call(6, 'thread/queue/add', { threadId, input: [] })
+    assert.match(empty.error.message, /must not be empty/)
+
+    await call(7, 'thread/queue/reorder', { threadId, queuedSubmissionIds: [second.id] })
+    const edited = await call(8, 'thread/queue/update', {
+      threadId,
+      queuedSubmissionId: third.id,
+      input: textInput('queued three edited'),
+    })
+    assert.deepEqual(edited.result.queuedSubmission.input, textInput('queued three edited'))
+    const list = await call(9, 'thread/queue/list', { threadId, cursor: null })
+    assert.deepEqual(
+      list.result.data.map((entry: any) => entry.id),
+      [second.id, first.id, third.id],
+    )
+    assert.equal(list.result.nextCursor, null)
+    assert.equal(
+      (await call(10, 'thread/queue/delete', { threadId, queuedSubmissionId: third.id })).result
+        .deleted,
+      true,
+    )
+    assert.equal(
+      (await call(11, 'thread/queue/delete', { threadId, queuedSubmissionId: third.id })).result
+        .deleted,
+      false,
+    )
+
+    // The queue drains head first once the running turn settles: one user
+    // turn per submission, each publishing its message with the client id.
+    const seen: any[] = []
+    let completedTurns = 0
+    await awaitMessage(
+      reader,
+      (message) => message.method === 'turn/completed' && ++completedTurns === 3,
+      seen,
+    )
+    const userMessages = seen
+      .filter(
+        (message) =>
+          message.method === 'item/started' && message.params.item.type === 'userMessage',
+      )
+      .map((message) => message.params.item.clientId)
+    assert.deepEqual(userMessages, ['client-2', 'client-1'])
+    assert.ok(seen.some((message) => message.method === 'thread/queue/changed'))
+
+    const drained = await call(12, 'thread/queue/list', { threadId, cursor: null })
+    assert.deepEqual(drained.result.data, [])
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('thread/queue pauses after an interrupt until thread/queue/start', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  const call = async (id: number, method: string, params: Record<string, unknown>) => {
+    proc.stdin.write(json({ id, method, params }))
+    return reader.nextResponse(id)
+  }
+  try {
+    const threadId = await startMockThread(reader, proc)
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: textInput('slow turn that the user stops') },
+      }),
+    )
+    const turnId = (await reader.nextResponse(2)).result.turn.id
+    await awaitMessage(reader, (message) => message.method === 'item/agentMessage/delta')
+    const queued = (
+      await call(3, 'thread/queue/add', {
+        threadId,
+        input: textInput('held message'),
+        clientUserMessageId: 'client-held',
+      })
+    ).result.queuedSubmission
+    await call(4, 'turn/interrupt', { threadId, turnId })
+
+    const quiet = await readQuiet(reader, 400)
+    assert.equal(
+      quiet.some((message) => message.method === 'turn/started'),
+      false,
+    )
+    const held = await call(5, 'thread/queue/list', { threadId, cursor: null })
+    assert.deepEqual(
+      held.result.data.map((entry: any) => entry.id),
+      [queued.id],
+    )
+
+    const started = await call(6, 'thread/queue/start', {
+      threadId,
+      queuedSubmissionId: queued.id,
+    })
+    assert.equal(typeof started.result.turn.id, 'string')
+    const seen: any[] = []
+    await awaitMessage(reader, (message) => message.method === 'turn/completed', seen)
+    assert.ok(seen.some((message) => isUserMessageItem(message, 'item/started', 'client-held')))
+    const drained = await call(7, 'thread/queue/list', { threadId, cursor: null })
+    assert.deepEqual(drained.result.data, [])
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('thread/goal/set keeps the thread working until the model completes the goal', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  const call = async (id: number, method: string, params: Record<string, unknown>) => {
+    proc.stdin.write(json({ id, method, params }))
+    return reader.nextResponse(id)
+  }
+  try {
+    const threadId = await startMockThread(reader, proc)
+    const missing = await call(2, 'thread/goal/set', { threadId, status: 'paused' })
+    assert.match(missing.error.message, /no goal exists/)
+
+    proc.stdin.write(
+      json({
+        id: 3,
+        method: 'thread/goal/set',
+        params: { threadId, objective: 'goal complete check', status: 'active' },
+      }),
+    )
+    const seen: any[] = []
+    const set = await awaitMessage(reader, (message) => message.id === 3, seen)
+    assert.equal(set.result.goal.status, 'active')
+    assert.equal(set.result.goal.tokenBudget, null)
+    const started = await awaitMessage(reader, (message) => message.method === 'turn/started', seen)
+    const turnId = started.params.turn.id
+    await awaitMessage(reader, (message) => message.method === 'turn/completed', seen)
+    const updates = seen
+      .filter((message) => message.method === 'thread/goal/updated')
+      .map((message) => message.params)
+    const finished = updates.at(-1)
+    assert.equal(finished.goal.status, 'complete')
+    assert.equal(finished.goal.tokensUsed, 145)
+    assert.equal(finished.turnId, turnId)
+    assert.ok(
+      updates.some((update) => update.goal.status === 'active' && update.goal.tokensUsed === 145),
+    )
+
+    // A completed goal ends the run; nothing else starts.
+    const quiet = await readQuiet(reader, 400)
+    assert.equal(
+      quiet.some((message) => message.method === 'turn/started'),
+      false,
+    )
+    // The continuation prompt is hidden: no user message on the turn.
+    const items = await call(4, 'thread/turns/items/list', { threadId, turnId })
+    assert.equal(
+      items.result.data.some((item: any) => item.type === 'userMessage'),
+      false,
+    )
+    const get = await call(5, 'thread/goal/get', { threadId })
+    assert.equal(get.result.goal.status, 'complete')
+    const clear = await call(6, 'thread/goal/clear', { threadId })
+    assert.equal(clear.result.cleared, true)
+    assert.equal((await call(7, 'thread/goal/get', { threadId })).result.goal, null)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('goal continuation stops when a hidden turn makes no progress or exhausts the budget', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  const call = async (id: number, method: string, params: Record<string, unknown>) => {
+    proc.stdin.write(json({ id, method, params }))
+    return reader.nextResponse(id)
+  }
+  const countTurns = (messages: any[]) =>
+    messages.filter((message) => message.method === 'turn/started').length
+  try {
+    const threadId = await startMockThread(reader, proc)
+    await call(2, 'thread/goal/set', { threadId, objective: 'keep going', status: 'active' })
+    // One hidden continuation with no tool work, then the run stops.
+    const first = await readTurns(reader, 1, 500)
+    assert.equal(countTurns(first), 1)
+    assert.equal((await call(3, 'thread/goal/get', { threadId })).result.goal.status, 'active')
+
+    // A user turn gives the goal another continuation.
+    proc.stdin.write(
+      json({ id: 4, method: 'turn/start', params: { threadId, input: textInput('nudge') } }),
+    )
+    const nudged = await readTurns(reader, 2, 500)
+    assert.equal(countTurns(nudged), 2)
+
+    // A budget the continuation overruns stops the goal.
+    await call(5, 'thread/goal/set', { threadId, tokenBudget: 300, status: 'active' })
+    const budgeted = await readTurns(reader, 1, 500)
+    assert.equal(countTurns(budgeted), 1)
+    const goal = (await call(6, 'thread/goal/get', { threadId })).result.goal
+    assert.equal(goal.status, 'budgetLimited')
+    assert.equal(goal.tokensUsed, 435)
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -6443,6 +6765,23 @@ class JsonLineReader {
       const msg = await this.next()
       if (msg.id === id && msg.method == null) return msg
     }
+  }
+
+  // Resolves null when nothing arrives within `ms`.
+  nextWithin(ms: number): Promise<any> {
+    const existing = this.queue.shift()
+    if (existing) return Promise.resolve(existing)
+    return new Promise((resolve) => {
+      const waiter = (value: any): void => {
+        clearTimeout(timer)
+        resolve(value)
+      }
+      const timer = setTimeout(() => {
+        this.waiters = this.waiters.filter((entry) => entry !== waiter)
+        resolve(null)
+      }, ms)
+      this.waiters.push(waiter)
+    })
   }
 
   private push(chunk: string): void {

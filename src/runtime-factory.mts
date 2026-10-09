@@ -12,6 +12,7 @@ import type {
   ClaudeRuntime,
   RuntimeBackgroundListener,
   RuntimeHandlers,
+  RuntimeSteerOptions,
   RuntimeTurnContext,
 } from './types.mjs'
 import { debugLog } from './util.mjs'
@@ -73,9 +74,13 @@ class SelectableRuntime implements ClaudeRuntime {
     }
   }
 
-  async steer(threadId: string, prompt: string): Promise<void> {
+  async steer(
+    threadId: string,
+    prompt: string,
+    options?: RuntimeSteerOptions,
+  ): Promise<boolean | undefined> {
     const runtime = this.activeRuntimeByThread.get(threadId) ?? this.runtimeFor(this.config.type)
-    await runtime.steer(threadId, prompt)
+    return runtime.steer(threadId, prompt, options)
   }
 
   async interrupt(threadId: string): Promise<void> {
@@ -103,6 +108,10 @@ class SelectableRuntime implements ClaudeRuntime {
       if (await runtime.stopTask?.(threadId, taskId)) return true
     }
     return false
+  }
+
+  liveTasks(threadId: string): Array<{ taskId: string; taskType: string | null }> {
+    return [...this.runtimes.values()].flatMap((runtime) => runtime.liveTasks?.(threadId) ?? [])
   }
 
   hasBackgroundWork(): boolean {

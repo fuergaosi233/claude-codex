@@ -5,6 +5,14 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { listClaudeHooks, listClaudeSkills } from './claude-capabilities.mjs'
+import {
+  goalBudgetExhausted,
+  goalContinuationPrompt,
+  goalObjectiveUpdatedPrompt,
+  goalToolResult,
+  isGoalStatus,
+  MODEL_GOAL_STATUSES,
+} from './goal-prompts.mjs'
 import { callMcpTool, listMcpServerStatuses, readMcpConfig, readMcpResource } from './mcp.mjs'
 import { projectProviderLoopConfig } from './provider-loop-config.mjs'
 import {
@@ -81,21 +89,25 @@ import { PINNED_SECTION_ID, type SessionStore } from './store.mjs'
 import type {
   ClaudeRuntime,
   FileUpdateChange,
+  GoalToolHandlers,
   ImageInput,
   JsonRpcId,
   JsonRpcRequest,
   JsonRpcResponse,
   PermissionDecision,
+  QueuedSubmission,
   RpcPeer,
   RuntimeEvent,
   RuntimeTaskEvent,
   RuntimeTaskUsage,
+  ThreadGoal,
   ThreadItem,
   ThreadRecord,
   ThreadSectionAppearance,
   ThreadTokenUsage,
   TokenUsageBreakdown,
   TurnRecord,
+  TurnStatus,
   UserInput,
   UserInputAnswers,
   UserInputQuestion,
@@ -205,6 +217,39 @@ const DETACHED_PEER: RpcPeer = { id: 'detached', send: () => {}, close: () => {}
 const MAX_TRACKED_TASK_IDS = 512
 const MAX_QUEUED_ACTIVITY = 64
 
+// A hidden goal continuation that does no tool work ends the run of
+// continuations until the user or the goal changes something.
+const GOAL_IDLE_TURN_LIMIT = 1
+const NO_PROGRESS_ITEM_TYPES = new Set(['userMessage', 'agentMessage', 'reasoning', 'plan'])
+
+// Only real work counts as goal progress; reading the goal back does not.
+function goalTurnMadeProgress(turn: TurnRecord): boolean {
+  return turn.items.some((item) => {
+    if (NO_PROGRESS_ITEM_TYPES.has(item.type)) return false
+    return !(item.type === 'mcpToolCall' && item.tool.startsWith('mcp__codex_goal__'))
+  })
+}
+
+function goalBudget(value: unknown): number | null {
+  if (value == null) return null
+  if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0)
+    throw new Error('goal budgets must be positive integers when provided')
+  return value
+}
+
+function isUsageLimitError(error: unknown): boolean {
+  const message = typeof asRecord(error).message === 'string' ? String(asRecord(error).message) : ''
+  return /usage limit|rate limit|quota|\b429\b/i.test(message)
+}
+
+function queuedInput(value: unknown): UserInput[] {
+  const input = Array.isArray(value) ? (value as UserInput[]) : []
+  const { textPrompt, images } = extractImageInputs(input)
+  if (!textPrompt.trim() && images.length === 0 && !textFromInput(input).trim())
+    throw new Error('queued message input must not be empty')
+  return input
+}
+
 interface PeerFeatures {
   // Codex cc 26.818.61809 only accepts started/interacted/interrupted in the
   // subAgentActivity schema. Newer clients may opt into the completed kind
@@ -256,7 +301,13 @@ export class CodexClaudeAppServer {
   private commandProcesses = new Map<string, ChildProcess>()
   private processHandles = new Map<string, ChildProcess>()
   private fsWatchers = new Map<string, FSWatcher>()
-  private goals = new Map<string, Record<string, unknown>>()
+  // Goal state lives in the store. These track the hidden continuation turns
+  // the adapter starts, how many of them in a row made no progress, and when
+  // goal time was last accrued for a thread's running turn.
+  private goalTurns = new Set<string>()
+  private goalIdleStreaks = new Map<string, number>()
+  private goalClockByThread = new Map<string, number>()
+  private goalToolHandlers = new Map<string, GoalToolHandlers>()
   private elicitationCounts = new Map<string, number>()
   private tokenUsageByThread = new Map<string, TokenUsageBreakdown>()
   private configModel = defaultSelectableModelId()
@@ -449,11 +500,23 @@ export class CodexClaudeAppServer {
       case 'thread/decrement_elicitation':
         return this.threadAdjustElicitation(asRecord(params), -1)
       case 'thread/goal/set':
-        return this.threadGoalSet(asRecord(params))
+        return this.threadGoalSet(peer, asRecord(params))
       case 'thread/goal/get':
         return this.threadGoalGet(asRecord(params))
       case 'thread/goal/clear':
-        return this.threadGoalClear(asRecord(params))
+        return this.threadGoalClear(peer, asRecord(params))
+      case 'thread/queue/add':
+        return this.threadQueueAdd(peer, asRecord(params))
+      case 'thread/queue/list':
+        return this.threadQueueList(asRecord(params))
+      case 'thread/queue/update':
+        return this.threadQueueUpdate(peer, asRecord(params))
+      case 'thread/queue/delete':
+        return this.threadQueueDelete(peer, asRecord(params))
+      case 'thread/queue/reorder':
+        return this.threadQueueReorder(peer, asRecord(params))
+      case 'thread/queue/start':
+        return this.threadQueueStart(peer, asRecord(params))
       case 'thread/metadata/update':
         return this.threadMetadataUpdate(asRecord(params))
       case 'thread/section/move':
@@ -497,7 +560,7 @@ export class CodexClaudeAppServer {
         return {}
       }
       case 'thread/backgroundTerminals/clean':
-        return this.threadBackgroundTerminalsClean(asRecord(params))
+        return this.threadBackgroundTerminalsClean(peer, asRecord(params))
       case 'thread/rollback':
         return this.historyForPeer(peer, this.threadRollback(asRecord(params)))
       case 'thread/loaded/list':
@@ -1118,12 +1181,15 @@ export class CodexClaudeAppServer {
   }
 
   // Drops per-thread in-memory state (session-scoped command approvals, token
-  // usage tallies, goals, elicitation counts) so an archived thread does not
-  // leak entries for the lifetime of the process.
+  // usage tallies, goal bookkeeping, elicitation counts) so an archived thread
+  // does not leak entries for the lifetime of the process. The goal itself and
+  // the queue stay persisted for an unarchive.
   private clearThreadState(threadId: string): void {
     this.commandSessionAllow.delete(threadId)
     this.tokenUsageByThread.delete(threadId)
-    this.goals.delete(threadId)
+    this.goalIdleStreaks.delete(threadId)
+    this.goalClockByThread.delete(threadId)
+    this.goalToolHandlers.delete(threadId)
     this.elicitationCounts.delete(threadId)
   }
 
@@ -1223,38 +1289,391 @@ export class CodexClaudeAppServer {
     return {}
   }
 
-  private threadGoalSet(params: Record<string, unknown>): unknown {
+  // Thread goals follow Codex: the goal is persisted per thread, and while it
+  // is active the adapter keeps the thread working by starting hidden
+  // continuation turns whenever it goes idle (see startFollowUp).
+  private threadGoalSet(peer: RpcPeer, params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
-    const existing = this.goals.get(threadId)
+    this.goalThread(threadId)
+    this.activePeerByThread.set(threadId, peer)
+    if (params.status != null && !isGoalStatus(params.status))
+      throw new Error(`invalid goal status: ${String(params.status)}`)
+    const status = isGoalStatus(params.status) ? params.status : null
+    const objective = typeof params.objective === 'string' ? params.objective.trim() : null
+    if (objective === '') throw new Error('goal objective must not be empty')
+    // An explicit null clears the budget; an absent field leaves it alone.
+    const budget = 'tokenBudget' in params ? goalBudget(params.tokenBudget) : undefined
+    const existing = this.store.getGoal(threadId)
     const now = nowSeconds()
-    const goal = {
-      threadId,
-      objective: stringOr(params.objective, String(existing?.objective ?? '')),
-      status: typeof params.status === 'string' ? params.status : (existing?.status ?? 'active'),
-      tokenBudget:
-        typeof params.tokenBudget === 'number'
-          ? params.tokenBudget
-          : (existing?.tokenBudget ?? null),
-      tokensUsed: existing?.tokensUsed ?? 0,
-      timeUsedSeconds: existing?.timeUsedSeconds ?? 0,
-      createdAt: existing?.createdAt ?? now,
-      updatedAt: now,
+    let goal: ThreadGoal
+    let objectiveChanged = false
+    if (
+      !existing ||
+      (existing.status === 'complete' && objective && objective !== existing.objective)
+    ) {
+      if (!objective) throw new Error(`no goal exists for thread ${threadId}`)
+      goal = {
+        threadId,
+        objective,
+        status: 'active',
+        tokenBudget: null,
+        tokensUsed: 0,
+        timeUsedSeconds: 0,
+        createdAt: now,
+        updatedAt: now,
+      }
+    } else {
+      goal = { ...existing }
+      this.accrueGoalTime(goal)
+      objectiveChanged = objective != null && objective !== existing.objective
+      if (objective) goal.objective = objective
     }
-    this.goals.set(threadId, goal)
-    this.notifyThread(threadId, { method: 'thread/goal/updated', params: { threadId, goal } })
+    if (budget !== undefined) goal.tokenBudget = budget
+    if (status) goal.status = status
+    if (goal.status === 'active' && goalBudgetExhausted(goal)) goal.status = 'budgetLimited'
+    goal.updatedAt = now
+    // Setting or resuming a goal gives continuation a fresh start.
+    if (goal.status === 'active') this.goalIdleStreaks.delete(threadId)
+    this.commitGoal(goal)
+    if (goal.status === 'active') {
+      if (!this.activeTurnByThread.has(threadId)) setImmediate(() => this.startFollowUp(threadId))
+      else if (objectiveChanged)
+        void this.runtime
+          .steer(threadId, goalObjectiveUpdatedPrompt(goal))
+          .catch((error) =>
+            debugLog('goal.objectiveSteer.failed', { threadId, error: String(error) }),
+          )
+    }
     return { goal }
   }
 
   private threadGoalGet(params: Record<string, unknown>): unknown {
-    return { goal: this.goals.get(stringOr(params.threadId, '')) ?? null }
+    return { goal: this.store.getGoal(stringOr(params.threadId, '')) }
   }
 
-  private threadGoalClear(params: Record<string, unknown>): unknown {
+  private threadGoalClear(peer: RpcPeer, params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
-    const cleared = this.goals.delete(threadId)
+    if (this.store.getThread(threadId)) this.activePeerByThread.set(threadId, peer)
+    const cleared = this.store.deleteGoal(threadId)
+    this.goalIdleStreaks.delete(threadId)
+    this.goalClockByThread.delete(threadId)
     if (cleared)
       this.notifyThread(threadId, { method: 'thread/goal/cleared', params: { threadId } })
     return { cleared }
+  }
+
+  private goalThread(threadId: string): ThreadRecord {
+    const thread = this.store.getThread(threadId)
+    if (!thread) throw new Error(`unknown thread: ${threadId}`)
+    if (thread.ephemeral) throw new Error('Goal tools require a persistent thread.')
+    return thread
+  }
+
+  private commitGoal(goal: ThreadGoal): void {
+    this.store.putGoal(goal)
+    this.syncGoalClock(goal.threadId, goal)
+    this.notifyThread(goal.threadId, {
+      method: 'thread/goal/updated',
+      params: {
+        threadId: goal.threadId,
+        turnId: this.activeTurnByThread.get(goal.threadId) ?? null,
+        goal,
+      },
+    })
+  }
+
+  // Goal time runs while the goal is active and the thread has a turn.
+  private syncGoalClock(threadId: string, goal: ThreadGoal | null): void {
+    if (goal?.status !== 'active' || !this.activeTurnByThread.has(threadId))
+      this.goalClockByThread.delete(threadId)
+    else if (!this.goalClockByThread.has(threadId)) this.goalClockByThread.set(threadId, Date.now())
+  }
+
+  private accrueGoalTime(goal: ThreadGoal): void {
+    const since = this.goalClockByThread.get(goal.threadId)
+    if (since == null) return
+    const seconds = Math.floor((Date.now() - since) / 1000)
+    if (seconds <= 0) return
+    goal.timeUsedSeconds += seconds
+    this.goalClockByThread.set(goal.threadId, since + seconds * 1000)
+  }
+
+  // Codex counts goal tokens while the goal is active; cache reads are free.
+  private accrueGoalTokens(threadId: string, usage: TokenUsageBreakdown): void {
+    const goal = this.store.getGoal(threadId)
+    if (goal?.status !== 'active') return
+    this.accrueGoalTime(goal)
+    goal.tokensUsed += usage.inputTokens + usage.outputTokens
+    if (goalBudgetExhausted(goal)) goal.status = 'budgetLimited'
+    goal.updatedAt = nowSeconds()
+    this.commitGoal(goal)
+  }
+
+  // Bookkeeping for a turn that just left the thread: close the goal clock
+  // and track whether hidden continuation turns still make progress.
+  private settleGoalTurn(threadId: string, settled: TurnRecord | null): void {
+    const goalTurn = settled ? this.goalTurns.delete(settled.id) : false
+    const goal = this.store.getGoal(threadId)
+    if (!goal) {
+      this.goalClockByThread.delete(threadId)
+      return
+    }
+    if (this.goalClockByThread.has(threadId)) {
+      this.accrueGoalTime(goal)
+      this.goalClockByThread.delete(threadId)
+      if (
+        goal.status === 'active' &&
+        settled?.status === 'failed' &&
+        isUsageLimitError(settled.error)
+      )
+        goal.status = 'usageLimited'
+      goal.updatedAt = nowSeconds()
+      this.commitGoal(goal)
+    }
+    if (!goalTurn || !settled) return
+    if (settled.status !== 'completed' || !goalTurnMadeProgress(settled))
+      this.goalIdleStreaks.set(threadId, (this.goalIdleStreaks.get(threadId) ?? 0) + 1)
+    else this.goalIdleStreaks.delete(threadId)
+  }
+
+  private canContinueGoal(threadId: string): boolean {
+    const thread = this.store.getThread(threadId)
+    return (
+      !this.stopped &&
+      !!thread &&
+      !thread.ephemeral &&
+      !thread.archived &&
+      thread.runtimeBackend === 'claude' &&
+      this.store.getGoal(threadId)?.status === 'active' &&
+      (this.goalIdleStreaks.get(threadId) ?? 0) < GOAL_IDLE_TURN_LIMIT
+    )
+  }
+
+  // Goal tools the model calls through the codex_goal MCP server. They read
+  // the thread's goal at call time, so one set of handlers serves the
+  // thread's whole session.
+  private goalToolsFor(threadId: string): GoalToolHandlers {
+    const cached = this.goalToolHandlers.get(threadId)
+    if (cached) return cached
+    const handlers: GoalToolHandlers = {
+      getGoal: async () => goalToolResult(this.store.getGoal(threadId)),
+      createGoal: async (rawObjective, tokenBudget) => {
+        this.goalThread(threadId)
+        const objective = rawObjective.trim()
+        if (!objective) throw new Error('goal objective must not be empty')
+        const budget = goalBudget(tokenBudget)
+        const existing = this.store.getGoal(threadId)
+        if (existing && existing.status !== 'complete')
+          throw new Error(
+            'cannot create a new goal because this thread has an unfinished goal; complete the existing goal first',
+          )
+        const now = nowSeconds()
+        const goal: ThreadGoal = {
+          threadId,
+          objective,
+          status: 'active',
+          tokenBudget: budget,
+          tokensUsed: 0,
+          timeUsedSeconds: 0,
+          createdAt: now,
+          updatedAt: now,
+        }
+        this.goalIdleStreaks.delete(threadId)
+        this.commitGoal(goal)
+        return goalToolResult(goal)
+      },
+      updateGoal: async (status) => {
+        const goal = this.store.getGoal(threadId)
+        if (!goal) throw new Error('cannot update goal because this thread has no goal')
+        if (!MODEL_GOAL_STATUSES.has(status) || !isGoalStatus(status))
+          throw new Error(
+            "update_goal can only mark the existing goal complete, blocked, or paused at the user's explicit request; resume, budget-limited, and usage-limited status changes are controlled by the user or system",
+          )
+        // Budget limits take precedence over pausing.
+        if (status === 'paused' && goal.status === 'budgetLimited') return goalToolResult(goal)
+        this.accrueGoalTime(goal)
+        goal.status = status
+        goal.updatedAt = nowSeconds()
+        this.commitGoal(goal)
+        return goalToolResult(goal, status === 'complete')
+      },
+    }
+    this.goalToolHandlers.set(threadId, handlers)
+    return handlers
+  }
+
+  // Server-side message queue (thread/queue/*). Codex App queues follow-ups
+  // here instead of in the window once the app-server version passes its
+  // gate; the server dispatches the head whenever the thread goes idle, and
+  // holds after an interrupted turn until the App resumes it with
+  // thread/queue/start.
+  private queueThread(threadId: string): ThreadRecord {
+    const thread = this.store.getThread(threadId)
+    if (!thread) throw new Error(`unknown thread: ${threadId}`)
+    if (thread.ephemeral) throw new Error('queued messages require a persistent thread')
+    return thread
+  }
+
+  private saveQueue(threadId: string, items: QueuedSubmission[]): void {
+    this.store.saveQueue(threadId, items)
+    this.notifyThread(threadId, { method: 'thread/queue/changed', params: { threadId } })
+  }
+
+  private queuedSubmission(threadId: string, id: string): QueuedSubmission {
+    const item = this.store.listQueue(threadId).find((entry) => entry.id === id)
+    if (!item) throw new Error(`unknown queued submission: ${id}`)
+    return item
+  }
+
+  private threadQueueAdd(peer: RpcPeer, params: Record<string, unknown>): unknown {
+    const threadId = stringOr(params.threadId, '')
+    this.queueThread(threadId)
+    this.activePeerByThread.set(threadId, peer)
+    const submission: QueuedSubmission = {
+      id: newId(),
+      input: queuedInput(params.input),
+      clientUserMessageId: nullIfEmpty(stringOr(params.clientUserMessageId, '')),
+    }
+    this.saveQueue(threadId, [...this.store.listQueue(threadId), submission])
+    if (!this.activeTurnByThread.has(threadId) && !this.queueHeld(threadId))
+      setImmediate(() => this.startFollowUp(threadId))
+    return { queuedSubmission: submission }
+  }
+
+  private threadQueueList(params: Record<string, unknown>): unknown {
+    const threadId = stringOr(params.threadId, '')
+    this.queueThread(threadId)
+    return { data: this.store.listQueue(threadId), nextCursor: null }
+  }
+
+  private threadQueueUpdate(peer: RpcPeer, params: Record<string, unknown>): unknown {
+    const threadId = stringOr(params.threadId, '')
+    this.queueThread(threadId)
+    this.activePeerByThread.set(threadId, peer)
+    const id = stringOr(params.queuedSubmissionId, '')
+    const updated: QueuedSubmission = {
+      ...this.queuedSubmission(threadId, id),
+      input: queuedInput(params.input),
+    }
+    this.saveQueue(
+      threadId,
+      this.store.listQueue(threadId).map((entry) => (entry.id === id ? updated : entry)),
+    )
+    return { queuedSubmission: updated }
+  }
+
+  private threadQueueDelete(peer: RpcPeer, params: Record<string, unknown>): unknown {
+    const threadId = stringOr(params.threadId, '')
+    this.queueThread(threadId)
+    this.activePeerByThread.set(threadId, peer)
+    const id = stringOr(params.queuedSubmissionId, '')
+    const items = this.store.listQueue(threadId)
+    const rest = items.filter((entry) => entry.id !== id)
+    if (rest.length === items.length) return { deleted: false }
+    this.saveQueue(threadId, rest)
+    return { deleted: true }
+  }
+
+  private threadQueueReorder(peer: RpcPeer, params: Record<string, unknown>): unknown {
+    const threadId = stringOr(params.threadId, '')
+    this.queueThread(threadId)
+    this.activePeerByThread.set(threadId, peer)
+    const order = Array.isArray(params.queuedSubmissionIds)
+      ? params.queuedSubmissionIds.filter((id): id is string => typeof id === 'string')
+      : []
+    const byId = new Map(this.store.listQueue(threadId).map((entry) => [entry.id, entry]))
+    const reordered: QueuedSubmission[] = []
+    for (const id of order) {
+      const entry = byId.get(id)
+      if (!entry) continue
+      byId.delete(id)
+      reordered.push(entry)
+    }
+    this.saveQueue(threadId, [...reordered, ...byId.values()])
+    return {}
+  }
+
+  private async threadQueueStart(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
+    const threadId = stringOr(params.threadId, '')
+    this.queueThread(threadId)
+    if (this.activeTurnByThread.has(threadId))
+      throw new Error(`cannot start a queued message while thread ${threadId} has an active turn`)
+    const id = stringOr(params.queuedSubmissionId, '')
+    const submission = this.queuedSubmission(threadId, id)
+    return this.dispatchQueued(peer, threadId, submission)
+  }
+
+  private queueHeld(threadId: string): boolean {
+    return this.store.lastTurnStatus(threadId) === 'interrupted'
+  }
+
+  // Runs one queued submission as a regular user turn. The submission leaves
+  // the queue only once its turn exists, so a rejected start keeps it.
+  private async dispatchQueued(
+    peer: RpcPeer,
+    threadId: string,
+    submission: QueuedSubmission,
+  ): Promise<unknown> {
+    const result = await this.turnStart(peer, {
+      ...this.followUpParams(threadId),
+      input: submission.input,
+      ...(submission.clientUserMessageId
+        ? { clientUserMessageId: submission.clientUserMessageId }
+        : {}),
+      _emitUserMessage: true,
+    })
+    this.saveQueue(
+      threadId,
+      this.store.listQueue(threadId).filter((entry) => entry.id !== submission.id),
+    )
+    return result
+  }
+
+  // Settings for a turn the adapter starts on the user's behalf: whatever the
+  // last user turn used, minus its input. Queued messages never carry a
+  // collaboration mode (the App keeps those in the window queue).
+  private followUpParams(threadId: string): Record<string, unknown> {
+    const {
+      input: _input,
+      clientUserMessageId: _clientId,
+      outputSchema: _schema,
+      ...rest
+    } = this.lastTurnParamsByThread.get(threadId) ?? {}
+    return { ...rest, threadId, planMode: false }
+  }
+
+  // The thread just went idle: run the next queued message, else keep an
+  // active goal going. `settled` is the status of the turn that just ended,
+  // when there is one; nothing follows an interrupt, and a goal does not
+  // retry a failure on its own. Returns whether a turn was started.
+  private startFollowUp(threadId: string, settled?: TurnStatus): boolean {
+    if (this.stopped || settled === 'interrupted' || this.activeTurnByThread.has(threadId))
+      return false
+    const thread = this.store.getThread(threadId)
+    if (!thread || thread.archived) return false
+    const peer = this.peerForThread(threadId)
+    if (!thread.ephemeral && !this.queueHeld(threadId)) {
+      const head = this.store.listQueue(threadId)[0]
+      if (head) {
+        void this.dispatchQueued(peer, threadId, head).catch((error) => {
+          debugLog('queue.dispatch.failed', { threadId, error: String(error) })
+          this.notify(peer, {
+            method: 'error',
+            params: { threadId, turnId: null, willRetry: false, error: { message: String(error) } },
+          })
+        })
+        return this.activeTurnByThread.has(threadId)
+      }
+    }
+    if (settled === 'failed' || !this.canContinueGoal(threadId)) return false
+    const goal = this.store.getGoal(threadId)
+    if (!goal) return false
+    void this.turnStart(peer, {
+      ...this.followUpParams(threadId),
+      input: [],
+      _hiddenPrompt: goalContinuationPrompt(goal),
+    }).catch((error) => debugLog('goal.continue.failed', { threadId, error: String(error) }))
+    return this.activeTurnByThread.has(threadId)
   }
 
   private threadAdjustElicitation(params: Record<string, unknown>, delta: number): unknown {
@@ -1450,9 +1869,29 @@ export class CodexClaudeAppServer {
     return {}
   }
 
-  private threadBackgroundTerminalsClean(params: Record<string, unknown>): unknown {
+  // Codex's "clean background terminals" ends the shells a thread left
+  // running. Claude's are its background Bash tasks; stopping them through the
+  // runtime also drops the turn Claude would start to acknowledge the stop.
+  private async threadBackgroundTerminalsClean(
+    peer: RpcPeer,
+    params: Record<string, unknown>,
+  ): Promise<unknown> {
+    const threadId = stringOr(params.threadId, '')
+    if (threadId) this.activePeerByThread.set(threadId, peer)
+    const shells = (this.runtime.liveTasks?.(threadId) ?? []).filter(
+      (task) => task.taskType === 'local_bash',
+    )
+    const stopped = await Promise.all(
+      shells.map((task) =>
+        (this.runtime.stopTask?.(threadId, task.taskId) ?? Promise.resolve(false)).catch(
+          () => false,
+        ),
+      ),
+    )
     debugLog('thread.backgroundTerminals.clean', {
-      threadId: stringOr(params.threadId, ''),
+      threadId,
+      backgroundShells: shells.length,
+      stopped: stopped.filter(Boolean).length,
       activeCommandProcesses: this.commandProcesses.size,
       activeProcessHandles: this.processHandles.size,
     })
@@ -1715,18 +2154,22 @@ export class CodexClaudeAppServer {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
     if (!thread) throw new Error(`unknown thread: ${threadId}`)
-    this.activePeerByThread.set(threadId, peer)
+    // Follow-up turns the adapter starts itself have no requesting peer.
+    if (peer !== DETACHED_PEER) this.activePeerByThread.set(threadId, peer)
 
     const turnId = newId()
     const input = Array.isArray(params.input) ? (params.input as UserInput[]) : []
+    // Goal continuations prompt the model with hidden internal context and
+    // carry no user message.
+    const hiddenPrompt = typeof params._hiddenPrompt === 'string' ? params._hiddenPrompt : null
     // extractImageInputs splits user input into the text prompt and any image
     // attachments (localImage / image URL / data:). Sidecar repacks the
     // images into a Claude SDK multimodal user message; here we also append
     // an `imageView` ThreadItem per image so the App's transcript shows them
     // inline next to the user message instead of losing them.
     const { textPrompt, images } = extractImageInputs(input)
-    const prompt = textPrompt || textFromInput(input)
-    const workflowCommand = parseWorkflowCommand(prompt)
+    const prompt = hiddenPrompt ?? (textPrompt || textFromInput(input))
+    const workflowCommand = hiddenPrompt ? null : parseWorkflowCommand(prompt)
     if (typeof params.cwd === 'string' && params.cwd.length > 0) thread.cwd = params.cwd
     const model = modelFromParams(params, thread.model)
     const reasoningEffort = reasoningEffortFromParams(params, thread.reasoningEffort)
@@ -1747,12 +2190,16 @@ export class CodexClaudeAppServer {
       if (requestedSandbox) thread.sandboxMode = requestedSandbox
     }
     this.store.upsertThread(thread)
-    if (!thread.preview && prompt) {
+    if (!hiddenPrompt && !thread.preview && prompt) {
       thread.preview = prompt.slice(0, 200)
       thread.updatedAt = nowSeconds()
       this.store.upsertThread(thread)
     }
-    const initialItems: ThreadItem[] = [{ type: 'userMessage', id: newId(), content: input }]
+    const clientId = nullIfEmpty(stringOr(params.clientUserMessageId, ''))
+    const userItem: ThreadItem | null = hiddenPrompt
+      ? null
+      : { type: 'userMessage', id: newId(), content: input, ...(clientId ? { clientId } : {}) }
+    const initialItems: ThreadItem[] = userItem ? [userItem] : []
     const imageItems: ThreadItem[] = []
     for (const img of images) {
       // Codex v2 imageView.path is AbsolutePathBuf — Rust's custom Deserialize
@@ -1796,6 +2243,9 @@ export class CodexClaudeAppServer {
       purpose: params.outputSchema == null ? 'normal' : 'summary',
     })
     this.activeTurnByThread.set(threadId, turnId)
+    if (hiddenPrompt) this.goalTurns.add(turnId)
+    else if (params.outputSchema == null) this.goalIdleStreaks.delete(threadId)
+    this.syncGoalClock(threadId, this.store.getGoal(threadId))
     this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
     const publicTurn = this.toLifecycleTurn(turn)
 
@@ -1804,6 +2254,10 @@ export class CodexClaudeAppServer {
       // Claude after the runtime stopped.
       if (this.stopped) return
       this.notify(peer, { method: 'turn/started', params: { threadId, turn: publicTurn } })
+      // The App renders its own optimistic user message for turn/start; a
+      // turn started from the server-side queue has none, so publish it.
+      if (userItem && params._emitUserMessage === true)
+        this.emitItemLifecycle(peer, threadId, turnId, userItem)
       for (const item of imageItems) {
         this.notify(peer, {
           method: 'item/started',
@@ -2108,8 +2562,8 @@ export class CodexClaudeAppServer {
     const continuation = params._continuation === true
     // A turn Claude starts on its own inherits the last user turn's policy,
     // model and instructions.
-    if (turnPurpose === 'normal' && !continuation) {
-      const { _imageInputs: _images, ...rest } = params
+    if (turnPurpose === 'normal' && !continuation && params._hiddenPrompt == null) {
+      const { _imageInputs: _images, _emitUserMessage: _emit, ...rest } = params
       this.lastTurnParamsByThread.set(thread.id, rest)
     }
     const desktopPresentation = turnPurpose === 'normal' && thread.runtimeBackend !== 'codex'
@@ -2249,6 +2703,13 @@ export class CodexClaudeAppServer {
         imageInputs: Array.isArray(params._imageInputs)
           ? (params._imageInputs as ImageInput[])
           : [],
+        goalTools:
+          turnPurpose === 'normal' &&
+          !isCodexThread &&
+          !thread.ephemeral &&
+          process.env.CLAUDE_CODEX_GOAL_TOOLS !== '0'
+            ? this.goalToolsFor(thread.id)
+            : null,
         ...(continuation ? { continuation: true } : {}),
       },
       {
@@ -4017,24 +4478,52 @@ export class CodexClaudeAppServer {
     return {}
   }
 
-  private async turnSteer(_peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
+  private async turnSteer(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
     const threadId = stringOr(params.threadId, '')
     const expectedTurnId = stringOr(params.expectedTurnId, '')
     const activeTurnId = this.activeTurnByThread.get(threadId)
-    if (!activeTurnId) throw new Error(`thread has no active turn: ${threadId}`)
-    if (expectedTurnId && expectedTurnId !== activeTurnId) {
-      throw new Error(`active turn mismatch: expected ${expectedTurnId}, got ${activeTurnId}`)
-    }
+    // Codex App matches these messages: "no active turn to steer" makes it
+    // send the message as a new turn instead, and the mismatch text carries
+    // the turn id it retries against.
+    if (!activeTurnId) throw new Error('no active turn to steer')
+    if (expectedTurnId && expectedTurnId !== activeTurnId)
+      throw new Error(`expected active turn id \`${expectedTurnId}\` but found \`${activeTurnId}\``)
+    const turn = this.store.getTurn(activeTurnId)
+    if (
+      turn?.items.some(
+        (item) => item.type === 'enteredReviewMode' || item.type === 'contextCompaction',
+      )
+    )
+      throw new Error('cannot steer a review or compaction turn')
     const input = Array.isArray(params.input) ? (params.input as UserInput[]) : []
-    const prompt = textFromInput(input)
-    // The steered message is retained on the turn for history (thread/read), but
-    // — like a normal turn's user message — it is NOT surfaced as a userMessage
-    // item/started+item/completed event. The real app-server's turn_steer just
-    // feeds the input into the core (steer_input) and EventMsg::UserMessage is
-    // unhandled in the live stream, so no userMessage item event is emitted.
-    const item: ThreadItem = { type: 'userMessage', id: newId(), content: input }
-    this.store.appendItem(activeTurnId, item)
-    await this.runtime.steer(threadId, prompt)
+    const { textPrompt, images } = extractImageInputs(input)
+    const prompt = textPrompt || textFromInput(input)
+    if (!prompt.trim() && images.length === 0) throw new Error('steer input must not be empty')
+    if (peer !== DETACHED_PEER) this.activePeerByThread.set(threadId, peer)
+    const clientId = nullIfEmpty(stringOr(params.clientUserMessageId, ''))
+    const item: ThreadItem = {
+      type: 'userMessage',
+      id: newId(),
+      content: input,
+      ...(clientId ? { clientId } : {}),
+    }
+    // The message joins the turn once Claude takes it in (between tool
+    // rounds). Publishing it then, with the App's clientUserMessageId, lets
+    // the App settle its pending steering bubble into the transcript.
+    let accepted = false
+    const accept = (): void => {
+      if (accepted) return
+      accepted = true
+      if (this.store.getTurn(activeTurnId)?.status !== 'inProgress') return
+      this.store.appendItem(activeTurnId, item)
+      this.emitItemLifecycle(this.peerForThread(threadId), threadId, activeTurnId, item)
+    }
+    const steered = await this.runtime.steer(threadId, prompt, {
+      imageInputs: images,
+      onAccepted: accept,
+    })
+    if (steered === false) throw new Error('no active turn to steer')
+    if (steered === undefined) accept()
     return { turnId: activeTurnId }
   }
 
@@ -4245,6 +4734,7 @@ export class CodexClaudeAppServer {
       method: 'thread/tokenUsage/updated',
       params: { threadId, turnId, tokenUsage },
     })
+    this.accrueGoalTokens(threadId, last)
     // NOTE: previously we also pushed `account/rateLimits/updated` here on
     // every token-usage event "to keep the UI in sync". That backfired —
     // Codex App treats every such notification as a fresh rate-limit signal
@@ -5278,13 +5768,22 @@ export class CodexClaudeAppServer {
   }
 
   private clearActiveTurn(threadId: string): void {
+    const turnId = this.activeTurnByThread.get(threadId)
     const existed = this.activeTurnByThread.delete(threadId)
+    const settled = turnId ? this.store.getTurn(turnId) : null
+    this.settleGoalTurn(threadId, settled)
+    // Let the settled turn's notifications go out first. Claude's own
+    // follow-up comes before the queue and goal continuation.
     if (this.pendingAutonomousTurns.delete(threadId)) {
-      // Let the settled turn's notifications go out first.
       setImmediate(() => this.startAutonomousTurn(threadId))
       return
     }
-    if (existed && this.activeTurnByThread.size === 0) this.idleCheckHandler?.()
+    if (existed) {
+      setImmediate(() => {
+        if (!this.startFollowUp(threadId, settled?.status) && this.activeTurnByThread.size === 0)
+          this.idleCheckHandler?.()
+      })
+    }
   }
 
   private peerForParams(peer: RpcPeer, params: unknown): RpcPeer {

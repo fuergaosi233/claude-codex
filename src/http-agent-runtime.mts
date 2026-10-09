@@ -162,7 +162,7 @@ export class HttpAgentRuntime implements ClaudeRuntime {
     }
   }
 
-  async steer(_threadId: string, prompt: string): Promise<void> {
+  async steer(_threadId: string, prompt: string): Promise<undefined> {
     await this.postMessage(
       this.active.get(_threadId)?.baseUrl ?? this.options.baseUrl,
       prompt,

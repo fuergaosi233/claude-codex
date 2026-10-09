@@ -157,8 +157,36 @@ export type UserInput =
   | { type: 'skill'; name: string; path: string }
   | { type: 'mention'; name: string; path: string }
 
+export type ThreadGoalStatus =
+  | 'active'
+  | 'paused'
+  | 'blocked'
+  | 'usageLimited'
+  | 'budgetLimited'
+  | 'complete'
+
+export interface ThreadGoal {
+  threadId: string
+  objective: string
+  status: ThreadGoalStatus
+  tokenBudget: number | null
+  tokensUsed: number
+  timeUsedSeconds: number
+  createdAt: number
+  updatedAt: number
+}
+
+// A follow-up the App queued server-side (thread/queue/*) while a turn ran.
+export interface QueuedSubmission {
+  id: string
+  input: UserInput[]
+  clientUserMessageId: string | null
+}
+
 export type ThreadItem =
-  | { type: 'userMessage'; id: string; content: UserInput[] }
+  // clientId echoes turn/start's or turn/steer's clientUserMessageId so the
+  // App can reconcile its optimistic copy of the message.
+  | { type: 'userMessage'; id: string; content: UserInput[]; clientId?: string }
   | { type: 'agentMessage'; id: string; text: string; phase: string | null; memoryCitation: null }
   | { type: 'plan'; id: string; text: string }
   | { type: 'reasoning'; id: string; summary: string[]; content: string[] }
@@ -337,6 +365,18 @@ export interface RuntimeTurnContext {
   // reported back) instead of sending `prompt`. Only meaningful after the
   // runtime called RuntimeBackgroundListener.onAutonomousTurn for the thread.
   continuation?: boolean
+  // The thread has a goal: expose Codex's goal tools (get_goal, create_goal,
+  // update_goal) to Claude. Backends without in-process tools ignore it.
+  goalTools?: GoalToolHandlers | null
+}
+
+// Each handler returns the text of the tool result; a thrown Error becomes an
+// error result. They outlive the turn (a live session keeps its tools), so
+// they must resolve the thread's state when called, not when created.
+export interface GoalToolHandlers {
+  getGoal(): Promise<string>
+  createGoal(objective: string, tokenBudget: number | null): Promise<string>
+  updateGoal(status: string): Promise<string>
 }
 
 export interface ImageInput {
@@ -511,15 +551,31 @@ export interface RuntimeBackgroundListener {
   onSessionReleased(threadId: string, liveTaskIds: string[]): void
 }
 
+export interface RuntimeSteerOptions {
+  imageInputs?: ImageInput[]
+  // Fires once the backend starts consuming the message (Claude Code folds a
+  // steer in at the next tool-round boundary, or runs it as its own turn).
+  onAccepted?: () => void
+}
+
 export interface ClaudeRuntime {
   runTurn(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void>
-  steer(threadId: string, prompt: string): Promise<void>
+  // false: no running turn took the message. true: delivered, and
+  // options.onAccepted fires once it is consumed. undefined: delivered by a
+  // backend that cannot tell when it is consumed.
+  steer(
+    threadId: string,
+    prompt: string,
+    options?: RuntimeSteerOptions,
+  ): Promise<boolean | undefined>
   interrupt(threadId: string): Promise<void>
   stop(): Promise<void>
   setBackgroundListener?(listener: RuntimeBackgroundListener): void
   // Stop one background task of the thread's live session. Resolves false
   // when no live session owns the task.
   stopTask?(threadId: string, taskId: string): Promise<boolean>
+  // Background tasks still running in the thread's live session.
+  liveTasks?(threadId: string): Array<{ taskId: string; taskType: string | null }>
   // True while a session outlives its turns: background tasks are running or
   // Claude may still answer one that just reported back.
   hasBackgroundWork?(): boolean

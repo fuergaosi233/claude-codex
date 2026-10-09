@@ -2,6 +2,8 @@ import { mkdirSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import type {
+  QueuedSubmission,
+  ThreadGoal,
   ThreadItem,
   ThreadRecord,
   ThreadSectionAppearance,
@@ -78,6 +80,14 @@ export class SessionStore {
         updated_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_thread_sections_created ON thread_sections(created_at, id);
+      CREATE TABLE IF NOT EXISTS thread_goals (
+        thread_id TEXT PRIMARY KEY,
+        goal_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS thread_queues (
+        thread_id TEXT PRIMARY KEY,
+        items_json TEXT NOT NULL
+      );
     `)
     this.ensureColumn('threads', 'is_pinned', 'INTEGER NOT NULL DEFAULT 0')
     this.ensureColumn('threads', 'section_id', 'TEXT')
@@ -639,6 +649,16 @@ export class SessionStore {
     return rows.map((row: unknown) => this.rowToTurn(row))
   }
 
+  // Status of the thread's newest turn, without decoding any turn's items.
+  lastTurnStatus(threadId: string): TurnRecord['status'] | null {
+    const row = this.db
+      .prepare(
+        'SELECT status FROM turns WHERE thread_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1',
+      )
+      .get(threadId) as { status?: unknown } | undefined
+    return typeof row?.status === 'string' ? (row.status as TurnRecord['status']) : null
+  }
+
   // Used by thread/rollback to drop the N most recent turns from a thread's
   // history. Codex App's rewind UI calls this when the user wants to redo a
   // turn — without it our handler used to no-op and the App's "Rewind" button
@@ -866,6 +886,47 @@ export class SessionStore {
     turn.diff = diff
     this.upsertTurn(turn)
     return turn
+  }
+
+  getGoal(threadId: string): ThreadGoal | null {
+    const row = this.db
+      .prepare('SELECT goal_json FROM thread_goals WHERE thread_id = ?')
+      .get(threadId) as { goal_json: string } | undefined
+    return row ? (JSON.parse(row.goal_json) as ThreadGoal) : null
+  }
+
+  putGoal(goal: ThreadGoal): void {
+    this.db
+      .prepare(
+        `INSERT INTO thread_goals (thread_id, goal_json) VALUES (?, ?)
+         ON CONFLICT(thread_id) DO UPDATE SET goal_json = excluded.goal_json`,
+      )
+      .run(goal.threadId, JSON.stringify(goal))
+  }
+
+  deleteGoal(threadId: string): boolean {
+    const result = this.db.prepare('DELETE FROM thread_goals WHERE thread_id = ?').run(threadId)
+    return Number(result.changes) > 0
+  }
+
+  listQueue(threadId: string): QueuedSubmission[] {
+    const row = this.db
+      .prepare('SELECT items_json FROM thread_queues WHERE thread_id = ?')
+      .get(threadId) as { items_json: string } | undefined
+    return row ? (JSON.parse(row.items_json) as QueuedSubmission[]) : []
+  }
+
+  saveQueue(threadId: string, items: QueuedSubmission[]): void {
+    if (items.length === 0) {
+      this.db.prepare('DELETE FROM thread_queues WHERE thread_id = ?').run(threadId)
+      return
+    }
+    this.db
+      .prepare(
+        `INSERT INTO thread_queues (thread_id, items_json) VALUES (?, ?)
+         ON CONFLICT(thread_id) DO UPDATE SET items_json = excluded.items_json`,
+      )
+      .run(threadId, JSON.stringify(items))
   }
 
   close(): void {

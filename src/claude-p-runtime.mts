@@ -67,7 +67,7 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
     }
   }
 
-  async steer(): Promise<void> {
+  async steer(): Promise<undefined> {
     throw new Error('claude-p runtime does not support turn/steer; start a new turn instead')
   }
 

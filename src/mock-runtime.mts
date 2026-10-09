@@ -4,6 +4,7 @@ import type {
   ClaudeRuntime,
   RuntimeBackgroundListener,
   RuntimeHandlers,
+  RuntimeSteerOptions,
   RuntimeTurnContext,
 } from './types.mjs'
 import { sleep } from './util.mjs'
@@ -12,12 +13,22 @@ const MOCK_BACKGROUND_AGENT_ID = 'a0b1c2d3e4f5a6b7'
 
 export class MockRuntime implements ClaudeRuntime {
   private interrupted = new Set<string>()
+  private running = new Set<string>()
   private listener: RuntimeBackgroundListener | null = null
   private backgroundTasks = new Map<string, { threadId: string; timer: NodeJS.Timeout }>()
   // What Claude says, unprompted, once a background agent reports back.
   private continuations = new Map<string, string>()
 
   async runTurn(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void> {
+    this.running.add(context.threadId)
+    try {
+      await this.playTurn(context, handlers)
+    } finally {
+      this.running.delete(context.threadId)
+    }
+  }
+
+  private async playTurn(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void> {
     this.interrupted.delete(context.threadId)
     await handlers.onEvent({
       type: 'session',
@@ -29,6 +40,35 @@ export class MockRuntime implements ClaudeRuntime {
       this.continuations.delete(context.threadId)
       if (text) await handlers.onEvent({ type: 'text_delta', delta: text })
       await handlers.onEvent({ type: 'completed', success: true, result: text })
+      return
+    }
+
+    // Goal continuation (hidden internal-context prompt). Its template text
+    // would trip the keyword branches below, so answer it first: report usage,
+    // and finish the goal when the objective asks for it.
+    if (context.prompt.includes('<codex_internal_context>')) {
+      await handlers.onEvent({
+        type: 'usage',
+        usage: {
+          input_tokens: 100,
+          output_tokens: 40,
+          cache_read_input_tokens: 10,
+          cache_creation_input_tokens: 5,
+        },
+      })
+      if (/goal complete check/i.test(context.prompt) && context.goalTools) {
+        const toolUseId = `goal-${Date.now()}`
+        await handlers.onEvent({
+          type: 'tool_use',
+          toolUseId,
+          toolName: 'mcp__codex_goal__update_goal',
+          input: { status: 'complete' },
+        })
+        const result = await context.goalTools.updateGoal('complete')
+        await handlers.onEvent({ type: 'tool_result', toolUseId, content: result })
+      }
+      await handlers.onEvent({ type: 'text_delta', delta: 'goal continuation' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'goal continuation' })
       return
     }
 
@@ -518,7 +558,12 @@ export class MockRuntime implements ClaudeRuntime {
     this.interrupted.add(threadId)
   }
 
-  async steer(_threadId: string, _prompt: string): Promise<void> {}
+  // Claude takes a steer at its next tool-round boundary.
+  async steer(threadId: string, _prompt: string, options?: RuntimeSteerOptions): Promise<boolean> {
+    if (!this.running.has(threadId)) return false
+    setImmediate(() => options?.onAccepted?.())
+    return true
+  }
 
   async stop(): Promise<void> {
     for (const { timer } of this.backgroundTasks.values()) clearTimeout(timer)

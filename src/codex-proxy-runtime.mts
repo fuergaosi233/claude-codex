@@ -177,7 +177,7 @@ export class CodexProxyRuntime implements ClaudeRuntime {
     })
   }
 
-  async steer(threadId: string, prompt: string): Promise<void> {
+  async steer(threadId: string, prompt: string): Promise<undefined> {
     // codex exec doesn't expose mid-turn input. Cleanest behavior: queue the
     // text for the next turn. The server already records the steer in items;
     // we just no-op here so the proxy doesn't crash.
