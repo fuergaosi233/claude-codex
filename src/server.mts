@@ -282,6 +282,9 @@ export class CodexClaudeAppServer {
   private peerFeatures = new WeakMap<RpcPeer, PeerFeatures>()
   private activeTurnByThread = new Map<string, string>()
   private subagentStateByTurn = new Map<string, ActiveSubagentState>()
+  // Closes the message, reasoning and plan items a turn is still streaming,
+  // so an interrupt that ends the turn from outside leaves none open.
+  private closeStreamingItemsByTurn = new Map<string, () => void>()
   // Keyed by child thread id. Entries outlive the run so SendMessage can
   // still find (and resume) an agent that already reported back.
   private backgroundSubagents = new Map<string, BackgroundSubagent>()
@@ -2605,6 +2608,15 @@ export class CodexClaudeAppServer {
       completeReasoningItem()
       completeAgentItem(phase)
     }
+    const completePlanItem = (): void => {
+      const item = this.store.getTurn(turn.id)?.items.find((item) => item.id === planItemId)
+      if (item)
+        this.notify(peer, {
+          method: 'item/completed',
+          params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
+        })
+      planItemId = null
+    }
 
     // Allow per-turn override of policy (Codex App may attach updated values
     // when the user toggles Full access mid-conversation), then fall back to
@@ -2715,6 +2727,10 @@ export class CodexClaudeAppServer {
       turn,
       contexts: subagentContexts,
       active: activeSubagents,
+    })
+    this.closeStreamingItemsByTurn.set(turn.id, () => {
+      completeMessage()
+      completePlanItem()
     })
     this.flushQueuedSubagentActivity(peer, thread.id, turn.id)
     let acceptRuntimeEvents = true
@@ -3689,17 +3705,7 @@ export class CodexClaudeAppServer {
       })
     }
     completeMessage('final_answer')
-    const planItem = this.store.getTurn(turn.id)?.items.find((item) => item.id === planItemId)
-    if (planItem)
-      this.notify(peer, {
-        method: 'item/completed',
-        params: {
-          threadId: thread.id,
-          turnId: turn.id,
-          item: planItem,
-          completedAtMs: nowMillis(),
-        },
-      })
+    completePlanItem()
     const completed: TurnRecord = this.store.completeTurn(turn.id, 'completed') ?? turn
     recordRunEvent('turn.completed', {
       threadId: thread.id,
@@ -4678,6 +4684,10 @@ export class CodexClaudeAppServer {
     if (turnId) {
       const turn = this.store.getTurn(turnId)
       if (turn?.status === 'inProgress') {
+        // Claude may still be streaming a message (a turn held open for its
+        // workflow always is); the App needs it completed before the turn.
+        this.closeStreamingItemsByTurn.get(turnId)?.()
+        this.closeStreamingItemsByTurn.delete(turnId)
         const subagents = this.subagentStateByTurn.get(turnId)
         if (subagents) {
           this.finalizeOrphanedSubagents(
@@ -6029,6 +6039,7 @@ export class CodexClaudeAppServer {
   private clearActiveTurn(threadId: string): void {
     const turnId = this.activeTurnByThread.get(threadId)
     const existed = this.activeTurnByThread.delete(threadId)
+    if (turnId) this.closeStreamingItemsByTurn.delete(turnId)
     const settled = turnId ? this.store.getTurn(turnId) : null
     this.settleGoalTurn(threadId, settled)
     // Let the settled turn's notifications go out first. Claude's own

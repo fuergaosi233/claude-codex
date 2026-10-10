@@ -18,7 +18,7 @@ import type {
 type CapturedMessage = { method?: string; id?: unknown; params?: any; result?: any; error?: any }
 
 async function present(
-  run: (handlers: RuntimeHandlers) => Promise<void>,
+  run: (handlers: RuntimeHandlers, turn: { interrupt: () => Promise<void> }) => Promise<void>,
   params: Record<string, unknown> = {},
 ) {
   const directory = await mkdtemp(join(tmpdir(), 'claude-presentation-'))
@@ -31,7 +31,15 @@ async function present(
     finish = resolve
   })
   const runtime: ClaudeRuntime = {
-    runTurn: async (_context, handlers) => run(handlers),
+    runTurn: async (context, handlers) =>
+      run(handlers, {
+        interrupt: () =>
+          server.handle(peer, {
+            id: 9,
+            method: 'turn/interrupt',
+            params: { threadId: context.threadId },
+          }) as Promise<void>,
+      }),
     steer: async () => {},
     interrupt: async () => {},
     stop: async () => {},
@@ -373,6 +381,32 @@ test('plan output retains its native plan item and complete Markdown', async () 
   assert.equal(plans[0]?.text, '## Plan\n\n1. Inspect\n2. Implement')
   assert.equal(assistantItems(turn.items).length, 0)
   assert.equal(messages.filter((message) => message.method === 'item/completed').length, 1)
+})
+
+test('an interrupt completes the message or plan still streaming before the turn', async () => {
+  for (const planMode of [false, true]) {
+    const { messages, turn, replay } = await present(
+      async (handlers, { interrupt }) => {
+        await handlers.onEvent({ type: 'text_delta', delta: 'Started the workflow.' })
+        await interrupt()
+      },
+      { planMode },
+    )
+    assert.equal(turn.status, 'interrupted')
+    const type = planMode ? 'plan' : 'agentMessage'
+    const order = messages
+      .filter(
+        (message) => message.method === 'item/completed' || message.method === 'turn/completed',
+      )
+      .map((message) => message.params.item?.type ?? message.method)
+    assert.deepEqual(order, [type, 'turn/completed'])
+    const live = messages.find((message) => message.method === 'item/completed')?.params.item
+    assert.equal(live.text, 'Started the workflow.')
+    assert.deepEqual(
+      replay.items.find((item: ThreadItem) => item.type === type),
+      live,
+    )
+  }
 })
 
 test('subagent results keep only the report, in both CLI trailer formats', () => {
