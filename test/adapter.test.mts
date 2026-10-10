@@ -4004,6 +4004,142 @@ test('background Agent outlives the parent turn, wakes the parent, and resumes o
   }
 })
 
+test('SendMessage to a finished foreground agent reopens it like a background one', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  const turnCompleted = (threadId: string) => (message: any) =>
+    message.method === 'turn/completed' && message.params.threadId === threadId
+  try {
+    proc.stdin.write(json(codex930Initialize(0)))
+    await reader.nextResponse(0)
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const threadId = (await reader.nextResponse(1)).result.thread.id
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: [{ type: 'text', text: 'subagent check', text_elements: [] }] },
+      }),
+    )
+    await reader.nextResponse(2)
+    const ran = await readUntil(reader, turnCompleted(threadId))
+    const childThreadId = String(
+      ran.find((m) => m.method === 'item/completed' && m.params.item.tool === 'spawnAgent')?.params
+        .item.receiverThreadIds[0] ?? '',
+    )
+    assert.ok(childThreadId)
+
+    proc.stdin.write(
+      json({
+        id: 3,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'foreground message check delay=300', text_elements: [] }],
+        },
+      }),
+    )
+    await reader.nextResponse(3)
+    const sent = await readUntil(reader, turnCompleted(threadId))
+    const sendInput = sent.find(
+      (m) => m.method === 'item/completed' && m.params.item.tool === 'sendInput',
+    )?.params.item
+    assert.ok(sendInput, 'SendMessage to a foreground agent is a sendInput, not a plain card')
+    assert.deepEqual(sendInput.receiverThreadIds, [childThreadId])
+    assert.equal(
+      sent.some((m) => m.method === 'item/started' && m.params.item.type === 'mcpToolCall'),
+      false,
+    )
+    const reopened = sent.find(
+      (m) => m.method === 'turn/started' && m.params.threadId === childThreadId,
+    )
+    assert.ok(reopened, 'the child gets a new turn for the message')
+    assert.deepEqual(activityKinds(sent, threadId), ['interacted'])
+
+    // The report settles the reopened turn and wakes the parent.
+    const report = await readUntil(reader, turnCompleted(threadId))
+    const reopenedDone = report.find(turnCompleted(childThreadId))
+    assert.equal(reopenedDone?.params.turn.id, reopened.params.turn.id)
+    assert.equal(reopenedDone?.params.turn.status, 'completed')
+    assert.ok(
+      report.some(
+        (m) =>
+          m.method === 'item/completed' &&
+          m.params.threadId === threadId &&
+          m.params.item.type === 'subAgentActivity' &&
+          m.params.item.kind === 'completed' &&
+          m.params.item.agentThreadId === childThreadId,
+      ),
+    )
+
+    proc.stdin.write(json({ id: 4, method: 'thread/read', params: { threadId: childThreadId } }))
+    const child = (await reader.nextResponse(4)).result.thread
+    assert.deepEqual(
+      child.turns.map((turn: any) => turn.status),
+      ['completed', 'completed'],
+    )
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('TaskStop on a background agent is a closeAgent that ends the child as interrupted', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  const turnCompleted = (threadId: string) => (message: any) =>
+    message.method === 'turn/completed' && message.params.threadId === threadId
+  try {
+    proc.stdin.write(json(codex930Initialize(0)))
+    await reader.nextResponse(0)
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const threadId = (await reader.nextResponse(1)).result.thread.id
+    const startTurn = (id: number, text: string) =>
+      proc.stdin.write(
+        json({
+          id,
+          method: 'turn/start',
+          params: { threadId, input: [{ type: 'text', text, text_elements: [] }] },
+        }),
+      )
+    startTurn(2, 'background subagent check delay=5000')
+    await reader.nextResponse(2)
+    const launch = await readUntil(reader, turnCompleted(threadId))
+    const childThreadId = String(
+      launch.find((m) => m.method === 'item/completed' && m.params.item.tool === 'spawnAgent')
+        ?.params.item.receiverThreadIds[0] ?? '',
+    )
+    assert.ok(childThreadId)
+
+    startTurn(3, 'background close check')
+    await reader.nextResponse(3)
+    const stopped = await readUntil(reader, turnCompleted(threadId))
+    const close = stopped.find(
+      (m) => m.method === 'item/completed' && m.params.item.tool === 'closeAgent',
+    )?.params.item
+    assert.ok(close, 'TaskStop on an agent is a closeAgent, not a plain card')
+    assert.equal(close.status, 'completed')
+    assert.deepEqual(close.receiverThreadIds, [childThreadId])
+    assert.equal(close.agentsStates[childThreadId].status, 'interrupted')
+    assert.equal(
+      stopped.some((m) => m.method === 'item/started' && m.params.item.type === 'mcpToolCall'),
+      false,
+    )
+    assert.equal(stopped.find(turnCompleted(childThreadId))?.params.turn.status, 'interrupted')
+    assert.deepEqual(activityKinds(stopped, threadId), ['interrupted'])
+    assert.equal(stopped.at(-1).params.turn.status, 'completed')
+
+    proc.stdin.write(json({ id: 4, method: 'thread/read', params: { threadId: childThreadId } }))
+    const child = (await reader.nextResponse(4)).result.thread
+    assert.equal(child.turns.at(-1).status, 'interrupted')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('a tool Claude runs beside an Agent call keeps its own card', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawnMockAdapter(home)

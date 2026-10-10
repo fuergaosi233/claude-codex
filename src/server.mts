@@ -287,10 +287,10 @@ export class CodexClaudeAppServer {
   private backgroundSubagents = new Map<string, BackgroundSubagent>()
   // task_started precedes the Agent tool result that backgrounds the task.
   private taskIdByToolUse = new Map<string, string>()
-  // SendMessage calls addressed to a known agent, by tool use id.
-  private pendingSendInputs = new Map<
+  // SendMessage and TaskStop calls addressed to a known agent, by tool use id.
+  private pendingAgentCalls = new Map<
     string,
-    { itemId: string; childThreadId: string; message: string }
+    { tool: 'sendInput' | 'closeAgent'; itemId: string; childThreadId: string; message: string }
   >()
   // Subagent activity that arrived while the parent had no turn to carry it.
   private queuedSubagentActivity = new Map<
@@ -2800,7 +2800,7 @@ export class CodexClaudeAppServer {
               event.type === 'tool_result' &&
               !activeSubagents.has(event.toolUseId) &&
               !itemIds.has(event.toolUseId) &&
-              !this.pendingSendInputs.has(event.toolUseId)
+              !this.pendingAgentCalls.has(event.toolUseId)
             )
               return
           }
@@ -2811,12 +2811,14 @@ export class CodexClaudeAppServer {
           if (event.type === 'tool_use' && !itemIds.has(event.toolUseId)) completeMessage()
           if (
             event.type === 'tool_use' &&
-            event.toolName === 'SendMessage' &&
-            this.beginSubagentSendInput(peer, thread, turn, event.toolUseId, event.input)
+            ((event.toolName === 'SendMessage' &&
+              this.beginSubagentSendInput(peer, thread, turn, event.toolUseId, event.input)) ||
+              (event.toolName === 'TaskStop' &&
+                this.beginSubagentClose(peer, thread, turn, event.toolUseId, event.input)))
           )
             return
-          if (event.type === 'tool_result' && this.pendingSendInputs.has(event.toolUseId)) {
-            this.finishSubagentSendInput(peer, thread, turn, event)
+          if (event.type === 'tool_result' && this.pendingAgentCalls.has(event.toolUseId)) {
+            this.finishSubagentCall(peer, thread, turn, event)
             return
           }
           if (event.type === 'tool_use' && isSubagentToolName(event.toolName)) {
@@ -4056,6 +4058,46 @@ export class CodexClaudeAppServer {
     return null
   }
 
+  // A child that ran in the foreground, or before a restart, has no entry,
+  // yet SendMessage resumes it all the same: the CLI runs it on in the
+  // background. Track it from then on like any background agent.
+  private adoptChildAgent(
+    thread: ThreadRecord,
+    turnId: string,
+    agentId: string,
+  ): BackgroundSubagent | null {
+    const child = this.store
+      .listThreads({ includeEphemeral: true, parentThreadId: thread.id, limit: 200 })
+      .find((candidate) => candidate.agentNickname === agentId)
+    // A child still inside its Agent call is not this one's to take over.
+    if (!child || this.store.lastTurnStatus(child.id) === 'inProgress') return null
+    const parentItems = this.store.listTurns(thread.id).flatMap((parentTurn) => parentTurn.items)
+    const marker = parentItems.find(
+      (item) => item.type === 'subAgentActivity' && item.agentThreadId === child.id,
+    )
+    const entry: BackgroundSubagent = {
+      parentThreadId: thread.id,
+      parentTurnId: turnId,
+      toolUseId: '',
+      taskId: null,
+      agentId,
+      context: {
+        childThreadId: child.id,
+        childTurnId: this.store.listTurns(child.id).at(-1)?.id ?? '',
+        waitItemId: newId(),
+        agentPath:
+          marker?.type === 'subAgentActivity' && typeof marker.agentPath === 'string'
+            ? marker.agentPath
+            : `/root/${agentId}`,
+        prompt: '',
+        subType: child.agentRole,
+      },
+      running: false,
+    }
+    this.backgroundSubagents.set(child.id, entry)
+    return entry
+  }
+
   private rememberTaskId(toolUseId: string, taskId: string): void {
     this.taskIdByToolUse.set(toolUseId, taskId)
     // Foreground agents report task_started too but never claim theirs.
@@ -4202,8 +4244,8 @@ export class CodexClaudeAppServer {
     }
   }
 
-  // SendMessage to a background agent is Codex's sendInput: render it as the
-  // collab tool call and reopen the child conversation with the message.
+  // SendMessage to one of the thread's agents is Codex's sendInput: render it
+  // as the collab tool call and reopen the child conversation with the message.
   private beginSubagentSendInput(
     peer: RpcPeer,
     thread: ThreadRecord,
@@ -4212,7 +4254,10 @@ export class CodexClaudeAppServer {
     input: Record<string, unknown>,
   ): boolean {
     const to = typeof input.to === 'string' ? input.to : ''
-    const entry = to ? this.findBackgroundSubagent(thread.id, { agentId: to }) : null
+    const entry = to
+      ? (this.findBackgroundSubagent(thread.id, { agentId: to }) ??
+        this.adoptChildAgent(thread, turn.id, to))
+      : null
     if (!entry) return false
     const message =
       typeof input.message === 'string'
@@ -4237,7 +4282,8 @@ export class CodexClaudeAppServer {
       method: 'item/started',
       params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: nowMillis() },
     })
-    this.pendingSendInputs.set(toolUseId, {
+    this.pendingAgentCalls.set(toolUseId, {
+      tool: 'sendInput',
       itemId: item.id,
       childThreadId: entry.context.childThreadId,
       message,
@@ -4245,31 +4291,73 @@ export class CodexClaudeAppServer {
     return true
   }
 
-  private finishSubagentSendInput(
+  // TaskStop on a background agent is Codex's closeAgent. The task
+  // notification that follows settles the child as interrupted.
+  private beginSubagentClose(
+    peer: RpcPeer,
+    thread: ThreadRecord,
+    turn: TurnRecord,
+    toolUseId: string,
+    input: Record<string, unknown>,
+  ): boolean {
+    const taskId = typeof input.task_id === 'string' ? input.task_id : ''
+    const entry = taskId ? this.findBackgroundSubagent(thread.id, { taskId }) : null
+    if (!entry) return false
+    const item: ThreadItem = {
+      type: 'collabAgentToolCall',
+      id: newId(),
+      tool: 'closeAgent',
+      status: 'inProgress',
+      senderThreadId: thread.id,
+      receiverThreadIds: [entry.context.childThreadId],
+      prompt: null,
+      model: null,
+      reasoningEffort: null,
+      agentsStates: {},
+    }
+    this.store.appendItem(turn.id, item)
+    this.notify(peer, {
+      method: 'item/started',
+      params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: nowMillis() },
+    })
+    this.pendingAgentCalls.set(toolUseId, {
+      tool: 'closeAgent',
+      itemId: item.id,
+      childThreadId: entry.context.childThreadId,
+      message: '',
+    })
+    return true
+  }
+
+  private finishSubagentCall(
     peer: RpcPeer,
     thread: ThreadRecord,
     turn: TurnRecord,
     event: Extract<RuntimeEvent, { type: 'tool_result' }>,
   ): void {
-    const pending = this.pendingSendInputs.get(event.toolUseId)
+    const pending = this.pendingAgentCalls.get(event.toolUseId)
     if (!pending) return
-    this.pendingSendInputs.delete(event.toolUseId)
+    this.pendingAgentCalls.delete(event.toolUseId)
     const ok = !event.isError
+    const failure = { status: 'errored' as const, message: toolResultText(event.content) || null }
     const item: ThreadItem = {
       type: 'collabAgentToolCall',
       id: pending.itemId,
-      tool: 'sendInput',
+      tool: pending.tool,
       status: ok ? 'completed' : 'failed',
       senderThreadId: thread.id,
       receiverThreadIds: [pending.childThreadId],
       prompt: pending.message || null,
       model: null,
       reasoningEffort: null,
-      agentsStates: {
-        [pending.childThreadId]: ok
-          ? { status: 'running', message: null }
-          : { status: 'errored', message: toolResultText(event.content) || null },
-      },
+      // A stop that failed says nothing about the agent, which may well have
+      // finished first.
+      agentsStates:
+        pending.tool === 'closeAgent'
+          ? ok
+            ? { [pending.childThreadId]: { status: 'interrupted', message: null } }
+            : {}
+          : { [pending.childThreadId]: ok ? { status: 'running', message: null } : failure },
     }
     this.store.updateItem(turn.id, pending.itemId, () => item)
     this.notify(peer, {
@@ -4278,6 +4366,11 @@ export class CodexClaudeAppServer {
     })
     const entry = this.backgroundSubagents.get(pending.childThreadId)
     if (!ok || !entry) return
+    if (pending.tool === 'closeAgent') {
+      // Settle now: a notification for a stop Claude asked for may never come.
+      this.settleBackgroundSubagent(entry, 'interrupted', 'Stopped by the parent agent.', null)
+      return
+    }
     this.resumeBackgroundChild(entry, pending.message, event.toolUseId)
     this.emitSubagentActivity(peer, thread.id, turn.id, entry.context, 'interacted')
   }

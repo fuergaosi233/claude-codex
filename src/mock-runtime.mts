@@ -10,6 +10,7 @@ import type {
 import { sleep } from './util.mjs'
 
 const MOCK_BACKGROUND_AGENT_ID = 'a0b1c2d3e4f5a6b7'
+const MOCK_FOREGROUND_AGENT_ID = 'deadbeefcafef00d'
 
 export class MockRuntime implements ClaudeRuntime {
   private interrupted = new Set<string>()
@@ -506,9 +507,36 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
-    if (/background message check/i.test(context.prompt)) {
+    if (/background close check/i.test(context.prompt)) {
+      // Claude stops its own background agent; no notification follows.
+      const toolUseId = `stop-${Date.now()}`
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId,
+        toolName: 'TaskStop',
+        input: { task_id: MOCK_BACKGROUND_AGENT_ID },
+      })
+      const task = this.backgroundTasks.get(MOCK_BACKGROUND_AGENT_ID)
+      if (task) clearTimeout(task.timer)
+      this.backgroundTasks.delete(MOCK_BACKGROUND_AGENT_ID)
+      await handlers.onEvent({
+        type: 'tool_result',
+        toolUseId,
+        content: `Successfully stopped task: ${MOCK_BACKGROUND_AGENT_ID}`,
+        isError: !task,
+      })
+      await handlers.onEvent({ type: 'text_delta', delta: 'stopped it' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'stopped it' })
+      return
+    }
+
+    if (/(background|foreground) message check/i.test(context.prompt)) {
+      // A foreground agent is the one `subagent check` ran; the CLI resumes
+      // it in the background just the same.
       const toolUseId = `send-${Date.now()}`
-      const agentId = MOCK_BACKGROUND_AGENT_ID
+      const agentId = /foreground/i.test(context.prompt)
+        ? MOCK_FOREGROUND_AGENT_ID
+        : MOCK_BACKGROUND_AGENT_ID
       await handlers.onEvent({
         type: 'tool_use',
         toolUseId,
@@ -588,7 +616,7 @@ export class MockRuntime implements ClaudeRuntime {
       // should strip both from the visible agentMessage and route the values
       // into agentNickname + tokenUsage instead.
       const trailer = [
-        "agentId: deadbeefcafef00d (use SendMessage with to: 'deadbeefcafef00d' to continue this agent)",
+        `agentId: ${MOCK_FOREGROUND_AGENT_ID} (use SendMessage with to: '${MOCK_FOREGROUND_AGENT_ID}' to continue this agent)`,
         '<usage>total_tokens: 4242',
         'tool_uses: 7',
         'duration_ms: 31415</usage>',
