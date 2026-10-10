@@ -2417,6 +2417,49 @@ test('Claude thinking maps to Codex reasoning content without a duplicate summar
   }
 })
 
+test('the context gauge follows the last API call and child tokens add to the total', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  try {
+    const threadId = await startMockThread(reader, proc)
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: textInput('context usage check') },
+      }),
+    )
+    await reader.nextResponse(2)
+    const turn = await readUntil(
+      reader,
+      (message) => message.method === 'turn/completed' && message.params.threadId === threadId,
+    )
+    const updates = turn
+      .filter((m) => m.method === 'thread/tokenUsage/updated')
+      .map((m) => m.params.tokenUsage)
+    const lastCall = {
+      inputTokens: 30,
+      cachedInputTokens: 120,
+      outputTokens: 50,
+      reasoningOutputTokens: 0,
+      totalTokens: 200,
+    }
+    assert.equal(updates.length, 2)
+    // Codex's last_token_usage is one response, which is what fills the
+    // context; the result's sum over both calls would not be.
+    assert.deepEqual(updates[0].last, lastCall)
+    assert.equal(updates[0].total.totalTokens, 320)
+    assert.equal(updates[0].modelContextWindow, 200_000)
+    assert.deepEqual(updates[1].last, lastCall, 'child tokens leave the gauge alone')
+    assert.equal(updates[1].total.totalTokens, 1320)
+    assert.equal(updates[1].modelContextWindow, 200_000)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('Claude token usage maps to thread/tokenUsage/updated notifications', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {

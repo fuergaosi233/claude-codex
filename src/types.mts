@@ -419,7 +419,14 @@ export type RuntimeEvent =
       questions: UserInputQuestion[]
     }
   | { type: 'notice'; level: 'info' | 'warning' | 'error'; message: string }
-  | { type: 'usage'; usage: Record<string, unknown> }
+  // A result's usage. `child` marks tokens a subagent or workflow spent:
+  // they add to the thread's total, not to its context window.
+  | {
+      type: 'usage'
+      usage: Record<string, unknown>
+      contextWindow?: number | null
+      child?: boolean
+    }
   // One API call of the main loop, before the turn's result settles its
   // usage. A message can be reported again with a larger count.
   | { type: 'usage_progress'; messageId: string; usage: Record<string, unknown> }

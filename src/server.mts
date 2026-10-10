@@ -320,6 +320,12 @@ export class CodexClaudeAppServer {
   private goalToolHandlers = new Map<string, GoalToolHandlers>()
   private elicitationCounts = new Map<string, number>()
   private tokenUsageByThread = new Map<string, TokenUsageBreakdown>()
+  // Like Codex's last_token_usage, `last` is one API call: the main loop's
+  // latest, which is what fills the context window. The first map follows
+  // the running turn; the second keeps the call last reported.
+  private lastCallUsageByThread = new Map<string, TokenUsageBreakdown>()
+  private lastUsageByThread = new Map<string, TokenUsageBreakdown>()
+  private contextWindowByThread = new Map<string, number>()
   private configModel = defaultSelectableModelId()
   private configReasoningEffort =
     normalizeCodexReasoningEffort(process.env.CLAUDE_CODEX_DEFAULT_EFFORT) ?? 'medium'
@@ -1197,6 +1203,9 @@ export class CodexClaudeAppServer {
   private clearThreadState(threadId: string): void {
     this.commandSessionAllow.delete(threadId)
     this.tokenUsageByThread.delete(threadId)
+    this.lastCallUsageByThread.delete(threadId)
+    this.lastUsageByThread.delete(threadId)
+    this.contextWindowByThread.delete(threadId)
     this.goalIdleStreaks.delete(threadId)
     this.goalClockByThread.delete(threadId)
     this.goalTurnByThread.delete(threadId)
@@ -1439,12 +1448,13 @@ export class CodexClaudeAppServer {
 
   // Charges one main-loop API call as it streams. Its usage only grows, and
   // the turn's result reconciles whatever it charged.
-  private recordGoalProgress(
+  private recordUsageProgress(
     threadId: string,
     messageId: string,
     usage: Record<string, unknown>,
   ): void {
     const breakdown = tokenBreakdownFromClaudeUsage(usage)
+    if (breakdown.totalTokens > 0) this.lastCallUsageByThread.set(threadId, breakdown)
     const counted = breakdown.inputTokens + breakdown.outputTokens
     const progress = this.goalProgressByThread.get(threadId) ?? new Map<string, number>()
     const charged = progress.get(messageId) ?? 0
@@ -3128,12 +3138,13 @@ export class CodexClaudeAppServer {
                   tokenUsage: childUsage,
                 },
               })
-              this.recordTokenUsage(peer, thread.id, turn.id, {
-                input_tokens: 0,
-                output_tokens: parsed.usage.totalTokens,
-                cache_read_input_tokens: 0,
-                cache_creation_input_tokens: 0,
-              })
+              this.recordTokenUsage(
+                peer,
+                thread.id,
+                turn.id,
+                { output_tokens: parsed.usage.totalTokens },
+                { child: true },
+              )
             }
 
             // Stage 2 close — wait (end). Re-emits the same waitItemId.
@@ -3425,11 +3436,14 @@ export class CodexClaudeAppServer {
             return
           }
           if (event.type === 'usage') {
-            this.recordTokenUsage(peer, thread.id, turn.id, event.usage)
+            this.recordTokenUsage(peer, thread.id, turn.id, event.usage, {
+              contextWindow: event.contextWindow ?? null,
+              child: event.child === true,
+            })
             return
           }
           if (event.type === 'usage_progress') {
-            this.recordGoalProgress(thread.id, event.messageId, event.usage)
+            this.recordUsageProgress(thread.id, event.messageId, event.usage)
             return
           }
           if (event.type === 'hook') {
@@ -4208,12 +4222,8 @@ export class CodexClaudeAppServer {
         this.peerForThread(entry.parentThreadId),
         entry.parentThreadId,
         parentTurnId,
-        {
-          input_tokens: 0,
-          output_tokens: usage.totalTokens,
-          cache_read_input_tokens: 0,
-          cache_creation_input_tokens: 0,
-        },
+        { output_tokens: usage.totalTokens },
+        { child: true },
       )
     }
     this.publishSubagentActivity(
@@ -4940,28 +4950,50 @@ export class CodexClaudeAppServer {
     threadId: string,
     turnId: string,
     usage: Record<string, unknown>,
+    source: { contextWindow?: number | null; child?: boolean } = {},
   ): void {
-    const last = tokenBreakdownFromClaudeUsage(usage)
-    const progress = this.goalProgressByThread.get(threadId)
-    this.goalProgressByThread.delete(threadId)
-    if (last.totalTokens === 0) return
+    const spent = tokenBreakdownFromClaudeUsage(usage)
+    // A child's tokens add to the thread's total and its goal; they neither
+    // settle the main loop's streamed progress nor fill its context window.
+    const child = source.child === true
+    const progress = child ? undefined : this.goalProgressByThread.get(threadId)
+    const lastCall = child ? undefined : this.lastCallUsageByThread.get(threadId)
+    if (!child) {
+      this.goalProgressByThread.delete(threadId)
+      this.lastCallUsageByThread.delete(threadId)
+    }
+    if (source.contextWindow) this.contextWindowByThread.set(threadId, source.contextWindow)
+    if (spent.totalTokens === 0) return
     const prior = this.tokenUsageByThread.get(threadId) ?? emptyTokenBreakdown()
     const total: TokenUsageBreakdown = {
-      totalTokens: prior.totalTokens + last.totalTokens,
-      inputTokens: prior.inputTokens + last.inputTokens,
-      cachedInputTokens: prior.cachedInputTokens + last.cachedInputTokens,
-      outputTokens: prior.outputTokens + last.outputTokens,
-      reasoningOutputTokens: prior.reasoningOutputTokens + last.reasoningOutputTokens,
+      totalTokens: prior.totalTokens + spent.totalTokens,
+      inputTokens: prior.inputTokens + spent.inputTokens,
+      cachedInputTokens: prior.cachedInputTokens + spent.cachedInputTokens,
+      outputTokens: prior.outputTokens + spent.outputTokens,
+      reasoningOutputTokens: prior.reasoningOutputTokens + spent.reasoningOutputTokens,
     }
     this.tokenUsageByThread.set(threadId, total)
-    const tokenUsage: ThreadTokenUsage = { total, last, modelContextWindow: null }
+    const measured = child ? this.lastUsageByThread.get(threadId) : lastCall
+    if (!child) {
+      if (lastCall) this.lastUsageByThread.set(threadId, lastCall)
+      else this.lastUsageByThread.delete(threadId)
+    }
+    const tokenUsage: ThreadTokenUsage = {
+      total,
+      last: measured ?? (child ? emptyTokenBreakdown() : spent),
+      // Only one call's usage measures the context; a whole turn's sum would
+      // overfill the App's gauge.
+      modelContextWindow: measured ? (this.contextWindowByThread.get(threadId) ?? null) : null,
+    }
     this.notify(peer, {
       method: 'thread/tokenUsage/updated',
       params: { threadId, turnId, tokenUsage },
     })
-    // The result is authoritative; charge only what streaming did not.
+    // The result is authoritative; charge only what streaming did not. A
+    // child that ends inside a running turn can still steer it to wrap up.
     const charged = [...(progress?.values() ?? [])].reduce((sum, tokens) => sum + tokens, 0)
-    this.accrueGoalTokens(threadId, last.inputTokens + last.outputTokens - charged, false)
+    const midTurn = child && this.activeTurnByThread.get(threadId) === turnId
+    this.accrueGoalTokens(threadId, spent.inputTokens + spent.outputTokens - charged, midTurn)
     // NOTE: previously we also pushed `account/rateLimits/updated` here on
     // every token-usage event "to keep the UI in sync". That backfired —
     // Codex App treats every such notification as a fresh rate-limit signal

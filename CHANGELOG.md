@@ -38,6 +38,9 @@ versioning or publishing metadata.
   with continuation turns, token and time budgets and goal tools for Claude;
   steer errors in Codex's wording; `thread/queue/*`; and a `turn/start` that
   races a running turn joins it instead of orphaning it.
+- The context gauge follows the main loop's latest API call, like Codex's
+  `last_token_usage`, and tokens spent by subagents and workflows count toward
+  the thread total without moving the gauge or goal progress.
 
 ### Provider and multi-agent boundaries
 

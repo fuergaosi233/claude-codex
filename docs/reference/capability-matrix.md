@@ -15,7 +15,7 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 | Steering / interrupt | Supported | `turn/steer` and `turn/interrupt` route to the active Claude client. A rejected steer uses Codex's error texts so the App falls back or retries, and a `turn/start` that races a running turn joins it. |
 | Goals | Supported | `thread/goal/*` keeps the thread working with hidden continuation turns, counts tokens and time, and stops on budget, usage limits or a turn without progress. Claude gets `get_goal` / `create_goal` / `update_goal` through an in-process MCP server. |
 | Message queue | Supported | `thread/queue/*` holds follow-ups during a turn and sends them in order when the thread goes idle; after an interrupt they wait for `thread/queue/start`. The App uses it from app-server `0.148.0-alpha.14` (see `CLAUDE_CODEX_COMPAT_VERSION`). |
-| Token usage | Supported | SDK ResultMessage usage → TokenUsageBreakdown, pushed as `thread/tokenUsage/updated` (cumulative + last turn). |
+| Token usage | Supported | SDK ResultMessage usage → TokenUsageBreakdown, pushed as `thread/tokenUsage/updated` (cumulative + last turn). The context gauge follows the main loop's latest API call; subagent and workflow tokens add to the total only. |
 
 ## Runtime selection
 

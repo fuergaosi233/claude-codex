@@ -810,3 +810,27 @@ test('the main loop keeps its own tools and text beside an Agent call; only suba
     'only main-loop API calls count toward goal progress',
   )
 })
+
+test('the result reports the context window of the model behind the main loop', async () => {
+  const { runtime, queries } = fakeRuntime()
+  const events: RuntimeEvent[] = []
+  const turn = runtime.runTurn(context, handlers(events))
+  const query = await waitFor(() => queries[0], 'session')
+  query.push(
+    { type: 'assistant', message: { id: 'm1', model: 'claude-main', content: [text('hi')] } },
+    {
+      type: 'result',
+      subtype: 'success',
+      result: 'hi',
+      usage: { input_tokens: 10, output_tokens: 2 },
+      // A subagent on another model shows up here too.
+      modelUsage: {
+        'claude-small': { contextWindow: 100_000 },
+        'claude-main': { contextWindow: 1_000_000 },
+      },
+    },
+  )
+  await turn
+  const usage = events.find((event) => event.type === 'usage')
+  assert.equal(usage?.type === 'usage' ? usage.contextWindow : undefined, 1_000_000)
+})

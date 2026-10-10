@@ -111,6 +111,8 @@ interface PendingTurn {
   pendingUserMessage: null | { resolve: (v: { message: unknown }) => void }
   deferredResult: PendingTurnResult | null
   workflowFailure: string | null
+  // The model behind the main loop's latest response.
+  model: string | null
 }
 
 interface PendingTurnResult {
@@ -805,6 +807,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       pendingUserMessage: null,
       deferredResult: null,
       workflowFailure: null,
+      model: null,
     }
   }
 
@@ -1576,6 +1579,14 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
               level: status === 'completed' ? 'info' : 'warning',
               message: `${state.workflowName || `Workflow ${taskId}`}: ${summary}${trailer}`,
             })
+            // Without an aggregate result, nothing else carries what the
+            // workflow's agents spent.
+            if (usage?.totalTokens)
+              await pending.handlers.onEvent({
+                type: 'usage',
+                usage: { output_tokens: usage.totalTokens },
+                child: true,
+              })
             await this.finishDeferredResult(pending)
             return
           }
@@ -1695,6 +1706,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     const nestedMessage = Boolean(message.parent_tool_use_id)
     if (!nestedMessage) {
       await this.beginAssistantMessage(pending, stringOrNull(inner.id))
+      pending.model = stringOrNull(inner.model) ?? pending.model
       const usage = recordOrNull(inner.usage)
       const messageId = stringOrNull(inner.id)
       // Not final until the result, but enough to see a goal budget run out
@@ -2102,7 +2114,11 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     // for every result the session spent tokens on, including ones that
     // don't end this turn.
     if (Object.keys(usage).length > 0) {
-      await pending.handlers.onEvent({ type: 'usage', usage })
+      await pending.handlers.onEvent({
+        type: 'usage',
+        usage,
+        contextWindow: contextWindowOf(message.modelUsage, pending.model),
+      })
     }
     // A resumed session can answer queued work of its own first, and a
     // queued steer gets a result of its own; only the result that answers
@@ -2277,6 +2293,19 @@ async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Prom
   } finally {
     if (timer) clearTimeout(timer)
   }
+}
+
+// The context window of the model that ran the main loop, as the CLI reports
+// it per model in the result.
+function contextWindowOf(modelUsage: unknown, model: string | null): number | null {
+  const models = recordOrNull(modelUsage)
+  if (!models) return null
+  const entries = Object.values(models)
+  const entry =
+    recordOrNull(model ? models[model] : null) ??
+    (entries.length === 1 ? recordOrNull(entries[0]) : null)
+  const window = numberOrNull(entry?.contextWindow)
+  return window != null && window > 0 ? window : null
 }
 
 function workflowTaskUsage(value: unknown): RuntimeTaskUsage | null {
