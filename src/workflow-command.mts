@@ -8,7 +8,8 @@ export function parseWorkflowCommand(prompt: string): WorkflowCommand | null {
   const match = prompt.match(WORKFLOWS_COMMAND)
   if (!match) return null
   const task = (match[1] ?? '').trim()
-  return task ? { type: 'run', prompt: task } : { type: 'list' }
+  // `/workflows list` asks for the list, not for a workflow about "list".
+  return task && !/^list$/i.test(task) ? { type: 'run', prompt: task } : { type: 'list' }
 }
 
 export function workflowRuntimePrompt(prompt: string): string {

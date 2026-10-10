@@ -402,6 +402,68 @@ test('native interrupt with live background work stops only the turn and keeps t
   await runtime.stop()
 })
 
+test('native interrupt stops the workflow the turn launched and leaves background agents running', async () => {
+  const { runtime, queries } = fakeRuntime()
+  const listener = recordingListener()
+  runtime.setBackgroundListener(listener)
+
+  const first = runtime.runTurn(context, handlers([]))
+  const query = await waitFor(() => queries[0], 'session')
+  query.push(...launchBackgroundAgent('a4'))
+  await first
+
+  const second = runtime.runTurn(
+    { ...context, turnId: 'turn-2', prompt: 'run a workflow' },
+    handlers([]),
+  )
+  await waitFor(() => query.prompts.length === 2, 'second prompt')
+  query.push(
+    assistant('launch-workflow', [
+      { type: 'tool_use', id: 'workflow-use', name: 'Workflow', input: { name: 'review' } },
+    ]),
+    {
+      type: 'system',
+      subtype: 'task_started',
+      task_id: 'w1',
+      tool_use_id: 'workflow-use',
+      task_type: 'local_workflow',
+      workflow_name: 'review',
+      description: 'review',
+      is_backgrounded: true,
+    },
+  )
+  await waitFor(
+    () => listener.tasks.some((event) => event.type === 'task_started' && event.taskId === 'a4'),
+    'agent task',
+  )
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  await runtime.interrupt('thread')
+  await second
+
+  assert.deepEqual(query.stoppedTasks, ['w1'], 'only the workflow is stopped')
+  assert.equal(query.closed, false)
+
+  // The CLI reports the stopped workflow and starts a turn to acknowledge it;
+  // nothing wakes the thread for a task the user stopped.
+  query.push(
+    {
+      type: 'system',
+      subtype: 'task_notification',
+      task_id: 'w1',
+      tool_use_id: 'workflow-use',
+      task_type: 'local_workflow',
+      status: 'stopped',
+      summary: 'stopped',
+    },
+    { type: 'system', subtype: 'init', session_id: 'session-1' },
+    assistant('ack', [text('The workflow was stopped.')]),
+    { type: 'result', subtype: 'success', result: 'The workflow was stopped.' },
+  )
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  assert.deepEqual(listener.autonomous, [])
+  await runtime.stop()
+})
+
 test('native parked agent stops holding the session open', async () => {
   await withSettleMs(40, async () => {
     const { runtime, queries } = fakeRuntime()

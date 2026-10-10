@@ -216,6 +216,11 @@ test('workflow command parser keeps list and run semantics distinct', () => {
     prompt: 'inspect the adapter',
   })
   assert.equal(parseWorkflowCommand('/workflowsx inspect'), null)
+  assert.deepEqual(parseWorkflowCommand('/workflows list'), { type: 'list' })
+  assert.deepEqual(parseWorkflowCommand('/workflows list the open bugs'), {
+    type: 'run',
+    prompt: 'list the open bugs',
+  })
   assert.equal(workflowRuntimePrompt('/workflows'), '/workflows')
 
   const runtime = new NativeClaudeRuntime()

@@ -291,6 +291,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         const current = live.current
         const cancelled = current ? this.cancelSends(live) : []
         if (current) {
+          await this.stopLiveWorkflows(live, current)
           await this.stopWorkflowTasks(current)
           this.releaseTurn(current)
           live.current = null
@@ -338,6 +339,30 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         error: error instanceof Error ? error.message : String(error),
       })
       return false
+    }
+  }
+
+  // A workflow belongs to the turn that launched it; the turn waits for it.
+  // Left running past an interrupt, it would finish later and wake the thread.
+  private async stopLiveWorkflows(live: LiveSession, pending: PendingTurn): Promise<void> {
+    const query = live.query as (Query & { stopTask?: (taskId: string) => Promise<void> }) | null
+    if (typeof query?.stopTask !== 'function') return
+    const taskIds = new Set<string>()
+    for (const [taskId, state] of pending.workflowTasks ?? [])
+      if (!state.terminal) taskIds.add(taskId)
+    for (const taskId of live.liveTasks)
+      if (live.tasks.get(taskId)?.taskType === 'local_workflow') taskIds.add(taskId)
+    for (const taskId of taskIds) {
+      live.stoppedTasks.add(taskId)
+      let failed = false
+      const settled = await settlesWithin(
+        query.stopTask(taskId).catch(() => {
+          failed = true
+        }),
+        SESSION_CONTROL_TIMEOUT_MS,
+      )
+      if (failed) live.stoppedTasks.delete(taskId)
+      debugLog('native.workflow.stop', { threadId: live.threadId, taskId, settled, failed })
     }
   }
 

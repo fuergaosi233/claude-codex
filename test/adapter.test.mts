@@ -4169,6 +4169,79 @@ test('stopping a background child interrupts it without waking the parent', asyn
   }
 })
 
+test('stopping a foreground child ends it as interrupted and the parent carries on', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json(codex930Initialize(0)))
+    await reader.nextResponse(0)
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const threadId = (await reader.nextResponse(1)).result.thread.id
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: textInput('foreground stop check') },
+      }),
+    )
+    await reader.nextResponse(2)
+    const launch = await readUntil(
+      reader,
+      (m) => m.method === 'item/started' && m.params.item?.tool === 'wait',
+    )
+    const childStarted = launch.find(
+      (m) => m.method === 'turn/started' && m.params.threadId !== threadId,
+    )
+    const childThreadId = childStarted.params.threadId
+
+    proc.stdin.write(
+      json({
+        id: 3,
+        method: 'turn/interrupt',
+        params: { threadId: childThreadId, turnId: childStarted.params.turn.id },
+      }),
+    )
+    const rest = await readUntil(
+      reader,
+      (m) => m.method === 'turn/completed' && m.params.threadId === threadId,
+    )
+    const childDone = rest.filter(
+      (m) => m.method === 'turn/completed' && m.params.threadId === childThreadId,
+    )
+    assert.deepEqual(
+      childDone.map((m) => m.params.turn.status),
+      ['interrupted'],
+      'the child ends once, as interrupted, and its late result does not overwrite it',
+    )
+    const parentDone = rest.find(
+      (m) => m.method === 'turn/completed' && m.params.threadId === threadId,
+    )
+    assert.equal(parentDone.params.turn.status, 'completed', 'the parent turn keeps going')
+    const waitEnd = rest.find(
+      (m) => m.method === 'item/completed' && m.params.item?.tool === 'wait',
+    ).params.item
+    assert.equal(waitEnd.agentsStates[childThreadId].status, 'interrupted')
+    assert.deepEqual(activityKinds(rest, threadId), ['interrupted'])
+
+    proc.stdin.write(
+      json({
+        id: 4,
+        method: 'thread/read',
+        params: { threadId: childThreadId, includeTurns: true },
+      }),
+    )
+    const child = (await reader.nextResponse(4)).result.thread
+    assert.equal(child.turns.at(-1).status, 'interrupted')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 function codex930Initialize(id: number) {
   return {
     id,

@@ -186,6 +186,9 @@ interface SubagentContext {
   agentPath: string
   prompt: string
   subType: string | null
+  // The user stopped this child from its own thread; its Agent call then
+  // returns early and the child counts as interrupted, not failed.
+  stoppedByUser?: boolean
 }
 
 interface ActiveSubagentState {
@@ -3038,8 +3041,14 @@ export class CodexClaudeAppServer {
               return
             }
             const rawResultText = toolResultText(event.content)
-            const collabStatus: 'completed' | 'failed' = event.isError ? 'failed' : 'completed'
-            const agentStatus: 'completed' | 'errored' = event.isError ? 'errored' : 'completed'
+            const stopped = ctx.stoppedByUser === true
+            const collabStatus: 'completed' | 'failed' =
+              event.isError && !stopped ? 'failed' : 'completed'
+            const agentStatus: 'completed' | 'errored' | 'interrupted' = stopped
+              ? 'interrupted'
+              : event.isError
+                ? 'errored'
+                : 'completed'
 
             // claude-agent-sdk's Task tool appends a metadata trailer to the
             // result content: an `agentId: <hex>` line + a `<usage>...</usage>`
@@ -3051,14 +3060,17 @@ export class CodexClaudeAppServer {
             const parsed = parseSubagentTrailer(rawResultText)
             const resultText = parsed.cleanText
 
-            const childTurn = this.completeSubagentChildTurn(
-              peer,
-              ctx,
-              resultText,
-              event.isError ? 'failed' : 'completed',
-              event.isError ? { message: 'subagent failed' } : null,
-              parsed.usage?.durationMs ?? null,
-            )
+            // A child the user stopped already ended as interrupted.
+            const childTurn =
+              (stopped ? this.store.getTurn(ctx.childTurnId) : null) ??
+              this.completeSubagentChildTurn(
+                peer,
+                ctx,
+                resultText,
+                event.isError ? 'failed' : 'completed',
+                event.isError ? { message: 'subagent failed' } : null,
+                parsed.usage?.durationMs ?? null,
+              )
             recordRunEvent('subagent.completed', {
               parentThreadId: thread.id,
               parentTurnId: turn.id,
@@ -3086,7 +3098,7 @@ export class CodexClaudeAppServer {
               thread.id,
               turn.id,
               ctx,
-              event.isError ? 'interrupted' : 'completed',
+              event.isError || stopped ? 'interrupted' : 'completed',
             )
 
             // Push the subagent's token usage as a Codex-native
@@ -3870,7 +3882,10 @@ export class CodexClaudeAppServer {
     contexts: Map<string, SubagentContext>,
     active: Set<string>,
     failureMessage = 'Subagent ended without a terminal task result.',
+    status: 'failed' | 'interrupted' = 'failed',
   ): void {
+    // The App shows an interrupted agent as done and an errored one as failed.
+    const agentState = status === 'interrupted' ? 'interrupted' : 'errored'
     for (const toolUseId of Array.from(active)) {
       const context = contexts.get(toolUseId)
       active.delete(toolUseId)
@@ -3878,15 +3893,19 @@ export class CodexClaudeAppServer {
       if (!context) continue
 
       const message = failureMessage
-      const childTurn = this.completeSubagentChildTurn(peer, context, message, 'failed', {
+      const childTurn = this.completeSubagentChildTurn(
+        peer,
+        context,
         message,
-      })
+        status,
+        status === 'failed' ? { message } : null,
+      )
       recordRunEvent('subagent.completed', {
         parentThreadId: thread.id,
         parentTurnId: turn.id,
         childThreadId: context.childThreadId,
         childTurnId: childTurn.id,
-        status: 'failed',
+        status,
         agentRole: context.subType ?? 'general-purpose',
       })
 
@@ -3902,7 +3921,7 @@ export class CodexClaudeAppServer {
         prompt: null,
         model: null,
         reasoningEffort: null,
-        agentsStates: { [context.childThreadId]: { status: 'errored', message } },
+        agentsStates: { [context.childThreadId]: { status: agentState, message } },
       }
       this.store.updateItemAndMoveToEnd(turn.id, context.waitItemId, () => waitEnd)
       this.notify(peer, {
@@ -3941,7 +3960,7 @@ export class CodexClaudeAppServer {
         const closeEnd: ThreadItem = {
           ...closeBegin,
           status: 'failed',
-          agentsStates: { [context.childThreadId]: { status: 'errored', message } },
+          agentsStates: { [context.childThreadId]: { status: agentState, message } },
         }
         this.store.updateItem(turn.id, closeId, () => closeEnd)
         this.notify(peer, {
@@ -4400,6 +4419,34 @@ export class CodexClaudeAppServer {
     this.settleBackgroundSubagent(entry, 'interrupted', 'Stopped by the user.', null)
   }
 
+  // Stops one foreground child of a running parent turn through its CLI task.
+  // The parent's Agent call then returns and the parent keeps going.
+  private async stopForegroundSubagent(peer: RpcPeer, childThreadId: string): Promise<boolean> {
+    for (const state of this.subagentStateByTurn.values()) {
+      for (const toolUseId of state.active) {
+        const context = state.contexts.get(toolUseId)
+        if (context?.childThreadId !== childThreadId || context.stoppedByUser) continue
+        const taskId = this.taskIdByToolUse.get(toolUseId)
+        const stopped = taskId
+          ? await this.runtime.stopTask?.(state.thread.id, taskId).catch(() => false)
+          : false
+        debugLog('subagent.foreground.stop', {
+          parentThreadId: state.thread.id,
+          childThreadId,
+          taskId: taskId ?? null,
+          stopped: stopped === true,
+        })
+        // Without a task to stop, only the child's turn ends here; the CLI
+        // still finishes the agent and its result replaces this state.
+        if (stopped !== true) return false
+        context.stoppedByUser = true
+        this.completeSubagentChildTurn(peer, context, 'Stopped by the user.', 'interrupted', null)
+        return true
+      }
+    }
+    return false
+  }
+
   private async requestApproval(
     peer: RpcPeer,
     threadId: string,
@@ -4507,6 +4554,8 @@ export class CodexClaudeAppServer {
       await this.stopBackgroundSubagent(background)
       return {}
     }
+    // Neither does a foreground child: it runs inside its parent's turn.
+    if (await this.stopForegroundSubagent(peer, threadId)) return {}
     const activeTurnId = this.activeTurnByThread.get(threadId)
     const turnId = activeTurnId || requestedTurnId
     if (turnId) {
@@ -4520,6 +4569,8 @@ export class CodexClaudeAppServer {
             subagents.turn,
             subagents.contexts,
             subagents.active,
+            'Interrupted by the user.',
+            'interrupted',
           )
           this.subagentStateByTurn.delete(turnId)
         }

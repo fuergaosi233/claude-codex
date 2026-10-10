@@ -19,6 +19,8 @@ export class MockRuntime implements ClaudeRuntime {
   // What Claude says, unprompted, once a background agent reports back.
   private continuations = new Map<string, string>()
   private steered = new Map<string, string[]>()
+  // Foreground agents waiting to be stopped by task id.
+  private foregroundStops = new Map<string, () => void>()
   // Threads whose scenario plays the native runtime, which drops a
   // subagent's own events before they reach the server.
   private nestedFiltered = new Set<string>()
@@ -445,6 +447,40 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    if (/foreground stop check/i.test(context.prompt)) {
+      // A foreground Agent call. Stopping its task makes the call return
+      // early with an error, and the parent goes on without it.
+      const toolUseId = `task-${Date.now()}`
+      const taskId = 'mock-foreground-task'
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId,
+        toolName: 'Agent',
+        input: { description: 'mock foreground agent', prompt: 'take your time' },
+      })
+      const stopped = new Promise<void>((resolve) => this.foregroundStops.set(taskId, resolve))
+      await this.listener?.onTaskEvent(context.threadId, {
+        type: 'task_started',
+        taskId,
+        toolUseId,
+        taskType: 'local_agent',
+        description: 'mock foreground agent',
+        subagentType: null,
+        prompt: 'take your time',
+        backgrounded: false,
+      })
+      await stopped
+      await handlers.onEvent({
+        type: 'tool_result',
+        toolUseId,
+        content: '[Request interrupted by user for tool use]',
+        isError: true,
+      })
+      await handlers.onEvent({ type: 'text_delta', delta: 'carried on without it' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'carried on without it' })
+      return
+    }
+
     if (/parallel agent tool check/i.test(context.prompt)) {
       // One assistant message calls Agent and Bash together. Claude runs them
       // side by side; the Bash call is the parent's own.
@@ -671,6 +707,12 @@ export class MockRuntime implements ClaudeRuntime {
   }
 
   async stopTask(threadId: string, taskId: string): Promise<boolean> {
+    const foreground = this.foregroundStops.get(taskId)
+    if (foreground) {
+      this.foregroundStops.delete(taskId)
+      setImmediate(foreground)
+      return true
+    }
     const task = this.backgroundTasks.get(taskId)
     if (!task || task.threadId !== threadId) return false
     clearTimeout(task.timer)
