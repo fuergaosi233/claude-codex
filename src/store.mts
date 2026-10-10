@@ -674,16 +674,6 @@ export class SessionStore {
     return turn
   }
 
-  removeItem(turnId: string, itemId: string): TurnRecord | null {
-    const turn = this.getTurn(turnId)
-    if (!turn) return null
-    const items = turn.items.filter((item) => item.id !== itemId)
-    if (items.length === turn.items.length) return turn
-    turn.items = items
-    this.upsertTurn(turn)
-    return turn
-  }
-
   updateItemAndMoveToEnd(
     turnId: string,
     itemId: string,
@@ -739,6 +729,12 @@ export class SessionStore {
     )
     const seenThreads = new Set<string>()
     let recoveredCount = 0
+    // Agents whose own turn the restart cut off, or that never got one. Any
+    // marker that still shows one of them working, here or in an earlier
+    // parent turn, is stale.
+    const cutOff = new Set(rows.map((row) => String(row.thread_id)))
+    const hasTurn = this.db.prepare('SELECT 1 FROM turns WHERE thread_id = ? LIMIT 1')
+    const isDead = (threadId: string) => cutOff.has(threadId) || hasTurn.get(threadId) === undefined
     for (const row of rows) {
       const startedAt = row.started_at == null ? null : Number(row.started_at)
       const durationMs = startedAt == null ? null : Math.max(0, (completedAt - startedAt) * 1000)
@@ -747,7 +743,7 @@ export class SessionStore {
         completedAt,
         durationMs,
         errorJson,
-        this.terminalizeStaleItems(row.items_json, message),
+        this.terminalizeStaleItems(row.items_json, message, isDead),
         row.id,
       )
       seenThreads.add(String(row.thread_id))
@@ -767,16 +763,9 @@ export class SessionStore {
     const updateItems = this.db.prepare('UPDATE turns SET items_json = ? WHERE id = ?')
     const repairThreadIds = new Set<string>()
     for (const row of terminalRows) {
-      // A successful legacy Codex cc turn may contain only a
-      // `subAgentActivity: started` marker. Remove that optional marker during
-      // recovery so the canonical spawnAgent/wait terminal state is used and
-      // a cold-opened child cannot be revived as working.
-      const itemsJson = this.terminalizeStaleItems(
-        row.items_json,
-        message,
-        row.status !== 'completed',
-        row.status === 'completed',
-      )
+      // A background agent outlives the parent turn that spawned it, so its
+      // markers can sit in a turn that ended long before the restart.
+      const itemsJson = this.terminalizeStaleItems(row.items_json, message, isDead)
       if (itemsJson === row.items_json) continue
       updateItems.run(itemsJson, row.id)
       repairThreadIds.add(String(row.thread_id))
@@ -809,14 +798,14 @@ export class SessionStore {
     return recoveredCount
   }
 
-  // A recovered turn is also replayed from its persisted item list. Clear any
-  // item-level liveness markers so the App's spinner projection cannot keep a
-  // child agent in `working` after the turn/thread has been terminalized.
+  // A recovered turn is also replayed from its persisted item list. Clear the
+  // item-level liveness markers of agents the restart killed so the App's
+  // spinner projection cannot keep them `working`. Markers of agents that
+  // finished stay as they were streamed, so a reload matches the live view.
   private terminalizeStaleItems(
     itemsJson: string,
     message: string,
-    terminalizeActivity = true,
-    stripCompletedActivity = false,
+    isDead: (threadId: string) => boolean,
   ): string {
     let parsed: unknown
     try {
@@ -826,59 +815,48 @@ export class SessionStore {
     }
     if (!Array.isArray(parsed)) return '[]'
 
-    const items = parsed
-      .map((raw) => {
-        if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) return raw
-        const item = raw as Record<string, unknown>
-        if (stripCompletedActivity && item.type === 'subAgentActivity') return null
-        if (
-          terminalizeActivity &&
-          item.type === 'subAgentActivity' &&
-          (item.kind === 'started' || item.kind === 'interacted')
-        ) {
-          return { ...item, kind: 'interrupted' }
+    const items = parsed.map((raw) => {
+      if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) return raw
+      const item = raw as Record<string, unknown>
+      if (
+        item.type === 'subAgentActivity' &&
+        (item.kind === 'started' || item.kind === 'interacted') &&
+        isDead(String(item.agentThreadId))
+      ) {
+        return { ...item, kind: 'interrupted' }
+      }
+      if (item.type === 'collabAgentToolCall') {
+        const agentsStates = item.agentsStates
+        const nextStates =
+          agentsStates && typeof agentsStates === 'object' && !Array.isArray(agentsStates)
+            ? Object.fromEntries(
+                Object.entries(agentsStates as Record<string, unknown>).map(
+                  ([threadId, rawState]) => {
+                    if (rawState == null || typeof rawState !== 'object' || Array.isArray(rawState))
+                      return [threadId, rawState]
+                    const state = rawState as Record<string, unknown>
+                    if (
+                      (state.status !== 'pendingInit' && state.status !== 'running') ||
+                      !isDead(threadId)
+                    )
+                      return [threadId, state]
+                    return [
+                      threadId,
+                      { ...state, status: 'errored', message: state.message ?? message },
+                    ]
+                  },
+                ),
+              )
+            : agentsStates
+        return {
+          ...item,
+          ...(item.status === 'inProgress' ? { status: 'failed' } : {}),
+          agentsStates: nextStates,
         }
-        // Older adapter builds persisted the newer `completed` activity kind,
-        // which Codex cc 26.x cannot deserialize. `interrupted` is the legacy
-        // terminal marker understood by the App reducer and prevents a cold
-        // open from reviving the child as working.
-        if (item.type === 'subAgentActivity' && item.kind === 'completed') {
-          return { ...item, kind: 'interrupted' }
-        }
-        if (item.type === 'collabAgentToolCall') {
-          const agentsStates = item.agentsStates
-          const nextStates =
-            agentsStates && typeof agentsStates === 'object' && !Array.isArray(agentsStates)
-              ? Object.fromEntries(
-                  Object.entries(agentsStates as Record<string, unknown>).map(
-                    ([threadId, rawState]) => {
-                      if (
-                        rawState == null ||
-                        typeof rawState !== 'object' ||
-                        Array.isArray(rawState)
-                      )
-                        return [threadId, rawState]
-                      const state = rawState as Record<string, unknown>
-                      if (state.status !== 'pendingInit' && state.status !== 'running')
-                        return [threadId, state]
-                      return [
-                        threadId,
-                        { ...state, status: 'errored', message: state.message ?? message },
-                      ]
-                    },
-                  ),
-                )
-              : agentsStates
-          return {
-            ...item,
-            ...(item.status === 'inProgress' ? { status: 'failed' } : {}),
-            agentsStates: nextStates,
-          }
-        }
-        if (item.status === 'inProgress') return { ...item, status: 'failed' }
-        return item
-      })
-      .filter((item) => item != null)
+      }
+      if (item.status === 'inProgress') return { ...item, status: 'failed' }
+      return item
+    })
     return JSON.stringify(items)
   }
 

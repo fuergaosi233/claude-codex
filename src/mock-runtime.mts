@@ -308,6 +308,37 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    if (/auto background check/i.test(context.prompt)) {
+      // A foreground Agent that Claude Code moves to the background while
+      // the parent is still waiting on it (auto-background after a timeout).
+      const toolUseId = `task-${Date.now()}`
+      const agentId = MOCK_BACKGROUND_AGENT_ID
+      const prompt = 'long survey'
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId,
+        toolName: 'Agent',
+        input: { description: 'mock slow agent', prompt },
+      })
+      await sleep(50)
+      await handlers.onEvent({
+        type: 'tool_result',
+        toolUseId,
+        content: `Async agent launched successfully.\nagentId: ${agentId}`,
+        structured: { isAsync: true, status: 'async_launched', agentId, prompt },
+      })
+      this.scheduleBackgroundReport(
+        context.threadId,
+        agentId,
+        toolUseId,
+        'auto background report',
+        backgroundDelayMs(context.prompt),
+      )
+      await handlers.onEvent({ type: 'text_delta', delta: 'agent moved to background' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'backgrounded' })
+      return
+    }
+
     if (/background message check/i.test(context.prompt)) {
       const toolUseId = `send-${Date.now()}`
       const agentId = MOCK_BACKGROUND_AGENT_ID

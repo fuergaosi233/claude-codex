@@ -427,17 +427,17 @@ export class CodexClaudeAppServer {
       case 'thread/start':
         return this.threadStart(peer, asRecord(params))
       case 'thread/resume':
-        return this.threadResume(peer, asRecord(params))
+        return this.historyForPeer(peer, this.threadResume(peer, asRecord(params)))
       case 'thread/fork':
-        return this.threadFork(peer, asRecord(params))
+        return this.historyForPeer(peer, this.threadFork(peer, asRecord(params)))
       case 'thread/list':
         return this.threadList(asRecord(params))
       case 'thread/read':
-        return this.threadRead(asRecord(params))
+        return this.historyForPeer(peer, this.threadRead(asRecord(params)))
       case 'thread/turns/list':
-        return this.threadTurnsList(asRecord(params))
+        return this.historyForPeer(peer, this.threadTurnsList(asRecord(params)))
       case 'thread/turns/items/list':
-        return this.threadTurnItemsList(asRecord(params))
+        return this.historyForPeer(peer, this.threadTurnItemsList(asRecord(params)))
       case 'thread/name/set':
         return this.threadNameSet(asRecord(params))
       case 'thread/archive':
@@ -475,7 +475,7 @@ export class CodexClaudeAppServer {
       case 'memory/reset':
         return {}
       case 'thread/unarchive':
-        return this.threadArchive(asRecord(params), false)
+        return this.historyForPeer(peer, this.threadArchive(asRecord(params), false))
       case 'thread/compact/start':
         return this.threadCompactStart(peer, asRecord(params))
       case 'thread/shellCommand':
@@ -499,7 +499,7 @@ export class CodexClaudeAppServer {
       case 'thread/backgroundTerminals/clean':
         return this.threadBackgroundTerminalsClean(asRecord(params))
       case 'thread/rollback':
-        return this.threadRollback(asRecord(params))
+        return this.historyForPeer(peer, this.threadRollback(asRecord(params)))
       case 'thread/loaded/list':
         return this.threadLoadedList(asRecord(params))
       case 'thread/inject_items':
@@ -2508,7 +2508,7 @@ export class CodexClaudeAppServer {
             if (!event.isError && isAsyncAgentLaunch(event.structured, event.content)) {
               // Claude backgrounded the agent: the call returned, the child
               // did not. It completes on its task notification instead.
-              this.backgroundSubagent(thread, turn, event.toolUseId, ctx, event.structured)
+              this.backgroundSubagent(peer, thread, turn, event.toolUseId, ctx, event.structured)
               activeSubagents.delete(event.toolUseId)
               subagentContexts.delete(event.toolUseId)
               itemIds.delete(event.toolUseId)
@@ -2556,19 +2556,16 @@ export class CodexClaudeAppServer {
             }
 
             // The child completion activity arrives before wait/completed in
-            // native V2. The installed Codex cc schema predates the
-            // `completed` activity kind, so only send it when the client
-            // explicitly advertises support; the wait terminal snapshot is
-            // sufficient for legacy reducers.
-            if (event.isError || this.supportsCompletedSubagentActivity(peer)) {
-              this.emitSubagentActivity(
-                peer,
-                thread.id,
-                turn.id,
-                ctx,
-                event.isError ? 'interrupted' : 'completed',
-              )
-            }
+            // native V2. emitSubagentActivity records it either way and only
+            // sends `completed` to clients that render it; the wait terminal
+            // snapshot is sufficient for legacy reducers.
+            this.emitSubagentActivity(
+              peer,
+              thread.id,
+              turn.id,
+              ctx,
+              event.isError ? 'interrupted' : 'completed',
+            )
 
             // Push the subagent's token usage as a Codex-native
             // thread/tokenUsage/updated notification on the CHILD thread
@@ -3263,11 +3260,6 @@ export class CodexClaudeAppServer {
     context: SubagentContext,
     kind: SubagentActivityKind,
   ): void {
-    // Codex cc 26.x treats a persisted started activity marker as liveness,
-    // but does not advertise a compatible terminal activity kind. The
-    // canonical spawnAgent/wait lifecycle remains available for discovery and
-    // review, so omit this optional marker for legacy peers.
-    if (!this.supportsCompletedSubagentActivity(peer) && kind !== 'interrupted') return
     const item: ThreadItem = {
       type: 'subAgentActivity',
       id: newId(),
@@ -3275,13 +3267,41 @@ export class CodexClaudeAppServer {
       agentThreadId: context.childThreadId,
       agentPath: context.agentPath,
     }
-    // Keep the persisted history capability-neutral. The durable wait and
-    // child-turn state covers live and completed runs; persisting either
-    // started or completed activity would make a mixed-version reconnect
-    // decode a kind the peer may not support. Interrupted remains the one
-    // legacy-safe terminal marker for abandoned children.
-    if (kind === 'interrupted') this.store.appendItem(parentTurnId, item)
+    // History keeps every kind so a reload shows the cards the App saw live;
+    // historyForPeer hides the ones a legacy client was never sent.
+    this.store.appendItem(parentTurnId, item)
+    // Codex cc 26.818 treats a started marker as liveness but has no
+    // terminal kind besides interrupted, so it only ever gets that one.
+    if (!this.supportsCompletedSubagentActivity(peer) && kind !== 'interrupted') return
     this.emitItemLifecycle(peer, parentThreadId, parentTurnId, item)
+  }
+
+  // Reads replay history. A client that predates the started/completed
+  // activity kinds gets only the items it would have been sent live.
+  private historyForPeer(peer: RpcPeer, result: unknown): unknown {
+    if (this.supportsCompletedSubagentActivity(peer)) return result
+    const sentLive = (item: unknown): boolean => {
+      const record = asRecord(item)
+      return record.type !== 'subAgentActivity' || record.kind === 'interrupted'
+    }
+    const turnForPeer = (turn: unknown): unknown => {
+      const record = asRecord(turn)
+      return Array.isArray(record.items)
+        ? { ...record, items: record.items.filter(sentLive) }
+        : turn
+    }
+    const record = asRecord(result)
+    const thread = asRecord(record.thread)
+    if (Array.isArray(thread.turns))
+      return { ...record, thread: { ...thread, turns: thread.turns.map(turnForPeer) } }
+    if (Array.isArray(record.data))
+      return {
+        ...record,
+        data: record.data
+          .filter((entry) => 'items' in asRecord(entry) || sentLive(entry))
+          .map(turnForPeer),
+      }
+    return result
   }
 
   private emitItemLifecycle(
@@ -3416,15 +3436,35 @@ export class CodexClaudeAppServer {
   }
 
   private backgroundSubagent(
+    peer: RpcPeer,
     thread: ThreadRecord,
     turn: TurnRecord,
     toolUseId: string,
     context: SubagentContext,
     structured: Record<string, unknown> | null | undefined,
   ): void {
-    // Nothing waits on a background agent, and closing the wait would tell
-    // the app the agent finished. The child turn carries liveness instead.
-    this.store.removeItem(turn.id, context.waitItemId)
+    // Claude backgrounded the agent after the wait began, so nothing waits on
+    // it any more. Close the wait without completing it: the App marks every
+    // working agent done on a *completed* wait, while a failed one keeps the
+    // child's own state (still running) and leaves no open item behind.
+    const waitEnd: ThreadItem = {
+      type: 'collabAgentToolCall',
+      id: context.waitItemId,
+      tool: 'wait',
+      status: 'failed',
+      senderThreadId: thread.id,
+      receiverThreadIds: [context.childThreadId],
+      prompt: null,
+      model: null,
+      reasoningEffort: null,
+      agentsStates: { [context.childThreadId]: { status: 'running', message: null } },
+    }
+    const updated = this.store.updateItem(turn.id, context.waitItemId, () => waitEnd)
+    if (updated?.items.some((item) => item.id === context.waitItemId))
+      this.notify(peer, {
+        method: 'item/completed',
+        params: { threadId: thread.id, turnId: turn.id, item: waitEnd, completedAtMs: nowMillis() },
+      })
     const agentId =
       typeof structured?.agentId === 'string' && structured.agentId ? structured.agentId : null
     const taskId = this.taskIdByToolUse.get(toolUseId) ?? null

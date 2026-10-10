@@ -1878,18 +1878,20 @@ test('startup recovery repairs stale items on already-terminal turns and is idem
   }
 })
 
-test('startup recovery removes legacy activity markers from completed subagent turns', async () => {
+test('startup recovery keeps markers of finished agents and ends the ones it cut off', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const store = new SessionStore(join(home, 'state.sqlite'))
   const threadId = randomUUID()
   const turnId = randomUUID()
-  const childThreadId = randomUUID()
-  try {
+  const finished = randomUUID()
+  const cutOff = randomUUID()
+  const now = Math.floor(Date.now() / 1000)
+  const thread = (id: string, preview: string) =>
     store.upsertThread({
-      id: threadId,
-      sessionId: threadId,
-      forkedFromId: null,
-      preview: 'legacy activity history',
+      id,
+      sessionId: id,
+      forkedFromId: id === threadId ? null : threadId,
+      preview,
       name: null,
       archived: false,
       cwd: process.cwd(),
@@ -1898,13 +1900,13 @@ test('startup recovery removes legacy activity markers from completed subagent t
       modelProvider: 'claude-code',
       claudeSessionId: null,
       source: 'appServer',
-      createdAt: Math.floor(Date.now() / 1000) - 2,
-      updatedAt: Math.floor(Date.now() / 1000) - 2,
+      createdAt: now - 5,
+      updatedAt: now - 5,
       status: { type: 'active', activeFlags: [] },
       approvalPolicy: 'on-request',
       sandboxMode: 'workspace-write',
-      ephemeral: false,
-      threadSource: 'user',
+      ephemeral: id !== threadId,
+      threadSource: id === threadId ? 'user' : 'subagent',
       agentRole: null,
       agentNickname: null,
       baseInstructions: null,
@@ -1913,52 +1915,93 @@ test('startup recovery removes legacy activity markers from completed subagent t
       runtimeBackend: 'claude',
       codexSessionId: null,
     })
+  const childTurn = (id: string, status: 'completed' | 'inProgress') =>
+    store.upsertTurn({
+      id: randomUUID(),
+      threadId: id,
+      status,
+      startedAt: now - 4,
+      completedAt: status === 'completed' ? now - 1 : null,
+      durationMs: status === 'completed' ? 3000 : null,
+      items: [],
+      diff: '',
+      error: null,
+    })
+  const spawn = (id: string) => ({
+    type: 'collabAgentToolCall' as const,
+    id: randomUUID(),
+    tool: 'spawnAgent' as const,
+    status: 'completed' as const,
+    senderThreadId: threadId,
+    receiverThreadIds: [id],
+    prompt: 'work',
+    model: null,
+    reasoningEffort: null,
+    agentsStates: { [id]: { status: 'running' as const, message: null } },
+  })
+  const activity = (id: string, kind: 'started' | 'completed') => ({
+    type: 'subAgentActivity' as const,
+    id: randomUUID(),
+    kind,
+    agentThreadId: id,
+    agentPath: `/root/${id.slice(0, 8)}`,
+  })
+  try {
+    thread(threadId, 'background agents across a restart')
+    thread(finished, 'finished')
+    thread(cutOff, 'cut off')
+    childTurn(finished, 'completed')
+    childTurn(cutOff, 'inProgress')
     store.upsertTurn({
       id: turnId,
       threadId,
       status: 'completed',
-      startedAt: Math.floor(Date.now() / 1000) - 2,
-      completedAt: Math.floor(Date.now() / 1000) - 1,
+      startedAt: now - 5,
+      completedAt: now - 4,
       durationMs: 1000,
       items: [
-        {
-          type: 'subAgentActivity',
-          id: randomUUID(),
-          kind: 'started',
-          agentThreadId: childThreadId,
-          agentPath: '/root/legacy',
-        },
-        {
-          type: 'subAgentActivity',
-          id: randomUUID(),
-          kind: 'completed',
-          agentThreadId: childThreadId,
-          agentPath: '/root/legacy',
-        },
+        spawn(finished),
+        activity(finished, 'started'),
+        spawn(cutOff),
+        activity(cutOff, 'started'),
         {
           type: 'collabAgentToolCall',
           id: randomUUID(),
           tool: 'wait',
-          status: 'completed',
+          status: 'failed',
           senderThreadId: threadId,
-          receiverThreadIds: [childThreadId],
+          receiverThreadIds: [cutOff],
           prompt: null,
           model: null,
           reasoningEffort: null,
-          agentsStates: { [childThreadId]: { status: 'completed', message: null } },
+          agentsStates: { [cutOff]: { status: 'running', message: null } },
         },
+        activity(finished, 'completed'),
       ],
       diff: '',
       error: null,
     })
 
-    assert.equal(store.recoverStaleInProgressTurns(), 1)
+    assert.ok(store.recoverStaleInProgressTurns() >= 2)
     const recovered = store.getTurn(turnId)
     assert.ok(recovered)
-    assert.equal(
-      recovered.items.some((item) => item.type === 'subAgentActivity'),
-      false,
+    const marks = recovered.items.map((item) =>
+      item.type === 'subAgentActivity'
+        ? `${item.agentThreadId === finished ? 'finished' : 'cutOff'}:${item.kind}`
+        : item.type === 'collabAgentToolCall'
+          ? `${item.tool}:${item.status}:${Object.entries(item.agentsStates)
+              .map(([id, state]) => `${id === finished ? 'finished' : 'cutOff'}=${state?.status}`)
+              .join(',')}`
+          : item.type,
     )
+    assert.deepEqual(marks, [
+      'spawnAgent:completed:finished=running',
+      'finished:started',
+      'spawnAgent:completed:cutOff=errored',
+      'cutOff:interrupted',
+      'wait:failed:cutOff=errored',
+      'finished:completed',
+    ])
     assert.equal(store.getThread(threadId)?.status.type, 'idle')
     assert.equal(store.recoverStaleInProgressTurns(), 0)
   } finally {
@@ -3308,21 +3351,26 @@ test('Task subagent emits the canonical activity lifecycle and leaves wait as th
       'the real subagent body must still be there',
     )
 
-    // A same-process late-opened parent must replay a terminal activity, not
-    // the stale started marker that drives the App spinner.
+    // A reload replays the activity cards this client saw live, in order, so
+    // the completed marker still lands before wait/completed.
     proc.stdin.write(
       json({ id: 8, method: 'thread/turns/list', params: { threadId, itemsView: 'full' } }),
     )
     const liveParentTurns = await reader.nextResponse(8)
-    const liveActivityKinds = (liveParentTurns.result.data as any[])
+    const replayed = (liveParentTurns.result.data as any[])
       .flatMap((turn: any) => turn.items ?? [])
-      .filter((item: any) => item.type === 'subAgentActivity')
-      .map((item: any) => item.kind)
+      .filter(
+        (item: any) => item.type === 'subAgentActivity' || item.type === 'collabAgentToolCall',
+      )
+      .map((item: any) =>
+        item.type === 'subAgentActivity' ? `activity:${item.kind}` : `collab:${item.tool}`,
+      )
     assert.deepEqual(
-      liveActivityKinds,
-      [],
-      'same-process parent history must not retain capability-specific activity markers',
+      replayed.filter((entry: string) => entry.startsWith('activity:')),
+      ['activity:started', 'activity:completed'],
+      'parent history must keep the activity cards the client saw live',
     )
+    assert.ok(replayed.indexOf('activity:completed') < replayed.indexOf('collab:wait'))
 
     assert.equal(leakedInnerItems, 0, 'inner Bash tool calls should not appear at the parent level')
     assert.doesNotMatch(
@@ -3424,8 +3472,9 @@ test('Task subagent emits the canonical activity lifecycle and leaves wait as th
 
     // Restart the adapter and replay the parent turn from SQLite. The bundled
     // App reduces items in persisted order, so wait/completed must still be
-    // the last subagent state after a cold restart. Activity markers are
-    // live-only extensions; the durable history stays capability-neutral.
+    // the last subagent state after a cold restart. This connection never
+    // initializes, so it reads like a legacy client and gets no started or
+    // completed activity markers it could not have been sent live.
     const exited = once(proc, 'exit')
     proc.kill()
     await exited
@@ -3934,6 +3983,64 @@ test('background Agent outlives the parent turn, wakes the parent, and resumes o
           /follow-up report/.test(m.params.item.text),
       ),
     )
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('an agent backgrounded mid-wait closes the wait without marking the child done', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  const turnCompleted = (threadId: string) => (message: any) =>
+    message.method === 'turn/completed' && message.params.threadId === threadId
+  try {
+    proc.stdin.write(json(codex930Initialize(0)))
+    await reader.nextResponse(0)
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const threadId = (await reader.nextResponse(1)).result.thread.id
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'auto background check delay=600', text_elements: [] }],
+        },
+      }),
+    )
+    await reader.nextResponse(2)
+    const launch = await readUntil(reader, turnCompleted(threadId))
+    const waits = launch.filter(
+      (m) =>
+        (m.method === 'item/started' || m.method === 'item/completed') &&
+        m.params.item.tool === 'wait',
+    )
+    assert.deepEqual(
+      waits.map((m) => `${m.method}:${m.params.item.status}`),
+      ['item/started:inProgress', 'item/completed:failed'],
+      'the wait began and must end, not vanish',
+    )
+    const waitEnd = waits[1].params.item
+    const childThreadId = waitEnd.receiverThreadIds[0]
+    // A completed wait would mark every working agent done in the App roster.
+    assert.equal(waitEnd.agentsStates[childThreadId].status, 'running')
+    assert.equal(launch.some(turnCompleted(childThreadId)), false)
+
+    const report = await readUntil(reader, turnCompleted(threadId))
+    assert.equal(report.find(turnCompleted(childThreadId))?.params.turn.status, 'completed')
+
+    proc.stdin.write(json({ id: 3, method: 'thread/read', params: { threadId } }))
+    const parent = (await reader.nextResponse(3)).result.thread
+    const persistedWait = parent.turns[0].items.find(
+      (item: any) => item.type === 'collabAgentToolCall' && item.tool === 'wait',
+    )
+    assert.equal(persistedWait?.status, 'failed', 'reload shows the wait the App saw close')
+    assert.equal(persistedWait?.agentsStates[childThreadId].status, 'running')
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
