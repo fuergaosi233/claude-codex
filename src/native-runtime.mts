@@ -351,6 +351,10 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }))
   }
 
+  filtersNestedEvents(): boolean {
+    return true
+  }
+
   hasBackgroundWork(): boolean {
     for (const session of this.sessions.values()) {
       if (!session.closed && this.hasLiveWork(session)) return true
@@ -1579,7 +1583,9 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   ): Promise<void> {
     const event = message.event as Record<string, unknown> | undefined
     if (!event) return
-    if (message.parent_tool_use_id || pending.activeSubagents.size > 0) return
+    // Subagent frames carry the Agent call's id; the main loop keeps
+    // streaming beside background and workflow agents.
+    if (message.parent_tool_use_id) return
     const eventType = String(event.type ?? '')
     if (eventType === 'message_start') {
       const inner = event.message as Record<string, unknown> | undefined
@@ -1662,7 +1668,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     const inner = message.message as Record<string, unknown> | undefined
     if (!inner) return
     const nestedMessage = Boolean(message.parent_tool_use_id)
-    if (!nestedMessage && pending.activeSubagents.size === 0) {
+    if (!nestedMessage) {
       await this.beginAssistantMessage(pending, stringOrNull(inner.id))
       const usage = recordOrNull(inner.usage)
       const messageId = stringOrNull(inner.id)
@@ -1675,7 +1681,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     for (const block of content) {
       const blockType = String(block.type ?? '')
       if (blockType === 'text') {
-        if (nestedMessage || pending.activeSubagents.size > 0) continue
+        if (nestedMessage) continue
         const text = this.unstreamedBlockText(pending, 'text', String(block.text ?? ''))
         if (pending.context?.outputFormat) {
           pending.structuredBuffer += text
@@ -1683,7 +1689,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
           await pending.handlers.onEvent({ type: 'text_delta', delta: text })
         }
       } else if (blockType === 'thinking') {
-        if (nestedMessage || pending.activeSubagents.size > 0) continue
+        if (nestedMessage) continue
         const thinking = this.unstreamedBlockText(pending, 'thinking', String(block.thinking ?? ''))
         if (thinking) await pending.handlers.onEvent({ type: 'reasoning_delta', delta: thinking })
       } else if (blockType === 'tool_use') {
@@ -1691,12 +1697,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         const name = String(block.name ?? '')
         const input = (block.input as Record<string, unknown>) || {}
         if (!id) continue
-        // Suppress nested tool uses while a subagent is in flight.
-        const parentSubagent = nestedMessage || pending.activeSubagents.size > 0
+        // A subagent's own tool calls stay inside its child thread. Tools the
+        // main loop runs beside an Agent call are the parent's.
         if (isSubagentTool(name)) {
           pending.activeSubagents.add(id)
         }
-        if (parentSubagent && !isSubagentTool(name)) continue
+        if (nestedMessage && !isSubagentTool(name)) continue
         if (name === 'StructuredOutput') {
           // Defer emission; the final coercion happens at result-time.
           continue
@@ -1732,6 +1738,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       if (String(block.type) !== 'tool_result') continue
       const toolUseId = String(block.tool_use_id ?? '')
       if (!toolUseId) continue
+      // Results of a subagent's own tools stay inside it, like their calls.
+      if (message.parent_tool_use_id && !pending.activeSubagents.has(toolUseId)) continue
       const isWorkflowLaunch = pending.workflowToolUseIds?.delete(toolUseId) === true
       const wasSubagent = pending.activeSubagents.delete(toolUseId)
       // Even if this was a subagent we still emit its tool_result so the

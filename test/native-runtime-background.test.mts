@@ -678,3 +678,73 @@ test('readTaskResult returns the final response of a subagent transcript', async
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('the main loop keeps its own tools and text beside an Agent call; only subagent frames drop', async () => {
+  const { runtime, queries } = fakeRuntime()
+  const events: RuntimeEvent[] = []
+  const turn = runtime.runTurn(context, handlers(events))
+  const query = await waitFor(() => queries[0], 'session')
+  const main = (id: string, block: Record<string, unknown>, output: number) => ({
+    type: 'assistant',
+    parent_tool_use_id: null,
+    message: { id, content: [block], usage: { input_tokens: 100, output_tokens: output } },
+  })
+  query.push(
+    main('m1', { type: 'tool_use', id: 'agent-1', name: 'Agent', input: { prompt: 'look' } }, 5),
+    main('m1', { type: 'tool_use', id: 'bash-1', name: 'Bash', input: { command: 'ls' } }, 30),
+    {
+      type: 'stream_event',
+      parent_tool_use_id: 'agent-1',
+      event: {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'text_delta', text: 'inner text' },
+      },
+    },
+    {
+      type: 'assistant',
+      parent_tool_use_id: 'agent-1',
+      message: {
+        id: 'sub-1',
+        content: [{ type: 'tool_use', id: 'grep-1', name: 'Grep', input: { pattern: 'x' } }],
+        usage: { input_tokens: 999, output_tokens: 9 },
+      },
+    },
+    {
+      type: 'user',
+      parent_tool_use_id: 'agent-1',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'grep-1', content: 'hit' }] },
+    },
+    {
+      type: 'user',
+      parent_tool_use_id: null,
+      message: { content: [{ type: 'tool_result', tool_use_id: 'bash-1', content: 'file' }] },
+    },
+    {
+      type: 'user',
+      parent_tool_use_id: null,
+      message: { content: [{ type: 'tool_result', tool_use_id: 'agent-1', content: 'report' }] },
+    },
+    assistant('m2', [text('done')]),
+    { type: 'result', subtype: 'success', result: 'done', usage: { input_tokens: 220 } },
+  )
+  await turn
+
+  assert.equal(runtime.filtersNestedEvents(), true)
+  assert.deepEqual(
+    events.flatMap((event) => (event.type === 'tool_use' ? [event.toolUseId] : [])),
+    ['agent-1', 'bash-1'],
+  )
+  assert.deepEqual(
+    events.flatMap((event) => (event.type === 'tool_result' ? [event.toolUseId] : [])),
+    ['bash-1', 'agent-1'],
+  )
+  assert.deepEqual(textDeltas(events), ['done'])
+  assert.deepEqual(
+    events.flatMap((event) =>
+      event.type === 'usage_progress' ? [`${event.messageId}:${event.usage.output_tokens}`] : [],
+    ),
+    ['m1:5', 'm1:30'],
+    'only main-loop API calls count toward goal progress',
+  )
+})

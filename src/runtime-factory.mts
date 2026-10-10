@@ -118,6 +118,10 @@ class SelectableRuntime implements ClaudeRuntime {
     return [...this.runtimes.values()].some((runtime) => runtime.hasBackgroundWork?.() === true)
   }
 
+  filtersNestedEvents(threadId: string): boolean {
+    return this.activeRuntimeByThread.get(threadId)?.filtersNestedEvents?.(threadId) === true
+  }
+
   hasPendingContinuation(threadId: string): boolean {
     return [...this.runtimes.values()].some(
       (runtime) => runtime.hasPendingContinuation?.(threadId) === true,

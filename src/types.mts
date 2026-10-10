@@ -585,4 +585,7 @@ export interface ClaudeRuntime {
   // True when Claude already produced output for a turn nobody has claimed
   // yet; the server answers it with a `continuation: true` turn.
   hasPendingContinuation?(threadId: string): boolean
+  // True when the backend drops a subagent's own events itself, so whatever
+  // reaches the server while an Agent call is open belongs to the parent.
+  filtersNestedEvents?(threadId: string): boolean
 }

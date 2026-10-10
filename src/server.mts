@@ -2784,7 +2784,7 @@ export class CodexClaudeAppServer {
             this.store.updateClaudeSessionId(thread.id, event.claudeSessionId)
             return
           }
-          if (activeSubagents.size > 0) {
+          if (activeSubagents.size > 0 && !this.runtime.filtersNestedEvents?.(thread.id)) {
             if (
               event.type === 'text_delta' ||
               event.type === 'reasoning_delta' ||

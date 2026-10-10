@@ -19,6 +19,9 @@ export class MockRuntime implements ClaudeRuntime {
   // What Claude says, unprompted, once a background agent reports back.
   private continuations = new Map<string, string>()
   private steered = new Map<string, string[]>()
+  // Threads whose scenario plays the native runtime, which drops a
+  // subagent's own events before they reach the server.
+  private nestedFiltered = new Set<string>()
 
   async runTurn(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void> {
     this.running.add(context.threadId)
@@ -442,6 +445,31 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    if (/parallel agent tool check/i.test(context.prompt)) {
+      // One assistant message calls Agent and Bash together. Claude runs them
+      // side by side; the Bash call is the parent's own.
+      this.nestedFiltered.add(context.threadId)
+      const agentId = `task-${Date.now()}`
+      const bashId = `bash-${Date.now()}`
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId: agentId,
+        toolName: 'Agent',
+        input: { description: 'mock parallel agent', prompt: 'look around' },
+      })
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId: bashId,
+        toolName: 'Bash',
+        input: { command: 'echo beside', description: 'parallel shell' },
+      })
+      await handlers.onEvent({ type: 'tool_result', toolUseId: bashId, content: 'beside' })
+      await handlers.onEvent({ type: 'tool_result', toolUseId: agentId, content: 'agent report' })
+      await handlers.onEvent({ type: 'text_delta', delta: 'both finished' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'both finished' })
+      return
+    }
+
     if (/background message check/i.test(context.prompt)) {
       const toolUseId = `send-${Date.now()}`
       const agentId = MOCK_BACKGROUND_AGENT_ID
@@ -627,6 +655,10 @@ export class MockRuntime implements ClaudeRuntime {
     this.steered.set(threadId, [...(this.steered.get(threadId) ?? []), prompt])
     setImmediate(() => options?.onAccepted?.())
     return true
+  }
+
+  filtersNestedEvents(threadId: string): boolean {
+    return this.nestedFiltered.has(threadId)
   }
 
   async stop(): Promise<void> {

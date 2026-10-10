@@ -4004,6 +4004,40 @@ test('background Agent outlives the parent turn, wakes the parent, and resumes o
   }
 })
 
+test('a tool Claude runs beside an Agent call keeps its own card', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  try {
+    const threadId = await startMockThread(reader, proc)
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: textInput('parallel agent tool check') },
+      }),
+    )
+    await reader.nextResponse(2)
+    const turn = await readUntil(
+      reader,
+      (message) => message.method === 'turn/completed' && message.params.threadId === threadId,
+    )
+    const parentItems = turn
+      .filter((m) => m.method === 'item/completed' && m.params.threadId === threadId)
+      .map((m) => m.params.item)
+    const shell = parentItems.find((item) => item.type === 'commandExecution')
+    assert.equal(shell?.status, 'completed', 'the parallel Bash call must not be swallowed')
+    assert.ok(parentItems.some((item) => item.tool === 'spawnAgent'))
+    assert.ok(parentItems.some((item) => item.tool === 'wait' && item.status === 'completed'))
+    assert.ok(
+      parentItems.some((item) => item.type === 'agentMessage' && item.text === 'both finished'),
+    )
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('an agent backgrounded mid-wait closes the wait without marking the child done', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
