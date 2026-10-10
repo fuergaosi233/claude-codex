@@ -281,12 +281,11 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     opts.permissionMode = mode
     if (mode === 'bypassPermissions') opts.allowDangerouslySkipPermissions = true
 
+    // Workflows are on by default except on Pro plans; the env switch turns
+    // them on there too. It deliberately avoids --settings, which pinned
+    // launchers reject outright, and leaves an explicit user opt-out alone.
     if (parseWorkflowCommand(context.prompt)?.type === 'run') {
-      opts.settings = {
-        ...((opts.settings as Record<string, unknown> | undefined) ?? {}),
-        enableWorkflows: true,
-        workflowKeywordTriggerEnabled: true,
-      }
+      opts.env = { ...(opts.env as NodeJS.ProcessEnv), CLAUDE_CODE_WORKFLOWS: '1' }
     }
 
     // Per-tool approval round-trip with Codex App. In App-level Full Access,
