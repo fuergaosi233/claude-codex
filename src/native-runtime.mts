@@ -1664,6 +1664,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     const nestedMessage = Boolean(message.parent_tool_use_id)
     if (!nestedMessage && pending.activeSubagents.size === 0) {
       await this.beginAssistantMessage(pending, stringOrNull(inner.id))
+      const usage = recordOrNull(inner.usage)
+      const messageId = stringOrNull(inner.id)
+      // Not final until the result, but enough to see a goal budget run out
+      // inside a long turn.
+      if (usage && messageId)
+        await pending.handlers.onEvent({ type: 'usage_progress', messageId, usage })
     }
     const content = (inner.content as Array<Record<string, unknown>>) || []
     for (const block of content) {

@@ -5023,6 +5023,48 @@ test('goal continuation stops when a hidden turn makes no progress or exhausts t
   }
 })
 
+test('a goal budget that runs out mid-turn steers the model to wrap up and ends the run', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  const call = async (id: number, method: string, params: Record<string, unknown>) => {
+    proc.stdin.write(json({ id, method, params }))
+    return reader.nextResponse(id)
+  }
+  try {
+    const threadId = await startMockThread(reader, proc)
+    await call(2, 'thread/goal/set', {
+      threadId,
+      objective: 'goal budget steer check',
+      tokenBudget: 300,
+      status: 'active',
+    })
+    const run = await readTurns(reader, 1, 600)
+    assert.equal(run.filter((message) => message.method === 'turn/started').length, 1)
+    const limitedAt = run.findIndex(
+      (message) =>
+        message.method === 'thread/goal/updated' && message.params.goal.status === 'budgetLimited',
+    )
+    const completedAt = run.findIndex((message) => message.method === 'turn/completed')
+    assert.ok(limitedAt >= 0 && limitedAt < completedAt, 'the budget runs out inside the turn')
+    assert.ok(
+      run.some(
+        (message) =>
+          message.method === 'item/agentMessage/delta' &&
+          message.params.delta === 'wrapping up on budget',
+      ),
+      'the running turn got the budget-limit steer',
+    )
+    const goal = (await call(3, 'thread/goal/get', { threadId })).result.goal
+    assert.equal(goal.status, 'budgetLimited')
+    // 420 streamed, then the result settles the turn at 510.
+    assert.equal(goal.tokensUsed, 510)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('AskUserQuestion is bridged to Codex item/tool/requestUserInput', async () => {
   // Bug repro: Claude's AskUserQuestion tool calls weren't surfaced in the
   // App UI — they fell through as generic mcpToolCall items with no choice

@@ -420,6 +420,9 @@ export type RuntimeEvent =
     }
   | { type: 'notice'; level: 'info' | 'warning' | 'error'; message: string }
   | { type: 'usage'; usage: Record<string, unknown> }
+  // One API call of the main loop, before the turn's result settles its
+  // usage. A message can be reported again with a larger count.
+  | { type: 'usage_progress'; messageId: string; usage: Record<string, unknown> }
   | {
       type: 'metrics'
       durationMs: number | null

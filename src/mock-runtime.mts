@@ -18,6 +18,7 @@ export class MockRuntime implements ClaudeRuntime {
   private backgroundTasks = new Map<string, { threadId: string; timer: NodeJS.Timeout }>()
   // What Claude says, unprompted, once a background agent reports back.
   private continuations = new Map<string, string>()
+  private steered = new Map<string, string[]>()
 
   async runTurn(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void> {
     this.running.add(context.threadId)
@@ -47,6 +48,25 @@ export class MockRuntime implements ClaudeRuntime {
     // would trip the keyword branches below, so answer it first: report usage,
     // and finish the goal when the objective asks for it.
     if (context.prompt.includes('<codex_internal_context>')) {
+      if (/goal budget steer check/i.test(context.prompt)) {
+        // One long API call overruns the budget before the turn's result.
+        await handlers.onEvent({
+          type: 'usage_progress',
+          messageId: 'mock-call-1',
+          usage: { input_tokens: 400, output_tokens: 20 },
+        })
+        await sleep(20)
+        const steers = this.steered.get(context.threadId) ?? []
+        this.steered.delete(context.threadId)
+        const wrapUp = steers.some((prompt) => prompt.includes('has reached its token budget'))
+        await handlers.onEvent({
+          type: 'text_delta',
+          delta: wrapUp ? 'wrapping up on budget' : 'kept working',
+        })
+        await handlers.onEvent({ type: 'usage', usage: { input_tokens: 450, output_tokens: 60 } })
+        await handlers.onEvent({ type: 'completed', success: true, result: 'wrapped up' })
+        return
+      }
       if (/goal complete check/i.test(context.prompt) && context.goalTools) {
         const toolUseId = `goal-${Date.now()}`
         await handlers.onEvent({
@@ -560,8 +580,9 @@ export class MockRuntime implements ClaudeRuntime {
   }
 
   // Claude takes a steer at its next tool-round boundary.
-  async steer(threadId: string, _prompt: string, options?: RuntimeSteerOptions): Promise<boolean> {
+  async steer(threadId: string, prompt: string, options?: RuntimeSteerOptions): Promise<boolean> {
     if (!this.running.has(threadId)) return false
+    this.steered.set(threadId, [...(this.steered.get(threadId) ?? []), prompt])
     setImmediate(() => options?.onAccepted?.())
     return true
   }

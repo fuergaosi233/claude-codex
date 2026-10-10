@@ -7,6 +7,7 @@ import { promisify } from 'node:util'
 import { listClaudeHooks, listClaudeSkills } from './claude-capabilities.mjs'
 import {
   goalBudgetExhausted,
+  goalBudgetLimitPrompt,
   goalContinuationPrompt,
   goalObjectiveUpdatedPrompt,
   goalToolResult,
@@ -310,6 +311,9 @@ export class CodexClaudeAppServer {
   // The turn each goal's tokens accrue to: one that ran while the goal was
   // active, even if the goal settles before the turn's usage arrives.
   private goalTurnByThread = new Map<string, string>()
+  // Tokens already charged to the goal for each main-loop API call of the
+  // running turn, before its result settles the turn's usage.
+  private goalProgressByThread = new Map<string, Map<string, number>>()
   private goalToolHandlers = new Map<string, GoalToolHandlers>()
   private elicitationCounts = new Map<string, number>()
   private tokenUsageByThread = new Map<string, TokenUsageBreakdown>()
@@ -1410,16 +1414,41 @@ export class CodexClaudeAppServer {
   // Codex counts goal tokens while the goal is active; cache reads are free.
   // Claude reports usage per result, so a turn that completed or paused the
   // goal midway still owes it the tokens it spent.
-  private accrueGoalTokens(threadId: string, usage: TokenUsageBreakdown): void {
+  private accrueGoalTokens(threadId: string, tokens: number, midTurn: boolean): void {
+    if (tokens <= 0) return
     const goal = this.store.getGoal(threadId)
     if (!goal) return
     const goalTurn = this.goalTurnByThread.get(threadId)
     if (goal.status !== 'active' && goalTurn !== this.activeTurnByThread.get(threadId)) return
     this.accrueGoalTime(goal)
-    goal.tokensUsed += usage.inputTokens + usage.outputTokens
-    if (goal.status === 'active' && goalBudgetExhausted(goal)) goal.status = 'budgetLimited'
+    goal.tokensUsed += tokens
+    const limited = goal.status === 'active' && goalBudgetExhausted(goal)
+    if (limited) goal.status = 'budgetLimited'
     goal.updatedAt = nowSeconds()
     this.commitGoal(goal)
+    // Like Codex, a budget that runs out mid-turn asks the model to wrap up
+    // rather than cutting the turn off; no continuation follows it.
+    if (limited && midTurn)
+      void this.runtime
+        .steer(threadId, goalBudgetLimitPrompt(goal))
+        .catch((error) => debugLog('goal.budgetSteer.failed', { threadId, error: String(error) }))
+  }
+
+  // Charges one main-loop API call as it streams. Its usage only grows, and
+  // the turn's result reconciles whatever it charged.
+  private recordGoalProgress(
+    threadId: string,
+    messageId: string,
+    usage: Record<string, unknown>,
+  ): void {
+    const breakdown = tokenBreakdownFromClaudeUsage(usage)
+    const counted = breakdown.inputTokens + breakdown.outputTokens
+    const progress = this.goalProgressByThread.get(threadId) ?? new Map<string, number>()
+    const charged = progress.get(messageId) ?? 0
+    if (counted <= charged) return
+    progress.set(messageId, counted)
+    this.goalProgressByThread.set(threadId, progress)
+    this.accrueGoalTokens(threadId, counted - charged, true)
   }
 
   // Bookkeeping for a turn that just left the thread: close the goal clock
@@ -1427,6 +1456,7 @@ export class CodexClaudeAppServer {
   private settleGoalTurn(threadId: string, settled: TurnRecord | null): void {
     const goalTurn = settled ? this.goalTurns.delete(settled.id) : false
     this.goalTurnByThread.delete(threadId)
+    this.goalProgressByThread.delete(threadId)
     const goal = this.store.getGoal(threadId)
     if (!goal) {
       this.goalClockByThread.delete(threadId)
@@ -3359,6 +3389,10 @@ export class CodexClaudeAppServer {
             this.recordTokenUsage(peer, thread.id, turn.id, event.usage)
             return
           }
+          if (event.type === 'usage_progress') {
+            this.recordGoalProgress(thread.id, event.messageId, event.usage)
+            return
+          }
           if (event.type === 'hook') {
             // Render hook activity once as a structured Codex hookPrompt item.
             // All fragments of the same hook run share one hookRunId so App
@@ -4733,6 +4767,8 @@ export class CodexClaudeAppServer {
     usage: Record<string, unknown>,
   ): void {
     const last = tokenBreakdownFromClaudeUsage(usage)
+    const progress = this.goalProgressByThread.get(threadId)
+    this.goalProgressByThread.delete(threadId)
     if (last.totalTokens === 0) return
     const prior = this.tokenUsageByThread.get(threadId) ?? emptyTokenBreakdown()
     const total: TokenUsageBreakdown = {
@@ -4748,7 +4784,9 @@ export class CodexClaudeAppServer {
       method: 'thread/tokenUsage/updated',
       params: { threadId, turnId, tokenUsage },
     })
-    this.accrueGoalTokens(threadId, last)
+    // The result is authoritative; charge only what streaming did not.
+    const charged = [...(progress?.values() ?? [])].reduce((sum, tokens) => sum + tokens, 0)
+    this.accrueGoalTokens(threadId, last.inputTokens + last.outputTokens - charged, false)
     // NOTE: previously we also pushed `account/rateLimits/updated` here on
     // every token-usage event "to keep the UI in sync". That backfired —
     // Codex App treats every such notification as a fresh rate-limit signal
