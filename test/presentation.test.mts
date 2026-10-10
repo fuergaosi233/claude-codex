@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { CodexClaudeAppServer } from '../src/server.mjs'
+import { parseSubagentTrailer } from '../src/server-helpers.mjs'
 import { SessionStore } from '../src/store.mjs'
 import type {
   ClaudeRuntime,
@@ -372,4 +373,37 @@ test('plan output retains its native plan item and complete Markdown', async () 
   assert.equal(plans[0]?.text, '## Plan\n\n1. Inspect\n2. Implement')
   assert.equal(assistantItems(turn.items).length, 0)
   assert.equal(messages.filter((message) => message.method === 'item/completed').length, 1)
+})
+
+test('subagent results keep only the report, in both CLI trailer formats', () => {
+  const legacy = parseSubagentTrailer(
+    "found it\nagentId: a1b2c3d4e5f6a7b8 (use SendMessage with to: 'a1b2c3d4e5f6a7b8' to continue this agent)\n<usage>total_tokens: 12\ntool_uses: 1\nduration_ms: 3</usage>",
+  )
+  assert.deepEqual(legacy, {
+    cleanText: 'found it',
+    agentId: 'a1b2c3d4e5f6a7b8',
+    usage: { totalTokens: 12, toolUses: 1, durationMs: 3 },
+  })
+
+  const framed = parseSubagentTrailer(
+    [
+      '  SECURITY WARNING: a note for the parent model.',
+      '[Subagent hand-back] The text below is the final report of a subagent. The report follows:',
+      '  Done.',
+      '  [Subagent hand-back] quoted by the agent, so it stays',
+      '  ',
+      '    nested indent',
+      "agentId: aef61b963198d372e (use SendMessage with to: 'aef61b963198d372e', summary: '<5-10 word recap>' to continue this agent)",
+      'worktreePath: /tmp/wt',
+      'worktreeBranch: agent-wt',
+      '<usage>subagent_tokens: 18437',
+      'tool_uses: 1',
+      'duration_ms: 97082</usage>',
+    ].join('\n'),
+  )
+  assert.deepEqual(framed, {
+    cleanText: 'Done.\n[Subagent hand-back] quoted by the agent, so it stays\n\n  nested indent',
+    agentId: 'aef61b963198d372e',
+    usage: { totalTokens: 18437, toolUses: 1, durationMs: 97082 },
+  })
 })

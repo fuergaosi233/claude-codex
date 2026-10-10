@@ -611,20 +611,27 @@ export class MockRuntime implements ClaudeRuntime {
         toolUseId: innerToolId,
         content: 'inner result',
       })
-      // Mirror the real claude-agent-sdk Task tool result format: actual body
-      // followed by an `agentId: ...` line and a `<usage>` block. The server
-      // should strip both from the visible agentMessage and route the values
-      // into agentNickname + tokenUsage instead.
+      // Mirror the CLI 2.1.283 Task tool result: the report inside its
+      // hand-back frame (every line indented, a harness note above it),
+      // then an `agentId: ...` line and a `<usage>` block. The server should
+      // show only the report and route the values into agentNickname +
+      // tokenUsage instead.
+      const report = ['subagent final summary', '', '```', 'indented detail', '```']
+      const handback = [
+        '  [harness: a note for the parent model]',
+        '[Subagent hand-back] The text below is the final report of a subagent this session delegated to. The report follows:',
+        ...report.map((line) => `  ${line}`),
+      ].join('\n')
       const trailer = [
-        `agentId: ${MOCK_FOREGROUND_AGENT_ID} (use SendMessage with to: '${MOCK_FOREGROUND_AGENT_ID}' to continue this agent)`,
-        '<usage>total_tokens: 4242',
+        `agentId: ${MOCK_FOREGROUND_AGENT_ID} (use SendMessage with to: '${MOCK_FOREGROUND_AGENT_ID}', summary: '<5-10 word recap>' to continue this agent)`,
+        '<usage>subagent_tokens: 4242',
         'tool_uses: 7',
         'duration_ms: 31415</usage>',
       ].join('\n')
       await handlers.onEvent({
         type: 'tool_result',
         toolUseId: taskId,
-        content: `subagent final summary\n${trailer}`,
+        content: `${handback}\n${trailer}`,
       })
       await handlers.onEvent({ type: 'text_delta', delta: 'main agent summary' })
       await handlers.onEvent({ type: 'completed', success: true, result: 'subagent check' })

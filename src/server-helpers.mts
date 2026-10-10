@@ -627,12 +627,12 @@ export function emptyTokenBreakdown(): TokenUsageBreakdown {
 
 // claude-agent-sdk's Task tool appends a fixed metadata trailer to the
 // subagent's tool_result content:
-//   `agentId: <hex> (use SendMessage with to: '<hex>' to continue this agent)`
-//   `<usage>total_tokens: N\ntool_uses: M\nduration_ms: K</usage>`
+//   `agentId: <hex> (use SendMessage with to: '<hex>', summary: ... to continue this agent)`
+//   `<usage>subagent_tokens: N\ntool_uses: M\nduration_ms: K</usage>`
 // Codex App renders neither natively — they just show as raw text after the
-// real result. Strip both from the visible body and surface the values via
-// agentNickname / token usage / metrics so the subagent timeline carries the
-// SDK-reported identity and cost.
+// real result. Strip both (and the hand-back frame around the report) from the
+// visible body and surface the values via agentNickname / token usage /
+// metrics so the subagent timeline carries the SDK-reported identity and cost.
 interface SubagentTrailer {
   cleanText: string
   agentId: string | null
@@ -689,8 +689,9 @@ export function parseSubagentTrailer(text: string): SubagentTrailer {
   let agentId: string | null = null
   let usage: SubagentTrailer['usage'] = null
 
+  // CLI 2.1.283 counts `subagent_tokens`; older builds said `total_tokens`.
   const usageMatch = cleanText.match(
-    /<usage>\s*total_tokens:\s*(\d+)\s*\n\s*tool_uses:\s*(\d+)\s*\n\s*duration_ms:\s*(\d+)\s*<\/usage>\s*$/,
+    /<usage>\s*(?:subagent|total)_tokens:\s*(\d+)\s*\n\s*tool_uses:\s*(\d+)\s*\n\s*duration_ms:\s*(\d+)\s*<\/usage>\s*$/,
   )
   if (usageMatch) {
     usage = {
@@ -701,13 +702,32 @@ export function parseSubagentTrailer(text: string): SubagentTrailer {
     cleanText = cleanText.slice(0, usageMatch.index).replace(/\s+$/, '')
   }
 
-  const agentMatch = cleanText.match(/\n?agentId:\s*([0-9a-f]{8,32})\b[^\n]*\s*$/i)
+  // A worktree agent's trailer lists its worktree after the agentId line.
+  const agentMatch = cleanText.match(
+    /\n?agentId:\s*([0-9a-f]{8,32})\b[^\n]*(?:\nworktree(?:Path|Branch):[^\n]*)*\s*$/i,
+  )
   if (agentMatch) {
     agentId = agentMatch[1] ?? null
     cleanText = cleanText.slice(0, agentMatch.index).replace(/\s+$/, '')
   }
 
-  return { cleanText, agentId, usage }
+  return { cleanText: unwrapSubagentHandback(cleanText), agentId, usage }
+}
+
+// CLI 2.1.283 frames a subagent's report for the parent model: a one-line
+// `[Subagent hand-back] ...` notice at column zero, then the report with every
+// line indented by two spaces. Harness notes, indented too, may sit above the
+// frame; they are for the model, so only the report is kept. A frame-like line
+// inside the report is indented, so the first one at column zero is the real one.
+function unwrapSubagentHandback(text: string): string {
+  const frame = /(?:^|\n)\[Subagent hand-back\][^\n]*(?:\n|$)/.exec(text)
+  if (!frame) return text
+  return text
+    .slice(frame.index + frame[0].length)
+    .split('\n')
+    .map((line) => (line.startsWith('  ') ? line.slice(2) : line))
+    .join('\n')
+    .replace(/\s+$/, '')
 }
 
 // Best-effort parse of a Claude Bash tool_result for the real shell exit
