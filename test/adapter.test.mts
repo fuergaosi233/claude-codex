@@ -5065,6 +5065,56 @@ test('a goal budget that runs out mid-turn steers the model to wrap up and ends 
   }
 })
 
+test('editing the goal objective mid-turn steers the running turn instead of starting another', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  try {
+    const threadId = await startMockThread(reader, proc)
+    const seen: any[] = []
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'thread/goal/set',
+        params: { threadId, objective: 'goal objective steer check', status: 'active' },
+      }),
+    )
+    await awaitMessage(reader, (message) => message.method === 'turn/started', seen)
+    const objective = 'goal objective steer check: revised objective'
+    proc.stdin.write(json({ id: 3, method: 'thread/goal/set', params: { threadId, objective } }))
+    const edit = await awaitMessage(
+      reader,
+      (message) => message.id === 3 && message.method == null,
+      seen,
+    )
+    assert.equal(edit.result.goal.objective, objective)
+    assert.equal(edit.result.goal.status, 'active')
+    const ended = seen.some((message) => message.method === 'turn/completed')
+    seen.push(...(await readTurns(reader, ended ? 0 : 1, 600)))
+
+    assert.ok(
+      seen.some(
+        (message) =>
+          message.method === 'item/agentMessage/delta' &&
+          message.params.delta === 'now on the revised objective',
+      ),
+      'the running turn got the edited objective',
+    )
+    assert.equal(seen.filter((message) => message.method === 'turn/started').length, 1)
+    assert.equal(seen.filter((message) => message.method === 'turn/completed').length, 1)
+    assert.ok(
+      !seen.some(
+        (message) =>
+          message.method === 'item/started' && message.params.item.type === 'userMessage',
+      ),
+      'the steer stays hidden',
+    )
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('AskUserQuestion is bridged to Codex item/tool/requestUserInput', async () => {
   // Bug repro: Claude's AskUserQuestion tool calls weren't surfaced in the
   // App UI — they fell through as generic mcpToolCall items with no choice

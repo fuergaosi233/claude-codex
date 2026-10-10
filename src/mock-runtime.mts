@@ -48,6 +48,30 @@ export class MockRuntime implements ClaudeRuntime {
     // would trip the keyword branches below, so answer it first: report usage,
     // and finish the goal when the objective asks for it.
     if (context.prompt.includes('<codex_internal_context>')) {
+      if (
+        /goal objective steer check/i.test(context.prompt) &&
+        !/revised objective/i.test(context.prompt)
+      ) {
+        // Still running when the user edits the objective, so the edit has to
+        // reach this turn as a steer.
+        let edit: string | undefined
+        for (let i = 0; i < 200 && !edit; i += 1) {
+          await sleep(10)
+          edit = this.steered
+            .get(context.threadId)
+            ?.find((prompt) => prompt.includes('objective was edited'))
+        }
+        this.steered.delete(context.threadId)
+        await handlers.onEvent({
+          type: 'text_delta',
+          delta: edit?.includes('revised objective')
+            ? 'now on the revised objective'
+            : 'never steered',
+        })
+        await handlers.onEvent({ type: 'usage', usage: { input_tokens: 40, output_tokens: 10 } })
+        await handlers.onEvent({ type: 'completed', success: true, result: 'switched' })
+        return
+      }
       if (/goal budget steer check/i.test(context.prompt)) {
         // One long API call overruns the budget before the turn's result.
         await handlers.onEvent({
