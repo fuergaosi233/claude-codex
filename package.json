@@ -54,8 +54,8 @@
     "ws": "^8.21.3"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.5.14",
-    "@types/node": "^26.6.2",
+    "@biomejs/biome": "^2.5.15",
+    "@types/node": "^26.6.4",
     "@types/ws": "^8.18.1",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
