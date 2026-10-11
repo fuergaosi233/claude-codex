@@ -4387,6 +4387,180 @@ test('stopping a foreground child ends it as interrupted and the parent carries 
   }
 })
 
+// Codex cc 26.930's subagent roster reducer (app-initial I5t), reduced to the
+// status it shows per agent for one parent turn's items.
+function appRoster(items: any[], isTurnLive: boolean): Map<string, string> {
+  const fromState: Record<string, string> = {
+    pendingInit: 'waiting',
+    running: 'working',
+    completed: 'done',
+    interrupted: 'done',
+    shutdown: 'done',
+    errored: 'failed',
+    notFound: 'failed',
+  }
+  const busy = (status: string) => status === 'waiting' || status === 'working'
+  const roster = new Map<string, string>()
+  const status = (id: string) => roster.get(id) ?? 'working'
+  for (const item of items) {
+    if (item.type === 'subAgentActivity') {
+      const ended = item.kind === 'completed' || item.kind === 'interrupted'
+      roster.set(item.agentThreadId, ended ? 'done' : 'working')
+      continue
+    }
+    if (item.type !== 'collabAgentToolCall') continue
+    const spawning = ['spawnAgent', 'sendInput', 'resumeAgent'].includes(item.tool)
+    for (const id of item.receiverThreadIds)
+      roster.set(id, item.status !== 'failed' && spawning ? 'working' : status(id))
+    for (const [id, state] of Object.entries<any>(item.agentsStates ?? {}))
+      roster.set(id, fromState[state.status] ?? status(id))
+    if (item.tool === 'wait' && item.status === 'completed')
+      for (const [id, value] of roster) if (busy(value)) roster.set(id, 'done')
+  }
+  if (!isTurnLive) for (const [id, value] of roster) if (busy(value)) roster.set(id, 'done')
+  return roster
+}
+
+// The parent thread's items as the App holds them: first appearance order,
+// latest state.
+function liveItems(messages: any[], threadId: string): any[] {
+  const items = new Map<string, any>()
+  for (const m of messages)
+    if (
+      (m.method === 'item/started' || m.method === 'item/completed') &&
+      m.params.threadId === threadId
+    )
+      items.set(m.params.item.id, m.params.item)
+  return [...items.values()]
+}
+
+test('a foreground agent finishing beside a background one leaves the background agent working', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  const turnCompleted = (threadId: string) => (message: any) =>
+    message.method === 'turn/completed' && message.params.threadId === threadId
+  try {
+    proc.stdin.write(json(codex930Initialize(0)))
+    await reader.nextResponse(0)
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const threadId = (await reader.nextResponse(1)).result.thread.id
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'mixed agents check delay=400', text_elements: [] }],
+        },
+      }),
+    )
+    await reader.nextResponse(2)
+    const launch = await readUntil(reader, turnCompleted(threadId))
+    const spawned = launch
+      .filter((m) => m.method === 'item/completed' && m.params.item.tool === 'spawnAgent')
+      .map((m) => m.params.item)
+    const bgChild = String(
+      spawned.find((item) => item.prompt === 'sleep then report')?.receiverThreadIds[0],
+    )
+    const fgChild = String(
+      spawned.find((item) => item.prompt === 'answer now')?.receiverThreadIds[0],
+    )
+    const waitEnd = launch.findIndex(
+      (m) => m.method === 'item/completed' && m.params.item.tool === 'wait',
+    )
+    assert.ok(waitEnd >= 0, 'the foreground agent is waited on')
+    const wait = launch[waitEnd].params.item
+    assert.deepEqual(wait.receiverThreadIds, [fgChild])
+    assert.equal(wait.agentsStates[fgChild].status, 'completed')
+    assert.equal(wait.status, 'failed', 'a completed wait would end the background agent too')
+    assert.equal(launch.some(turnCompleted(bgChild)), false)
+
+    const roster = appRoster(liveItems(launch.slice(0, waitEnd + 1), threadId), true)
+    assert.equal(roster.get(fgChild), 'done')
+    assert.equal(roster.get(bgChild), 'working')
+
+    const report = await readUntil(reader, turnCompleted(threadId))
+    const childDone = report.find(turnCompleted(bgChild))
+    assert.equal(childDone?.params.turn.status, 'completed')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('the first of two foreground agents to finish does not end the other in the App roster', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json(codex930Initialize(0)))
+    await reader.nextResponse(0)
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const threadId = (await reader.nextResponse(1)).result.thread.id
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'sibling agents check', text_elements: [] }],
+        },
+      }),
+    )
+    await reader.nextResponse(2)
+    const turn = await readUntil(
+      reader,
+      (m) => m.method === 'turn/completed' && m.params.threadId === threadId,
+    )
+    const child = (prompt: string) =>
+      String(
+        turn.find(
+          (m) =>
+            m.method === 'item/completed' &&
+            m.params.item.tool === 'spawnAgent' &&
+            m.params.item.prompt === prompt,
+        )?.params.item.receiverThreadIds[0],
+      )
+    const quick = child('quick agent')
+    const slow = child('slow agent')
+    const waitEnds = turn
+      .map((m, index) => ({ m, index }))
+      .filter(({ m }) => m.method === 'item/completed' && m.params.item.tool === 'wait')
+    assert.equal(waitEnds.length, 2)
+    const [first, second] = waitEnds
+    assert.deepEqual(first?.m.params.item.receiverThreadIds, [quick])
+    assert.equal(first?.m.params.item.status, 'failed')
+    assert.equal(first?.m.params.item.agentsStates[quick].status, 'completed')
+    const midway = appRoster(liveItems(turn.slice(0, (first?.index ?? 0) + 1), threadId), true)
+    assert.equal(midway.get(quick), 'done')
+    assert.equal(midway.get(slow), 'working')
+
+    assert.deepEqual(second?.m.params.item.receiverThreadIds, [slow])
+    assert.equal(second?.m.params.item.status, 'completed', 'the last agent closes normally')
+    const settled = appRoster(liveItems(turn, threadId), false)
+    assert.deepEqual([settled.get(quick), settled.get(slow)], ['done', 'done'])
+
+    proc.stdin.write(json({ id: 3, method: 'thread/read', params: { threadId } }))
+    const persisted = (await reader.nextResponse(3)).result.thread.turns[0].items
+    const persistedWaits = persisted.filter((item: any) => item.tool === 'wait')
+    assert.deepEqual(
+      persistedWaits.map((item: any) => item.status).sort(),
+      ['completed', 'failed'],
+      'reload shows the same wait states the App saw live',
+    )
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 function codex930Initialize(id: number) {
   return {
     id,

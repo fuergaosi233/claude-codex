@@ -3137,11 +3137,19 @@ export class CodexClaudeAppServer {
             }
 
             // Stage 2 close — wait (end). Re-emits the same waitItemId.
+            // The App marks every working agent done on a *completed* wait,
+            // so while another agent of this thread still runs (a background
+            // agent, or a sibling launched in the same message) the wait
+            // closes failed instead. The App never renders a wait, and this
+            // child's own agentsStates still carries its real outcome.
+            const siblingRunning =
+              [...activeSubagents].some((id) => id !== event.toolUseId) ||
+              this.hasRunningBackgroundSubagent(thread.id)
             const waitEnd: ThreadItem = {
               type: 'collabAgentToolCall',
               id: ctx.waitItemId,
               tool: 'wait',
-              status: collabStatus,
+              status: siblingRunning ? 'failed' : collabStatus,
               senderThreadId: thread.id,
               receiverThreadIds: [ctx.childThreadId],
               prompt: null,
@@ -4489,6 +4497,12 @@ export class CodexClaudeAppServer {
       'Claude session ended before this agent reported back.',
     )
     this.idleCheckHandler?.()
+  }
+
+  private hasRunningBackgroundSubagent(parentThreadId: string): boolean {
+    for (const entry of this.backgroundSubagents.values())
+      if (entry.running && entry.parentThreadId === parentThreadId) return true
+    return false
   }
 
   private finalizeBackgroundSubagents(threadId: string | null, message: string): void {

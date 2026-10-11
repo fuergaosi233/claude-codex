@@ -507,6 +507,71 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    if (/mixed agents check/i.test(context.prompt)) {
+      // One message launches a background agent and a foreground one. The
+      // foreground agent finishes inside the turn; the background one reports
+      // after it.
+      const bgId = `task-bg-${Date.now()}`
+      const fgId = `task-fg-${Date.now()}`
+      const agentId = MOCK_BACKGROUND_AGENT_ID
+      const prompt = 'sleep then report'
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId: bgId,
+        toolName: 'Agent',
+        input: { description: 'mock background agent', prompt, run_in_background: true },
+      })
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId: fgId,
+        toolName: 'Agent',
+        input: { description: 'mock foreground agent', prompt: 'answer now' },
+      })
+      await handlers.onEvent({
+        type: 'tool_result',
+        toolUseId: bgId,
+        content: `Async agent launched successfully.\nagentId: ${agentId}`,
+        structured: { isAsync: true, status: 'async_launched', agentId, prompt },
+      })
+      this.scheduleBackgroundReport(
+        context.threadId,
+        agentId,
+        bgId,
+        'mixed background report',
+        backgroundDelayMs(context.prompt),
+      )
+      await sleep(50)
+      await handlers.onEvent({ type: 'tool_result', toolUseId: fgId, content: 'foreground report' })
+      await handlers.onEvent({ type: 'text_delta', delta: 'foreground done, background running' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'mixed' })
+      return
+    }
+
+    if (/sibling agents check/i.test(context.prompt)) {
+      // Two foreground agents launched in one message; the first one to
+      // finish must not end the other.
+      const firstId = `task-a-${Date.now()}`
+      const secondId = `task-b-${Date.now()}`
+      for (const [toolUseId, description] of [
+        [firstId, 'quick agent'],
+        [secondId, 'slow agent'],
+      ] as const) {
+        await handlers.onEvent({
+          type: 'tool_use',
+          toolUseId,
+          toolName: 'Agent',
+          input: { description, prompt: description },
+        })
+      }
+      await sleep(30)
+      await handlers.onEvent({ type: 'tool_result', toolUseId: firstId, content: 'quick report' })
+      await sleep(30)
+      await handlers.onEvent({ type: 'tool_result', toolUseId: secondId, content: 'slow report' })
+      await handlers.onEvent({ type: 'text_delta', delta: 'both agents reported' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'siblings' })
+      return
+    }
+
     if (/background close check/i.test(context.prompt)) {
       // Claude stops its own background agent; no notification follows.
       const toolUseId = `stop-${Date.now()}`
