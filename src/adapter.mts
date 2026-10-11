@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { chmodSync, existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
+import { forgetCliChildren, reapOrphanedCliChildren } from './cli-orphans.mjs'
 import { createRuntime } from './runtime-factory.mjs'
 import { CodexClaudeAppServer } from './server.mjs'
 import { SessionStore } from './store.mjs'
@@ -88,6 +89,14 @@ async function main(): Promise<void> {
       `[claude-codex-adapter] recovered ${recovered} stale in-progress turn(s)\n`,
     )
   }
+  // Same boundary for processes: a killed adapter's CLI keeps writing the
+  // session this process may resume, so stop it before serving.
+  const reaped = await reapOrphanedCliChildren()
+  if (reaped.length > 0) {
+    process.stderr.write(
+      `[claude-codex-adapter] stopped ${reaped.length} orphaned Claude CLI process(es)\n`,
+    )
+  }
   const runtime = createRuntime()
   const server = new CodexClaudeAppServer(store, runtime)
   let shuttingDown = false
@@ -98,6 +107,7 @@ async function main(): Promise<void> {
     let code = 0
     try {
       await server.stop()
+      forgetCliChildren()
     } catch (error) {
       // shuttingDown already ignores the next signal, so a failed stop has to
       // end the process here or nothing will.
