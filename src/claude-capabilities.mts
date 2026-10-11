@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { claudeCommandManifest, firstSentence, listClaudeCommands } from './claude-commands.mjs'
 
 interface SkillMetadata {
   readonly name: string
@@ -46,11 +47,21 @@ interface HooksListEntry {
 export function listClaudeSkills(params: Record<string, unknown>): SkillsListEntry[] {
   const roots = cwdsFromParams(params)
   const userSkills = readSkillDir(join(homedir(), '.claude', 'skills'), 'user')
+  const builtins = listClaudeCommands().map(
+    (command): SkillMetadata => ({
+      name: command.name,
+      description: command.description,
+      shortDescription: firstSentence(command.description),
+      path: claudeCommandManifest(command.name),
+      scope: 'system',
+      enabled: true,
+    }),
+  )
   return roots.map((cwd) => {
     const repo = readSkillDir(join(cwd, '.claude', 'skills'), 'repo')
     return {
       cwd,
-      skills: [...userSkills.skills, ...repo.skills],
+      skills: [...userSkills.skills, ...repo.skills, ...builtins],
       errors: [...userSkills.errors, ...repo.errors],
     }
   })
@@ -81,7 +92,9 @@ function readSkillDir(
         name,
         description: frontmatter.description || '',
         ...(frontmatter.description ? { shortDescription: frontmatter.description } : {}),
-        path: skillPath,
+        // Codex points `path` at the manifest; the App opens it when the
+        // skill chip is clicked.
+        path: manifest,
         scope,
         enabled: true,
       })

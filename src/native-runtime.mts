@@ -35,6 +35,7 @@ if (!process.env.ANTHROPIC_BETAS) {
 // installed via optionalDependencies.
 
 import type { Query } from '@anthropic-ai/claude-agent-sdk'
+import { noteClaudeCommands } from './claude-commands.mjs'
 import { recordCliChildren } from './cli-orphans.mjs'
 import {
   CREATE_GOAL_DESCRIPTION,
@@ -1394,6 +1395,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     const subtype = String(message.subtype ?? '')
     if (subtype === 'init') {
       void recordCliChildren()
+      const skills = Array.isArray(message.skills) ? message.skills.map(String) : null
+      if (skills)
+        void pending.session.query
+          ?.supportedCommands()
+          .then((commands) => noteClaudeCommands(commands, skills))
+          .catch(() => {})
       const sessionId = String(message.session_id ?? '')
       if (sessionId) await pending.handlers.onEvent({ type: 'session', claudeSessionId: sessionId })
       return

@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { listClaudeHooks, listClaudeSkills } from './claude-capabilities.mjs'
+import { onClaudeCommandsChanged, skillLinksToCommand } from './claude-commands.mjs'
 import {
   goalBudgetExhausted,
   goalBudgetLimitPrompt,
@@ -341,6 +342,9 @@ export class CodexClaudeAppServer {
   private readonly configPath = join(adapterHome(), 'config.json')
   private idleCheckHandler: (() => void) | null = null
   private stopped = false
+  // Every connected peer, for notifications that belong to no thread.
+  private peers = new Map<string, RpcPeer>()
+  private readonly stopCommandsListener: () => void
   private readonly store: SessionStore
   private readonly runtime: ClaudeRuntime
 
@@ -348,6 +352,12 @@ export class CodexClaudeAppServer {
     this.store = store
     this.runtime = runtime
     this.loadPersistedConfig()
+    // A CLI reported a different set of built-in commands: the App refetches
+    // skills/list, which serves them as skills.
+    this.stopCommandsListener = onClaudeCommandsChanged(() => {
+      for (const peer of this.peers.values())
+        this.notify(peer, { method: 'skills/changed', params: {} })
+    })
     this.runtime.setBackgroundListener?.({
       onTaskEvent: (threadId, event) => this.handleTaskEvent(threadId, event),
       onAutonomousTurn: (threadId) => this.handleAutonomousTurn(threadId),
@@ -357,6 +367,7 @@ export class CodexClaudeAppServer {
   }
 
   async handle(peer: RpcPeer, message: WireMessage): Promise<void> {
+    if (peer !== DETACHED_PEER) this.peers.set(peer.id, peer)
     if ('method' in message && message.method) {
       debugLog('rpc.request', {
         peerId: peer.id,
@@ -383,6 +394,7 @@ export class CodexClaudeAppServer {
 
   closePeer(peer: RpcPeer): void {
     debugLog('peer.close', { peerId: peer.id })
+    this.peers.delete(peer.id)
     for (const [threadId, activePeer] of this.activePeerByThread.entries()) {
       if (activePeer.id === peer.id) this.activePeerByThread.delete(threadId)
     }
@@ -391,6 +403,7 @@ export class CodexClaudeAppServer {
   async stop(): Promise<void> {
     if (this.stopped) return
     this.stopped = true
+    this.stopCommandsListener()
     try {
       // Child turns are created directly from Task/Workflow events and are not
       // registered in activeTurnByThread. Finalize them before aborting the
@@ -2228,7 +2241,9 @@ export class CodexClaudeAppServer {
     // an `imageView` ThreadItem per image so the App's transcript shows them
     // inline next to the user message instead of losing them.
     const { textPrompt, images } = extractImageInputs(input)
-    const prompt = hiddenPrompt ?? (textPrompt || textFromInput(input))
+    // A skill picked in the composer arrives as a markdown link; Claude Code
+    // runs it as a slash command. The user message keeps the original input.
+    const prompt = hiddenPrompt ?? skillLinksToCommand(textPrompt || textFromInput(input))
     const workflowCommand = hiddenPrompt ? null : parseWorkflowCommand(prompt)
     // Like Codex, input that arrives while a turn is running joins that turn.
     // A turn/start can race a turn the adapter has just opened itself (for a
@@ -4771,7 +4786,7 @@ export class CodexClaudeAppServer {
       throw new Error('cannot steer a review or compaction turn')
     const input = Array.isArray(params.input) ? (params.input as UserInput[]) : []
     const { textPrompt, images } = extractImageInputs(input)
-    const prompt = textPrompt || textFromInput(input)
+    const prompt = skillLinksToCommand(textPrompt || textFromInput(input))
     if (!prompt.trim() && images.length === 0) throw new Error('steer input must not be empty')
     if (peer !== DETACHED_PEER) this.activePeerByThread.set(threadId, peer)
     const clientId = nullIfEmpty(stringOr(params.clientUserMessageId, ''))

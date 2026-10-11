@@ -7272,6 +7272,76 @@ test('skills/list and hooks/list surface Claude Code skills and settings hooks',
   }
 })
 
+test('Claude Code built-in commands are listed as skills and run as slash commands', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const adapterDir = join(home, 'adapter')
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      CODEX_HOME: home,
+      HOME: home,
+      CLAUDE_CODEX_HOME: adapterDir,
+      CLAUDE_CODEX_MOCK: '1',
+      NODE_NO_WARNINGS: '1',
+    },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'skills/list', params: { cwds: [home] } }))
+    const skills = await reader.nextResponse(1)
+    const simplify = skills.result.data[0].skills.find(
+      (skill: Record<string, unknown>) => skill.name === 'simplify',
+    )
+    assert.ok(simplify, 'expected /simplify in the App skill list')
+    assert.equal(simplify.scope, 'system')
+    assert.equal(simplify.enabled, true)
+    assert.match(simplify.shortDescription, /^Review the changed code for reuse/)
+    assert.equal(simplify.path, join(adapterDir, 'claude-commands', 'simplify', 'SKILL.md'))
+    // The App opens `path` when the chip is clicked.
+    assert.match(await readFile(simplify.path, 'utf8'), /runs `\/simplify \[<target>\]`/)
+
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'initialize',
+        params: { clientInfo: { name: 'test', title: 'Test', version: '0' }, capabilities: null },
+      }),
+    )
+    await reader.nextResponse(2)
+    proc.stdin.write(json({ id: 3, method: 'thread/start', params: { cwd: home } }))
+    const threadId = (await reader.nextResponse(3)).result.thread.id
+    // What the composer sends after the user picks /simplify and types.
+    const text = `[$simplify](${simplify.path}) focus on the parser`
+    proc.stdin.write(
+      json({
+        id: 4,
+        method: 'turn/start',
+        params: { threadId, input: [{ type: 'text', text, text_elements: [] }] },
+      }),
+    )
+    const seen: any[] = []
+    await awaitMessage(reader, (message) => message.method === 'turn/completed', seen)
+    const reply = seen
+      .filter((message) => message.method === 'item/agentMessage/delta')
+      .map((message) => message.params.delta)
+      .join('')
+    assert.match(reply, /mock response for: \/simplify focus on the parser$/)
+    // The transcript keeps what the user sent.
+    proc.stdin.write(
+      json({ id: 5, method: 'thread/read', params: { threadId, includeTurns: true } }),
+    )
+    const read = await reader.nextResponse(5)
+    const userMessage = read.result.thread.turns[0].items.find(
+      (item: Record<string, unknown>) => item.type === 'userMessage',
+    )
+    assert.equal(userMessage?.content[0].text, text)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('direct MCP HTTP tool calls work', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const httpServer = http.createServer((req, res) => {

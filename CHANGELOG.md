@@ -47,6 +47,9 @@ versioning or publishing metadata.
 - The adapter stops Claude CLI processes a previous adapter on the same state
   dir left running, matching pid, start time and command line before
   signalling (`CLAUDE_CODEX_REAP_ORPHANED_CLI=0` turns it off).
+- The App's "/" popup offers Claude Code's built-in skills (`/simplify`,
+  `/code-review`, …) from the list the CLI reports, and a picked one runs as
+  the CLI's slash command.
 
 ### Provider and multi-agent boundaries
 
