@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { chmodSync, existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
-import { forgetCliChildren, reapOrphanedCliChildren } from './cli-orphans.mjs'
+import { reapOrphanedCliChildren } from './cli-orphans.mjs'
 import { createRuntime } from './runtime-factory.mjs'
 import { CodexClaudeAppServer } from './server.mjs'
 import { SessionStore } from './store.mjs'
@@ -106,8 +106,9 @@ async function main(): Promise<void> {
     debugLog('adapter.shutdown', { reason, pid: process.pid })
     let code = 0
     try {
+      // The CLI record stays: a SIGTERMed CLI does not always exit with the
+      // adapter, and the next adapter reaps whatever is left.
       await server.stop()
-      forgetCliChildren()
     } catch (error) {
       // shuttingDown already ignores the next signal, so a failed stop has to
       // end the process here or nothing will.

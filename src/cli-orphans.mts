@@ -125,12 +125,6 @@ export function recordCliChildren(dir = registryDir()): Promise<void> {
   return recording
 }
 
-export function forgetCliChildren(dir = registryDir()): void {
-  try {
-    unlinkSync(join(dir, `${process.pid}.json`))
-  } catch {}
-}
-
 // SIGTERMs the process tree of every recorded CLI whose owning adapter is
 // gone, then SIGKILLs whatever is still there after `graceMs`. Resolves with
 // the reaped CLI pids once the SIGTERM pass is done; the SIGKILL pass runs in
