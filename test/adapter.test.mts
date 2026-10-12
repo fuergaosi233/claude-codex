@@ -4786,6 +4786,87 @@ test('turn/steer appends user input to an active Claude turn', async () => {
   }
 })
 
+test('turn/start during a running turn joins that turn instead of orphaning it', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  try {
+    const threadId = await startMockThread(reader, proc)
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: textInput('hold this turn until released while another turn/start arrives'),
+        },
+      }),
+    )
+    const turnId = (await reader.nextResponse(2)).result.turn.id
+    const seen: any[] = []
+    await awaitMessage(reader, (message) => message.method === 'item/agentMessage/delta', seen)
+
+    proc.stdin.write(
+      json({
+        id: 3,
+        method: 'turn/start',
+        params: { threadId, clientUserMessageId: 'client-late-1', input: textInput('late input') },
+      }),
+    )
+    proc.stdin.write(
+      json({
+        id: 4,
+        method: 'turn/start',
+        params: { threadId, input: textInput('/workflows') },
+      }),
+    )
+    // The refusal can answer first: the joined input waits for Claude to take
+    // it in.
+    const replies = new Map<number, any>()
+    await awaitMessage(
+      reader,
+      (message) => {
+        if (message.id === 3 || message.id === 4) replies.set(message.id, message)
+        return replies.size === 2
+      },
+      seen,
+    )
+    assert.equal(replies.get(3).result.turn.id, turnId)
+    assert.equal(
+      replies.get(4).error.message,
+      '/workflows list can run once the current turn finishes',
+    )
+    proc.stdin.write(
+      json({
+        id: 5,
+        method: 'turn/steer',
+        params: { threadId, expectedTurnId: turnId, input: textInput('release') },
+      }),
+    )
+    const completed = await awaitMessage(
+      reader,
+      (message) => message.method === 'turn/completed',
+      seen,
+    )
+    assert.equal(completed.params.turn.id, turnId)
+    seen.push(...(await readQuiet(reader, 200)))
+    assert.deepEqual(
+      seen
+        .filter((message) => message.method === 'turn/started' && message.params.turn.id !== turnId)
+        .map((message) => message.params.turn.id),
+      [],
+      'no second turn starts',
+    )
+    const joined = seen.find((message) =>
+      isUserMessageItem(message, 'item/started', 'client-late-1'),
+    )
+    assert.equal(joined?.params.turnId, turnId)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('thread/queue holds follow-ups during a turn and dispatches them in order', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawnMockAdapter(home)

@@ -117,6 +117,24 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    // Keeps running until a steer says "release", so a test can count on the
+    // turn still running when its next requests arrive.
+    if (/hold this turn until released/i.test(context.prompt)) {
+      await handlers.onEvent({ type: 'text_delta', delta: 'holding' })
+      for (let i = 0; i < 1000; i += 1) {
+        if (this.interrupted.has(context.threadId)) {
+          await handlers.onEvent({ type: 'completed', success: false, result: 'interrupted' })
+          return
+        }
+        if (this.steered.get(context.threadId)?.some((prompt) => /release/i.test(prompt))) break
+        await sleep(10)
+      }
+      this.steered.delete(context.threadId)
+      await handlers.onEvent({ type: 'text_delta', delta: ' released' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'released' })
+      return
+    }
+
     if (/approval|permission|bash/i.test(context.prompt)) {
       const toolUseId = `tool-${Date.now()}`
       await handlers.onEvent({
