@@ -9,6 +9,7 @@ import { adapterHome, debugLog } from './util.mjs'
 // App's "/" popup. Each command gets a small SKILL.md the App can open when the
 // chip is clicked; the chip itself arrives in the prompt as
 // `[$name](<that SKILL.md>)` and is turned back into `/name args` for the CLI.
+// App rule: skills-popup
 
 export interface ClaudeCommand {
   readonly name: string

@@ -1,0 +1,102 @@
+# Codex App compatibility
+
+The app-server protocol schema says which messages exist. It does not say how
+the Codex desktop App reacts to them: which error text makes it retry a steer,
+which notification removes a subagent from the panel, which version turns a
+feature on. The adapter depends on a number of these behaviors, read from the
+App bundle, and an App release can change any of them without touching the
+protocol. This page lists them and describes how to check a new App build.
+
+## App rules
+
+Each behavior is an **App rule** in `src/app-compat.mts` (`APP_RULES`), with
+what the App does, what the adapter does because of it, and how to tell it
+still holds. Every place in `src/` that depends on a rule carries a
+`// App rule: <id>` comment; `test/app-compat.test.mts` fails when a rule has no
+tag or a tag names no rule, so `rg 'App rule: steer-errors' src` finds every
+line a rule touches.
+
+| Rule | The App… | Check on a new build |
+| --- | --- | --- |
+| `client-info` | identifies itself in `initialize` as `clientInfo.name` `codex_desktop`, with its build as the version | `check:app-upgrade` finds the name |
+| `feature-gates` | turns features on by the app-server version in the `initialize` userAgent, and rejects one below its minimum | `check:app-upgrade` lists the gates |
+| `config-warnings` | lists `configWarning` notifications under Settings > Agent > Configuration | an unlisted build shows the warning there |
+| `bedrock-account` | filters the model picker through its OpenAI allowlist unless `account/read` returns a Bedrock account | the picker lists the Claude models |
+| `skills-popup` | fills the "/" popup from `skills/list` and sends a picked skill as a `[$name](path)` link | `/simplify` is listed and runs |
+| `optimistic-user-message` | draws its own user message for every `turn/start` it sends | a message shows once; a queued one when it starts |
+| `steer-errors` | matches `turn/steer` error texts to fall back to a new turn or retry another turn id | a message sent as a turn ends still arrives |
+| `steer-bubble` | settles the steering bubble when a `userMessage` item carries its `clientUserMessageId` | a steer shows once, in the transcript |
+| `subagent-completed-kind` | renders the completed `subAgentActivity` kind from 26.930 without declaring it | a finished subagent shows as done |
+| `subagent-close-hides` | removes a child from the panel when `closeAgent` follows its successful wait | a finished subagent stays in the panel |
+| `completed-wait` | marks every working agent of the thread done when a wait completes | with two agents, the first to finish does not end the second |
+| `agent-states` | shows `interrupted` as done and `errored` as failed | a stopped subagent shows as done |
+| `subagent-read` | reads a child with `includeTurns: false` and shows one without turns as loading | a finished subagent opens with its prompt and reply |
+| `child-prompt` | creates the child conversation from `thread/started` with an empty turn | a running subagent shows its prompt |
+| `rate-limit-banner` | shows a banner for every `account/rateLimits/updated` | no banner after an ordinary reply |
+
+The full text of each rule, including the adapter side, is in
+`src/app-compat.mts`.
+
+## Unverified App builds
+
+`VERIFIED_APP_VERSIONS` lists the App builds the rules were checked against.
+When the desktop App connects with a version not on the list, the adapter still
+serves it, and reports the version once per connection:
+
+- as a `configWarning` notification, which the App shows under
+  Settings > Agent > Configuration;
+- on stderr, and as an `app.unverified` event in the debug log.
+
+Other app-server clients (the App's LaTeX preview, the Codex TUI) are not
+checked.
+
+## Checking a new App build
+
+Run the upgrade check against the new bundle. It needs the bundled `codex`
+binary, which it finds inside the bundle (pass `--codex` to point elsewhere):
+
+```sh
+npm run check:app-upgrade -- --app /Applications/Codex.app
+# or compare two bundles directly
+npm run check:app-upgrade -- --app <new.app> --old <old.app>
+```
+
+It compares the build with `scripts/app-baseline.json`, the last verified one,
+and prints:
+
+- **Protocol** — client requests, server requests and server notifications the
+  bundled `codex` generates, added and removed. A new client request the adapter
+  has no `case` for will be answered with `method not implemented`; the report
+  lists every such method. A method the adapter sends that the schema dropped is
+  a problem.
+- **Feature gates** — the App's gate table, each marked on or off for the
+  version the adapter reports, with new, changed and removed gates, and the
+  minimum app-server version the App accepts.
+- **clientInfo names** — the names the App sends in `initialize`.
+- **App rules** — the checklist above, to go through by hand with the App
+  connected to the adapter.
+
+It exits 1 when it finds a problem and 2 when it cannot run. Once the report
+is clean and the rules hold:
+
+1. Add the build to `VERIFIED_APP_VERSIONS` in `src/app-compat.mts`. If a rule
+   changed, update it, the code it tags, and its tests.
+2. Rewrite the baseline:
+   `npm run check:app-upgrade -- --app <verified.app> --write-baseline`.
+   It refuses while there are problems or the build is not yet listed.
+3. Commit both with the code changes.
+
+## Feature gates and `CLAUDE_CODEX_COMPAT_VERSION`
+
+The App decides which features to use from the app-server version in the
+`initialize` userAgent, which the adapter takes from
+`CLAUDE_CODEX_COMPAT_VERSION` (default `0.142.3`). Two consequences:
+
+- At the default, the App keeps queued messages in the window instead of using
+  the server-side queue (`thread/queue/*`), which needs `0.148.0-alpha.14` or
+  later. The upgrade check notes this.
+- A higher version also turns on gates whose methods the adapter does not
+  implement. At `0.149.0-alpha.4.1`, for example, the App may call
+  `thread/revert`, `project/*`, `server/diagnostics` and `app/read`, which are
+  answered with `method not implemented`. Run the upgrade check with the
+  variable set to see which gates a version turns on.

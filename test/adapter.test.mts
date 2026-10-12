@@ -4604,6 +4604,41 @@ test('the first of two foreground agents to finish does not end the other in the
   }
 })
 
+test('initialize reports an unverified desktop App build as a config warning', async () => {
+  const warningsFor = async (version: string): Promise<any[]> => {
+    const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+    const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+    })
+    const reader = new JsonLineReader(proc)
+    try {
+      proc.stdin.write(
+        json({
+          id: 0,
+          method: 'initialize',
+          params: {
+            clientInfo: { name: 'codex_desktop', title: 'Codex Desktop', version },
+            capabilities: { experimentalApi: true },
+          },
+        }),
+      )
+      proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+      const seen = await readUntil(reader, (message) => message.id === 1 && message.method == null)
+      return seen.filter((message) => message.method === 'configWarning')
+    } finally {
+      proc.kill()
+      await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+    }
+  }
+
+  assert.deepEqual(await warningsFor('26.930.21537'), [])
+  const [warning, ...rest] = await warningsFor('26.1015.100')
+  assert.equal(rest.length, 0)
+  assert.match(warning.params.summary, /Codex App 26\.1015\.100/)
+  assert.match(warning.params.details, /26\.930\.21537/)
+})
+
 function codex930Initialize(id: number) {
   return {
     id,

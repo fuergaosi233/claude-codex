@@ -4,6 +4,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
+import { rendersCompletedSubagentActivity, unverifiedAppWarning } from './app-compat.mjs'
 import { listClaudeHooks, listClaudeSkills } from './claude-capabilities.mjs'
 import { onClaudeCommandsChanged, skillLinksToCommand } from './claude-commands.mjs'
 import {
@@ -277,14 +278,8 @@ interface PeerFeatures {
   // Codex cc 26.818.61809 only accepts started/interacted/interrupted in the
   // subAgentActivity schema. Newer clients may opt into the completed kind
   // explicitly during initialize; keep the legacy wire shape otherwise.
+  // App rule: subagent-completed-kind
   supportsCompletedSubagentActivity: boolean
-}
-
-// Codex cc 26.930 renders the completed activity kind without advertising it.
-function clientRendersCompletedActivity(version: string): boolean {
-  const [major, minor] = version.split('.').map((part) => Number.parseInt(part, 10))
-  if (!Number.isFinite(major) || !Number.isFinite(minor)) return false
-  return (major as number) > 26 || (major === 26 && (minor as number) >= 930)
 }
 
 function turnItemsView(value: unknown): TurnItemsView {
@@ -372,6 +367,7 @@ export class CodexClaudeAppServer {
     this.loadPersistedConfig()
     // A CLI reported a different set of built-in commands: the App refetches
     // skills/list, which serves them as skills.
+    // App rule: skills-popup
     this.stopCommandsListener = onClaudeCommandsChanged(() => {
       this.notifyAll({ method: 'skills/changed', params: {} })
     })
@@ -496,9 +492,17 @@ export class CodexClaudeAppServer {
           supportsCompletedSubagentActivity:
             capabilities.subAgentActivityCompleted === true ||
             declaredActivityKinds.includes('completed') ||
-            clientRendersCompletedActivity(stringOr(clientInfo.version, '')) ||
+            rendersCompletedSubagentActivity(stringOr(clientInfo.version, '')) ||
             process.env.CLAUDE_CODEX_SUBAGENT_COMPLETED === '1',
         })
+        // The App lists config warnings in its settings, which is where an App
+        // build nobody checked the App rules against gets reported.
+        // App rule: config-warnings
+        const appWarning = unverifiedAppWarning(clientInfo)
+        if (appWarning) {
+          debugLog('app.unverified', { clientInfo, summary: appWarning.summary })
+          process.stderr.write(`[claude-codex-adapter] ${appWarning.summary}\n`)
+        }
         // Push the account snapshot + MCP server statuses right after handshake
         // so the App's sidebar avatar and MCP panel populate without waiting
         // for the next polling cycle. Without these the avatar stays "signed
@@ -514,8 +518,10 @@ export class CodexClaudeAppServer {
               params: { name: status.name, status: status.status, error: status.error ?? null },
             })
           }
+          if (appWarning) this.notify(peer, { method: 'configWarning', params: appWarning })
         })
         return {
+          // App rule: feature-gates
           userAgent: codexUserAgent(
             stringOr(clientInfo.name, 'codex-app'),
             stringOr(clientInfo.version, 'unknown'),
@@ -795,6 +801,7 @@ export class CodexClaudeAppServer {
         // The App applies its OpenAI hidden-model allowlist unless auth is
         // Bedrock-shaped. Claude Code is externally authenticated, so use that
         // local auth shape to keep Claude aliases visible in the model picker.
+        // App rule: bedrock-account
         return { account: { type: 'amazonBedrock' }, requiresOpenaiAuth: false }
       case 'account/rateLimits/read':
         return this.accountRateLimits()
@@ -1423,6 +1430,7 @@ export class CodexClaudeAppServer {
     // as still loading, and it does not reliably follow up with turns/list.
     // Keep metadata-only reads for ordinary threads, but return the small
     // child transcript so Prompt/Response and the terminal state can render.
+    // App rule: subagent-read
     const includeTurns = params.includeTurns !== false || thread.threadSource === 'subagent'
     const turns = includeTurns ? this.store.listTurns(threadId) : []
     return { thread: this.toThread(thread, turns) }
@@ -2922,6 +2930,7 @@ export class CodexClaudeAppServer {
       this.notify(peer, { method: 'turn/started', params: { threadId, turn: publicTurn } })
       // The App renders its own optimistic user message for turn/start; a
       // turn started from the server-side queue has none, so publish it.
+      // App rule: optimistic-user-message
       if (userItem && params._emitUserMessage === true)
         this.emitItemLifecycle(peer, threadId, turnId, userItem)
       for (const item of imageItems) {
@@ -3576,6 +3585,7 @@ export class CodexClaudeAppServer {
             // loaded while the child is live. Replay the persisted prompt as
             // a normal item lifecycle so the child page has its Prompt even
             // when it is opened before the first response token arrives.
+            // App rule: child-prompt
             const childPrompt = childTurn.items.find((item) => item.type === 'userMessage')
             if (childPrompt) this.emitItemLifecycle(peer, childThreadId, childTurn.id, childPrompt)
             recordRunEvent('subagent.spawned', {
@@ -3801,6 +3811,7 @@ export class CodexClaudeAppServer {
             // agent, or a sibling launched in the same message) the wait
             // closes failed instead. The App never renders a wait, and this
             // child's own agentsStates still carries its real outcome.
+            // App rule: completed-wait
             const siblingRunning =
               [...activeSubagents].some((id) => id !== event.toolUseId) ||
               this.hasRunningBackgroundSubagent(thread.id)
@@ -3832,6 +3843,7 @@ export class CodexClaudeAppServer {
             // is already the terminal display state; appending closeAgent
             // makes the bundled client hide the finished child. Keep the
             // legacy closeAgent cleanup only for failed results.
+            // App rule: subagent-close-hides
             if (!this.supportsCompletedSubagentActivity(peer) && event.isError) {
               const closeId = newId()
               const closeBegin: ThreadItem = {
@@ -4495,6 +4507,7 @@ export class CodexClaudeAppServer {
     this.store.appendItem(parentTurnId, item)
     // Codex cc 26.818 treats a started marker as liveness but has no
     // terminal kind besides interrupted, so it only ever gets that one.
+    // App rule: subagent-completed-kind
     if (!this.supportsCompletedSubagentActivity(peer) && kind !== 'interrupted') return
     this.emitItemLifecycle(peer, parentThreadId, parentTurnId, item)
   }
@@ -4574,6 +4587,7 @@ export class CodexClaudeAppServer {
     status: 'failed' | 'interrupted' = 'failed',
   ): void {
     // The App shows an interrupted agent as done and an errored one as failed.
+    // App rule: agent-states
     const agentState = status === 'interrupted' ? 'interrupted' : 'errored'
     for (const toolUseId of Array.from(active)) {
       const context = contexts.get(toolUseId)
@@ -4681,6 +4695,7 @@ export class CodexClaudeAppServer {
     // it any more. Close the wait without completing it: the App marks every
     // working agent done on a *completed* wait, while a failed one keeps the
     // child's own state (still running) and leaves no open item behind.
+    // App rule: completed-wait
     const waitEnd: ThreadItem = {
       type: 'collabAgentToolCall',
       id: context.waitItemId,
@@ -5387,6 +5402,7 @@ export class CodexClaudeAppServer {
     // Codex App matches these messages: "no active turn to steer" makes it
     // send the message as a new turn instead, and the mismatch text carries
     // the turn id it retries against.
+    // App rule: steer-errors
     if (!activeTurnId) throw new Error('no active turn to steer')
     if (expectedTurnId && expectedTurnId !== activeTurnId)
       throw new Error(`expected active turn id \`${expectedTurnId}\` but found \`${activeTurnId}\``)
@@ -5412,6 +5428,7 @@ export class CodexClaudeAppServer {
     // The message joins the turn once Claude takes it in (between tool
     // rounds). Publishing it then, with the App's clientUserMessageId, lets
     // the App settle its pending steering bubble into the transcript.
+    // App rule: steer-bubble
     let accepted = false
     const accept = (): void => {
       if (accepted) return
@@ -5671,6 +5688,7 @@ export class CodexClaudeAppServer {
     // real rate-limit data from the Anthropic SDK (no headers exposed), the
     // notification was empty noise. The initial snapshot still fires once
     // post-handshake in `initialize` so the UI populates on first connect.
+    // App rule: rate-limit-banner
   }
 
   private async fsReadFile(params: Record<string, unknown>): Promise<unknown> {

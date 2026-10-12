@@ -1,0 +1,149 @@
+// What the adapter assumes about the Codex desktop App beyond the app-server
+// protocol schema. The schema says which messages exist; these rules say how
+// the App reacts to them, as read from its bundle. An App release can change
+// any of them without touching the protocol, so each one is tagged
+// `App rule: <id>` where the adapter depends on it, and a new App build is
+// checked against the list (`npm run check:app-upgrade`) before its version
+// joins VERIFIED_APP_VERSIONS. See docs/reference/app-compat.md.
+
+export interface AppRule {
+  readonly id: string
+  // What the App does.
+  readonly app: string
+  // What the adapter does because of it.
+  readonly adapter: string
+  // How to tell it still holds on a new App build.
+  readonly verify: string
+}
+
+// App builds every rule below was checked against.
+export const VERIFIED_APP_VERSIONS: readonly string[] = ['26.930.21537']
+
+// initialize.clientInfo.name of the desktop App. Its other app-server clients
+// (the LaTeX preview, for one) use their own names and versions.
+export const DESKTOP_CLIENT_NAME = 'codex_desktop'
+
+export const APP_RULES: readonly AppRule[] = [
+  {
+    id: 'client-info',
+    app: `Identifies itself in initialize as clientInfo.name "${DESKTOP_CLIENT_NAME}" with its build as the version.`,
+    adapter:
+      'Checks that version against VERIFIED_APP_VERSIONS and gates the completed subagent kind on it.',
+    verify: 'check:app-upgrade finds the clientInfo name in the bundle.',
+  },
+  {
+    id: 'feature-gates',
+    app: 'Turns features on by the app-server version in the initialize userAgent (the server-side message queue needs 0.148.0-alpha.14) and rejects a version below its minimum.',
+    adapter:
+      'Reports codexCompatVersion() there; CLAUDE_CODEX_COMPAT_VERSION picks which gated features the App uses.',
+    verify:
+      'check:app-upgrade lists the gate table and the minimum next to the version the adapter reports.',
+  },
+  {
+    id: 'config-warnings',
+    app: 'Lists configWarning notifications under Settings > Agent > Configuration, keeping the last 20 per host.',
+    adapter: 'Reports an App build missing from VERIFIED_APP_VERSIONS there.',
+    verify:
+      'Connect an App build that is not listed and look for the warning in that settings page.',
+  },
+  {
+    id: 'bedrock-account',
+    app: 'Filters the model picker through its OpenAI model allowlist unless account/read returns a Bedrock-shaped account.',
+    adapter: 'Answers account/read with an amazonBedrock account.',
+    verify: 'The model picker still lists the Claude models.',
+  },
+  {
+    id: 'skills-popup',
+    app: 'Fills the Skills group of the "/" popup from skills/list, refetches it on skills/changed, and sends a picked skill as a [$name](path) link inside the prompt text.',
+    adapter:
+      "Lists Claude Code's built-in commands as skills and turns the first such link back into `/name args`.",
+    verify: 'Type "/" in the composer: /simplify is listed, and picking it runs the command.',
+  },
+  {
+    id: 'optimistic-user-message',
+    app: 'Draws its own user message for every turn/start it sends.',
+    adapter: 'Publishes the userMessage item only for turns it starts from the server-side queue.',
+    verify: 'A sent message shows once; a queued one shows when it starts.',
+  },
+  {
+    id: 'steer-errors',
+    app: 'Matches turn/steer error texts: "no active turn to steer" makes it send the message as a new turn, and "expected active turn id `X` but found `Y`" makes it retry against Y.',
+    adapter: 'Fails turn/steer with exactly these texts.',
+    verify: 'Both texts are still in the bundle; a message sent as a turn ends still arrives.',
+  },
+  {
+    id: 'steer-bubble',
+    app: 'Settles its pending steering bubble into the transcript when a userMessage item carries the clientUserMessageId of that turn/steer as clientId.',
+    adapter: 'Publishes the steered message with that id once Claude takes it in.',
+    verify: 'Steer a running turn: the bubble becomes a transcript message, shown once.',
+  },
+  {
+    id: 'subagent-completed-kind',
+    app: 'From 26.930 renders the completed subAgentActivity kind without declaring it in initialize; 26.818 rejects it.',
+    adapter: 'Sends the completed kind only to clients that declare it or report 26.930 or later.',
+    verify: 'A finished subagent shows as done, both in the parent transcript and in the panel.',
+  },
+  {
+    id: 'subagent-close-hides',
+    app: 'Removes a child from the subagent panel when closeAgent follows its successful wait.',
+    adapter: 'Sends closeAgent only for failed children of clients without the completed kind.',
+    verify: 'A finished subagent stays in the panel.',
+  },
+  {
+    id: 'completed-wait',
+    app: 'Marks every working agent of the thread done when a wait completes, and never draws the wait itself.',
+    adapter:
+      "Closes a wait as failed while another agent of the thread still runs, or once Claude backgrounds the agent; the child's own state carries its outcome.",
+    verify: 'Run two agents in parallel: the first to finish does not mark the second done.',
+  },
+  {
+    id: 'agent-states',
+    app: 'Shows agentState interrupted as done and errored as failed.',
+    adapter: 'Marks a stopped agent interrupted and one that ended without a result errored.',
+    verify: 'Stop a running subagent; it shows as done, not failed.',
+  },
+  {
+    id: 'subagent-read',
+    app: 'Reads a child for the subagent panel with thread/read includeTurns:false, and shows a child without turns as still loading.',
+    adapter: 'Returns the turns of a subagent thread even when they are not asked for.',
+    verify: 'Open a finished subagent from the panel: its prompt and response render.',
+  },
+  {
+    id: 'child-prompt',
+    app: 'Creates the child conversation from thread/started with an empty turn and takes its history as loaded while the child runs.',
+    adapter: "Replays the child's prompt as an item lifecycle.",
+    verify: 'Open a running subagent before it answers: its prompt shows.',
+  },
+  {
+    id: 'rate-limit-banner',
+    app: 'Shows a rate-limit banner for every account/rateLimits/updated notification.',
+    adapter: 'Sends none per turn; account/rateLimits/read answers the snapshot.',
+    verify: 'No rate-limit banner appears after an ordinary reply.',
+  },
+]
+
+// App rule: subagent-completed-kind
+export function rendersCompletedSubagentActivity(version: string): boolean {
+  const [major, minor] = version.split('.').map((part) => Number.parseInt(part, 10))
+  if (!Number.isFinite(major) || !Number.isFinite(minor)) return false
+  return (major as number) > 26 || (major === 26 && (minor as number) >= 930)
+}
+
+export interface AppVersionWarning {
+  summary: string
+  details: string
+}
+
+// App rule: client-info
+export function unverifiedAppWarning(clientInfo: {
+  name?: unknown
+  version?: unknown
+}): AppVersionWarning | null {
+  if (clientInfo.name !== DESKTOP_CLIENT_NAME) return null
+  const version = typeof clientInfo.version === 'string' ? clientInfo.version.trim() : ''
+  if (VERIFIED_APP_VERSIONS.includes(version)) return null
+  return {
+    summary: `claude-codex has not been checked against Codex App ${version || '(no version)'}`,
+    details: `Checked builds: ${VERIFIED_APP_VERSIONS.join(', ')}. Subagent cards, steering, the message queue and the "/" skills rely on App behavior the protocol does not pin down; run \`npm run check:app-upgrade\` and the checklist in docs/reference/app-compat.md before relying on them.`,
+  }
+}

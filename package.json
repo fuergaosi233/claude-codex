@@ -33,6 +33,7 @@
     "check": "biome check src test scripts",
     "check:fix": "biome check --write src test scripts",
     "check:rust-protocol-fixtures": "node scripts/check-rust-protocol-fixtures.mjs",
+    "check:app-upgrade": "npm run build && node scripts/check-app-upgrade.mjs",
     "docs:dev": "vitepress dev docs",
     "docs:build": "vitepress build docs",
     "docs:preview": "vitepress preview docs",

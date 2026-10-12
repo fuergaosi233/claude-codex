@@ -37,6 +37,7 @@ export default defineConfig({
           items: [
             { text: 'Protocol coverage', link: '/reference/protocol-coverage' },
             { text: 'Capability matrix', link: '/reference/capability-matrix' },
+            { text: 'Codex App compatibility', link: '/reference/app-compat' },
             { text: 'Validation', link: '/reference/validation' },
             { text: 'Workflow operations', link: '/reference/workflow-operations' },
             { text: 'Release readiness', link: '/reference/release-readiness' },
