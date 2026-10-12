@@ -2508,6 +2508,10 @@ export class CodexClaudeAppServer {
     // report a real durationMs in turn/completed (otherwise the App's status
     // bar shows "—" for every command).
     const itemStartedAtMs = new Map<string, number>()
+    // Tool items still waiting for their tool_result. A turn that ends first
+    // (interrupt, error, watchdog) drops the late result, so these are closed
+    // as failed before the turn completes.
+    const openToolItems = new Set<string>()
     // Mutable holder rather than `let collectedMetrics`: TS's control-flow
     // analysis doesn't see writes from inside the onEvent callback, so a bare
     // `let` would still be inferred as `null` outside the closure.
@@ -2616,6 +2620,26 @@ export class CodexClaudeAppServer {
           params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
         })
       planItemId = null
+    }
+    const completeOpenToolItems = (message: string): void => {
+      for (const itemId of openToolItems) {
+        const started = itemStartedAtMs.get(itemId)
+        const durationMs = started == null ? null : Math.max(0, nowMillis() - started)
+        const updated = this.store.updateItem(turn.id, itemId, (item) => {
+          if (item.type === 'commandExecution') return { ...item, status: 'failed', durationMs }
+          if (item.type === 'fileChange') return { ...item, status: 'failed' }
+          if (item.type === 'mcpToolCall')
+            return { ...item, status: 'failed', error: { message }, durationMs }
+          return item
+        })
+        const item = updated?.items.find((candidate) => candidate.id === itemId)
+        if (item)
+          this.notify(peer, {
+            method: 'item/completed',
+            params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
+          })
+      }
+      openToolItems.clear()
     }
 
     // Allow per-turn override of policy (Codex App may attach updated values
@@ -2731,6 +2755,7 @@ export class CodexClaudeAppServer {
     this.closeStreamingItemsByTurn.set(turn.id, () => {
       completeMessage()
       completePlanItem()
+      completeOpenToolItems('Interrupted by the user.')
     })
     this.flushQueuedSubagentActivity(peer, thread.id, turn.id)
     let acceptRuntimeEvents = true
@@ -3338,6 +3363,7 @@ export class CodexClaudeAppServer {
             const item = this.toolUseToItem(event, thread.cwd)
             itemIds.set(event.toolUseId, item.id)
             itemStartedAtMs.set(item.id, nowMillis())
+            openToolItems.add(item.id)
             this.store.appendItem(turn.id, item)
             this.notify(peer, {
               method: 'item/started',
@@ -3379,6 +3405,7 @@ export class CodexClaudeAppServer {
             }
             const itemId = itemIds.get(event.toolUseId)
             if (!itemId) return
+            openToolItems.delete(itemId)
             const resultText = toolResultText(event.content)
             const durationMs = (() => {
               const started = itemStartedAtMs.get(itemId)
@@ -3539,6 +3566,7 @@ export class CodexClaudeAppServer {
             )
             itemId = item.id
             itemIds.set(event.toolUseId, item.id)
+            openToolItems.add(item.id)
             this.store.appendItem(turn.id, item)
             this.notify(peer, {
               method: 'item/started',
@@ -3652,6 +3680,7 @@ export class CodexClaudeAppServer {
       const message = `Subagent did not publish a terminal result within ${timeoutSeconds} ${timeoutUnit}.`
       if (this.store.getTurn(turn.id)?.status === 'inProgress') {
         completeMessage()
+        completeOpenToolItems(message)
         this.finalizeOrphanedSubagents(
           peer,
           thread,
@@ -3671,12 +3700,14 @@ export class CodexClaudeAppServer {
     if (outcome.kind === 'rejected') {
       if (this.store.getTurn(turn.id)?.status === 'inProgress') {
         completeMessage()
+        completeOpenToolItems(outcome.error.message)
         this.finalizeOrphanedSubagents(peer, thread, turn, subagentContexts, activeSubagents)
       }
       this.subagentStateByTurn.delete(turn.id)
       throw outcome.error
     }
     if (this.store.getTurn(turn.id)?.status === 'inProgress') {
+      completeOpenToolItems('Claude finished the turn without a result for this tool.')
       this.finalizeOrphanedSubagents(peer, thread, turn, subagentContexts, activeSubagents)
     }
     this.subagentStateByTurn.delete(turn.id)

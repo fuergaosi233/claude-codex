@@ -409,6 +409,51 @@ test('an interrupt completes the message or plan still streaming before the turn
   }
 })
 
+test('a turn that ends early fails the tool calls still running before the turn', async () => {
+  for (const ending of ['interrupt', 'error'] as const) {
+    const { messages, turn, replay } = await present(async (handlers, { interrupt }) => {
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId: 'sleep',
+        toolName: 'Bash',
+        input: { command: 'sleep 10' },
+      })
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId: 'read',
+        toolName: 'Read',
+        input: { file_path: 'notes.md' },
+      })
+      await handlers.onEvent({ type: 'tool_result', toolUseId: 'read', content: 'notes' })
+      if (ending === 'error') throw new Error('Claude exited')
+      await interrupt()
+      // The result that arrives after the interrupt is dropped.
+      await handlers.onEvent({ type: 'tool_result', toolUseId: 'sleep', content: 'late' })
+    })
+    assert.equal(turn.status, ending === 'interrupt' ? 'interrupted' : 'failed')
+    const order = messages
+      .filter(
+        (message) => message.method === 'item/completed' || message.method === 'turn/completed',
+      )
+      .map((message) =>
+        message.params.item
+          ? `${message.params.item.type}:${message.params.item.status}`
+          : message.method,
+      )
+    assert.deepEqual(order, ['mcpToolCall:completed', 'commandExecution:failed', 'turn/completed'])
+    const live = messages.find(
+      (message) =>
+        message.method === 'item/completed' && message.params.item.type === 'commandExecution',
+    )?.params.item
+    assert.equal(live.exitCode, null)
+    assert.equal(typeof live.durationMs, 'number')
+    assert.deepEqual(
+      replay.items.find((item: ThreadItem) => item.type === 'commandExecution'),
+      live,
+    )
+  }
+})
+
 test('subagent results keep only the report, in both CLI trailer formats', () => {
   const legacy = parseSubagentTrailer(
     "found it\nagentId: a1b2c3d4e5f6a7b8 (use SendMessage with to: 'a1b2c3d4e5f6a7b8' to continue this agent)\n<usage>total_tokens: 12\ntool_uses: 1\nduration_ms: 3</usage>",
