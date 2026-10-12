@@ -9,6 +9,9 @@ versioning or publishing metadata.
 
 ### App-server and protocol compatibility
 
+- The model picker reads the Codex model catalog from `CODEX_HOME` instead of
+  `~/.codex`, so an App with its own home lists its catalog rather than the
+  built-in fallback models.
 - Updated the adapter to advertise Codex app-server protocol v2 compatibility at
   the current pinned Codex CLI compatibility version, while keeping a
   `claude-codex` suffix so hosts can distinguish the adapter from upstream

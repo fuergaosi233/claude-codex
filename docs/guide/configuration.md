@@ -116,6 +116,7 @@ export CLAUDE_CODEX_NODE="/absolute/path/to/node"
 | `provider_loop_agent_loop` | Saved config key for agent-loop selection via `config/value/write`. |
 | `CLAUDE_CODEX_DEFAULT_MODEL` / `_EFFORT` | Defaults for new threads. |
 | `CLAUDE_CODEX_MODELS` | Codex App model picker list. |
+| `CLAUDE_CODEX_CODEX_MODELS` | Codex models the picker offers through the bundled `codex` (comma-separated). Without it the list comes from `model_catalog.json` in `CODEX_HOME`. |
 | `CLAUDE_CODEX_MODEL_ALIASES` / `_EFFORT_ALIASES` | Id remapping. |
 | `CLAUDE_CODEX_MCP_SERVERS` | MCP server config (JSON or file path). |
 | `CLAUDE_CODEX_ALLOWED_TOOLS` | Pre-approved tools. |
