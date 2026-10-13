@@ -41,6 +41,9 @@ versioning or publishing metadata.
 - The context gauge follows the main loop's latest API call, like Codex's
   `last_token_usage`, and tokens spent by subagents and workflows count toward
   the thread total without moving the gauge or goal progress.
+- A turn that ends early completes the message still streaming and fails the
+  tool calls still running before `turn/completed`, instead of leaving them
+  in progress in the App.
 
 ### Provider and multi-agent boundaries
 

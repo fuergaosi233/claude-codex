@@ -121,6 +121,10 @@ codex.
   ∈ pending/inProgress/completed); the checklist tool is not also surfaced as a
   timeline item. Plan-mode prose stays on the separate `plan` ThreadItem +
   `item/plan/delta` channel.
+- A turn that ends early (interrupt, failure, subagent watchdog) completes
+  what Claude was still streaming as commentary and fails the tool calls still
+  running, before `turn/completed`, so no card keeps spinning in a stopped
+  turn.
 
 ## Robustness notes
 
