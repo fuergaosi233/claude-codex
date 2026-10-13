@@ -15,6 +15,7 @@ import {
   isGoalStatus,
   MODEL_GOAL_STATUSES,
 } from './goal-prompts.mjs'
+import { accountUsage, hostMethod, RpcError } from './host-methods.mjs'
 import { callMcpTool, listMcpServerStatuses, readMcpConfig, readMcpResource } from './mcp.mjs'
 import { projectProviderLoopConfig } from './provider-loop-config.mjs'
 import {
@@ -68,6 +69,9 @@ import {
   permissionProfileList,
   permissionProfilePolicy,
   personalityPromptCue,
+  projectMetadata,
+  projectName,
+  projectRoots,
   readConfigReasoningEffort,
   reasoningEffortFromParams,
   reviewLabel,
@@ -88,7 +92,18 @@ import {
   wrapMcpToolResult,
 } from './server-helpers.mjs'
 import { PINNED_SECTION_ID, type SessionStore } from './store.mjs'
+import {
+  findOccurrences,
+  offsetCursor,
+  pageItems,
+  pageLimit,
+  pageTimeline,
+  pageTurns,
+  sortDirectionOr,
+  threadSnippet,
+} from './thread-history.mjs'
 import type {
+  ClaudeCheckpoint,
   ClaudeRuntime,
   FileUpdateChange,
   GoalToolHandlers,
@@ -97,11 +112,14 @@ import type {
   JsonRpcRequest,
   JsonRpcResponse,
   PermissionDecision,
+  ProjectRecord,
   QueuedSubmission,
   RpcPeer,
   RuntimeEvent,
+  RuntimeLiveTask,
   RuntimeTaskEvent,
   RuntimeTaskUsage,
+  ThreadAttachmentRecord,
   ThreadGoal,
   ThreadItem,
   ThreadRecord,
@@ -355,8 +373,7 @@ export class CodexClaudeAppServer {
     // A CLI reported a different set of built-in commands: the App refetches
     // skills/list, which serves them as skills.
     this.stopCommandsListener = onClaudeCommandsChanged(() => {
-      for (const peer of this.peers.values())
-        this.notify(peer, { method: 'skills/changed', params: {} })
+      this.notifyAll({ method: 'skills/changed', params: {} })
     })
     this.runtime.setBackgroundListener?.({
       onTaskEvent: (threadId, event) => this.handleTaskEvent(threadId, event),
@@ -461,6 +478,7 @@ export class CodexClaudeAppServer {
       this.sendResponse(peer, request.id, undefined, {
         code: -32000,
         message: error instanceof Error ? error.message : String(error),
+        ...(error instanceof RpcError ? { data: error.data } : {}),
       })
     }
   }
@@ -521,6 +539,20 @@ export class CodexClaudeAppServer {
         return this.historyForPeer(peer, this.threadTurnsList(asRecord(params)))
       case 'thread/turns/items/list':
         return this.historyForPeer(peer, this.threadTurnItemsList(asRecord(params)))
+      case 'thread/items/list':
+        return this.historyForPeer(peer, this.threadItemsList(asRecord(params)))
+      case 'thread/timeline/list':
+        return this.historyForPeer(peer, this.threadTimelineList(asRecord(params)))
+      case 'thread/search':
+        return this.threadSearch(asRecord(params))
+      case 'thread/searchOccurrences':
+        return this.threadSearchOccurrences(asRecord(params))
+      case 'thread/attachment/add':
+        return this.threadAttachmentAdd(asRecord(params))
+      case 'thread/attachment/list':
+        return this.threadAttachmentList(asRecord(params))
+      case 'thread/attachment/remove':
+        return this.threadAttachmentRemove(asRecord(params))
       case 'thread/name/set':
         return this.threadNameSet(asRecord(params))
       case 'thread/archive':
@@ -561,6 +593,19 @@ export class CodexClaudeAppServer {
         return this.threadSectionUpdate(asRecord(params))
       case 'threadSection/delete':
         return this.threadSectionDelete(asRecord(params))
+      case 'project/list':
+        return this.projectList(asRecord(params))
+      case 'project/read':
+        return { project: this.requireProject(stringOr(asRecord(params).projectId, '')) }
+      case 'project/create':
+      case 'project/import':
+        return this.projectCreate(asRecord(params), method === 'project/import')
+      case 'project/update':
+        return this.projectUpdate(asRecord(params))
+      case 'project/delete':
+        return this.projectDelete(asRecord(params))
+      case 'project/move':
+        return this.projectMove(asRecord(params))
       case 'thread/settings/update':
         return this.threadSettingsUpdate(peer, asRecord(params))
       // Intentional no-ops: Claude Code has no equivalent concept, so the
@@ -569,6 +614,9 @@ export class CodexClaudeAppServer {
       case 'thread/memoryMode/set':
       case 'memory/reset':
         return {}
+      // Claude Code keeps no Codex memories, so none were ever consolidated.
+      case 'memory/status':
+        return { v2ConsolidatedThreads: 0, v2Ready: false }
       case 'thread/unarchive':
         return this.historyForPeer(peer, this.threadArchive(asRecord(params), false))
       case 'thread/compact/start':
@@ -593,8 +641,16 @@ export class CodexClaudeAppServer {
       }
       case 'thread/backgroundTerminals/clean':
         return this.threadBackgroundTerminalsClean(peer, asRecord(params))
+      case 'thread/backgroundTerminals/list':
+        return this.threadBackgroundTerminalsList(asRecord(params))
+      case 'thread/backgroundTerminals/terminate':
+        return this.threadBackgroundTerminalsTerminate(peer, asRecord(params))
       case 'thread/rollback':
         return this.historyForPeer(peer, this.threadRollback(asRecord(params)))
+      case 'thread/revert':
+        return this.threadRevert(peer, asRecord(params))
+      case 'thread/delete':
+        return this.threadDelete(peer, asRecord(params))
       case 'thread/loaded/list':
         return this.threadLoadedList(asRecord(params))
       case 'thread/inject_items':
@@ -605,12 +661,15 @@ export class CodexClaudeAppServer {
         return this.turnSteer(peer, asRecord(params))
       case 'turn/interrupt':
         return this.turnInterrupt(peer, asRecord(params))
+      case 'turn/settings/update':
+        return this.turnSettingsUpdate(asRecord(params))
       // Realtime voice is unsupported: Claude Code has no realtime audio
       // channel. These ack so the App's capability probe does not error; a
       // real session would need a separate audio backend.
       case 'thread/realtime/start':
       case 'thread/realtime/appendAudio':
       case 'thread/realtime/appendText':
+      case 'thread/realtime/appendSpeech':
       case 'thread/realtime/stop':
         return {}
       case 'thread/realtime/listVoices':
@@ -646,6 +705,11 @@ export class CodexClaudeAppServer {
         }
       case 'skills/list':
         return { data: listClaudeSkills(asRecord(params)) }
+      // Skill folders the App adds, such as its plugins'. Claude Code loads
+      // skills only from its own folders, so listing these would offer skills
+      // Claude cannot run.
+      case 'skills/extraRoots/set':
+        return {}
       case 'hooks/list':
         return { data: listClaudeHooks(asRecord(params)) }
       case 'marketplace/add':
@@ -695,6 +759,11 @@ export class CodexClaudeAppServer {
         }
       case 'config/mcpServer/reload':
         return {}
+      // Event streams feed MCP app widgets. This server forwards no MCP
+      // events, so a subscription stays silent until the App stops it.
+      case 'mcpServer/event/stream/start':
+      case 'mcpServer/event/stream/stop':
+        return {}
       case 'mcpServerStatus/list':
         return listMcpServerStatuses().then((data) => ({ data, nextCursor: null }))
       case 'mcpServer/resource/read':
@@ -729,6 +798,8 @@ export class CodexClaudeAppServer {
         return { account: { type: 'amazonBedrock' }, requiresOpenaiAuth: false }
       case 'account/rateLimits/read':
         return this.accountRateLimits()
+      case 'account/usage/read':
+        return accountUsage(this.store.turnActivity())
       case 'fs/readFile':
         return this.fsReadFile(asRecord(params))
       case 'fs/readDirectory':
@@ -767,6 +838,15 @@ export class CodexClaudeAppServer {
         return { items: [] }
       case 'externalAgentConfig/import':
         return {}
+      case 'externalAgentConfig/import/readHistories':
+        return { data: this.store.listImportHistories(), connectors: [] }
+      case 'externalAgentConfig/import/recordHistory':
+        return this.externalAgentImportRecord(asRecord(params))
+      // Codex compresses its rollout files; the store here has none.
+      case 'rollout/compress':
+        return {}
+      case 'server/diagnostics':
+        return this.serverDiagnostics()
       case 'config/value/write':
       case 'config/batchWrite':
         return this.configWriteResponse(asRecord(params))
@@ -784,14 +864,19 @@ export class CodexClaudeAppServer {
         return this.fuzzySessionUpdate(peer, asRecord(params))
       case 'fuzzyFileSearch/sessionStop':
         return this.fuzzySessionStop(peer, asRecord(params))
-      default:
-        throw new Error(`method not implemented: ${method}`)
+      default: {
+        const result = hostMethod(method, asRecord(params))
+        if (result === undefined) throw new Error(`method not implemented: ${method}`)
+        return result
+      }
     }
   }
 
   private threadStart(peer: RpcPeer, params: Record<string, unknown>): unknown {
     const id = newId()
     const now = nowSeconds()
+    const projectId = stringOr(params.projectId, '') || null
+    if (projectId) this.requireProject(projectId)
     const requestedCwd = stringOr(params.cwd, process.cwd())
     const cwd = maybeCreateThreadWorktree(id, requestedCwd).cwd
     const model = modelFromParams(params, this.configModel)
@@ -855,8 +940,10 @@ export class CodexClaudeAppServer {
           ? 'codex'
           : 'claude',
       codexSessionId: null,
+      projectId,
     }
     this.store.upsertThread(thread)
+    if (projectId) this.store.setThreadProject(id, projectId)
     recordRunEvent('thread.started', {
       threadId: thread.id,
       cwd: thread.cwd,
@@ -942,8 +1029,16 @@ export class CodexClaudeAppServer {
     if (!parent) throw new Error(`unknown thread: ${parentId}`)
     const now = nowSeconds()
     const id = newId()
+    // Fork: model may flip backend (forking from claude-thread with a
+    // gpt-* model = new codex-backed thread); otherwise inherit parent.
+    const runtimeBackend: ThreadRecord['runtimeBackend'] = isCodexOpenAiModel(
+      modelFromParams(params, parent.model),
+    )
+      ? 'codex'
+      : 'claude'
     const requestedCwd = stringOr(params.cwd, parent.cwd)
     const cwd = maybeCreateThreadWorktree(id, requestedCwd).cwd
+    const forkPoint = runtimeBackend === 'claude' ? this.forkPointOf(parent) : null
     const thread: ThreadRecord = {
       ...parent,
       id,
@@ -957,7 +1052,7 @@ export class CodexClaudeAppServer {
       cwd,
       model: modelFromParams(params, parent.model),
       reasoningEffort: reasoningEffortFromParams(params, parent.reasoningEffort),
-      claudeSessionId: parent.claudeSessionId,
+      claudeSessionId: forkPoint?.sessionId ?? parent.claudeSessionId,
       createdAt: now,
       updatedAt: now,
       status: { type: 'idle' },
@@ -999,14 +1094,16 @@ export class CodexClaudeAppServer {
         typeof params.personality === 'string'
           ? normalizePersonality(params.personality)
           : parent.personality,
-      // Fork: model may flip backend (forking from claude-thread with a
-      // gpt-* model = new codex-backed thread); otherwise inherit parent.
-      runtimeBackend: isCodexOpenAiModel(modelFromParams(params, parent.model))
-        ? 'codex'
-        : 'claude',
+      runtimeBackend,
       codexSessionId: null,
     }
     this.store.upsertThread(thread)
+    // A fork stays in its parent's project.
+    if (parent.projectId) this.store.setThreadProject(id, parent.projectId)
+    if (forkPoint) {
+      this.store.setForkCheckpoint(id, forkPoint)
+      this.store.rewindClaudeSession(id, forkPoint.sessionId, forkPoint.messageUuid)
+    }
     recordRunEvent('thread.forked', {
       threadId: thread.id,
       parentThreadId: parent.id,
@@ -1024,7 +1121,40 @@ export class CodexClaudeAppServer {
     )
   }
 
+  // Where a fork of `thread` picks up Claude's context: the checkpoint the
+  // thread itself resumes at next if it was just rewound, else the end of its
+  // newest settled turn. Null for legacy threads, which fork the whole session.
+  private forkPointOf(thread: ThreadRecord): ClaudeCheckpoint | null {
+    if (thread.runtimeBackend === 'codex') return null
+    const resumeAt = this.store.claudeResumeAt(thread.id)
+    if (thread.claudeSessionId && resumeAt)
+      return { sessionId: thread.claudeSessionId, messageUuid: resumeAt }
+    for (const turn of this.store.listTurns(thread.id).toReversed()) {
+      if (turn.status === 'inProgress') continue
+      const checkpoint = this.store.turnCheckpoint(turn.id)
+      if (checkpoint) return checkpoint
+    }
+    return null
+  }
+
   private threadList(params: Record<string, unknown>): unknown {
+    const query = this.threadListQuery(params)
+    const threads = this.store.listThreads(query.options)
+    const last = threads.at(-1)
+    return {
+      data: threads.map((thread) => this.toThread(thread, [])),
+      nextCursor: last && threads.length >= query.limit ? query.cursorOf(last) : null,
+      backwardsCursor: threads[0] ? query.cursorOf(threads[0]) : null,
+    }
+  }
+
+  // The filters, order and page size of thread/list, which thread/search
+  // shares. A cursor is a thread's sort value and id; see listThreads.
+  private threadListQuery(params: Record<string, unknown>): {
+    options: Parameters<SessionStore['listThreads']>[0] & { cursor: string | null }
+    limit: number
+    cursorOf: (thread: ThreadRecord) => string
+  } {
     const sourceKinds = Array.isArray(params.sourceKinds)
       ? params.sourceKinds.filter((value): value is string => typeof value === 'string')
       : []
@@ -1050,35 +1180,85 @@ export class CodexClaudeAppServer {
         : typeof params.sectionId === 'string'
           ? params.sectionId
           : undefined
-    const threads = this.store.listThreads({
-      archived: (params.archived as boolean | null | undefined) ?? null,
-      limit: numberOr(params.limit, 50),
-      cursor: typeof params.cursor === 'string' ? params.cursor : null,
-      isPinned,
-      sectionId,
-      cwd:
-        typeof params.cwd === 'string' || Array.isArray(params.cwd)
-          ? (params.cwd as string | string[])
-          : null,
-      includeEphemeral: params.includeEphemeral === true,
-      parentThreadId,
-      ancestorThreadId,
-      sourceKinds,
-      sortKey,
-      sortDirection,
-    })
-    const last = threads.at(-1)
-    const cursorValue = (thread: ThreadRecord): number =>
-      sortKey === 'section_position'
-        ? (thread.sectionPosition ?? thread.createdAt)
-        : sortKey === 'created_at'
-          ? thread.createdAt
-          : thread.updatedAt
+    // Omitted: every project; null: unassigned threads; an id: that project.
+    const projectId =
+      params.projectId === null
+        ? null
+        : typeof params.projectId === 'string'
+          ? params.projectId
+          : undefined
+    // The store pages at most 200 threads.
+    const limit = pageLimit(params.limit, 200) ?? 50
     return {
-      data: threads.map((thread) => this.toThread(thread, [])),
-      nextCursor:
-        last && threads.length >= numberOr(params.limit, 50) ? String(cursorValue(last)) : null,
-      backwardsCursor: threads[0] ? String(cursorValue(threads[0])) : null,
+      options: {
+        archived: (params.archived as boolean | null | undefined) ?? null,
+        limit,
+        cursor: typeof params.cursor === 'string' ? params.cursor : null,
+        isPinned,
+        sectionId,
+        projectId,
+        cwd:
+          typeof params.cwd === 'string' || Array.isArray(params.cwd)
+            ? (params.cwd as string | string[])
+            : null,
+        includeEphemeral: params.includeEphemeral === true,
+        parentThreadId,
+        ancestorThreadId,
+        sourceKinds,
+        sortKey,
+        sortDirection,
+      },
+      limit,
+      cursorOf: (thread) => {
+        const value =
+          sortKey === 'section_position'
+            ? (thread.sectionPosition ?? thread.createdAt)
+            : sortKey === 'created_at'
+              ? thread.createdAt
+              : thread.updatedAt
+        return `${value}:${thread.id}`
+      },
+    }
+  }
+
+  // The sidebar's and the archive's search. The store narrows the threads by
+  // text; a thread matches when its name, its preview or one of its visible
+  // messages holds the term, and the first match is its snippet. A page keeps
+  // reading the store until it is full, past threads the store let through.
+  private threadSearch(params: Record<string, unknown>): unknown {
+    const searchTerm = typeof params.searchTerm === 'string' ? params.searchTerm : ''
+    const query = this.threadListQuery(params)
+    const data: Array<{ thread: unknown; snippet: string }> = []
+    let first: ThreadRecord | null = null
+    let scanned: ThreadRecord | null = null
+    let exhausted = searchTerm.trim().length === 0
+    while (!exhausted && data.length < query.limit) {
+      const batch = this.store.listThreads({
+        ...query.options,
+        cursor: scanned ? query.cursorOf(scanned) : query.options.cursor,
+        searchTerm,
+      })
+      exhausted = batch.length < query.limit
+      for (const thread of batch) {
+        if (data.length === query.limit) {
+          exhausted = false
+          break
+        }
+        scanned = thread
+        const snippet = threadSnippet(
+          [thread.name, thread.preview],
+          () => this.store.listTurns(thread.id),
+          searchTerm,
+        )
+        if (!snippet) continue
+        first ??= thread
+        data.push({ thread: this.toThread(thread, []), snippet })
+      }
+    }
+    return {
+      data,
+      nextCursor: !exhausted && scanned ? query.cursorOf(scanned) : null,
+      backwardsCursor: first ? query.cursorOf(first) : null,
     }
   }
 
@@ -1151,6 +1331,89 @@ export class CodexClaudeAppServer {
     }
   }
 
+  // Projects group threads in the App's sidebar. Under the projects gate the
+  // App holds every project write until project/list answers, and it matches
+  // the store's error texts.
+  private projectList(params: Record<string, unknown>): unknown {
+    const sortKey = params.sortKey === 'recencyAt' ? 'recencyAt' : 'position'
+    const sortDirection =
+      params.sortDirection === 'asc' || params.sortDirection === 'desc'
+        ? params.sortDirection
+        : sortKey === 'position'
+          ? 'asc'
+          : 'desc'
+    const requestedLimit = numberOr(params.limit, 100)
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.max(1, Math.min(Math.floor(requestedLimit), 200))
+      : 100
+    const offset = typeof params.cursor === 'string' ? Number(params.cursor) : 0
+    if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('invalid project cursor')
+    const projects = this.store.listProjects(sortKey, sortDirection, limit + 1, offset)
+    return {
+      data: projects.slice(0, limit),
+      nextCursor: projects.length > limit ? String(offset + limit) : null,
+    }
+  }
+
+  private requireProject(projectId: string): ProjectRecord {
+    const project = this.store.getProject(projectId)
+    if (!project) throw new Error(`project not found: ${projectId}`)
+    return project
+  }
+
+  private projectCreate(params: Record<string, unknown>, importing: boolean): unknown {
+    const idempotencyKey = stringOr(params.idempotencyKey, '')
+    if (!idempotencyKey) throw new Error('idempotencyKey must not be empty')
+    const { project, created } = this.store.createProject(newId(), idempotencyKey, {
+      name: projectName(params.name),
+      roots: projectRoots(params.roots),
+      metadata: params.metadata == null ? {} : projectMetadata(params.metadata),
+    })
+    if (!created) return { project }
+    this.notifyAll({
+      method: 'project/changed',
+      params: { projectId: project.id, changeType: 'created' },
+    })
+    if (!importing || !Array.isArray(params.threads)) return { project }
+    for (const threadId of params.threads)
+      if (typeof threadId === 'string') this.assignThreadProject(threadId, project.id)
+    return { project: this.requireProject(project.id) }
+  }
+
+  private projectUpdate(params: Record<string, unknown>): unknown {
+    const projectId = stringOr(params.projectId, '')
+    const project = this.store.updateProject(projectId, {
+      ...(params.name == null ? {} : { name: projectName(params.name) }),
+      ...(params.roots == null ? {} : { roots: projectRoots(params.roots) }),
+      ...(params.metadata == null ? {} : { metadata: projectMetadata(params.metadata) }),
+    })
+    this.notifyAll({ method: 'project/changed', params: { projectId, changeType: 'updated' } })
+    return { project }
+  }
+
+  private projectDelete(params: Record<string, unknown>): unknown {
+    const projectId = stringOr(params.projectId, '')
+    for (const threadId of this.store.deleteProject(projectId))
+      this.notifyAll({ method: 'thread/project/updated', params: { threadId, projectId: null } })
+    this.notifyAll({ method: 'project/changed', params: { projectId, changeType: 'deleted' } })
+    return {}
+  }
+
+  private projectMove(params: Record<string, unknown>): unknown {
+    const projectId = stringOr(params.projectId, '')
+    const beforeProjectId = stringOr(params.beforeProjectId, '') || null
+    this.store.moveProject(projectId, beforeProjectId)
+    this.notifyAll({ method: 'project/changed', params: { projectId, changeType: 'updated' } })
+    return {}
+  }
+
+  // Assigns a thread to a project (null: none), telling the App if it changed.
+  // Unknown threads are skipped.
+  private assignThreadProject(threadId: string, projectId: string | null): void {
+    if (this.store.setThreadProject(threadId, projectId))
+      this.notifyAll({ method: 'thread/project/updated', params: { threadId, projectId } })
+  }
+
   private threadRead(params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
@@ -1165,14 +1428,108 @@ export class CodexClaudeAppServer {
     return { thread: this.toThread(thread, turns) }
   }
 
+  // The App pages a long thread from its newest turn, and loads a search
+  // match by reading both ways from the match's turn.
   private threadTurnsList(params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     const itemsView = turnItemsView(params.itemsView)
+    const page = pageTurns(this.store.listTurns(threadId), {
+      cursor: params.cursor,
+      limit: pageLimit(params.limit),
+      sortDirection: sortDirectionOr(params.sortDirection, 'desc'),
+    })
+    return { ...page, data: page.data.map((turn) => this.toTurnView(turn, itemsView)) }
+  }
+
+  private threadItemsList(params: Record<string, unknown>): unknown {
+    return pageItems(this.store.listTurns(stringOr(params.threadId, '')), {
+      turnId: stringOr(params.turnId, '') || null,
+      cursor: params.cursor,
+      limit: pageLimit(params.limit),
+      sortDirection: sortDirectionOr(params.sortDirection, 'asc'),
+    })
+  }
+
+  private threadTimelineList(params: Record<string, unknown>): unknown {
+    return pageTimeline(this.store.listTurns(stringOr(params.threadId, '')), {
+      cursor: params.cursor,
+      limit: pageLimit(params.limit),
+    })
+  }
+
+  // Find in a conversation: every match in its messages, each with the
+  // thread/turns/list cursor that loads the match's turn.
+  private threadSearchOccurrences(params: Record<string, unknown>): unknown {
+    const threadId = stringOr(params.threadId, '')
+    if (!this.store.getThread(threadId)) throw new Error(`unknown thread: ${threadId}`)
+    const searchTerm = typeof params.searchTerm === 'string' ? params.searchTerm : ''
+    const occurrences = findOccurrences(this.store.listTurns(threadId), searchTerm)
+    const start = offsetCursor(params.cursor, 'occurrence')
+    const end = start + (pageLimit(params.limit, 1000) ?? 250)
     return {
-      data: this.store.listTurns(threadId).map((turn) => this.toTurnView(turn, itemsView)),
-      nextCursor: null,
-      backwardsCursor: null,
+      data: occurrences.slice(start, end),
+      nextCursor: end < occurrences.length ? String(end) : null,
     }
+  }
+
+  // JSON the App keeps with a thread, one per type and key: the worktree it
+  // archived with the thread, the pull requests opened from it.
+  private threadAttachmentAdd(params: Record<string, unknown>): unknown {
+    const threadId = stringOr(params.threadId, '')
+    if (!this.store.getThread(threadId)) throw new Error(`unknown thread: ${threadId}`)
+    const attachmentType = stringOr(params.attachmentType, '')
+    const identityKey = stringOr(params.identityKey, '')
+    if (!attachmentType || !identityKey)
+      throw new Error('attachmentType and identityKey must not be empty')
+    const { attachment, created } = this.store.addThreadAttachment(threadId, {
+      id: newId(),
+      attachmentType,
+      identityKey,
+      payload: params.payload ?? null,
+    })
+    if (created) this.notifyAttachment(threadId, attachment, 'created')
+    return { outcome: created ? 'created' : 'existing', attachment }
+  }
+
+  private threadAttachmentList(params: Record<string, unknown>): unknown {
+    const threadId = stringOr(params.threadId, '')
+    if (!this.store.getThread(threadId)) throw new Error(`unknown thread: ${threadId}`)
+    const offset = offsetCursor(params.cursor, 'attachment')
+    const limit = pageLimit(params.limit, 200) ?? 100
+    const attachments = this.store.listThreadAttachments(threadId, limit + 1, offset)
+    return {
+      data: attachments.slice(0, limit),
+      nextCursor: attachments.length > limit ? String(offset + limit) : null,
+    }
+  }
+
+  // Removing an attachment that is not there leaves nothing to report.
+  private threadAttachmentRemove(params: Record<string, unknown>): unknown {
+    const threadId = stringOr(params.threadId, '')
+    const removed = this.store.removeThreadAttachment(
+      threadId,
+      stringOr(params.attachmentType, ''),
+      stringOr(params.identityKey, ''),
+    )
+    if (removed) this.notifyAttachment(threadId, removed, 'deleted')
+    return {}
+  }
+
+  private notifyAttachment(
+    threadId: string,
+    attachment: ThreadAttachmentRecord,
+    operation: 'created' | 'deleted',
+  ): void {
+    this.notifyAll({
+      method: 'thread/attachment/updated',
+      params: {
+        threadId,
+        attachmentType: attachment.attachmentType,
+        identityKey: attachment.identityKey,
+        attachmentId: attachment.id,
+        operation,
+      },
+    })
   }
 
   private threadTurnItemsList(params: Record<string, unknown>): unknown {
@@ -1760,6 +2117,9 @@ export class CodexClaudeAppServer {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
     if (!thread) throw new Error(`unknown thread: ${threadId}`)
+    // projectId: omitted or null leaves it, '' clears it, an id assigns it.
+    const projectId = typeof params.projectId === 'string' ? params.projectId || null : undefined
+    if (projectId) this.requireProject(projectId)
 
     // Support dynamic model, reasoning effort, approval policy and sandbox updates
     const rawModel = modelFromParams(params, null)
@@ -1795,6 +2155,10 @@ export class CodexClaudeAppServer {
       thread.developerInstructions = nullIfEmpty(params.developerInstructions)
     if (typeof params.personality === 'string')
       thread.personality = normalizePersonality(params.personality)
+    if (projectId !== undefined) {
+      this.assignThreadProject(threadId, projectId)
+      thread.projectId = projectId
+    }
 
     thread.updatedAt = nowSeconds()
     this.store.upsertThread(thread)
@@ -1893,10 +2257,101 @@ export class CodexClaudeAppServer {
     const numTurns =
       typeof params.numTurns === 'number' && params.numTurns >= 1 ? Math.floor(params.numTurns) : 0
     if (numTurns > 0) {
-      const dropped = this.store.deleteRecentTurns(threadId, numTurns)
+      const dropped = this.rewindThread(thread, () =>
+        this.store.deleteRecentTurns(threadId, numTurns),
+      )
       debugLog('thread.rollback', { threadId, requested: numTurns, dropped })
     }
     return { thread: this.toThread(thread, this.store.listTurns(threadId)) }
+  }
+
+  // thread/revert is the paginated-history form of rollback: drop a turn and
+  // everything after it, then let the App hydrate what is left through
+  // thread/turns/list. Local file changes stay, as in Codex.
+  private threadRevert(peer: RpcPeer, params: Record<string, unknown>): unknown {
+    const threadId = stringOr(params.threadId, '')
+    const beforeTurnId = stringOr(params.beforeTurnId, '')
+    const thread = this.store.getThread(threadId)
+    if (!thread) throw new Error(`unknown thread: ${threadId}`)
+    if (!this.store.listTurns(threadId).some((turn) => turn.id === beforeTurnId))
+      throw new Error(`unknown turn: ${beforeTurnId}`)
+    const dropped = this.rewindThread(thread, () =>
+      this.store.deleteTurnsFrom(threadId, beforeTurnId),
+    )
+    debugLog('thread.revert', { threadId, beforeTurnId, dropped })
+    const kept = this.store.listTurns(threadId)
+    const last = kept.at(-1)
+    const lastItem = last?.items.at(-1)
+    this.notify(peer, { method: 'thread/reverted', params: { threadId } })
+    return {
+      thread: this.toThread(this.store.getThread(threadId) ?? thread, []),
+      turnsBackwardsCursor: last ? last.id : null,
+      itemsBackwardsCursor: lastItem ? lastItem.id : null,
+    }
+  }
+
+  // Drops turns from the end of a thread and makes Claude forget them too:
+  // the thread's next turn resumes the newest remaining checkpoint in a
+  // forked session, so the transcript it came from stays valid for later
+  // rewinds. Returns the number of turns dropped.
+  private rewindThread(thread: ThreadRecord, drop: () => number): number {
+    if (this.activeTurnByThread.has(thread.id))
+      throw new Error(`cannot rewind thread ${thread.id} while a turn is running`)
+    const dropped = drop()
+    if (dropped === 0) return 0
+    const remaining = this.store.listTurns(thread.id)
+    if (thread.runtimeBackend === 'codex') {
+      // `codex exec resume` cannot truncate a session; only a full rewind is exact.
+      if (remaining.length === 0) this.store.updateCodexSessionId(thread.id, null)
+      return dropped
+    }
+    this.runtime.resetSession?.(thread.id)
+    for (const turn of remaining.toReversed()) {
+      const checkpoint = this.store.turnCheckpoint(turn.id)
+      if (checkpoint) {
+        this.store.rewindClaudeSession(thread.id, checkpoint.sessionId, checkpoint.messageUuid)
+        return dropped
+      }
+    }
+    if (remaining.length === 0) {
+      // Back to where the thread began: its fork point, or a new session.
+      const fork = this.store.forkCheckpoint(thread.id)
+      const parent = thread.forkedFromId ? this.store.getThread(thread.forkedFromId) : null
+      this.store.rewindClaudeSession(
+        thread.id,
+        fork?.sessionId ?? parent?.claudeSessionId ?? null,
+        fork?.messageUuid ?? null,
+      )
+      return dropped
+    }
+    // The remaining turns predate checkpoints: Claude keeps its context.
+    debugLog('thread.rewind.unanchored', { threadId: thread.id, dropped })
+    return dropped
+  }
+
+  // thread/delete removes a thread for good: its turns, goal and queue, and
+  // the subagent threads it spawned. Claude's transcripts stay on disk;
+  // forks of the thread may still resume from them. An unknown thread fails
+  // the way Codex fails a thread without a rollout, so the App retries with
+  // missingRolloutRecovery, which finds nothing left to delete.
+  private async threadDelete(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
+    const threadId = stringOr(params.threadId, '')
+    if (!this.store.getThread(threadId)) {
+      if (params.missingRolloutRecovery === true) return {}
+      throw new Error(`no rollout found for thread id ${threadId}`)
+    }
+    if (this.activeTurnByThread.has(threadId)) await this.turnInterrupt(peer, { threadId })
+    for (const id of this.store.deleteThread(threadId)) {
+      this.runtime.resetSession?.(id)
+      this.clearThreadState(id)
+      this.pendingAutonomousTurns.delete(id)
+      this.lastTurnParamsByThread.delete(id)
+      this.goalProgressByThread.delete(id)
+      this.backgroundSubagents.delete(id)
+      this.activePeerByThread.delete(id)
+      this.notify(peer, { method: 'thread/deleted', params: { threadId: id } })
+    }
+    return {}
   }
 
   private threadShellCommand(peer: RpcPeer, params: Record<string, unknown>): unknown {
@@ -1969,6 +2424,125 @@ export class CodexClaudeAppServer {
       activeProcessHandles: this.processHandles.size,
     })
     return {}
+  }
+
+  // Claude's background shells, shown by the App as the thread's background
+  // terminals. Each is the Bash call that started it; the CLI runs it, so
+  // there is no process id or usage to report.
+  private threadBackgroundTerminalsList(params: Record<string, unknown>): unknown {
+    const threadId = stringOr(params.threadId, '')
+    const terminals = this.backgroundShells(threadId).map(({ task, item }) => ({
+      itemId: item?.id ?? task.taskId,
+      processId: item?.processId ?? `claude-task:${task.taskId}`,
+      command: item?.command ?? '',
+      cwd: item?.cwd ?? this.store.getThread(threadId)?.cwd ?? '',
+      osPid: null,
+      cpuPercent: null,
+      rssKb: null,
+    }))
+    const offset = offsetCursor(params.cursor, 'terminal')
+    const end = offset + (pageLimit(params.limit, 200) ?? 100)
+    return {
+      data: terminals.slice(offset, end),
+      nextCursor: end < terminals.length ? String(end) : null,
+    }
+  }
+
+  private async threadBackgroundTerminalsTerminate(
+    peer: RpcPeer,
+    params: Record<string, unknown>,
+  ): Promise<unknown> {
+    const threadId = stringOr(params.threadId, '')
+    const processId = stringOr(params.processId, '')
+    const shell = this.backgroundShells(threadId).find(
+      ({ task, item }) =>
+        item?.processId === processId || `claude-task:${task.taskId}` === processId,
+    )
+    if (!shell) return { terminated: false }
+    this.activePeerByThread.set(threadId, peer)
+    const terminated =
+      (await this.runtime.stopTask?.(threadId, shell.task.taskId).catch(() => false)) === true
+    debugLog('thread.backgroundTerminals.terminate', { threadId, processId, terminated })
+    return { terminated }
+  }
+
+  // The thread's running background shells, each with the command item of
+  // the Bash call that started it when the store has one.
+  private backgroundShells(threadId: string): Array<{
+    task: RuntimeLiveTask
+    item: Extract<ThreadItem, { type: 'commandExecution' }> | null
+  }> {
+    const shells = (this.runtime.liveTasks?.(threadId) ?? []).filter(
+      (task) => task.taskType === 'local_bash',
+    )
+    if (shells.length === 0) return []
+    const commands = new Map<string, Extract<ThreadItem, { type: 'commandExecution' }>>()
+    for (const turn of this.store.listTurns(threadId))
+      for (const item of turn.items)
+        if (item.type === 'commandExecution' && item.processId) commands.set(item.processId, item)
+    return shells.map((task) => ({
+      task,
+      item: task.toolUseId ? (commands.get(`claude:${task.toolUseId}`) ?? null) : null,
+    }))
+  }
+
+  // Codex can change a running turn's model, effort or reviewer. A Claude turn
+  // keeps the settings it started with, so only a call that changes nothing
+  // applies; the next turn picks up new settings from turn/start.
+  private turnSettingsUpdate(params: Record<string, unknown>): unknown {
+    const threadId = stringOr(params.threadId, '')
+    const turnId = stringOr(params.turnId, '')
+    if (this.activeTurnByThread.get(threadId) !== turnId) return { status: 'targetUnavailable' }
+    const changed = ['approvalsReviewer', 'model', 'effort', 'summary', 'serviceTier'].filter(
+      (key) => params[key] != null,
+    )
+    if (changed.length > 0)
+      throw new Error(`a running Claude turn cannot change ${changed.join(', ')}`)
+    return { status: 'applied' }
+  }
+
+  // What the App's feedback report shows about this server.
+  private serverDiagnostics(): unknown {
+    let backgroundSubagents = 0
+    for (const entry of this.backgroundSubagents.values())
+      if (entry.running) backgroundSubagents += 1
+    return {
+      process: {
+        id: process.pid,
+        residentMemoryBytes: process.memoryUsage.rss(),
+        physicalFootprintBytes: null,
+      },
+      gauges: [
+        { name: 'connections', value: this.peers.size },
+        { name: 'active_turns', value: this.activeTurnByThread.size },
+        { name: 'background_subagents', value: backgroundSubagents },
+        { name: 'command_processes', value: this.commandProcesses.size },
+        { name: 'process_handles', value: this.processHandles.size },
+      ],
+    }
+  }
+
+  // The App imports another agent's setup itself and records the outcome
+  // here, to show it later.
+  private externalAgentImportRecord(params: Record<string, unknown>): unknown {
+    const results = Array.isArray(params.itemTypeResults)
+      ? params.itemTypeResults.map(asRecord)
+      : []
+    const importId = newId()
+    this.store.addImportHistory({
+      importId,
+      providerId: stringOr(params.providerId, '') || null,
+      completedAtMs: Date.now(),
+      successes: results.flatMap((result) =>
+        Array.isArray(result.successes)
+          ? result.successes.map((success) => ({ title: null, ...asRecord(success) }))
+          : [],
+      ),
+      failures: results.flatMap((result) =>
+        Array.isArray(result.failures) ? result.failures : [],
+      ),
+    })
+    return { importId }
   }
 
   private reviewStart(peer: RpcPeer, params: Record<string, unknown>): unknown {
@@ -2809,6 +3383,10 @@ export class CodexClaudeAppServer {
       acceptRuntimeEvents &&
       this.store.getTurn(turn.id)?.status === 'inProgress' &&
       this.activeTurnByThread.get(thread.id) === turn.id
+    // Set after a rewind or fork: this turn resumes the session only up to a
+    // checkpoint. It stays pending until Claude starts the forked session.
+    const resumeSessionAt = isCodexThread ? null : this.store.claudeResumeAt(thread.id)
+    let resumedAtCheckpoint = false
     const runtimeTurn = this.runtime.runTurn(
       {
         threadId: thread.id,
@@ -2821,6 +3399,7 @@ export class CodexClaudeAppServer {
         effort: resolvedEffort,
         claudeSessionId: isCodexThread ? thread.codexSessionId : thread.claudeSessionId,
         forkSession,
+        resumeSessionAt,
         mcpServers: readMcpConfig().sdkValue,
         allowedTools: defaultAllowedTools(),
         addDirs: stringListFromEnv('CLAUDE_CODEX_ADD_DIRS', []),
@@ -2848,9 +3427,22 @@ export class CodexClaudeAppServer {
           // SDK messages queued after the server has terminalized the turn.
           // They are stale and must never resurrect a child or an inProgress
           // item in the Codex App.
+          // Checkpoints are the exception: whatever Claude wrote last, even
+          // after an interrupt, is where a rewind to this turn must resume.
+          if (event.type === 'checkpoint') {
+            this.store.setTurnCheckpoint(turn.id, {
+              sessionId: event.claudeSessionId,
+              messageUuid: event.messageUuid,
+            })
+            return
+          }
           if (!turnIsActive()) return
           if (event.type === 'session') {
             this.store.updateClaudeSessionId(thread.id, event.claudeSessionId)
+            if (resumeSessionAt) {
+              this.store.clearClaudeResumeAt(thread.id)
+              resumedAtCheckpoint = true
+            }
             return
           }
           if (activeSubagents.size > 0 && !this.runtime.filtersNestedEvents?.(thread.id)) {
@@ -3689,6 +4281,23 @@ export class CodexClaudeAppServer {
     // stop() has already settled this turn and closes SQLite once the runtime
     // stops, so a turn that winds down after that has nothing left to record.
     if (this.stopped) return
+    if (
+      outcome.kind !== 'resolved' &&
+      resumeSessionAt &&
+      !resumedAtCheckpoint &&
+      this.store.getTurn(turn.id)?.status === 'inProgress'
+    ) {
+      // Claude exits before starting a session when it cannot resume at the
+      // checkpoint (its transcript was edited or removed). Give the rewind up
+      // so the thread's next turn resumes the whole session instead.
+      this.store.clearClaudeResumeAt(thread.id)
+      debugLog('thread.rewind.dropped', {
+        threadId: thread.id,
+        turnId: turn.id,
+        resumeSessionAt,
+        error: outcome.kind === 'rejected' ? outcome.error.message : 'timeout',
+      })
+    }
     if (outcome.kind === 'timeout') {
       const timeoutSeconds = Math.ceil(watchdogTimeoutMs / 1000)
       const timeoutUnit = timeoutSeconds === 1 ? 'second' : 'seconds'
@@ -3912,7 +4521,11 @@ export class CodexClaudeAppServer {
       return {
         ...record,
         data: record.data
-          .filter((entry) => 'items' in asRecord(entry) || sentLive(entry))
+          .filter((entry) => {
+            const fields = asRecord(entry)
+            // Turns, items/list entries, timeline entries.
+            return 'items' in fields || sentLive('item' in fields ? fields.item : entry)
+          })
           .map(turnForPeer),
       }
     return result
@@ -5882,6 +6495,7 @@ export class CodexClaudeAppServer {
       agentRole,
       gitInfo: null,
       name: thread.name,
+      projectId: thread.projectId ?? null,
       turns: turns.map((turn) => this.toTurn(turn)),
     }
   }
@@ -5997,6 +6611,19 @@ export class CodexClaudeAppServer {
       params: summarizeRpcParams(notification.method, notification.params),
     })
     target.send({ jsonrpc: '2.0', method: notification.method, params: notification.params })
+  }
+
+  // Shared state (skills, projects) changed: every connected peer hears it,
+  // whichever thread the notification names.
+  private notifyAll(notification: { method: string; params: unknown }): void {
+    if (this.stopped) return
+    debugLog('rpc.notify', {
+      peerIds: [...this.peers.keys()],
+      method: notification.method,
+      params: summarizeRpcParams(notification.method, notification.params),
+    })
+    for (const peer of this.peers.values())
+      peer.send({ jsonrpc: '2.0', method: notification.method, params: notification.params })
   }
 
   private notifyThread(threadId: string, notification: { method: string; params: unknown }): void {

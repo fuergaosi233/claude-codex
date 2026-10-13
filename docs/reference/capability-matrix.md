@@ -10,7 +10,10 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 | Area | Status | Notes |
 | --- | --- | --- |
 | Remote transport | Supported | SSH starts `codex app-server --listen unix://` + `proxy`; the shim reports a Codex-compatible version/user agent. |
-| Thread lifecycle | Supported | start/resume/fork/archive/list/read + turn listing, backed by SQLite + Claude session ids. |
+| Thread lifecycle | Supported | start/resume/fork/archive/list/read/delete + turn listing, backed by SQLite + Claude session ids. `thread/delete` also removes the thread's subagents; an unknown thread fails with Codex's missing-rollout text so the App's `missingRolloutRecovery` retry succeeds. |
+| Rollback / revert | Supported | `thread/rollback` and `thread/revert` drop turns and make Claude forget them: the next turn resumes the newest remaining turn's checkpoint in a forked session (a fork's own start point when none remain). Turns from before checkpoints keep Claude's context. |
+| History paging & search | Supported | `thread/turns/list` pages either way from a turn cursor; `thread/items/list` and `thread/timeline/list` page items and turn events. `thread/search` matches names, previews and visible message text; `thread/searchOccurrences` serves find-in-conversation. |
+| Projects | Supported | `project/*` keeps projects and thread membership in SQLite, with `project/changed` and `thread/project/updated` notifications. |
 | Normal chat | Supported | `turn/start` streams Claude text/reasoning into Codex agentMessage/reasoning items. |
 | Steering / interrupt | Supported | `turn/steer` and `turn/interrupt` route to the active Claude client. A rejected steer uses Codex's error texts so the App falls back or retries, and a `turn/start` that races a running turn joins it. |
 | Goals | Supported | `thread/goal/*` keeps the thread working with hidden continuation turns, counts tokens and time, and stops on budget, usage limits or a turn without progress. Claude gets `get_goal` / `create_goal` / `update_goal` through an in-process MCP server. |
@@ -64,6 +67,9 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 | Fuzzy file search | Supported | One-shot `fuzzyFileSearch` plus the stateful session API (`sessionStart/Update/Stop`) that streams `fuzzyFileSearch/sessionUpdated` results and a final `sessionCompleted`. |
 | Filesystem RPCs | Supported | `fs/readFile`, write, metadata, list, remove, copy, watch/unwatch (Codex v2-shaped). |
 | Command/process RPCs | Supported | `command/exec` and `process/spawn` implemented. |
+| Background terminals | Supported | Claude's background Bash shells are listed by `thread/backgroundTerminals/list` and stopped by `terminate`/`clean`. The CLI runs them, so there is no OS pid or usage. |
+| Thread attachments | Supported | `thread/attachment/*` keeps the App's per-thread JSON (archived worktree, linked pull requests). |
+| Running-turn settings | Partial | `turn/settings/update` reports `applied` when nothing changes and fails on a model, effort or other change: a running Claude turn keeps its settings until the next `turn/start`. |
 
 ## Not applicable / unsupported
 
@@ -71,8 +77,9 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 | --- | --- | --- |
 | Realtime audio | Unsupported | No Claude audio channel; methods ack so capability probe doesn't error; listVoices returns empty. |
 | Plugins/marketplace/apps | N/A | No Codex plugin marketplace; methods return empty schema-shaped responses. (Claude skills/hooks are surfaced — see Utilities.) |
-| Account/rate limits/auth | N/A | Claude manages its own auth; account/OpenAI-auth panels report null/empty. |
-| External agent import | Stub | `externalAgentConfig/detect` and import return empty. |
+| Account/rate limits/auth | N/A | Claude manages its own auth; account/OpenAI-auth panels report null/empty. `account/usage/read` reports the longest turn and day streaks from local history, with token counts `null`. |
+| Remote control / passkeys | Unsupported | `remoteControl/*` reports a disabled installation; `userVerification/*` reports the provider unavailable, with the error data the App reads. |
+| External agent import | Stub | `externalAgentConfig/detect` and import return empty; the import histories the App records are kept and listed. |
 | Windows sandbox | Unsupported | Target deployment is Linux/macOS; methods return not configured. |
 
 ## Protocol version
@@ -83,12 +90,11 @@ The adapter advertises codex app-server protocol **v2 @ 0.142.3** (via
 backward-compatible: new optional request methods (`thread/search`,
 `thread/delete`, `account/usage/read`, `plugin/*`, `remoteControl/*`,
 `environment/add`, …) plus widened enums (`ReasoningEffort` → free-form string,
-new `AuthMode` / `WebSearchMode` variants). The new methods are
-OpenAI-account / plugin / remote-control surfaces with no Claude Code
-equivalent; unimplemented methods return a JSON-RPC error, which Codex App
-treats as "unsupported" for these optional features. Regenerate the reference
-schema under `generated/` with `npm run generate:schema` (needs a matching
-`codex` on PATH).
+new `AuthMode` / `WebSearchMode` variants). Every client request Codex App
+26.930 can send has a handler; where Claude Code has no equivalent it answers
+with an empty, disabled or `unavailable` result rather than an error.
+Regenerate the reference schema under `generated/` with
+`npm run generate:schema` (needs a matching `codex` on PATH).
 
 Because the adapter now reports the same version as a real `codex`, it appends a
 distinguishing suffix: `codex --version` prints `codex-cli 0.142.3

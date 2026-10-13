@@ -51,6 +51,7 @@ import type {
   PermissionDecision,
   RuntimeBackgroundListener,
   RuntimeHandlers,
+  RuntimeLiveTask,
   RuntimeSteerOptions,
   RuntimeTaskUsage,
   RuntimeTurnContext,
@@ -371,12 +372,13 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   }
 
   // Background tasks of the thread's live session that are still running.
-  liveTasks(threadId: string): Array<{ taskId: string; taskType: string | null }> {
+  liveTasks(threadId: string): RuntimeLiveTask[] {
     const live = this.sessions.get(threadId)
     if (!live || live.closed) return []
     return [...live.liveTasks].map((taskId) => ({
       taskId,
       taskType: live.tasks.get(taskId)?.taskType ?? null,
+      toolUseId: live.tasks.get(taskId)?.toolUseId ?? null,
     }))
   }
 
@@ -394,6 +396,11 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   hasPendingContinuation(threadId: string): boolean {
     const live = this.sessions.get(threadId)
     return live != null && !live.closed && live.current == null && live.backlog.length > 0
+  }
+
+  resetSession(threadId: string): void {
+    const live = this.sessions.get(threadId)
+    if (live) this.closeSession(live)
   }
 
   async stop(): Promise<void> {
@@ -468,6 +475,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     const resume = sdkResumeSessionId(context.claudeSessionId, context.cwd)
     if (resume) opts.resume = resume
     if (resume && context.forkSession) opts.forkSession = true
+    // A rewound thread continues from one of its own checkpoints. Forking
+    // leaves the source transcript intact, so older checkpoints stay valid.
+    if (resume && context.resumeSessionAt) {
+      opts.resumeSessionAt = context.resumeSessionAt
+      opts.forkSession = true
+    }
 
     // Ensure extended cache TTL is explicitly requested
     if (!process.env.ANTHROPIC_BETAS) {
@@ -1363,6 +1376,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     message: Record<string, unknown>,
   ): Promise<void> {
     const type = String(message.type ?? '')
+    if ((type === 'assistant' || type === 'user') && !message.parent_tool_use_id) {
+      const messageUuid = stringOrNull(message.uuid)
+      const claudeSessionId = stringOrNull(message.session_id)
+      if (messageUuid && claudeSessionId)
+        await pending.handlers.onEvent({ type: 'checkpoint', claudeSessionId, messageUuid })
+    }
     switch (type) {
       case 'system':
         await this.handleSystem(pending, message)

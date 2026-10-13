@@ -2,7 +2,11 @@ import { mkdirSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import type {
+  ClaudeCheckpoint,
+  ImportHistoryRecord,
+  ProjectRecord,
   QueuedSubmission,
+  ThreadAttachmentRecord,
   ThreadGoal,
   ThreadItem,
   ThreadRecord,
@@ -24,6 +28,21 @@ type DatabaseSync = any
 function openDatabase(path: string): DatabaseSync {
   const sqlite = require('node:sqlite') as { DatabaseSync: new (filename: string) => DatabaseSync }
   return new sqlite.DatabaseSync(path)
+}
+
+const PROJECT_SELECT = `SELECT p.*, (
+  SELECT MAX(t.updated_at) FROM threads t WHERE t.project_id = p.id AND t.archived = 0
+) AS recency_at FROM projects p`
+
+// A LIKE pattern matching the text anywhere, with `\` as the escape.
+function likePattern(text: string): string {
+  return `%${text.replace(/[\\%_]/g, '\\$&')}%`
+}
+
+function checkpointFrom(sessionId: unknown, messageUuid: unknown): ClaudeCheckpoint | null {
+  return typeof sessionId === 'string' && typeof messageUuid === 'string'
+    ? { sessionId, messageUuid }
+    : null
 }
 
 export class SessionStore {
@@ -88,6 +107,33 @@ export class SessionStore {
         thread_id TEXT PRIMARY KEY,
         items_json TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS projects (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        roots_json TEXT NOT NULL,
+        metadata_json TEXT NOT NULL,
+        position INTEGER NOT NULL,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        deleted INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS thread_attachments (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL,
+        attachment_type TEXT NOT NULL,
+        identity_key TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        UNIQUE(thread_id, attachment_type, identity_key)
+      );
+      CREATE TABLE IF NOT EXISTS import_histories (
+        id TEXT PRIMARY KEY,
+        provider_id TEXT,
+        completed_at_ms INTEGER NOT NULL,
+        successes_json TEXT NOT NULL,
+        failures_json TEXT NOT NULL
+      );
     `)
     this.ensureColumn('threads', 'is_pinned', 'INTEGER NOT NULL DEFAULT 0')
     this.ensureColumn('threads', 'section_id', 'TEXT')
@@ -114,6 +160,16 @@ export class SessionStore {
     // Real Codex session id for runtime_backend='codex' threads (returned
     // by `codex exec` as thread.started.thread_id). NULL until first turn.
     this.ensureColumn('threads', 'codex_session_id', 'TEXT')
+    // Claude transcript checkpoints for thread/rollback, thread/revert and
+    // thread/fork: see setTurnCheckpoint and rewindClaudeSession.
+    this.ensureColumn('threads', 'claude_resume_at', 'TEXT')
+    this.ensureColumn('threads', 'claude_fork_session_id', 'TEXT')
+    this.ensureColumn('threads', 'claude_fork_message_uuid', 'TEXT')
+    this.ensureColumn('turns', 'claude_session_id', 'TEXT')
+    this.ensureColumn('turns', 'claude_message_uuid', 'TEXT')
+    // Project membership; written only by setThreadProject and deleteProject.
+    this.ensureColumn('threads', 'project_id', 'TEXT')
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_threads_project ON threads(project_id)')
     this.ensurePinnedSection()
     this.migrateLegacyPinState()
     this.sanitizeLegacyEnumColumns()
@@ -290,6 +346,10 @@ export class SessionStore {
       ancestorThreadId?: string | null
       sourceKinds?: string[]
       sectionId?: string | null | undefined
+      projectId?: string | null | undefined
+      // Keeps threads whose name, preview or stored items contain the text.
+      // A prefilter: a match inside item JSON may be a key, not visible text.
+      searchTerm?: string | undefined
       sortKey?: 'created_at' | 'updated_at' | 'recency_at' | 'section_position'
       sortDirection?: 'asc' | 'desc'
     } = {},
@@ -307,13 +367,25 @@ export class SessionStore {
         ? 'COALESCE(t.section_position, t.created_at)'
         : `t.${sortKey === 'created_at' ? 'created_at' : 'updated_at'}`
     const sortDirection = options.sortDirection === 'asc' ? 'ASC' : 'DESC'
+    // A cursor is "<sort value>:<thread id>" of the last thread a page showed.
+    // Sort values are whole seconds, so the id keeps the rest of that second's
+    // threads on the next page. A bare value skips them all.
+    const separator = options.cursor ? options.cursor.indexOf(':') : -1
     const cursor = options.cursor
-      ? Number(options.cursor)
+      ? Number(separator < 0 ? options.cursor : options.cursor.slice(0, separator))
       : sortDirection === 'ASC'
         ? -1
         : Number.MAX_SAFE_INTEGER
-    const where = ['t.archived = ?', `${sortExpression} ${sortDirection === 'ASC' ? '>' : '<'} ?`]
-    const args: unknown[] = [archived, cursor]
+    const cursorId = options.cursor && separator >= 0 ? options.cursor.slice(separator + 1) : null
+    const comparison = sortDirection === 'ASC' ? '>' : '<'
+    const where = [
+      't.archived = ?',
+      cursorId == null
+        ? `${sortExpression} ${comparison} ?`
+        : `(${sortExpression} ${comparison} ? OR (${sortExpression} = ? AND t.id ${comparison} ?))`,
+    ]
+    const args: unknown[] =
+      cursorId == null ? [archived, cursor] : [archived, cursor, cursor, cursorId]
     if (options.isPinned != null) {
       where.push('t.is_pinned = ?')
       args.push(options.isPinned ? 1 : 0)
@@ -325,6 +397,23 @@ export class SessionStore {
         where.push('t.section_id = ?')
         args.push(options.sectionId)
       }
+    }
+    if (options.projectId !== undefined) {
+      if (options.projectId === null) {
+        where.push('t.project_id IS NULL')
+      } else {
+        where.push('t.project_id = ?')
+        args.push(options.projectId)
+      }
+    }
+    if (options.searchTerm) {
+      const text = likePattern(options.searchTerm)
+      const json = likePattern(JSON.stringify(options.searchTerm).slice(1, -1))
+      where.push(
+        `(t.name LIKE ? ESCAPE '\\' OR t.preview LIKE ? ESCAPE '\\' OR EXISTS (
+           SELECT 1 FROM turns u WHERE u.thread_id = t.id AND u.items_json LIKE ? ESCAPE '\\'))`,
+      )
+      args.push(text, text, json)
     }
     const parentThreadId = options.parentThreadId ?? null
     const ancestorThreadId = options.ancestorThreadId ?? null
@@ -577,6 +666,281 @@ export class SessionStore {
     for (const [position, threadId] of threadIds.entries()) update.run(position, threadId)
   }
 
+  // Live projects in `sortKey` order. Recency puts projects without unarchived
+  // threads last in either direction, as Codex does.
+  listProjects(
+    sortKey: 'position' | 'recencyAt',
+    sortDirection: 'asc' | 'desc',
+    limit: number,
+    offset: number,
+  ): ProjectRecord[] {
+    const direction = sortDirection === 'asc' ? 'ASC' : 'DESC'
+    const order =
+      sortKey === 'recencyAt'
+        ? `recency_at IS NULL, recency_at ${direction}, p.position ASC, p.id ASC`
+        : `p.position ${direction}, p.id ${direction}`
+    const rows = this.db
+      .prepare(`${PROJECT_SELECT} WHERE p.deleted = 0 ORDER BY ${order} LIMIT ? OFFSET ?`)
+      .all(limit, offset)
+    return rows.map((row: unknown) => this.rowToProject(row))
+  }
+
+  getProject(id: string): ProjectRecord | null {
+    const row = this.db.prepare(`${PROJECT_SELECT} WHERE p.id = ? AND p.deleted = 0`).get(id)
+    return row ? this.rowToProject(row) : null
+  }
+
+  // One project per idempotency key: a retried create returns the project the
+  // first call made (`created: false`), and the key of a deleted project stays
+  // spent. New projects go last.
+  createProject(
+    id: string,
+    idempotencyKey: string,
+    fields: Pick<ProjectRecord, 'name' | 'roots' | 'metadata'>,
+  ): { project: ProjectRecord; created: boolean } {
+    return this.transaction(() => {
+      const existing = this.db
+        .prepare('SELECT id, deleted FROM projects WHERE idempotency_key = ?')
+        .get(idempotencyKey) as { id: string; deleted: number } | undefined
+      if (existing && Number(existing.deleted) === 1)
+        throw new Error(`idempotency key refers to deleted project: ${existing.id}`)
+      if (existing)
+        return { project: this.getProject(String(existing.id)) as ProjectRecord, created: false }
+      const { next } = this.db
+        .prepare('SELECT COALESCE(MAX(position) + 1, 0) AS next FROM projects WHERE deleted = 0')
+        .get() as { next: number }
+      const now = nowSeconds()
+      this.db
+        .prepare(
+          `INSERT INTO projects
+           (id, name, roots_json, metadata_json, position, idempotency_key, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          id,
+          fields.name,
+          JSON.stringify(fields.roots),
+          JSON.stringify(fields.metadata),
+          Number(next),
+          idempotencyKey,
+          now,
+          now,
+        )
+      return { project: this.getProject(id) as ProjectRecord, created: true }
+    })
+  }
+
+  // Replaces the fields given; metadata is replaced as a whole.
+  updateProject(
+    id: string,
+    fields: Partial<Pick<ProjectRecord, 'name' | 'roots' | 'metadata'>>,
+  ): ProjectRecord {
+    const project = this.getProject(id)
+    if (!project) throw new Error(`project not found: ${id}`)
+    this.db
+      .prepare(
+        `UPDATE projects SET name = ?, roots_json = ?, metadata_json = ?, updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(
+        fields.name ?? project.name,
+        JSON.stringify(fields.roots ?? project.roots),
+        JSON.stringify(fields.metadata ?? project.metadata),
+        nowSeconds(),
+        id,
+      )
+    return this.getProject(id) as ProjectRecord
+  }
+
+  // Leaves a tombstone so the idempotency key stays spent, and unassigns the
+  // project's threads. Returns their ids.
+  deleteProject(id: string): string[] {
+    if (!this.getProject(id)) throw new Error(`project not found: ${id}`)
+    return this.transaction(() => {
+      const threadIds = (
+        this.db.prepare('SELECT id FROM threads WHERE project_id = ?').all(id) as Array<{
+          id: string
+        }>
+      ).map((row) => String(row.id))
+      this.db.prepare('UPDATE threads SET project_id = NULL WHERE project_id = ?').run(id)
+      this.db
+        .prepare('UPDATE projects SET deleted = 1, updated_at = ? WHERE id = ?')
+        .run(nowSeconds(), id)
+      this.renumberProjects(this.projectIds())
+      return threadIds
+    })
+  }
+
+  // Moves a project in front of `beforeProjectId`, or last when that is null.
+  moveProject(id: string, beforeProjectId: string | null): void {
+    if (!this.getProject(id)) throw new Error(`project not found: ${id}`)
+    if (beforeProjectId != null && !this.getProject(beforeProjectId))
+      throw new Error(`project not found: ${beforeProjectId}`)
+    if (beforeProjectId === id) return
+    const ids = this.projectIds().filter((projectId) => projectId !== id)
+    const before = beforeProjectId == null ? -1 : ids.indexOf(beforeProjectId)
+    ids.splice(before >= 0 ? before : ids.length, 0, id)
+    this.transaction(() => this.renumberProjects(ids))
+  }
+
+  // Returns whether the thread's project changed.
+  setThreadProject(threadId: string, projectId: string | null): boolean {
+    const result = this.db
+      .prepare('UPDATE threads SET project_id = ? WHERE id = ? AND project_id IS NOT ?')
+      .run(projectId, threadId, projectId)
+    return Number(result.changes) > 0
+  }
+
+  private projectIds(): string[] {
+    return (
+      this.db
+        .prepare('SELECT id FROM projects WHERE deleted = 0 ORDER BY position, id')
+        .all() as Array<{ id: string }>
+    ).map((row) => String(row.id))
+  }
+
+  private renumberProjects(projectIds: string[]): void {
+    const update = this.db.prepare('UPDATE projects SET position = ? WHERE id = ?')
+    for (const [position, projectId] of projectIds.entries()) update.run(position, projectId)
+  }
+
+  private transaction<T>(body: () => T): T {
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const result = body()
+      this.db.exec('COMMIT')
+      return result
+    } catch (error) {
+      try {
+        this.db.exec('ROLLBACK')
+      } catch {}
+      throw error
+    }
+  }
+
+  // Adds the attachment unless the thread already has one with its type and
+  // key, which is returned unchanged instead.
+  addThreadAttachment(
+    threadId: string,
+    attachment: Omit<ThreadAttachmentRecord, 'createdAt'>,
+  ): { attachment: ThreadAttachmentRecord; created: boolean } {
+    return this.transaction(() => {
+      const existing = this.threadAttachment(
+        threadId,
+        attachment.attachmentType,
+        attachment.identityKey,
+      )
+      if (existing) return { attachment: existing, created: false }
+      this.db
+        .prepare(
+          `INSERT INTO thread_attachments
+             (id, thread_id, attachment_type, identity_key, payload_json, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          attachment.id,
+          threadId,
+          attachment.attachmentType,
+          attachment.identityKey,
+          JSON.stringify(attachment.payload ?? null),
+          nowSeconds(),
+        )
+      const created = this.threadAttachment(
+        threadId,
+        attachment.attachmentType,
+        attachment.identityKey,
+      )
+      if (!created) throw new Error(`thread attachment was not saved: ${attachment.id}`)
+      return { attachment: created, created: true }
+    })
+  }
+
+  // Oldest first.
+  listThreadAttachments(threadId: string, limit: number, offset: number): ThreadAttachmentRecord[] {
+    return (
+      this.db
+        .prepare(
+          `SELECT * FROM thread_attachments WHERE thread_id = ?
+           ORDER BY created_at, rowid LIMIT ? OFFSET ?`,
+        )
+        .all(threadId, limit, offset) as unknown[]
+    ).map((row) => this.rowToAttachment(row))
+  }
+
+  // Returns the removed attachment, or null when there was none.
+  removeThreadAttachment(
+    threadId: string,
+    attachmentType: string,
+    identityKey: string,
+  ): ThreadAttachmentRecord | null {
+    const existing = this.threadAttachment(threadId, attachmentType, identityKey)
+    if (existing) this.db.prepare('DELETE FROM thread_attachments WHERE id = ?').run(existing.id)
+    return existing
+  }
+
+  private threadAttachment(
+    threadId: string,
+    attachmentType: string,
+    identityKey: string,
+  ): ThreadAttachmentRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM thread_attachments
+         WHERE thread_id = ? AND attachment_type = ? AND identity_key = ?`,
+      )
+      .get(threadId, attachmentType, identityKey)
+    return row ? this.rowToAttachment(row) : null
+  }
+
+  addImportHistory(history: ImportHistoryRecord): void {
+    this.db
+      .prepare(
+        `INSERT INTO import_histories
+           (id, provider_id, completed_at_ms, successes_json, failures_json)
+         VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(
+        history.importId,
+        history.providerId,
+        history.completedAtMs,
+        JSON.stringify(history.successes),
+        JSON.stringify(history.failures),
+      )
+  }
+
+  // Newest first.
+  listImportHistories(): ImportHistoryRecord[] {
+    return (
+      this.db
+        .prepare('SELECT * FROM import_histories ORDER BY completed_at_ms DESC, rowid DESC')
+        .all() as Array<Record<string, unknown>>
+    ).map((row) => ({
+      importId: String(row.id),
+      providerId: row.provider_id == null ? null : String(row.provider_id),
+      completedAtMs: Number(row.completed_at_ms),
+      successes: JSON.parse(String(row.successes_json)) as unknown[],
+      failures: JSON.parse(String(row.failures_json)) as unknown[],
+    }))
+  }
+
+  // The local days (YYYY-MM-DD, oldest first) on which any turn started, and
+  // the longest a turn ran.
+  turnActivity(): { days: string[]; longestTurnMs: number | null } {
+    const days = this.db
+      .prepare(
+        `SELECT DISTINCT date(started_at, 'unixepoch', 'localtime') AS day FROM turns
+         WHERE started_at IS NOT NULL ORDER BY day`,
+      )
+      .all() as Array<{ day: unknown }>
+    const longest = this.db.prepare('SELECT MAX(duration_ms) AS longest FROM turns').get() as
+      | { longest?: unknown }
+      | undefined
+    return {
+      days: days.map((row) => String(row.day)),
+      longestTurnMs: longest?.longest == null ? null : Number(longest.longest),
+    }
+  }
+
   updateThreadStatus(threadId: string, status: ThreadStatus): void {
     this.db
       .prepare('UPDATE threads SET status_json = ?, updated_at = ? WHERE id = ?')
@@ -672,6 +1036,104 @@ export class SessionStore {
     const stmt = this.db.prepare('DELETE FROM turns WHERE id = ?')
     for (const row of ids) stmt.run(row.id)
     return ids.length
+  }
+
+  // thread/revert: drops `turnId` and every later turn. Returns the number of
+  // turns removed (0 when the turn is not part of the thread).
+  deleteTurnsFrom(threadId: string, turnId: string): number {
+    const ids = (
+      this.db
+        .prepare('SELECT id FROM turns WHERE thread_id = ? ORDER BY started_at ASC, rowid ASC')
+        .all(threadId) as Array<{ id: string }>
+    ).map((row) => row.id)
+    const start = ids.indexOf(turnId)
+    if (start < 0) return 0
+    const stmt = this.db.prepare('DELETE FROM turns WHERE id = ?')
+    for (const id of ids.slice(start)) stmt.run(id)
+    return ids.length - start
+  }
+
+  // The newest transcript entry Claude wrote for a turn. Resuming its session
+  // at that entry restores the context the thread had when the turn ended.
+  setTurnCheckpoint(turnId: string, checkpoint: ClaudeCheckpoint): void {
+    this.db
+      .prepare('UPDATE turns SET claude_session_id = ?, claude_message_uuid = ? WHERE id = ?')
+      .run(checkpoint.sessionId, checkpoint.messageUuid, turnId)
+  }
+
+  turnCheckpoint(turnId: string): ClaudeCheckpoint | null {
+    const row = this.db
+      .prepare('SELECT claude_session_id, claude_message_uuid FROM turns WHERE id = ?')
+      .get(turnId) as { claude_session_id?: unknown; claude_message_uuid?: unknown } | undefined
+    return checkpointFrom(row?.claude_session_id, row?.claude_message_uuid)
+  }
+
+  // Where a forked thread branched off its parent's Claude session; a rewind
+  // past the thread's own first turn returns there.
+  setForkCheckpoint(threadId: string, checkpoint: ClaudeCheckpoint | null): void {
+    this.db
+      .prepare(
+        'UPDATE threads SET claude_fork_session_id = ?, claude_fork_message_uuid = ? WHERE id = ?',
+      )
+      .run(checkpoint?.sessionId ?? null, checkpoint?.messageUuid ?? null, threadId)
+  }
+
+  forkCheckpoint(threadId: string): ClaudeCheckpoint | null {
+    const row = this.db
+      .prepare('SELECT claude_fork_session_id, claude_fork_message_uuid FROM threads WHERE id = ?')
+      .get(threadId) as
+      | { claude_fork_session_id?: unknown; claude_fork_message_uuid?: unknown }
+      | undefined
+    return checkpointFrom(row?.claude_fork_session_id, row?.claude_fork_message_uuid)
+  }
+
+  // Points the thread's next Claude turn at `sessionId`, resumed only up to
+  // the `resumeAt` entry (in a forked session) when given. A null session
+  // starts a new one.
+  rewindClaudeSession(threadId: string, sessionId: string | null, resumeAt: string | null): void {
+    this.db
+      .prepare(
+        'UPDATE threads SET claude_session_id = ?, claude_resume_at = ?, updated_at = ? WHERE id = ?',
+      )
+      .run(sessionId, sessionId ? resumeAt : null, nowSeconds(), threadId)
+  }
+
+  // The pending rewind target within claude_session_id, if any.
+  claudeResumeAt(threadId: string): string | null {
+    const row = this.db
+      .prepare('SELECT claude_resume_at FROM threads WHERE id = ?')
+      .get(threadId) as { claude_resume_at?: unknown } | undefined
+    return typeof row?.claude_resume_at === 'string' ? row.claude_resume_at : null
+  }
+
+  clearClaudeResumeAt(threadId: string): void {
+    this.db.prepare('UPDATE threads SET claude_resume_at = NULL WHERE id = ?').run(threadId)
+  }
+
+  // thread/delete: the thread, the subagent threads it spawned (recursively)
+  // and everything stored for them. Returns the deleted thread ids.
+  deleteThread(threadId: string): string[] {
+    const ids = (
+      this.db
+        .prepare(
+          `WITH RECURSIVE doomed(id) AS (
+             SELECT id FROM threads WHERE id = ?
+             UNION
+             SELECT child.id FROM threads child JOIN doomed parent ON child.forked_from_id = parent.id
+             WHERE child.thread_source = 'subagent'
+           )
+           SELECT id FROM doomed`,
+        )
+        .all(threadId) as Array<{ id: string }>
+    ).map((row) => row.id)
+    for (const id of ids) {
+      this.db.prepare('DELETE FROM turns WHERE thread_id = ?').run(id)
+      this.db.prepare('DELETE FROM thread_goals WHERE thread_id = ?').run(id)
+      this.db.prepare('DELETE FROM thread_queues WHERE thread_id = ?').run(id)
+      this.db.prepare('DELETE FROM thread_attachments WHERE thread_id = ?').run(id)
+      this.db.prepare('DELETE FROM threads WHERE id = ?').run(id)
+    }
+    return ids
   }
 
   appendItem(turnId: string, item: ThreadItem): TurnRecord | null {
@@ -969,6 +1431,30 @@ export class SessionStore {
       personality: row.personality == null ? null : String(row.personality),
       runtimeBackend: row.runtime_backend === 'codex' ? 'codex' : 'claude',
       codexSessionId: row.codex_session_id == null ? null : String(row.codex_session_id),
+      projectId: row.project_id == null ? null : String(row.project_id),
+    }
+  }
+
+  private rowToProject(row: any): ProjectRecord {
+    return {
+      id: String(row.id),
+      name: String(row.name),
+      roots: JSON.parse(String(row.roots_json)),
+      metadata: JSON.parse(String(row.metadata_json)),
+      position: Number(row.position),
+      createdAt: Number(row.created_at),
+      updatedAt: Number(row.updated_at),
+      recencyAt: row.recency_at == null ? null : Number(row.recency_at),
+    }
+  }
+
+  private rowToAttachment(row: any): ThreadAttachmentRecord {
+    return {
+      id: String(row.id),
+      attachmentType: String(row.attachment_type),
+      identityKey: String(row.identity_key),
+      payload: JSON.parse(String(row.payload_json)),
+      createdAt: Number(row.created_at),
     }
   }
 

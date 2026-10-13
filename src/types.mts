@@ -112,6 +112,43 @@ export interface ThreadRecord {
   baseInstructions: string | null
   developerInstructions: string | null
   personality: string | null
+  // The project the thread belongs to. Read-only here: upsertThread leaves it
+  // alone, so a stale record saved after a turn cannot undo an assignment
+  // made meanwhile. Assign through SessionStore.setThreadProject.
+  projectId?: string | null
+}
+
+// Codex `Project`: a named group of threads with workspace roots. Times are
+// Unix seconds; recencyAt is the newest unarchived member thread's update.
+export interface ProjectRecord {
+  id: string
+  name: string
+  roots: Array<{ path: string }>
+  metadata: Record<string, string>
+  position: number
+  createdAt: number
+  updatedAt: number
+  recencyAt: number | null
+}
+
+// Codex `ThreadAttachment`: App-owned JSON kept with a thread (its archived
+// worktree, linked pull requests), unique per (type, identityKey).
+export interface ThreadAttachmentRecord {
+  id: string
+  attachmentType: string
+  identityKey: string
+  payload: unknown
+  createdAt: number
+}
+
+// Codex `ExternalAgentConfigImportHistory`: one finished import the App
+// recorded, with what it brought over and what failed.
+export interface ImportHistoryRecord {
+  importId: string
+  providerId: string | null
+  completedAtMs: number
+  successes: unknown[]
+  failures: unknown[]
 }
 
 export interface ThreadSectionAppearance {
@@ -339,6 +376,9 @@ export interface RuntimeTurnContext {
   effort: string | null
   claudeSessionId: string | null
   forkSession: boolean
+  // Resume claudeSessionId only up to this transcript entry, in a forked
+  // session (thread rewind or fork). Backends that cannot truncate ignore it.
+  resumeSessionAt?: string | null
   mcpServers: unknown | null
   allowedTools: string[] | null
   addDirs: string[]
@@ -388,8 +428,18 @@ export interface ImageInput {
   displayPath: string
 }
 
+// A point in a Claude session transcript: resuming `sessionId` at
+// `messageUuid` restores exactly the context Claude had there.
+export interface ClaudeCheckpoint {
+  sessionId: string
+  messageUuid: string
+}
+
 export type RuntimeEvent =
   | { type: 'session'; claudeSessionId: string }
+  // Claude wrote a top-level transcript entry; the newest one of a turn is
+  // where a rewind back to that turn resumes.
+  | { type: 'checkpoint'; claudeSessionId: string; messageUuid: string }
   // A new top-level model response is beginning, not a streamed content block.
   | { type: 'message_boundary' }
   | { type: 'text_delta'; delta: string }
@@ -568,6 +618,14 @@ export interface RuntimeSteerOptions {
   onAccepted?: () => void
 }
 
+// A background task of a live session: a backgrounded Bash shell
+// (`local_bash`), agent or workflow, with the tool call that started it.
+export interface RuntimeLiveTask {
+  taskId: string
+  taskType: string | null
+  toolUseId: string | null
+}
+
 export interface ClaudeRuntime {
   runTurn(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void>
   // false: no running turn took the message. true: delivered, and
@@ -585,7 +643,7 @@ export interface ClaudeRuntime {
   // when no live session owns the task.
   stopTask?(threadId: string, taskId: string): Promise<boolean>
   // Background tasks still running in the thread's live session.
-  liveTasks?(threadId: string): Array<{ taskId: string; taskType: string | null }>
+  liveTasks?(threadId: string): RuntimeLiveTask[]
   // True while a session outlives its turns: background tasks are running or
   // Claude may still answer one that just reported back.
   hasBackgroundWork?(): boolean
@@ -595,4 +653,7 @@ export interface ClaudeRuntime {
   // True when the backend drops a subagent's own events itself, so whatever
   // reaches the server while an Agent call is open belongs to the parent.
   filtersNestedEvents?(threadId: string): boolean
+  // Close the thread's live session, background tasks included, so its next
+  // turn starts a new one: the thread's history was rewound or deleted.
+  resetSession?(threadId: string): void
 }

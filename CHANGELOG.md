@@ -50,6 +50,17 @@ versioning or publishing metadata.
 - The App's "/" popup offers Claude Code's built-in skills (`/simplify`,
   `/code-review`, …) from the list the CLI reports, and a picked one runs as
   the CLI's slash command.
+- Every client request the Codex App can send now has a handler. New real
+  ones: `project/*`, `thread/delete` (with its subagents), `thread/rollback`
+  and `thread/revert` that also rewind Claude's session, `thread/search` and
+  `thread/searchOccurrences`, item and timeline paging, `thread/attachment/*`,
+  background shell listing and termination, `turn/settings/update`,
+  `account/usage/read` from local history, import history, and server
+  diagnostics. Remote control and passkey verification answer disabled and
+  unavailable instead of failing.
+- Fixed `thread/turns/list` paging and ordering, and `thread/list` /
+  `thread/search` pages that skipped threads updated in the same second as the
+  last one shown.
 
 ### Provider and multi-agent boundaries
 

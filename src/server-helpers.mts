@@ -1,6 +1,6 @@
 import { type ChildProcess, execFile, spawn } from 'node:child_process'
 import { type FSWatcher, readFileSync, watch, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 import { promisify } from 'node:util'
 import { callMcpTool, readMcpConfig, readMcpResource } from './mcp.mjs'
 import type { SessionStore } from './store.mjs'
@@ -524,6 +524,32 @@ export function normalizeSessionSource(value: unknown): string {
 export function nullIfEmpty(value: string | null | undefined): string | null {
   if (value == null) return null
   return value === '' ? null : value
+}
+
+// Project params, checked the way Codex's typed params would be.
+export function projectName(value: unknown): string {
+  const name = typeof value === 'string' ? value.trim() : ''
+  if (!name) throw new Error('project name must not be empty')
+  return name
+}
+
+export function projectRoots(value: unknown): Array<{ path: string }> {
+  if (!Array.isArray(value)) throw new Error('project roots must be an array')
+  return value.map((root) => {
+    const path = asRecord(root).path
+    if (typeof path !== 'string' || !isAbsolute(path))
+      throw new Error(`project root must be an absolute path: ${String(path)}`)
+    return { path }
+  })
+}
+
+export function projectMetadata(value: unknown): Record<string, string> {
+  const metadata: Record<string, string> = {}
+  for (const [key, entry] of Object.entries(asRecord(value))) {
+    if (typeof entry !== 'string') throw new Error(`project metadata ${key} must be a string`)
+    metadata[key] = entry
+  }
+  return metadata
 }
 
 const desktopPresentationPrompt = [

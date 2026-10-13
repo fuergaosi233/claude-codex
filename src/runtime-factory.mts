@@ -12,6 +12,7 @@ import type {
   ClaudeRuntime,
   RuntimeBackgroundListener,
   RuntimeHandlers,
+  RuntimeLiveTask,
   RuntimeSteerOptions,
   RuntimeTurnContext,
 } from './types.mjs'
@@ -110,7 +111,7 @@ class SelectableRuntime implements ClaudeRuntime {
     return false
   }
 
-  liveTasks(threadId: string): Array<{ taskId: string; taskType: string | null }> {
+  liveTasks(threadId: string): RuntimeLiveTask[] {
     return [...this.runtimes.values()].flatMap((runtime) => runtime.liveTasks?.(threadId) ?? [])
   }
 
@@ -126,6 +127,10 @@ class SelectableRuntime implements ClaudeRuntime {
     return [...this.runtimes.values()].some(
       (runtime) => runtime.hasPendingContinuation?.(threadId) === true,
     )
+  }
+
+  resetSession(threadId: string): void {
+    for (const runtime of this.runtimes.values()) runtime.resetSession?.(threadId)
   }
 
   private runtimeFor(type: RuntimeBackendType): ClaudeRuntime {

@@ -4,6 +4,7 @@ import type {
   ClaudeRuntime,
   RuntimeBackgroundListener,
   RuntimeHandlers,
+  RuntimeLiveTask,
   RuntimeSteerOptions,
   RuntimeTurnContext,
 } from './types.mjs'
@@ -25,6 +26,10 @@ export class MockRuntime implements ClaudeRuntime {
   // Threads whose scenario plays the native runtime, which drops a
   // subagent's own events before they reach the server.
   private nestedFiltered = new Set<string>()
+  // resetSession calls per thread, echoed by the rewind check scenario.
+  private resets = new Map<string, number>()
+  // Background Bash shells by task id.
+  private shells = new Map<string, { threadId: string; toolUseId: string }>()
 
   async runTurn(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void> {
     this.running.add(context.threadId)
@@ -37,10 +42,24 @@ export class MockRuntime implements ClaudeRuntime {
 
   private async playTurn(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void> {
     this.interrupted.delete(context.threadId)
+    // Resuming at a checkpoint forks the session, like the CLI does.
+    const sessionId =
+      context.claudeSessionId && context.resumeSessionAt
+        ? `${context.claudeSessionId}~${context.turnId}`
+        : (context.claudeSessionId ?? `mock-${context.threadId}`)
+    await handlers.onEvent({ type: 'session', claudeSessionId: sessionId })
     await handlers.onEvent({
-      type: 'session',
-      claudeSessionId: context.claudeSessionId ?? `mock-${context.threadId}`,
+      type: 'checkpoint',
+      claudeSessionId: sessionId,
+      messageUuid: `${context.turnId}-entry`,
     })
+
+    if (/rewind check/i.test(context.prompt)) {
+      const text = `resumed ${context.claudeSessionId ?? 'nothing'} at ${context.resumeSessionAt ?? 'end'} after ${this.resets.get(context.threadId) ?? 0} resets`
+      await handlers.onEvent({ type: 'text_delta', delta: text })
+      await handlers.onEvent({ type: 'completed', success: true, result: text })
+      return
+    }
 
     if (context.continuation) {
       const text = this.continuations.get(context.threadId) ?? null
@@ -572,6 +591,28 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    if (/background shell check/i.test(context.prompt)) {
+      // A Bash call Claude runs in the background: the call returns at once
+      // and the shell stays live until it is stopped.
+      const toolUseId = `shell-${Date.now()}`
+      const taskId = `bash-${this.shells.size + 1}`
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId,
+        toolName: 'Bash',
+        input: { command: 'npm run dev', run_in_background: true },
+      })
+      this.shells.set(taskId, { threadId: context.threadId, toolUseId })
+      await handlers.onEvent({
+        type: 'tool_result',
+        toolUseId,
+        content: `Command running in background with ID: ${taskId}`,
+      })
+      await handlers.onEvent({ type: 'text_delta', delta: 'dev server started' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'started' })
+      return
+    }
+
     if (/background close check/i.test(context.prompt)) {
       // Claude stops its own background agent; no notification follows.
       const toolUseId = `stop-${Date.now()}`
@@ -824,6 +865,7 @@ export class MockRuntime implements ClaudeRuntime {
   async stop(): Promise<void> {
     for (const { timer } of this.backgroundTasks.values()) clearTimeout(timer)
     this.backgroundTasks.clear()
+    this.shells.clear()
   }
 
   setBackgroundListener(listener: RuntimeBackgroundListener): void {
@@ -835,6 +877,11 @@ export class MockRuntime implements ClaudeRuntime {
     if (foreground) {
       this.foregroundStops.delete(taskId)
       setImmediate(foreground)
+      return true
+    }
+    const shell = this.shells.get(taskId)
+    if (shell?.threadId === threadId) {
+      this.shells.delete(taskId)
       return true
     }
     const task = this.backgroundTasks.get(taskId)
@@ -856,12 +903,26 @@ export class MockRuntime implements ClaudeRuntime {
     return true
   }
 
+  liveTasks(threadId: string): RuntimeLiveTask[] {
+    const agents = [...this.backgroundTasks]
+      .filter(([, task]) => task.threadId === threadId)
+      .map(([taskId]) => ({ taskId, taskType: 'local_agent', toolUseId: null }))
+    const shells = [...this.shells]
+      .filter(([, shell]) => shell.threadId === threadId)
+      .map(([taskId, shell]) => ({ taskId, taskType: 'local_bash', toolUseId: shell.toolUseId }))
+    return [...agents, ...shells]
+  }
+
   hasBackgroundWork(): boolean {
     return this.backgroundTasks.size > 0 || this.continuations.size > 0
   }
 
   hasPendingContinuation(threadId: string): boolean {
     return this.continuations.has(threadId)
+  }
+
+  resetSession(threadId: string): void {
+    this.resets.set(threadId, (this.resets.get(threadId) ?? 0) + 1)
   }
 
   private scheduleBackgroundReport(
