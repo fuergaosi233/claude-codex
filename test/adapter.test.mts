@@ -2108,6 +2108,8 @@ test('remote shim launches daemon and proxy with Codex-compatible commands', {
     env: {
       ...process.env,
       CODEX_HOME: home,
+      // The shim sources a runtime env; keep the developer's own out of it.
+      CLAUDE_CODEX_RUNTIME_ENV: join(home, 'runtime.env'),
       CLAUDE_CODEX_ADAPTER: adapter,
       CLAUDE_CODEX_MOCK: '1',
       NODE_NO_WARNINGS: '1',
@@ -2118,6 +2120,8 @@ test('remote shim launches daemon and proxy with Codex-compatible commands', {
     env: {
       ...process.env,
       CODEX_HOME: home,
+      // The shim sources a runtime env; keep the developer's own out of it.
+      CLAUDE_CODEX_RUNTIME_ENV: join(home, 'runtime.env'),
       CLAUDE_CODEX_ADAPTER: adapter,
       CLAUDE_CODEX_MOCK: '1',
       NODE_NO_WARNINGS: '1',

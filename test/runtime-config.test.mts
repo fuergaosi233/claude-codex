@@ -2146,7 +2146,9 @@ test('claude-p runtime runs each turn in its own cwd', async () => {
   const runtime = new ClaudePTranscriptRuntime({
     command,
     extraArgs: [],
-    timeoutMs: 2_000,
+    // Generous: node cold starts can take seconds when the suite runs in
+    // parallel, and the fake answers as soon as it is up.
+    timeoutMs: 20_000,
     skipPermissions: false,
     resume: false,
   })
@@ -2218,7 +2220,8 @@ test('claude-p runtime timeout terminates spawned process tree', async () => {
   const runtime = new ClaudePTranscriptRuntime({
     command,
     extraArgs: [],
-    timeoutMs: 1_000,
+    // Long enough for a loaded machine to start the fake and its grandchild.
+    timeoutMs: 3_000,
     skipPermissions: false,
     resume: false,
   })
@@ -2493,21 +2496,23 @@ test('HTTP agent runtime keeps recoverable SSE fallback out of the conversation'
 test('agentapi runtime polls running terminal output before final status-only screen', async () => {
   let status: 'running' | 'stable' = 'stable'
   let messages: Array<{ id: number; role: 'agent'; content: string; time: string }> = []
+  let sawRunningScreen = false
   const server = http.createServer((req, res) => {
     if (req.method === 'GET' && req.url === '/messages') {
+      // The screen settles to a status-only line once the runtime has read
+      // the running screen, whatever its poll timing.
+      if (status === 'running' && messages.length > 0) sawRunningScreen = true
       res.setHeader('content-type', 'application/json')
       res.end(JSON.stringify({ messages }))
       return
     }
     if (req.method === 'GET' && req.url === '/status') {
-      res.setHeader('content-type', 'application/json')
-      res.end(JSON.stringify({ status }))
-      return
-    }
-    if (req.method === 'POST' && req.url === '/message') {
-      req.resume()
-      status = 'running'
-      setTimeout(() => {
+      if (sawRunningScreen) {
+        messages = [
+          { id: 1, role: 'agent', content: '✻ Cooked for 1s', time: new Date().toISOString() },
+        ]
+        status = 'stable'
+      } else if (status === 'running') {
         messages = [
           {
             id: 1,
@@ -2516,13 +2521,14 @@ test('agentapi runtime polls running terminal output before final status-only sc
             time: new Date().toISOString(),
           },
         ]
-      }, 20)
-      setTimeout(() => {
-        messages = [
-          { id: 1, role: 'agent', content: '✻ Cooked for 1s', time: new Date().toISOString() },
-        ]
-        status = 'stable'
-      }, 80)
+      }
+      res.setHeader('content-type', 'application/json')
+      res.end(JSON.stringify({ status }))
+      return
+    }
+    if (req.method === 'POST' && req.url === '/message') {
+      req.resume()
+      status = 'running'
       res.setHeader('content-type', 'application/json')
       res.end(JSON.stringify({ ok: true }))
       return
