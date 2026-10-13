@@ -34,6 +34,10 @@ versioning or publishing metadata.
 - Kept compatibility-only account, plugin, marketplace, realtime, and other
   OpenAI-specific surfaces inert or schema-shaped where Claude Code has no
   equivalent.
+- Goals, steer and the message queue follow the Codex App: `thread/goal/*`
+  with continuation turns, token and time budgets and goal tools for Claude;
+  steer errors in Codex's wording; `thread/queue/*`; and a `turn/start` that
+  races a running turn joins it instead of orphaning it.
 
 ### Provider and multi-agent boundaries
 
