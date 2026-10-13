@@ -22,6 +22,9 @@ versioning or publishing metadata.
 - When the adapter cannot record the turns it interrupts on shutdown (its
   database was deleted, for example), it still stops Claude and exits with
   status 1 instead of staying alive.
+- A turn, review or compaction requested just before the adapter stops no
+  longer starts afterwards: it launched Claude after the runtime had stopped,
+  and a compaction crashed writing to the closed store.
 - Added protocol fixture coverage for `config/read`, including the sanitized
   `config.provider_loop_config` shape, so the Rust fixture drift gate covers
   provider-loop config projection behavior.

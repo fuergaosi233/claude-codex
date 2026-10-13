@@ -1429,6 +1429,9 @@ export class CodexClaudeAppServer {
     // lifecycle turn.
     const responseTurn = this.toLifecycleTurn(turn, [userItem])
     setImmediate(() => {
+      // stop() has already settled this turn; starting it now would launch
+      // Claude after the runtime stopped.
+      if (this.stopped) return
       this.notify(peer, {
         method: 'turn/started',
         params: { threadId, turn: this.toLifecycleTurn(turn) },
@@ -1493,6 +1496,9 @@ export class CodexClaudeAppServer {
     this.activeTurnByThread.set(threadId, turnId)
     this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
     setImmediate(() => {
+      // stop() has already settled this turn; starting it now would launch
+      // Claude after the runtime stopped.
+      if (this.stopped) return
       this.notify(peer, {
         method: 'turn/started',
         params: { threadId, turn: this.toLifecycleTurn(turn) },
@@ -1722,6 +1728,9 @@ export class CodexClaudeAppServer {
     const publicTurn = this.toLifecycleTurn(turn)
 
     setImmediate(() => {
+      // stop() has already settled this turn; starting it now would launch
+      // Claude after the runtime stopped.
+      if (this.stopped) return
       this.notify(peer, { method: 'turn/started', params: { threadId, turn: publicTurn } })
       for (const item of imageItems) {
         this.notify(peer, {

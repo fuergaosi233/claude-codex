@@ -5514,6 +5514,83 @@ test('server stop still stops the runtime when the running turn cannot be record
   }
 })
 
+test('server stop keeps a queued turn, review or compaction from starting', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  try {
+    const result = execFileSync(
+      process.execPath,
+      [
+        '--no-warnings',
+        '--input-type=module',
+        '-e',
+        `
+      import { join } from 'node:path'
+      import { CodexClaudeAppServer } from './dist/src/server.mjs'
+      import { SessionStore } from './dist/src/store.mjs'
+
+      process.env.CLAUDE_CODEX_HOME = ${JSON.stringify(home)}
+      const launches = []
+      const server = new CodexClaudeAppServer(
+        new SessionStore(join(${JSON.stringify(home)}, 'state.sqlite')),
+        {
+          runTurn: (context) => {
+            launches.push(context.purpose)
+            return new Promise(() => {})
+          },
+          async steer() {},
+          async interrupt() {},
+          async stop() {},
+        },
+      )
+      const messages = []
+      const peer = { id: 'peer', send: (message) => messages.push(message), close() {} }
+      const response = (id) => messages.find((message) => 'id' in message && message.id === id)
+
+      const threadIds = []
+      for (const id of [1, 2, 3]) {
+        await server.handle(peer, {
+          id,
+          method: 'thread/start',
+          params: { cwd: process.cwd(), persistExtendedHistory: false },
+        })
+        threadIds.push(response(id).result.thread.id)
+      }
+      // Each of these answers first and starts on the next tick, after stop().
+      await server.handle(peer, {
+        id: 4,
+        method: 'turn/start',
+        params: {
+          threadId: threadIds[0],
+          input: [{ type: 'text', text: 'never starts', text_elements: [] }],
+        },
+      })
+      await server.handle(peer, {
+        id: 5,
+        method: 'review/start',
+        params: {
+          threadId: threadIds[1],
+          delivery: 'inline',
+          target: { type: 'custom', instructions: 'never starts' },
+        },
+      })
+      await server.handle(peer, {
+        id: 6,
+        method: 'thread/compact/start',
+        params: { threadId: threadIds[2] },
+      })
+      await server.stop()
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      process.stdout.write(JSON.stringify({ launches }))
+    `,
+      ],
+      { cwd: resolve('.'), encoding: 'utf8', stdio: 'pipe' },
+    )
+    assert.deepEqual(JSON.parse(result).launches, [], 'nothing reaches Claude after stop')
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
 test('mcp status list reflects configured Claude SDK MCP servers', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
