@@ -5183,12 +5183,11 @@ test('server shutdown terminalizes active child turns before closing the store',
   }
 })
 
-test('interrupt during final git diff cannot overwrite an interrupted turn', async () => {
-  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+// A repo whose `git diff` blocks until the release file exists, so a test can
+// act while the adapter waits on a turn's diff. The done file marks its return.
+async function blockingGitDiff(home: string): Promise<{ repo: string; env: NodeJS.ProcessEnv }> {
   const repo = join(home, 'repo')
   const bin = join(home, 'bin')
-  const diffStarted = join(home, 'git-diff-started')
-  const diffRelease = join(home, 'git-diff-release')
   await mkdir(repo, { recursive: true })
   await mkdir(bin, { recursive: true })
   execFileSync('git', ['init'], { cwd: repo, stdio: 'ignore' })
@@ -5206,6 +5205,7 @@ test('interrupt during final git diff cannot overwrite an interrupted turn', asy
       '  : > "$CLAUDE_CODEX_TEST_GIT_DIFF_STARTED"',
       '  while [ ! -f "$CLAUDE_CODEX_TEST_GIT_DIFF_RELEASE" ]; do sleep 0.01; done',
       "  printf 'diff --git a/file b/file\\n--- a/file\\n+++ b/file\\n@@ -1 +1 @@\\n-old\\n+new\\n'",
+      '  : > "$CLAUDE_CODEX_TEST_GIT_DIFF_DONE"',
       '  exit 0',
       'fi',
       'exec "$CLAUDE_CODEX_REAL_GIT" "$@"',
@@ -5213,6 +5213,22 @@ test('interrupt during final git diff cannot overwrite an interrupted turn', asy
     ].join('\n'),
   )
   await chmod(fakeGit, 0o755)
+  return {
+    repo,
+    env: {
+      ...process.env,
+      PATH: `${bin}:${process.env.PATH ?? ''}`,
+      CLAUDE_CODEX_REAL_GIT: realGit,
+      CLAUDE_CODEX_TEST_GIT_DIFF_STARTED: join(home, 'git-diff-started'),
+      CLAUDE_CODEX_TEST_GIT_DIFF_RELEASE: join(home, 'git-diff-release'),
+      CLAUDE_CODEX_TEST_GIT_DIFF_DONE: join(home, 'git-diff-done'),
+    },
+  }
+}
+
+test('interrupt during final git diff cannot overwrite an interrupted turn', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const { repo, env } = await blockingGitDiff(home)
 
   try {
     execFileSync(
@@ -5240,7 +5256,7 @@ test('interrupt during final git diff cannot overwrite an interrupted turn', asy
       const peer = { id: 'peer', send: (message) => messages.push(message), close() {} }
       const response = (id) => messages.find((message) => 'id' in message && message.id === id)
       const waitFor = async (condition) => {
-        for (let attempt = 0; attempt < 200; attempt += 1) {
+        for (let attempt = 0; attempt < 1000; attempt += 1) {
           if (condition()) return
           await new Promise((resolve) => setTimeout(resolve, 5))
         }
@@ -5270,6 +5286,9 @@ test('interrupt during final git diff cannot overwrite an interrupted turn', asy
         params: { threadId, turnId },
       })
       writeFileSync(process.env.CLAUDE_CODEX_TEST_GIT_DIFF_RELEASE, 'continue')
+      // Assert only once the diff has returned, so its late result is what
+      // gets checked rather than a loaded machine's slow fake git.
+      await waitFor(() => existsSync(process.env.CLAUDE_CODEX_TEST_GIT_DIFF_DONE))
       await new Promise((resolve) => setTimeout(resolve, 50))
 
       assert.equal(store.getTurn(turnId)?.status, 'interrupted')
@@ -5302,18 +5321,84 @@ test('interrupt during final git diff cannot overwrite an interrupted turn', asy
       await server.stop()
     `,
       ],
-      {
-        cwd: resolve('.'),
-        stdio: 'pipe',
-        env: {
-          ...process.env,
-          PATH: `${bin}:${process.env.PATH ?? ''}`,
-          CLAUDE_CODEX_REAL_GIT: realGit,
-          CLAUDE_CODEX_TEST_GIT_DIFF_STARTED: diffStarted,
-          CLAUDE_CODEX_TEST_GIT_DIFF_RELEASE: diffRelease,
-        },
-      },
+      { cwd: resolve('.'), stdio: 'pipe', env },
     )
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('server stop during final git diff leaves the closed store alone', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const { repo, env } = await blockingGitDiff(home)
+
+  try {
+    // The diff finishes after stop() closed SQLite. A turn that touched the
+    // store then would throw from its failure path and crash the process.
+    const turnId = execFileSync(
+      process.execPath,
+      [
+        '--no-warnings',
+        '--input-type=module',
+        '-e',
+        `
+      import { existsSync, writeFileSync } from 'node:fs'
+      import { join } from 'node:path'
+      import { CodexClaudeAppServer } from './dist/src/server.mjs'
+      import { SessionStore } from './dist/src/store.mjs'
+
+      process.env.CLAUDE_CODEX_HOME = ${JSON.stringify(home)}
+      const store = new SessionStore(join(${JSON.stringify(home)}, 'state.sqlite'))
+      const server = new CodexClaudeAppServer(store, {
+        async runTurn() {},
+        async steer() {},
+        async interrupt() {},
+        async stop() {},
+      })
+      const messages = []
+      const peer = { id: 'peer', send: (message) => messages.push(message), close() {} }
+      const response = (id) => messages.find((message) => 'id' in message && message.id === id)
+      const waitFor = async (condition) => {
+        for (let attempt = 0; attempt < 1000; attempt += 1) {
+          if (condition()) return
+          await new Promise((resolve) => setTimeout(resolve, 5))
+        }
+        throw new Error('timed out waiting for final git diff')
+      }
+
+      await server.handle(peer, {
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: ${JSON.stringify(repo)}, persistExtendedHistory: false },
+      })
+      const threadId = response(1).result.thread.id
+      await server.handle(peer, {
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'stop during final diff', text_elements: [] }],
+        },
+      })
+      const turnId = response(2).result.turn.id
+      await waitFor(() => existsSync(process.env.CLAUDE_CODEX_TEST_GIT_DIFF_STARTED))
+
+      await server.stop()
+      writeFileSync(process.env.CLAUDE_CODEX_TEST_GIT_DIFF_RELEASE, 'continue')
+      process.stdout.write(turnId)
+    `,
+      ],
+      { cwd: resolve('.'), encoding: 'utf8', stdio: 'pipe', env },
+    )
+
+    const store = new SessionStore(join(home, 'state.sqlite'))
+    try {
+      const turn = store.getTurn(turnId)
+      assert.equal(turn?.status, 'interrupted')
+      assert.equal(turn?.diff, '')
+    } finally {
+      store.close()
+    }
   } finally {
     await rm(home, { recursive: true, force: true })
   }
