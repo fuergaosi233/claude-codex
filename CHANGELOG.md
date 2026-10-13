@@ -44,6 +44,9 @@ versioning or publishing metadata.
 - A turn that ends early completes the message still streaming and fails the
   tool calls still running before `turn/completed`, instead of leaving them
   in progress in the App.
+- The adapter stops Claude CLI processes a previous adapter on the same state
+  dir left running, matching pid, start time and command line before
+  signalling (`CLAUDE_CODEX_REAP_ORPHANED_CLI=0` turns it off).
 
 ### Provider and multi-agent boundaries
 

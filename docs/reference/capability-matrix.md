@@ -135,6 +135,11 @@ codex.
   "not a git repository" from real errors) rather than swallowed.
 - Per-thread in-memory state (command approvals, token usage, goals, elicitation
   counts) is released when a thread is archived.
+- A Claude CLI that outlives its adapter (killed, or slow to exit after
+  SIGTERM) is stopped by the next adapter on the same state dir before it
+  serves, so it cannot keep appending to a transcript about to be resumed.
+  Only processes whose pid, start time and command line match the record are
+  signalled.
 
 ## Next targets
 
