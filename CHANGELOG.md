@@ -19,6 +19,15 @@ versioning or publishing metadata.
 - Expanded Codex App Remote coverage across thread lifecycle, turn envelopes,
   item streaming, approvals, MCP status, fuzzy file search sessions, Claude
   skills/hooks, and `thread/turns/list` item views.
+- A turn still finishing when the adapter stops (waiting on its final
+  `git diff`, an approval or the runtime) no longer writes to the closed
+  SQLite store, which crashed the process on the way out.
+- When the adapter cannot record the turns it interrupts on shutdown (its
+  database was deleted, for example), it still stops Claude and exits with
+  status 1 instead of staying alive.
+- A turn, review or compaction requested just before the adapter stops no
+  longer starts afterwards: it launched Claude after the runtime had stopped,
+  and a compaction crashed writing to the closed store.
 - Added protocol fixture coverage for `config/read`, including the sanitized
   `config.provider_loop_config` shape, so the Rust fixture drift gate covers
   provider-loop config projection behavior.
@@ -28,6 +37,9 @@ versioning or publishing metadata.
 
 ### Provider and multi-agent boundaries
 
+- `/workflows` runs turn workflows on with the CLI's `CLAUDE_CODE_WORKFLOWS`
+  switch instead of `--settings`, which pinned launchers reject, and respect a
+  user's `enableWorkflows: false`.
 - Added the provider and multi-agent loop boundaries RFC to separate runtime
   backends, provider metadata, agent-loop fidelity, credential ownership, and
   subscription/entitlement boundaries.
