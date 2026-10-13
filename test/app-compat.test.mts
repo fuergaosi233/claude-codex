@@ -4,6 +4,7 @@ import test from 'node:test'
 import {
   APP_RULES,
   DESKTOP_CLIENT_NAME,
+  GATED_METHODS,
   rendersCompletedSubagentActivity,
   unverifiedAppWarning,
   VERIFIED_APP_VERSIONS,
@@ -48,6 +49,37 @@ test('the App baseline is a verified build', () => {
   const baseline = JSON.parse(readFileSync(new URL('scripts/app-baseline.json', root), 'utf8'))
   assert.ok(VERIFIED_APP_VERSIONS.includes(baseline.appVersion))
   assert.ok(baseline.clientNames.includes(DESKTOP_CLIENT_NAME))
+})
+
+// The methods the adapter's request switches have a case for.
+function handledMethods(): Set<string> {
+  const handled = new Set<string>()
+  for (const file of ['server.mts', 'host-methods.mts']) {
+    const text = readFileSync(new URL(`src/${file}`, root), 'utf8')
+    for (const match of text.matchAll(/case '([A-Za-z][\w/]*)':/g)) handled.add(match[1] as string)
+  }
+  return handled
+}
+
+test('every request the verified App can send has a case', () => {
+  const baseline = JSON.parse(readFileSync(new URL('scripts/app-baseline.json', root), 'utf8'))
+  const handled = handledMethods()
+  assert.deepEqual(
+    baseline.clientRequests.filter((method: string) => !handled.has(method)),
+    [],
+  )
+})
+
+test('GATED_METHODS names the baseline gates and their requests', () => {
+  const baseline = JSON.parse(readFileSync(new URL('scripts/app-baseline.json', root), 'utf8'))
+  const handled = handledMethods()
+  for (const [gate, methods] of Object.entries(GATED_METHODS)) {
+    assert.ok(gate in baseline.gates, `${gate} is not a gate of the baseline App`)
+    for (const method of methods) {
+      assert.ok(baseline.clientRequests.includes(method), `${method} is not an App request`)
+      assert.ok(handled.has(method), `${gate} needs a case for ${method}`)
+    }
+  }
 })
 
 test('unverifiedAppWarning only speaks up for an unlisted desktop build', () => {

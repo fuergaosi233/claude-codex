@@ -120,7 +120,65 @@ export const APP_RULES: readonly AppRule[] = [
     adapter: 'Sends none per turn; account/rateLimits/read answers the snapshot.',
     verify: 'No rate-limit banner appears after an ordinary reply.',
   },
+  {
+    id: 'projects',
+    app: 'With the projects gate on, holds every project write until project/list answers, imports its local projects keyed by their ids (ignoring "idempotency key refers to deleted project: <id>"), and treats "project not found: <id>" as a missing project.',
+    adapter:
+      'Keeps projects and thread membership in its state database and fails with exactly these texts.',
+    verify:
+      'Create a project in the sidebar, move a chat into it, and restart the App: both persist.',
+  },
+  {
+    id: 'delete-missing-rollout',
+    app: 'Deleting archived chats retries thread/delete with missingRolloutRecovery when it fails with "no rollout found for thread id <id>", and stops at any other error.',
+    adapter:
+      'Fails thread/delete of a thread it does not know with that text and takes the retry as done.',
+    verify: 'Delete all archived chats in Settings: the list empties without an error.',
+  },
 ]
+
+// The methods the App starts calling once the app-server version turns a
+// feature gate on (the gate table is in its bundle; see
+// scripts/app-baseline.json). check:app-upgrade flags a gate the adapter's
+// version turns on while one of these has no case.
+export const GATED_METHODS: Readonly<Record<string, readonly string[]>> = {
+  appRead: ['app/read'],
+  diagnostics: ['server/diagnostics'],
+  gatewayOAuth: [
+    'account/gatewayOAuth/read',
+    'account/gatewayOAuth/login',
+    'account/gatewayOAuth/cancel',
+  ],
+  mcpEventStream: ['mcpServer/event/stream/start', 'mcpServer/event/stream/stop'],
+  projects: [
+    'project/list',
+    'project/read',
+    'project/create',
+    'project/import',
+    'project/update',
+    'project/delete',
+    'project/move',
+  ],
+  reasoningEffortUpdates: ['turn/settings/update'],
+  rolloutCompression: ['rollout/compress'],
+  serviceTierForTurn: ['turn/settings/update'],
+  threadAttachments: [
+    'thread/attachment/add',
+    'thread/attachment/list',
+    'thread/attachment/remove',
+  ],
+  threadQueue: [
+    'thread/queue/add',
+    'thread/queue/list',
+    'thread/queue/update',
+    'thread/queue/delete',
+    'thread/queue/reorder',
+    'thread/queue/start',
+  ],
+  threadRevert: ['thread/revert'],
+  threadTimeline: ['thread/timeline/list'],
+  turnApprovalsReviewer: ['turn/settings/update'],
+}
 
 // App rule: subagent-completed-kind
 export function rendersCompletedSubagentActivity(version: string): boolean {

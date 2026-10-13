@@ -33,6 +33,8 @@ line a rule touches.
 | `subagent-read` | reads a child with `includeTurns: false` and shows one without turns as loading | a finished subagent opens with its prompt and reply |
 | `child-prompt` | creates the child conversation from `thread/started` with an empty turn | a running subagent shows its prompt |
 | `rate-limit-banner` | shows a banner for every `account/rateLimits/updated` | no banner after an ordinary reply |
+| `projects` | holds project writes until `project/list` answers, and matches the `project not found` and deleted-key error texts | a project and a chat moved into it survive an App restart |
+| `delete-missing-rollout` | retries `thread/delete` with `missingRolloutRecovery` after `no rollout found for thread id <id>` | deleting all archived chats empties the list |
 
 The full text of each rule, including the adapter side, is in
 `src/app-compat.mts`.
@@ -71,7 +73,9 @@ and prints:
   a problem.
 - **Feature gates** — the App's gate table, each marked on or off for the
   version the adapter reports, with new, changed and removed gates, and the
-  minimum app-server version the App accepts.
+  minimum app-server version the App accepts. A gate that is on while one of
+  its methods in `GATED_METHODS` has no `case` is a problem; a new gate that is
+  on gets a note to find its methods and add them there.
 - **clientInfo names** — the names the App sends in `initialize`.
 - **App rules** — the checklist above, to go through by hand with the App
   connected to the adapter.
@@ -95,8 +99,20 @@ The App decides which features to use from the app-server version in the
 - At the default, the App keeps queued messages in the window instead of using
   the server-side queue (`thread/queue/*`), which needs `0.148.0-alpha.14` or
   later. The upgrade check notes this.
-- A higher version also turns on gates whose methods the adapter does not
-  implement. At `0.149.0-alpha.4.1`, for example, the App may call
-  `thread/revert`, `project/*`, `server/diagnostics` and `app/read`, which are
-  answered with `method not implemented`. Run the upgrade check with the
-  variable set to see which gates a version turns on.
+- A higher version turns on more gates, and the App starts calling the methods
+  behind them. `GATED_METHODS` in `src/app-compat.mts` maps each gate to those
+  methods, and `test/app-compat.test.mts` checks that every one has a `case`.
+  Run the upgrade check with the variable set to see which gates a version
+  turns on:
+
+  ```sh
+  CLAUDE_CODEX_COMPAT_VERSION=0.149.0-alpha.4.1 npm run check:app-upgrade -- --app /Applications/Codex.app
+  ```
+
+Every client request the verified App can send has a `case`. Where Claude Code
+has no counterpart, the answer says so instead of failing: an empty list, a
+disabled status (remote control), an `unavailable` error the App knows
+(passkey verification), or `null` for what the adapter does not track (token
+counts in `account/usage/read`). Some gates are best left off anyway:
+`threadAttachments` also turns on the App's managed worktree cleanup, which
+needs a ChatGPT sign-in.

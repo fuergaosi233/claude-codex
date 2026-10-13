@@ -7,7 +7,8 @@
 //   call that the adapter has no case for, methods the adapter sends that the
 //   schema no longer has);
 // - the App's feature-gate table and minimum app-server version, against the
-//   version the adapter reports;
+//   version the adapter reports, and the methods each gate it turns on makes
+//   the App call (GATED_METHODS in src/app-compat.mts);
 // - the clientInfo name the App sends in initialize;
 // - the App rules, which only a person can re-check.
 //
@@ -57,7 +58,7 @@ function fail(message) {
 const baselinePath = resolve(args.baseline)
 if (!args.app) fail('pass the App bundle to check with --app <path/to/Codex.app>')
 
-const { APP_RULES, DESKTOP_CLIENT_NAME, VERIFIED_APP_VERSIONS } = await import(
+const { APP_RULES, DESKTOP_CLIENT_NAME, GATED_METHODS, VERIFIED_APP_VERSIONS } = await import(
   join(root, 'dist', 'src', 'app-compat.mjs')
 ).catch(() => fail('dist/ is missing; run it through `npm run check:app-upgrade`'))
 const { codexCompatVersion } = await import(join(root, 'dist', 'src', 'util.mjs'))
@@ -243,6 +244,9 @@ function facts(app, codexPath) {
 
 // --- Adapter side ------------------------------------------------------------
 
+// The files whose switch answers the App's requests.
+const DISPATCH_FILES = new Set(['server.mts', 'host-methods.mts'])
+
 function adapterFacts() {
   const handled = new Set()
   const sent = new Set()
@@ -250,7 +254,7 @@ function adapterFacts() {
   for (const file of readdirSync(srcDir)) {
     if (!file.endsWith('.mts')) continue
     const text = readFileSync(join(srcDir, file), 'utf8')
-    if (file === 'server.mts')
+    if (DISPATCH_FILES.has(file))
       for (const match of text.matchAll(/case '([A-Za-z][\w/]*)':/g)) handled.add(match[1])
     for (const match of text.matchAll(
       /method: '([a-zA-Z]+(?:\/[a-zA-Z_]+)+|configWarning|error|warning)'/g,
@@ -398,6 +402,23 @@ if (!next.gates) {
   }
   for (const name of Object.keys(before).filter((name) => !(name in next.gates)))
     console.log(`  --  ${name.padEnd(32)} removed`)
+  for (const [name, methods] of Object.entries(GATED_METHODS)) {
+    if (!(name in next.gates)) {
+      notes.push(`GATED_METHODS lists ${name}, which the App no longer gates on`)
+      continue
+    }
+    if (compareVersions(reported, next.gates[name]) < 0) continue
+    const unanswered = methods.filter((method) => !adapter.handled.has(method))
+    if (unanswered.length > 0)
+      problems.push(
+        `the adapter's version turns on ${name}, but it has no case for ${unanswered.join(', ')}`,
+      )
+  }
+  for (const name of Object.keys(next.gates).filter((name) => !(name in before)))
+    if (compareVersions(reported, next.gates[name]) >= 0)
+      notes.push(
+        `the new gate ${name} is on; find what the App calls behind it and add those methods to GATED_METHODS`,
+      )
   if (compareVersions(reported, next.gates.threadQueue) < 0)
     notes.push(
       `the App keeps queued messages in the window: threadQueue needs ${next.gates.threadQueue}, set CLAUDE_CODEX_COMPAT_VERSION to use the server-side queue`,

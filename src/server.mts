@@ -1341,6 +1341,7 @@ export class CodexClaudeAppServer {
   // Projects group threads in the App's sidebar. Under the projects gate the
   // App holds every project write until project/list answers, and it matches
   // the store's error texts.
+  // App rule: projects
   private projectList(params: Record<string, unknown>): unknown {
     const sortKey = params.sortKey === 'recencyAt' ? 'recencyAt' : 'position'
     const sortDirection =
@@ -2342,6 +2343,7 @@ export class CodexClaudeAppServer {
   // forks of the thread may still resume from them. An unknown thread fails
   // the way Codex fails a thread without a rollout, so the App retries with
   // missingRolloutRecovery, which finds nothing left to delete.
+  // App rule: delete-missing-rollout
   private async threadDelete(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
     const threadId = stringOr(params.threadId, '')
     if (!this.store.getThread(threadId)) {
