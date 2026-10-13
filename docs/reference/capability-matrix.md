@@ -92,8 +92,8 @@ backward-compatible: new optional request methods (`thread/search`,
 `environment/add`, …) plus widened enums (`ReasoningEffort` → free-form string,
 new `AuthMode` / `WebSearchMode` variants). Every client request Codex App
 26.930 can send has a handler; where Claude Code has no equivalent it answers
-with an empty, disabled or `unavailable` result rather than an error.
-Regenerate the reference schema under `generated/` with
+with an empty, disabled or `unavailable` result rather than an error (see
+[Codex App compatibility](/reference/app-compat)). Regenerate the reference schema under `generated/` with
 `npm run generate:schema` (needs a matching `codex` on PATH).
 
 Because the adapter now reports the same version as a real `codex`, it appends a

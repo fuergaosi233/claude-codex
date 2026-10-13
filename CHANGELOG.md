@@ -134,6 +134,13 @@ versioning or publishing metadata.
 - Documentation changes should run `npm run docs:build`.
 - Credentialed smoke and acceptance checks remain opt-in and must use
   credentials already owned by the local user or organization on the host.
+- `npm run check:app-upgrade -- --app <bundle>` checks a new Codex App build
+  against `scripts/app-baseline.json`: the protocol its bundled `codex`
+  generates, the feature gates on at the reported version and whether every
+  method behind them has a handler, and the clientInfo names. The App
+  behaviors the adapter relies on are App rules in `src/app-compat.mts`, tagged
+  in the code and kept in sync by `test/app-compat.test.mts`; an App build not
+  yet checked gets a config warning. See `docs/reference/app-compat.md`.
 
 ### Still experimental or not yet included
 
