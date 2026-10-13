@@ -95,13 +95,23 @@ async function main(): Promise<void> {
     if (shuttingDown) return
     shuttingDown = true
     debugLog('adapter.shutdown', { reason, pid: process.pid })
-    await server.stop()
+    let code = 0
+    try {
+      await server.stop()
+    } catch (error) {
+      // shuttingDown already ignores the next signal, so a failed stop has to
+      // end the process here or nothing will.
+      code = 1
+      const message = error instanceof Error ? error.message : String(error)
+      debugLog('adapter.shutdown.failed', { reason, pid: process.pid, message })
+      process.stderr.write(`[claude-codex-adapter] shutdown failed: ${message}\n`)
+    }
     if (pidFile) {
       try {
         unlinkSync(pidFile)
       } catch {}
     }
-    process.exit(0)
+    process.exit(code)
   }
   process.once('SIGINT', () => void shutdown('SIGINT'))
   process.once('SIGTERM', () => void shutdown('SIGTERM'))

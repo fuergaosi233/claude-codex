@@ -5404,6 +5404,116 @@ test('server stop during final git diff leaves the closed store alone', async ()
   }
 })
 
+test('adapter exits on SIGTERM even when stopping fails to record the running turn', {
+  timeout: 30_000,
+}, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  let stderr = ''
+  proc.stderr.setEncoding('utf8')
+  proc.stderr.on('data', (chunk: string) => {
+    stderr += chunk
+  })
+  try {
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), persistExtendedHistory: false, permissions: ':workspace' },
+      }),
+    )
+    const threadId = (await reader.nextResponse(1)).result.thread.id
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'please run approval bash', text_elements: [] }],
+        },
+      }),
+    )
+    await reader.nextResponse(2)
+    // The turn stays in progress until its approval is answered.
+    await nextNotification(reader, 'item/commandExecution/requestApproval')
+
+    // With its database deleted, stop() cannot record the interrupted turn,
+    // as when a test removes the adapter's home before the signal lands.
+    await rm(join(home, 'claude-codex-adapter', 'state.sqlite'))
+    proc.kill('SIGTERM')
+    assert.equal(await waitForExit(proc, 20_000), 1, 'the adapter must not linger')
+    assert.match(stderr, /\[claude-codex-adapter\] shutdown failed: /)
+  } finally {
+    await stopProcess(proc)
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('server stop still stops the runtime when the running turn cannot be recorded', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  try {
+    const result = execFileSync(
+      process.execPath,
+      [
+        '--no-warnings',
+        '--input-type=module',
+        '-e',
+        `
+      import { rmSync } from 'node:fs'
+      import { join } from 'node:path'
+      import { CodexClaudeAppServer } from './dist/src/server.mjs'
+      import { SessionStore } from './dist/src/store.mjs'
+
+      process.env.CLAUDE_CODEX_HOME = ${JSON.stringify(home)}
+      const dbPath = join(${JSON.stringify(home)}, 'state.sqlite')
+      let runtimeStopped = false
+      const server = new CodexClaudeAppServer(new SessionStore(dbPath), {
+        runTurn: () => new Promise(() => {}),
+        async steer() {},
+        async interrupt() {},
+        async stop() {
+          runtimeStopped = true
+        },
+      })
+      const messages = []
+      const peer = { id: 'peer', send: (message) => messages.push(message), close() {} }
+      const response = (id) => messages.find((message) => 'id' in message && message.id === id)
+
+      await server.handle(peer, {
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), persistExtendedHistory: false },
+      })
+      await server.handle(peer, {
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId: response(1).result.thread.id,
+          input: [{ type: 'text', text: 'never finishes', text_elements: [] }],
+        },
+      })
+      rmSync(dbPath)
+      const error = await server.stop().then(
+        () => null,
+        (error) => error.message,
+      )
+      process.stdout.write(JSON.stringify({ error, runtimeStopped }))
+    `,
+      ],
+      { cwd: resolve('.'), encoding: 'utf8', stdio: 'pipe' },
+    )
+    const { error, runtimeStopped } = JSON.parse(result)
+    assert.notEqual(error, null, 'recording the interrupted turn fails without its database')
+    assert.equal(runtimeStopped, true)
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
 test('mcp status list reflects configured Claude SDK MCP servers', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {

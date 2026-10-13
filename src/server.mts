@@ -255,14 +255,22 @@ export class CodexClaudeAppServer {
   async stop(): Promise<void> {
     if (this.stopped) return
     this.stopped = true
-    // Child turns are created directly from Task/Workflow events and are not
-    // registered in activeTurnByThread. Finalize them before aborting the
-    // runtime or closing SQLite, otherwise stdio EOF can leave child turns
-    // persisted as inProgress until a later restart recovery pass.
-    this.finalizeActiveSubagentsForShutdown('server stopped')
-    this.completeActiveTurns('interrupted', { message: 'server stopped' })
-    await this.runtime.stop()
-    this.store.close()
+    try {
+      // Child turns are created directly from Task/Workflow events and are not
+      // registered in activeTurnByThread. Finalize them before aborting the
+      // runtime or closing SQLite, otherwise stdio EOF can leave child turns
+      // persisted as inProgress until a later restart recovery pass.
+      this.finalizeActiveSubagentsForShutdown('server stopped')
+      this.completeActiveTurns('interrupted', { message: 'server stopped' })
+    } finally {
+      // A store that can no longer be written must not keep the Claude
+      // processes running.
+      try {
+        await this.runtime.stop()
+      } finally {
+        this.store.close()
+      }
+    }
   }
 
   hasActiveTurns(): boolean {
