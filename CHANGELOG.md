@@ -63,6 +63,11 @@ versioning or publishing metadata.
   turns, as Codex App 26.930 shows them: the Claude session stays open while
   they run, a finished agent's report wakes the parent with a new turn,
   `SendMessage` resumes an agent, and the child's Stop button ends it.
+- Subagents behave the way the Codex App draws them: the parent's own tools
+  beside an Agent call keep their cards, interrupts stop workflows and single
+  children as Codex does, `SendMessage` / `TaskStop` map to agent calls, the
+  CLI 2.1.283 hand-back report and usage trailer are parsed, and a finishing
+  child no longer clears its still-running siblings from the roster.
 
 ### Rust-first protocol groundwork
 
