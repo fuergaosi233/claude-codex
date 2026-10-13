@@ -856,7 +856,7 @@ test('config writes persist across adapter restarts', async () => {
       await once(second, 'exit')
     }
   } finally {
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -908,7 +908,7 @@ test('invalid persisted model selections are repaired to a selectable model', as
       await once(proc, 'exit')
     }
   } finally {
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -981,7 +981,7 @@ test('Fable and Opus picker aliases reach the runtime without changing plan mode
   } finally {
     proc.kill()
     await once(proc, 'exit')
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -1009,7 +1009,7 @@ for (const configuredModels of ['sonnet', '["sonnet"]', '[{"id":"sonnet"}]']) {
     } finally {
       proc.kill()
       await once(proc, 'exit')
-      await rm(home, { recursive: true, force: true })
+      await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
     }
   })
 }
@@ -1134,7 +1134,7 @@ test('Codex app config payload model and effort map into Claude runtime context'
     assert.equal(text, 'model=haiku effort=xhigh')
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -1378,7 +1378,7 @@ test('stateful HTTP bridge runtimes keep Codex title-generation turns local', as
     assert.doesNotMatch(logText, /"http\.bridge\.ensure\.start"/)
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -1541,7 +1541,7 @@ test('unix daemon keeps active turns alive across peer reconnect', async () => {
     assert.equal(await waitForExit(proc, 2000), 0)
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -4660,7 +4660,7 @@ test('turn interrupt completes requested in-progress turn after reconnect', asyn
       { cwd: resolve('.'), stdio: 'pipe' },
     )
   } finally {
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -4819,7 +4819,7 @@ test('runtime settlement cannot overwrite an interrupted turn', async () => {
       { cwd: resolve('.'), stdio: 'pipe' },
     )
   } finally {
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -4911,7 +4911,7 @@ test('subagent watchdog terminalizes a runtime that never returns', async () => 
       { cwd: resolve('.'), stdio: 'pipe' },
     )
   } finally {
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -5006,7 +5006,7 @@ test('workflow watchdog terminalizes a launch that never publishes a result', as
       { cwd: resolve('.'), stdio: 'pipe' },
     )
   } finally {
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -5090,7 +5090,7 @@ test('workflow watchdog disarms when the original Workflow tool result arrives',
       { cwd: resolve('.'), stdio: 'pipe' },
     )
   } finally {
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -5179,7 +5179,7 @@ test('server shutdown terminalizes active child turns before closing the store',
       { cwd: resolve('.'), stdio: 'pipe' },
     )
   } finally {
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -5324,7 +5324,7 @@ test('interrupt during final git diff cannot overwrite an interrupted turn', asy
       { cwd: resolve('.'), stdio: 'pipe', env },
     )
   } finally {
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -5400,7 +5400,7 @@ test('server stop during final git diff leaves the closed store alone', async ()
       store.close()
     }
   } finally {
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -5510,7 +5510,7 @@ test('server stop still stops the runtime when the running turn cannot be record
     assert.notEqual(error, null, 'recording the interrupted turn fails without its database')
     assert.equal(runtimeStopped, true)
   } finally {
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -5587,7 +5587,7 @@ test('server stop keeps a queued turn, review or compaction from starting', asyn
     )
     assert.deepEqual(JSON.parse(result).launches, [], 'nothing reaches Claude after stop')
   } finally {
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -6384,6 +6384,6 @@ test('thread sections paginate without losing entries at page boundaries', async
   } finally {
     proc.kill()
     await once(proc, 'exit')
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
