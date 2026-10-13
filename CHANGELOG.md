@@ -55,6 +55,10 @@ versioning or publishing metadata.
 - Added tests proving built-in descriptors validate cleanly, unsupported
   credential labels are not projected as allowed, and secret-like descriptor
   text is redacted from public projection results.
+- Background subagents (`run_in_background` Agent calls) keep running across
+  turns, as Codex App 26.930 shows them: the Claude session stays open while
+  they run, a finished agent's report wakes the parent with a new turn,
+  `SendMessage` resumes an agent, and the child's Stop button ends it.
 
 ### Rust-first protocol groundwork
 

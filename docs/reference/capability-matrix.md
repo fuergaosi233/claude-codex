@@ -45,6 +45,7 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 | Bash output | Supported | Forwarded as command output on completion (SDK has no incremental tool-output streaming). |
 | Generic Claude tools | Supported | Non-command/file tools → mcpToolCall items under the `claude-code` pseudo server. |
 | Subagent (Task) | Supported | Task spawns an ephemeral child thread and emits native `subAgentActivity` lifecycle events (capability-gated `completed`) plus `spawnAgent`/`wait` tool state; inner events are hidden, and the final result lands as one agentMessage on the child thread. |
+| Background subagents | Supported | `run_in_background` agents keep running across turns: the Claude session stays open while they run, a finished agent's report wakes the parent with a new turn, `SendMessage` resumes an agent, and the child's Stop button ends it. |
 | Ephemeral / threadSource | Supported | `ephemeral: true` threads (title-gen, memory-consolidation, subagents) persist but are excluded from `thread/list` unless `includeEphemeral: true`. `threadSource` round-trips. |
 | Claude side events | Supported | rate_limit / hook / subagent / compaction events summarized into structured notice lines. |
 | Review mode | Supported (text) | `review/start` creates an in-progress review turn and routes the prompt through Claude. No native guardian finding items. |
