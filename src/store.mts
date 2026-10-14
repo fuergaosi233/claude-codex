@@ -19,9 +19,41 @@ export const PINNED_SECTION_NAME = 'Pinned'
 
 type DatabaseSync = any
 
+// How long a statement waits for another connection's lock before SQLite
+// gives up with "database is locked". Without a wait, anything that reads the
+// file at the wrong moment (a backup, a sqlite3 shell, a status script) fails
+// whichever turn happens to write then. Python's sqlite3 uses the same 5s.
+const DEFAULT_BUSY_TIMEOUT_MS = 5_000
+
+function busyTimeoutMs(): number {
+  const raw = process.env.CLAUDE_CODEX_STATE_DB_TIMEOUT_MS?.trim()
+  if (!raw) return DEFAULT_BUSY_TIMEOUT_MS
+  const value = Number(raw)
+  return Number.isInteger(value) && value >= 0 ? value : DEFAULT_BUSY_TIMEOUT_MS
+}
+
 function openDatabase(path: string): DatabaseSync {
-  const sqlite = require('node:sqlite') as { DatabaseSync: new (filename: string) => DatabaseSync }
-  return new sqlite.DatabaseSync(path)
+  const sqlite = require('node:sqlite') as {
+    DatabaseSync: new (filename: string, options?: { timeout?: number }) => DatabaseSync
+  }
+  return new sqlite.DatabaseSync(path, { timeout: busyTimeoutMs() })
+}
+
+// The terminal form of a turn. completeTurn writes it; a caller whose write
+// the store refused still needs it to tell the client the turn ended.
+export function settledTurn(
+  turn: TurnRecord,
+  status: TurnStatus,
+  error: unknown | null = null,
+): TurnRecord {
+  const completedAt = nowSeconds()
+  return {
+    ...turn,
+    status,
+    completedAt,
+    durationMs: turn.startedAt == null ? null : Math.max(0, (completedAt - turn.startedAt) * 1000),
+    error,
+  }
 }
 
 export class SessionStore {
@@ -698,14 +730,9 @@ export class SessionStore {
   ): TurnRecord | null {
     const turn = this.getTurn(turnId)
     if (!turn) return null
-    const completedAt = nowSeconds()
-    turn.status = status
-    turn.completedAt = completedAt
-    turn.durationMs =
-      turn.startedAt == null ? null : Math.max(0, (completedAt - turn.startedAt) * 1000)
-    turn.error = error
-    this.upsertTurn(turn)
-    return turn
+    const completed = settledTurn(turn, status, error)
+    this.upsertTurn(completed)
+    return completed
   }
 
   recoverStaleInProgressTurns(message = 'server restarted before completing turn'): number {
