@@ -1229,7 +1229,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       // closes while a workflow journal still has an unresolved task, there
       // will be no later task_notification to unblock the deferred result.
       // Close those projected agents as failed and finish the parent turn
-      // rather than leaving Codex cc's spinner alive forever.
+      // rather than leaving the Codex App's spinner alive forever.
       if (this.hasPendingWorkflowTasks(pending)) await this.stopWorkflowTasks(pending)
       await this.finishDeferredResult(pending, true)
       if (!pending.resolved) return

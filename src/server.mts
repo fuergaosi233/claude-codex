@@ -164,7 +164,7 @@ import { maybeCreateThreadWorktree } from './worktree.mjs'
 
 const execFileAsync = promisify(execFile)
 
-// A missing Claude Task result must not keep Codex cc in its working state
+// A missing Claude Task result must not keep the Codex App in its working state
 // forever. This is deliberately a long, configurable watchdog for the whole
 // subagent phase; it is not the short journal-drain grace period used when a
 // terminal notification has already arrived.
@@ -289,7 +289,7 @@ function queuedInput(value: unknown): UserInput[] {
 }
 
 interface PeerFeatures {
-  // Codex cc 26.818.61809 only accepts started/interacted/interrupted in the
+  // Codex App 26.818.61809 only accepts started/interacted/interrupted in the
   // subAgentActivity schema. Newer clients may opt into the completed kind
   // explicitly during initialize; keep the legacy wire shape otherwise.
   // App rule: subagent-completed-kind
@@ -1445,7 +1445,7 @@ export class CodexClaudeAppServer {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
     if (!thread) throw new Error('unknown thread: ' + threadId)
-    // Codex cc hydrates the Subagent panel with includeTurns:false. A
+    // The Codex App hydrates the Subagent panel with includeTurns:false. A
     // parent-linked child with no renderable turns is treated by that client
     // as still loading, and it does not reliably follow up with turns/list.
     // Keep metadata-only reads for ordinary threads, but return the small
@@ -3632,7 +3632,7 @@ export class CodexClaudeAppServer {
                 turn: this.toLifecycleTurn(childTurn),
               },
             })
-            // The bundled Codex cc client creates a child conversation from
+            // The bundled Codex App client creates a child conversation from
             // thread/started with an empty turn and treats the history as
             // loaded while the child is live. Replay the persisted prompt as
             // a normal item lifecycle so the child page has its Prompt even
@@ -3890,7 +3890,7 @@ export class CodexClaudeAppServer {
               },
             })
 
-            // Codex cc 26.x does not advertise the terminal
+            // Codex App 26.x does not advertise the terminal
             // subAgentActivity kind. For a successful child, wait/completed
             // is already the terminal display state; appending closeAgent
             // makes the bundled client hide the finished child. Keep the
@@ -4557,7 +4557,7 @@ export class CodexClaudeAppServer {
     // History keeps every kind so a reload shows the cards the App saw live;
     // historyForPeer hides the ones a legacy client was never sent.
     this.store.appendItem(parentTurnId, item)
-    // Codex cc 26.818 treats a started marker as liveness but has no
+    // Codex App 26.818 treats a started marker as liveness but has no
     // terminal kind besides interrupted, so it only ever gets that one.
     // App rule: subagent-completed-kind
     if (!this.supportsCompletedSubagentActivity(peer) && kind !== 'interrupted') return

@@ -3293,7 +3293,7 @@ test('Task subagent emits the canonical activity lifecycle and leaves wait as th
           json({
             id: 50,
             method: 'thread/read',
-            // The bundled Codex cc panel uses includeTurns:false while it
+            // The bundled Codex App panel uses includeTurns:false while it
             // opens a child. The adapter must still hydrate this subagent.
             params: { threadId: message.params.threadId, includeTurns: false },
           }),
@@ -3706,7 +3706,7 @@ test('Task subagent emits the canonical activity lifecycle and leaves wait as th
         json({
           id: 3,
           method: 'thread/read',
-          // Cold-open follows the same metadata-only request as Codex cc.
+          // Cold-open follows the same metadata-only request as the Codex App.
           params: { threadId: childThreadId, includeTurns: false },
         }),
       )
@@ -3745,7 +3745,7 @@ test('Task subagent emits the canonical activity lifecycle and leaves wait as th
   }
 })
 
-test('Codex cc 26.818 settles subagents without the unsupported completed activity kind', async () => {
+test('Codex App 26.818 settles subagents without the unsupported completed activity kind', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -3815,7 +3815,7 @@ test('Codex cc 26.818 settles subagents without the unsupported completed activi
     assert.deepEqual(
       activityKinds,
       [],
-      'Codex cc 26.818 must use spawnAgent/wait lifecycle instead of an unsupported started marker',
+      'Codex App 26.818 must use spawnAgent/wait lifecycle instead of an unsupported started marker',
     )
     assert.ok(childPromptStarted)
     assert.ok(childPromptCompleted)
@@ -3909,7 +3909,7 @@ test('subagent without a terminal result emits interrupted activity and failed w
     assert.equal(
       sawClose,
       true,
-      'legacy Codex cc needs closeAgent to clear an orphaned child spinner',
+      'legacy Codex App needs closeAgent to clear an orphaned child spinner',
     )
     assert.deepEqual(activityKinds, ['interrupted'])
     assert.ok(childTurnCompleted)
@@ -4589,7 +4589,7 @@ test('stopping a foreground child ends it as interrupted and the parent carries 
   }
 })
 
-// Codex cc 26.930's subagent roster reducer (app-initial I5t), reduced to the
+// Codex App 26.930's subagent roster reducer (app-initial I5t), reduced to the
 // status it shows per agent for one parent turn's items.
 function appRoster(items: any[], isTurnLive: boolean): Map<string, string> {
   const fromState: Record<string, string> = {

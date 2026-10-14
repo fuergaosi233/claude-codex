@@ -78,7 +78,7 @@ async function main(): Promise<void> {
   }
 
   const store = new SessionStore()
-  // Codex cc normally launches the app-server over stdio, so a crashed or
+  // The Codex App normally launches the app-server over stdio, so a crashed or
   // force-quit adapter leaves its last turn persisted as `inProgress`. The
   // next stdio process is the recovery boundary just like the unix daemon;
   // only recovering unix transports leaves the App's subagent view stuck on
