@@ -667,6 +667,28 @@ test('a fork resumes at its fork point, and a full rollback returns there', asyn
   })
 })
 
+test('the ephemeral fork the App describes a thread with stays out of the thread list', async () => {
+  await withServer(async (server) => {
+    const parent = await server.startThread()
+    await server.runTurn(parent, 'parent one')
+    const { thread: fork } = await server.request('thread/fork', {
+      threadId: parent,
+      ephemeral: true,
+      excludeTurns: true,
+      threadSource: 'thread_description',
+    })
+    assert.equal(fork.ephemeral, true)
+    assert.deepEqual(ids(await server.request('thread/list')), [parent])
+    // A plain fork is the user's own thread.
+    const { thread: kept } = await server.request('thread/fork', { threadId: parent })
+    assert.equal(kept.ephemeral, false)
+    assert.deepEqual(
+      ids(await server.request('thread/list')).toSorted(),
+      [parent, kept.id].toSorted(),
+    )
+  })
+})
+
 test('thread/delete removes a thread with its subagents, even mid-turn', async () => {
   await withServer(async (server) => {
     const parent = await server.startThread()

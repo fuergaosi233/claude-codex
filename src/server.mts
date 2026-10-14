@@ -1093,7 +1093,9 @@ export class CodexClaudeAppServer {
       permissionProfileId:
         permissionProfileIdFromParams(params) ??
         (hasLegacyPermissionParams(params) ? null : (parent.permissionProfileId ?? null)),
-      ephemeral: parent.ephemeral,
+      // The App forks a thread to describe it and asks for an ephemeral fork;
+      // like any helper thread, it stays out of the thread list.
+      ephemeral: params.ephemeral === true || parent.ephemeral,
       threadSource:
         typeof params.threadSource === 'string'
           ? normalizeThreadSource(params.threadSource)
