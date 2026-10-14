@@ -65,6 +65,12 @@ versioning or publishing metadata.
 - Fixed `thread/turns/list` paging and ordering, and `thread/list` /
   `thread/search` pages that skipped threads updated in the same second as the
   last one shown.
+- Input sent while a turn is still starting waits up to 10 s for it instead
+  of failing with `no active turn to steer`, a turn whose runtime run has
+  returned is ended instead of holding the thread until Stop, and a turn the
+  server failed also stops the CLI turn behind it.
+- An ephemeral `thread/fork`, which the App uses to describe a thread, stays
+  out of `thread/list`.
 
 ### Provider and multi-agent boundaries
 
@@ -95,6 +101,10 @@ versioning or publishing metadata.
   children as Codex does, `SendMessage` / `TaskStop` map to agent calls, the
   CLI 2.1.283 hand-back report and usage trailer are parsed, and a finishing
   child no longer clears its still-running siblings from the roster.
+- Deleting a thread ends its running background agents first, so each child
+  turn completes as interrupted; stopping a turn no longer wakes the thread to
+  acknowledge the background agents Claude Code stopped with it; and
+  `/workflows` lists the workflows Claude ran on its own.
 
 ### Rust-first protocol groundwork
 
