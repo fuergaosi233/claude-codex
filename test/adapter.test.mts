@@ -12,6 +12,7 @@ import http from 'node:http'
 import net from 'node:net'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { Duplex } from 'node:stream'
 import test from 'node:test'
 import WebSocket from 'ws'
@@ -1693,6 +1694,112 @@ test('stdio app-server recovers stale in-progress turns after process restart', 
     const recoveredTurn = read.result.thread.turns.find((turn: any) => turn.id === turnId)
     assert.equal(recoveredTurn.status, 'interrupted')
     assert.match(recoveredTurn.error.message, /server restarted before completing turn/)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('a turn waits out a reader briefly holding the state database', {
+  timeout: 20_000,
+}, async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      CODEX_HOME: home,
+      CLAUDE_CODEX_HOME: join(home, 'adapter'),
+      CLAUDE_CODEX_MOCK: '1',
+      NODE_NO_WARNINGS: '1',
+    },
+  })
+  // A hung turn must not keep the test runner alive past the timeout; the
+  // adapter defers a plain SIGTERM while it still has an active turn.
+  t.signal.addEventListener('abort', () => proc.kill('SIGKILL'))
+  const reader = new JsonLineReader(proc)
+  try {
+    const threadId = await startLockTestThread(proc, reader)
+    const turnId = await startLockTestTurn(proc, reader, threadId, 2, 'state lock wait check')
+    await nextNotification(reader, 'item/agentMessage/delta')
+    const release = holdStateDatabase(join(home, 'adapter', 'state.sqlite'))
+    await delay(300)
+    release()
+
+    const seen = await nextTurnCompleted(reader, turnId)
+    assert.equal(seen.completed.status, 'completed')
+    assert.equal(seen.methods.includes('error'), false)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('a turn the state database refuses still ends and frees the thread', {
+  timeout: 30_000,
+}, async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const debugLogPath = join(home, 'debug.jsonl')
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      CODEX_HOME: home,
+      CLAUDE_CODEX_HOME: join(home, 'adapter'),
+      CLAUDE_CODEX_DEBUG_LOG: debugLogPath,
+      CLAUDE_CODEX_MOCK: '1',
+      CLAUDE_CODEX_STATE_DB_TIMEOUT_MS: '50',
+      NODE_NO_WARNINGS: '1',
+    },
+  })
+  // A hung turn must not keep the test runner alive past the timeout; the
+  // adapter defers a plain SIGTERM while it still has an active turn.
+  t.signal.addEventListener('abort', () => proc.kill('SIGKILL'))
+  const reader = new JsonLineReader(proc)
+  try {
+    const threadId = await startLockTestThread(proc, reader)
+    const turnId = await startLockTestTurn(proc, reader, threadId, 2, 'state lock refusal check')
+    await nextNotification(reader, 'item/agentMessage/delta')
+    // Held past the adapter's busy timeout: its next write fails, and so does
+    // the write that would record the failure.
+    const release = holdStateDatabase(join(home, 'adapter', 'state.sqlite'))
+    let seen: Awaited<ReturnType<typeof nextTurnCompleted>>
+    let status: { params: Record<string, unknown> }
+    try {
+      seen = await nextTurnCompleted(reader, turnId)
+      status = await nextNotification(reader, 'thread/status/changed')
+    } finally {
+      release()
+    }
+    assert.equal(seen.completed.status, 'failed')
+    assert.match(seen.completed.error.message, /database is locked/)
+    assert.equal(seen.methods.includes('error'), true)
+    assert.deepEqual(status.params.status, { type: 'idle' })
+
+    const nextTurnId = await startLockTestTurn(proc, reader, threadId, 3, 'after the lock')
+    const next = await nextTurnCompleted(reader, nextTurnId)
+    assert.equal(next.completed.status, 'completed')
+
+    // The refused write is retried, so the stored turn ends too.
+    let stored: any = null
+    for (let attempt = 0; attempt < 40 && stored?.status !== 'failed'; attempt += 1) {
+      await delay(250)
+      const id = 100 + attempt
+      proc.stdin?.write(
+        json({ id, method: 'thread/read', params: { threadId, includeTurns: true } }),
+      )
+      const read = await reader.nextResponse(id)
+      stored = read.result.thread.turns.find((turn: any) => turn.id === turnId)
+    }
+    assert.equal(stored?.status, 'failed')
+
+    const events = (await readFile(debugLogPath, 'utf8'))
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line).event)
+    assert.equal(events.includes('turn.persist_failed'), true)
+    assert.equal(events.includes('turn.persist_recovered'), true)
+    assert.equal(events.includes('adapter.unhandledRejection'), false)
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -7663,6 +7770,70 @@ function asTestRecord(value: unknown): Record<string, unknown> {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+// Opens a read transaction on the adapter's state database, the way a backup
+// or a sqlite3 shell would. Until the returned release runs, the adapter
+// cannot commit a write.
+function holdStateDatabase(path: string): () => void {
+  const db = new DatabaseSync(path, { readOnly: true, timeout: 2_000 })
+  db.exec('BEGIN')
+  db.prepare('SELECT count(*) FROM turns').get()
+  return () => {
+    db.exec('COMMIT')
+    db.close()
+  }
+}
+
+async function startLockTestThread(proc: ChildProcess, reader: JsonLineReader): Promise<string> {
+  proc.stdin?.write(
+    json({
+      id: 1,
+      method: 'thread/start',
+      params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false },
+    }),
+  )
+  const start = await reader.nextResponse(1)
+  return start.result.thread.id
+}
+
+// The mock streams the echoed prompt one character at a time, so a long
+// prompt keeps the turn writing for a while.
+async function startLockTestTurn(
+  proc: ChildProcess,
+  reader: JsonLineReader,
+  threadId: string,
+  id: number,
+  text: string,
+): Promise<string> {
+  proc.stdin?.write(
+    json({
+      id,
+      method: 'turn/start',
+      params: {
+        threadId,
+        input: [{ type: 'text', text: `${text} ${'x'.repeat(300)}`, text_elements: [] }],
+      },
+    }),
+  )
+  const started = await reader.nextResponse(id)
+  assert.equal(started.error, undefined)
+  return started.result.turn.id
+}
+
+async function nextTurnCompleted(
+  reader: JsonLineReader,
+  turnId: string,
+): Promise<{ completed: any; methods: string[] }> {
+  const methods: string[] = []
+  for (let i = 0; i < 5_000; i += 1) {
+    const message = await reader.next()
+    if (message.method == null) continue
+    methods.push(message.method)
+    if (message.method === 'turn/completed' && message.params.turn.id === turnId)
+      return { completed: message.params.turn, methods }
+  }
+  throw new Error(`turn/completed never arrived for ${turnId}`)
 }
 
 async function waitForExit(proc: ChildProcess, timeoutMs: number): Promise<number | null> {

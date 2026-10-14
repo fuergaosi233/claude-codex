@@ -92,7 +92,7 @@ import {
   wrapMcpToolError,
   wrapMcpToolResult,
 } from './server-helpers.mjs'
-import { PINNED_SECTION_ID, type SessionStore } from './store.mjs'
+import { PINNED_SECTION_ID, type SessionStore, settledTurn } from './store.mjs'
 import {
   findOccurrences,
   offsetCursor,
@@ -168,6 +168,12 @@ const execFileAsync = promisify(execFile)
 // terminal notification has already arrived.
 const DEFAULT_SUBAGENT_WATCHDOG_MS = 30 * 60 * 1000
 const MIN_SUBAGENT_WATCHDOG_MS = 100
+
+// A turn end the state database refused is written again on this schedule
+// (2s, 4s, ... apart), so thread/read stops showing the turn as running once
+// the lock holder lets go.
+const TURN_END_RETRY_DELAY_MS = 2_000
+const TURN_END_RETRY_ATTEMPTS = 5
 
 function isWorkflowToolName(value: string): boolean {
   const name = value.trim().toLowerCase()
@@ -2612,24 +2618,13 @@ export class CodexClaudeAppServer {
         model: thread.model,
         effort: thread.reasoningEffort,
       }).catch((error) => {
-        const completed =
-          this.store.completeTurn(turnId, 'failed', { message: error.message }) ?? turn
+        if (!this.failTurn(peer, threadId, turn, error)) return
         recordRunEvent('turn.failed', {
           threadId,
           turnId,
           runtimeBackend: thread.runtimeBackend,
           error: { message: error.message },
         })
-        this.notify(peer, {
-          method: 'error',
-          params: { threadId, turnId, willRetry: false, error: { message: error.message } },
-        })
-        this.notify(peer, {
-          method: 'turn/completed',
-          params: { threadId, turn: this.toLifecycleTurn(completed) },
-        })
-        this.clearActiveTurn(threadId)
-        this.setThreadStatus(peer, threadId, { type: 'idle' })
       })
     })
     return { turn: responseTurn, reviewThreadId: threadId }
@@ -2708,13 +2703,18 @@ export class CodexClaudeAppServer {
             method: 'item/completed',
             params: { threadId, turnId, item: compactItem, completedAtMs: nowMillis() },
           })
-          const finalAgent =
-            this.store.getTurn(turnId)?.items.find((i) => i.id === agentItem.id) ?? agentItem
+          let finalAgent: ThreadItem = agentItem
+          try {
+            finalAgent =
+              this.store.getTurn(turnId)?.items.find((i) => i.id === agentItem.id) ?? agentItem
+          } catch {}
           this.notify(peer, {
             method: 'item/completed',
             params: { threadId, turnId, item: finalAgent, completedAtMs: nowMillis() },
           })
-          const completed = this.store.completeTurn(turnId, 'completed') ?? turn
+          // An interrupt already ended the turn and told the client.
+          const completed = this.endTurn(turn, 'completed', null)
+          if (!completed) return
           this.clearActiveTurn(threadId)
           this.setThreadStatus(peer, threadId, { type: 'idle' })
           this.notify(peer, {
@@ -2722,6 +2722,13 @@ export class CodexClaudeAppServer {
             params: { threadId, turn: this.toLifecycleTurn(completed) },
           })
           this.notify(peer, { method: 'thread/compacted', params: { threadId } })
+        })
+        // The fallback writes to the store too; the turn has still ended above.
+        .catch((error) => {
+          debugLog('thread.compact.fallback_failed', {
+            threadId,
+            error: error instanceof Error ? error.message : String(error),
+          })
         })
     })
     return {}
@@ -2954,26 +2961,11 @@ export class CodexClaudeAppServer {
       void this.runRuntimeTurn(peer, thread, turn, prompt, {
         ...params,
         _imageInputs: images,
-      }).catch((error) => this.failRuntimeTurn(peer, threadId, turn, error))
+      }).catch((error) => {
+        this.failTurn(peer, threadId, turn, error)
+      })
     })
     return { turn: publicTurn }
-  }
-
-  private failRuntimeTurn(peer: RpcPeer, threadId: string, turn: TurnRecord, error: Error): void {
-    const turnId = turn.id
-    const current = this.store.getTurn(turnId)
-    if (current && current.status !== 'inProgress') return
-    const completed = this.store.completeTurn(turnId, 'failed', { message: error.message }) ?? turn
-    this.notify(peer, {
-      method: 'error',
-      params: { threadId, turnId, willRetry: false, error: { message: error.message } },
-    })
-    this.notify(peer, {
-      method: 'turn/completed',
-      params: { threadId, turn: this.toLifecycleTurn(completed) },
-    })
-    this.clearActiveTurn(threadId)
-    this.setThreadStatus(peer, threadId, { type: 'idle' })
   }
 
   private completeWorkflowListTurn(peer: RpcPeer, thread: ThreadRecord, turn: TurnRecord): void {
@@ -5177,7 +5169,7 @@ export class CodexClaudeAppServer {
       _continuation: true,
     }
     void this.runRuntimeTurn(peer, thread, turn, '', params).catch((error) =>
-      this.failRuntimeTurn(peer, threadId, turn, error),
+      this.failTurn(peer, threadId, turn, error),
     )
   }
 
@@ -6656,7 +6648,17 @@ export class CodexClaudeAppServer {
     threadId: string,
     status: ThreadRecord['status'],
   ): void {
-    this.store.updateThreadStatus(threadId, status)
+    // The client's view comes first: a status it never hears about leaves the
+    // thread spinning. A stored status the write missed is repaired at startup.
+    try {
+      this.store.updateThreadStatus(threadId, status)
+    } catch (error) {
+      debugLog('thread.status.persist_failed', {
+        threadId,
+        status: status.type,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
     const target = peer ?? this.activePeerByThread.get(threadId)
     if (target)
       this.notify(target, { method: 'thread/status/changed', params: { threadId, status } })
@@ -6747,6 +6749,80 @@ export class CodexClaudeAppServer {
           this.idleCheckHandler?.()
       })
     }
+  }
+
+  // Ends a turn whose runtime run failed. The client leaves its running state
+  // only on turn/completed, so that goes out even when the store refuses the
+  // write too; the usual cause is another connection holding the state
+  // database past its busy timeout. Returns false for a turn that had already
+  // ended, e.g. through turn/interrupt.
+  private failTurn(peer: RpcPeer, threadId: string, turn: TurnRecord, error: Error): boolean {
+    const completed = this.endTurn(turn, 'failed', { message: error.message })
+    if (!completed) return false
+    this.notify(peer, {
+      method: 'error',
+      params: { threadId, turnId: turn.id, willRetry: false, error: { message: error.message } },
+    })
+    this.notify(peer, {
+      method: 'turn/completed',
+      params: { threadId, turn: this.toLifecycleTurn(completed) },
+    })
+    this.clearActiveTurn(threadId)
+    this.setThreadStatus(peer, threadId, { type: 'idle' })
+    return true
+  }
+
+  // Writes a turn's terminal state. Returns null when the turn already ended,
+  // and the terminal record built in memory when the store refused the write;
+  // that write is then retried in the background.
+  private endTurn(turn: TurnRecord, status: TurnStatus, error: unknown | null): TurnRecord | null {
+    try {
+      const current = this.store.getTurn(turn.id)
+      if (current && current.status !== 'inProgress') return null
+      return this.store.completeTurn(turn.id, status, error) ?? turn
+    } catch (storeError) {
+      debugLog('turn.persist_failed', {
+        threadId: turn.threadId,
+        turnId: turn.id,
+        status,
+        error: storeError instanceof Error ? storeError.message : String(storeError),
+      })
+      this.retryTurnEnd(turn.threadId, turn.id, status, error, 1)
+      return settledTurn(turn, status, error)
+    }
+  }
+
+  private retryTurnEnd(
+    threadId: string,
+    turnId: string,
+    status: TurnStatus,
+    error: unknown | null,
+    attempt: number,
+  ): void {
+    const timer = setTimeout(() => {
+      try {
+        if (this.store.getTurn(turnId)?.status === 'inProgress')
+          this.store.completeTurn(turnId, status, error)
+        if (
+          !this.activeTurnByThread.has(threadId) &&
+          this.store.getThread(threadId)?.status.type === 'active'
+        )
+          this.store.updateThreadStatus(threadId, { type: 'idle' })
+        debugLog('turn.persist_recovered', { threadId, turnId, attempt })
+      } catch (storeError) {
+        if (attempt < TURN_END_RETRY_ATTEMPTS) {
+          this.retryTurnEnd(threadId, turnId, status, error, attempt + 1)
+          return
+        }
+        // Startup recovery still settles the row on the next launch.
+        debugLog('turn.persist_abandoned', {
+          threadId,
+          turnId,
+          error: storeError instanceof Error ? storeError.message : String(storeError),
+        })
+      }
+    }, TURN_END_RETRY_DELAY_MS * attempt)
+    timer.unref?.()
   }
 
   private peerForParams(peer: RpcPeer, params: unknown): RpcPeer {
