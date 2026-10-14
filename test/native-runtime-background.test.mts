@@ -709,6 +709,62 @@ test('native drops the turn Claude starts only to acknowledge a task the user st
   })
 })
 
+for (const order of ['before', 'after'] as const) {
+  test(`native drops the turn Claude starts only to acknowledge agents an interrupt stopped (notice ${order} the result)`, async () => {
+    await withSettleMs(30, async () => {
+      const { runtime, queries } = fakeRuntime()
+      const listener = recordingListener()
+      runtime.setBackgroundListener(listener)
+
+      const first = runtime.runTurn(context, handlers([]))
+      const query = await waitFor(() => queries[0], 'session')
+      query.push(...launchBackgroundAgent('b0', 'agent-use-0'))
+      await first
+
+      // The next turn launches another agent and is still running when the
+      // user stops it.
+      const second = runtime.runTurn({ ...context, turnId: 'turn-2', prompt: 'more' }, handlers([]))
+      await waitFor(() => query.prompts.length === 2, 'second prompt')
+      query.push(
+        init,
+        ...launchBackgroundAgent('b1', 'agent-use-1').slice(0, 3),
+        assistant('bash', [
+          { type: 'tool_use', id: 'bash-1', name: 'Bash', input: { command: 'sleep 30' } },
+        ]),
+      )
+      await sleep(10)
+      await runtime.interrupt('thread')
+      await second
+      assert.equal(query.interrupts, 1)
+
+      // The CLI stops the agent that turn launched along with it, then starts
+      // a turn of its own to tell Claude so.
+      const notice = [
+        { type: 'system', subtype: 'task_updated', task_id: 'b1', patch: { status: 'killed' } },
+        { type: 'system', subtype: 'task_notification', task_id: 'b1', status: 'stopped' },
+      ]
+      const end = { type: 'result', subtype: 'error_during_execution' }
+      query.push(...(order === 'before' ? [...notice, end] : [end, ...notice]), init)
+      await waitFor(() => query.interrupts === 2, 'acknowledgement interrupted')
+      query.push(assistant('ack', [text('The agent was stopped.')]), {
+        type: 'result',
+        subtype: 'error_during_execution',
+        origin: { kind: 'task-notification' },
+      })
+      await sleep(20)
+      assert.equal(listener.autonomous.length, 0, 'stopping the turn must not wake the thread')
+
+      // The agent from before keeps running; its report still wakes the thread.
+      query.push(
+        { type: 'system', subtype: 'task_notification', task_id: 'b0', status: 'completed' },
+        init,
+      )
+      await waitFor(() => listener.autonomous.length === 1, 'wake-up for the surviving agent')
+      await runtime.stop()
+    })
+  })
+}
+
 function failingOn(type: RuntimeEvent['type']): RuntimeHandlers {
   return {
     ...handlers([]),

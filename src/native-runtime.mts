@@ -1363,10 +1363,15 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     // task_notification: the task is over and Claude is told about it. A
     // foreground task ends inside its turn and leaves nothing to answer.
     if (!session.levelSeen && session.liveTasks.delete(taskId)) this.markTaskEnded(session)
-    if (!session.cliRunning) session.endedWhileIdle.push(taskId)
     const rawStatus = String(message.status ?? '')
     const status =
       rawStatus === 'failed' ? 'failed' : rawStatus === 'stopped' ? 'stopped' : 'completed'
+    // Interrupting a turn also stops the background agents it launched. Like
+    // a stop from the user, that is no news to wake the thread with.
+    if (status === 'stopped') session.stoppedTasks.add(taskId)
+    // An interrupted turn answers nothing more: what ends while it drains is
+    // left for the turn after it, same as when the CLI is idle.
+    if (!session.cliRunning || session.sink) session.endedWhileIdle.push(taskId)
     const outputFile = stringOrNull(message.output_file) ?? known?.outputFile ?? null
     const result =
       listener && outputFile && (taskType === 'local_agent' || taskType == null)
