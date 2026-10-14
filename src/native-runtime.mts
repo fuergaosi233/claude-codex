@@ -1092,13 +1092,32 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       await this.stopWorkflowTasks(pending).catch(() => {})
       pending.resolved = true
       this.turns.delete(pending.context.turnId)
+      if (session.current === pending && message.type !== 'result') this.abandonCliTurn(session)
       const error = err instanceof Error ? err : new Error(String(err))
       try {
         await pending.handlers.onEvent({ type: 'error', message: error.message })
       } catch {}
       pending.reject(error)
     }
-    void session
+  }
+
+  // The server failed a turn the CLI is still running. Left alone, the CLI
+  // would carry on with it unseen, tools and all, and its output would come
+  // back as a turn of its own. Background tasks keep the session; a session
+  // without any has nothing worth keeping.
+  private abandonCliTurn(session: LiveSession): void {
+    session.current = null
+    session.steers.clear()
+    session.backlog.length = 0
+    session.autonomousRequested = false
+    if (session.liveTasks.size === 0) {
+      this.closeSession(session)
+      session.abort.abort()
+      return
+    }
+    // Routing must keep draining the stream, so the interrupt is not awaited.
+    this.beginSink(session, this.cancelSends(session), session.cliRunning)
+    this.reinterrupt(session)
   }
 
   private detach(session: LiveSession, pending: PendingTurn): void {

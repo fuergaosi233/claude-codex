@@ -709,6 +709,72 @@ test('native drops the turn Claude starts only to acknowledge a task the user st
   })
 })
 
+function failingOn(type: RuntimeEvent['type']): RuntimeHandlers {
+  return {
+    ...handlers([]),
+    onEvent: async (event) => {
+      if (event.type === type) throw new Error('database is locked')
+    },
+  }
+}
+
+test('native turn the server fails mid-stream takes a session with nothing else running down with it', async () => {
+  await withSettleMs(40, async () => {
+    const { runtime, queries } = fakeRuntime()
+    const listener = recordingListener()
+    runtime.setBackgroundListener(listener)
+
+    const turn = runtime.runTurn(context, failingOn('text_delta'))
+    const query = await waitFor(() => queries[0], 'session')
+    query.push(init, assistant('m1', [text('Editing the parser')]))
+    await assert.rejects(turn, /database is locked/)
+    assert.equal(query.closed, true, 'the CLI must not carry on with a failed turn')
+
+    query.push(assistant('m2', [text('Still editing')]), {
+      type: 'result',
+      subtype: 'success',
+      result: 'Still editing',
+    })
+    await sleep(50)
+    assert.deepEqual(listener.autonomous, [], 'the rest of the failed turn is not replayed')
+    await runtime.stop()
+  })
+})
+
+test('native turn the server fails mid-stream stops only that turn while background work runs', async () => {
+  await withSettleMs(40, async () => {
+    const { runtime, queries } = fakeRuntime()
+    const listener = recordingListener()
+    runtime.setBackgroundListener(listener)
+
+    const first = runtime.runTurn(context, handlers([]))
+    const query = await waitFor(() => queries[0], 'session')
+    query.push(...launchBackgroundAgent('a5'))
+    await first
+
+    const second = runtime.runTurn(
+      { ...context, turnId: 'turn-2', prompt: 'and now this' },
+      failingOn('text_delta'),
+    )
+    await waitFor(() => query.prompts.length === 2, 'second prompt')
+    query.push(init, assistant('m2', [text('Working on it')]))
+    await assert.rejects(second, /database is locked/)
+    assert.equal(query.interrupts, 1, 'the CLI turn is interrupted')
+    assert.equal(query.closed, false, 'the background agent keeps its session')
+
+    // What the CLI still sends for that turn is drained, not replayed.
+    query.push(assistant('m3', [text('Still working')]), {
+      type: 'result',
+      subtype: 'error_during_execution',
+      result: '',
+    })
+    await sleep(50)
+    assert.deepEqual(listener.autonomous, [])
+    assert.equal(runtime.hasBackgroundWork(), true)
+    await runtime.stop()
+  })
+})
+
 test('readTaskResult returns the final response of a subagent transcript', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'claude-codex-task-'))
   try {
