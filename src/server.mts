@@ -3074,14 +3074,19 @@ export class CodexClaudeAppServer {
         const userItem = turn.items.find((item) => item.type === 'userMessage')
         const prompt = userItem?.type === 'userMessage' ? textFromInput(userItem.content) : ''
         const command = parseWorkflowCommand(prompt)
-        if (command?.type !== 'run') return null
         const childIds = new Set<string>()
         for (const item of turn.items) {
           if (item.type !== 'collabAgentToolCall' || item.tool !== 'spawnAgent') continue
           for (const childId of item.receiverThreadIds) childIds.add(childId)
         }
-        const agents = Array.from(childIds).map((childId) => {
-          const child = this.store.getThread(childId)
+        const children = Array.from(childIds).map((childId) => ({
+          childId,
+          child: this.store.getThread(childId),
+        }))
+        // Claude also runs workflows unasked; their agents carry the workflow role.
+        const workflow = children.find(({ child }) => child?.agentRole === 'workflow')?.child
+        if (command?.type !== 'run' && !workflow) return null
+        const agents = children.map(({ childId, child }) => {
           const latestTurn = this.store.listTurns(childId).at(-1)
           return {
             nickname: child?.agentNickname ?? childId.slice(0, 12),
@@ -3089,7 +3094,8 @@ export class CodexClaudeAppServer {
             status: latestTurn?.status ?? child?.status.type ?? 'unknown',
           }
         })
-        return { turn, prompt: command.prompt, agents }
+        const task = command?.type === 'run' ? command.prompt : prompt || workflow?.preview || ''
+        return { turn, prompt: task, agents }
       })
       .filter((run): run is NonNullable<typeof run> => run !== null)
       .reverse()

@@ -691,6 +691,26 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    if (/model workflow check/i.test(context.prompt)) {
+      // Claude runs a workflow of its own accord: the native runtime shows it
+      // as an agent with the workflow role.
+      const toolUseId = `workflow-${Date.now()}`
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId,
+        toolName: 'Agent',
+        input: {
+          description: 'Workflow: review',
+          prompt: 'review the diff',
+          subagent_type: 'workflow',
+        },
+      })
+      await handlers.onEvent({ type: 'tool_result', toolUseId, content: 'review done' })
+      await handlers.onEvent({ type: 'text_delta', delta: 'workflow finished' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'workflow finished' })
+      return
+    }
+
     if (/subagent check/i.test(context.prompt)) {
       // Drive the subagent suppression contract: a Task tool_use opens the
       // subagent context, internal tool_use/text/tool_result are emitted but

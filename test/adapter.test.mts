@@ -4891,6 +4891,44 @@ test('bare /workflows lists prior workflow runs without invoking the model', asy
   }
 })
 
+test('/workflows also lists the workflows Claude ran without the command', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const threadId = (await reader.nextResponse(1)).result.thread.id
+    const prompts = ['run the model workflow check', 'plain question', '/workflows']
+    let listText = ''
+    for (const [index, text] of prompts.entries()) {
+      const id = index + 2
+      proc.stdin.write(
+        json({ id, method: 'turn/start', params: { threadId, input: textInput(text) } }),
+      )
+      await reader.nextResponse(id)
+      const messages = await readUntil(
+        reader,
+        (m) => m.method === 'turn/completed' && m.params.threadId === threadId,
+      )
+      listText = messages
+        .filter((m) => m.method === 'item/agentMessage/delta' && m.params.threadId === threadId)
+        .map((m) => m.params.delta)
+        .join('')
+    }
+
+    assert.match(listText, /Workflow runs in this task:/)
+    assert.match(listText, /completed · 1 agent\(s\) · run the model workflow check/)
+    assert.match(listText, /\(workflow, completed\)/)
+    assert.doesNotMatch(listText, /plain question/)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('thread/start picks up effort from config.model_reasoning_effort when top-level effort is absent', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
