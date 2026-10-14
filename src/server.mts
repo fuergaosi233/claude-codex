@@ -4194,7 +4194,14 @@ export class CodexClaudeAppServer {
         skills: [],
         hooks: [],
         apps: [],
+        // Required by the protocol. The App's composer reads
+        // `appTemplates.length` unguarded, and without it a thread with the
+        // in-app browser open fails to render.
+        appTemplates: [],
         mcpServers: [],
+        scheduledTasks: null,
+        onboardingSkill: null,
+        shareUrl: null,
       },
     }
   }

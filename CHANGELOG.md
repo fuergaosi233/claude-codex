@@ -13,6 +13,9 @@ versioning or publishing metadata.
   the current pinned Codex CLI compatibility version, while keeping a
   `claude-codex` suffix so hosts can distinguish the adapter from upstream
   Codex.
+- `plugin/read` returns the plugin's `appTemplates` the protocol requires. The
+  Codex App read them unguarded, so a thread with the in-app browser open
+  showed an error page instead of the conversation.
 - Expanded Codex App Remote coverage across thread lifecycle, turn envelopes,
   item streaming, approvals, MCP status, fuzzy file search sessions, Claude
   skills/hooks, and `thread/turns/list` item views.

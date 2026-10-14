@@ -2154,6 +2154,13 @@ test('remote utility methods use v2 response shapes', async () => {
     )
     const command = await reader.nextResponse(4)
     assert.deepEqual(command.result, { exitCode: 0, stdout: 'ok', stderr: '' })
+
+    proc.stdin.write(json({ id: 5, method: 'plugin/read', params: { pluginName: 'browser-use' } }))
+    const plugin = (await reader.nextResponse(5)).result.plugin
+    for (const field of ['appTemplates', 'apps', 'hooks', 'mcpServers', 'skills']) {
+      assert.deepEqual(plugin[field], [], field)
+    }
+    assert.equal(plugin.summary.name, 'browser-use')
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
