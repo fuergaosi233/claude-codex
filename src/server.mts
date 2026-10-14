@@ -2368,6 +2368,13 @@ export class CodexClaudeAppServer {
       throw new Error(`no rollout found for thread id ${threadId}`)
     }
     if (this.activeTurnByThread.has(threadId)) await this.turnInterrupt(peer, { threadId })
+    // Background agents go with the thread that launched them (or that they
+    // are): their turns end before their threads do.
+    for (const entry of [...this.backgroundSubagents.values()]) {
+      if (!entry.running) continue
+      if (entry.parentThreadId !== threadId && entry.context.childThreadId !== threadId) continue
+      await this.stopBackgroundSubagent(entry)
+    }
     for (const id of this.store.deleteThread(threadId)) {
       this.runtime.resetSession?.(id)
       this.clearThreadState(id)

@@ -4464,6 +4464,58 @@ test('stopping a background child interrupts it without waking the parent', asyn
   }
 })
 
+test('deleting a thread stops its running background child and ends the child turn first', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json(codex930Initialize(0)))
+    await reader.nextResponse(0)
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const threadId = (await reader.nextResponse(1)).result.thread.id
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [
+            { type: 'text', text: 'background subagent check delay=30000', text_elements: [] },
+          ],
+        },
+      }),
+    )
+    await reader.nextResponse(2)
+    const launch = await readUntil(
+      reader,
+      (m) => m.method === 'turn/completed' && m.params.threadId === threadId,
+    )
+    const childThreadId = launch.find(
+      (m) => m.method === 'turn/started' && m.params.threadId !== threadId,
+    ).params.threadId
+
+    proc.stdin.write(json({ id: 3, method: 'thread/delete', params: { threadId } }))
+    const deleted = await readUntil(reader, (m) => m.id === 3 && m.method == null)
+    assert.equal(deleted.at(-1).error, undefined)
+    const childDone = deleted.findIndex(
+      (m) => m.method === 'turn/completed' && m.params.threadId === childThreadId,
+    )
+    const childGone = deleted.findIndex(
+      (m) => m.method === 'thread/deleted' && m.params.threadId === childThreadId,
+    )
+    assert.notEqual(childDone, -1, 'the running child turn must end')
+    assert.equal(deleted[childDone].params.turn.status, 'interrupted')
+    assert.ok(childDone < childGone, 'the child turn ends before its thread goes')
+    assert.ok(deleted.some((m) => m.method === 'thread/deleted' && m.params.threadId === threadId))
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('stopping a foreground child ends it as interrupted and the parent carries on', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
