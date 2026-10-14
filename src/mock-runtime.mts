@@ -32,6 +32,9 @@ export class MockRuntime implements ClaudeRuntime {
   private shells = new Map<string, { threadId: string; toolUseId: string }>()
 
   async runTurn(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void> {
+    // A session slow to come up (the CLI's, while an interrupted turn is
+    // still draining): input cannot reach the turn yet.
+    if (/slow start/i.test(context.prompt)) await sleep(500)
     this.running.add(context.threadId)
     try {
       await this.playTurn(context, handlers)

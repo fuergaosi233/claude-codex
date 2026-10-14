@@ -118,6 +118,7 @@ import type {
   RpcPeer,
   RuntimeEvent,
   RuntimeLiveTask,
+  RuntimeSteerOptions,
   RuntimeTaskEvent,
   RuntimeTaskUsage,
   ThreadAttachmentRecord,
@@ -155,6 +156,7 @@ import {
   platformOs,
   resolveClaudeEffort,
   resolveClaudeModel,
+  sleep,
   textFromInput,
 } from './util.mjs'
 import { parseWorkflowCommand } from './workflow-command.mjs'
@@ -174,6 +176,12 @@ const MIN_SUBAGENT_WATCHDOG_MS = 100
 // the lock holder lets go.
 const TURN_END_RETRY_DELAY_MS = 2_000
 const TURN_END_RETRY_ATTEMPTS = 5
+
+// Input for a running turn the runtime has not taken up yet (its session is
+// still coming up, or the last turn's interrupt is still draining) waits this
+// long for it, checking this often.
+const STEER_WAIT_MS = 10_000
+const STEER_RETRY_MS = 100
 
 function isWorkflowToolName(value: string): boolean {
   const name = value.trim().toLowerCase()
@@ -301,6 +309,9 @@ export class CodexClaudeAppServer {
   private activePeerByThread = new Map<string, RpcPeer>()
   private peerFeatures = new WeakMap<RpcPeer, PeerFeatures>()
   private activeTurnByThread = new Map<string, string>()
+  // Turns whose runtime run has not returned yet. A running turn outside this
+  // set has nothing left that would ever end it.
+  private runtimeRuns = new Set<string>()
   private subagentStateByTurn = new Map<string, ActiveSubagentState>()
   // Closes the message, reasoning and plan items a turn is still streaming,
   // so an interrupt that ends the turn from outside leaves none open.
@@ -2840,18 +2851,14 @@ export class CodexClaudeAppServer {
     // A turn/start can race a turn the adapter has just opened itself (for a
     // background agent's or workflow's report); a second turn would orphan
     // it, and it would never complete.
-    const runningTurnId = this.activeTurnByThread.get(threadId)
-    if (
-      runningTurnId &&
-      !hiddenPrompt &&
-      params.outputSchema == null &&
-      this.store.getTurn(runningTurnId)?.status === 'inProgress'
-    ) {
-      if (workflowCommand?.type === 'list')
-        throw new Error('/workflows list can run once the current turn finishes')
-      await this.turnSteer(peer, { ...params, expectedTurnId: runningTurnId })
-      const running = this.store.getTurn(runningTurnId)
-      if (running) return { turn: this.toLifecycleTurn(running) }
+    if (!hiddenPrompt && params.outputSchema == null) {
+      const joined = await this.joinRunningTurn(
+        peer,
+        threadId,
+        params,
+        workflowCommand?.type === 'list',
+      )
+      if (joined) return { turn: this.toLifecycleTurn(joined) }
     }
     if (typeof params.cwd === 'string' && params.cwd.length > 0) thread.cwd = params.cwd
     const model = modelFromParams(params, thread.model)
@@ -2958,14 +2965,50 @@ export class CodexClaudeAppServer {
       }
       // Carry parsed images through the params bag so runRuntimeTurn can hand
       // them to the runtime context without re-parsing user input.
-      void this.runRuntimeTurn(peer, thread, turn, prompt, {
-        ...params,
-        _imageInputs: images,
-      }).catch((error) => {
-        this.failTurn(peer, threadId, turn, error)
-      })
+      this.launchRuntimeTurn(peer, thread, turn, prompt, { ...params, _imageInputs: images })
     })
     return { turn: publicTurn }
+  }
+
+  // Steers input into the thread's running turn. Returns null when there is
+  // none, or when it ended before the runtime took the input in, so that the
+  // input starts the next turn instead.
+  private async joinRunningTurn(
+    peer: RpcPeer,
+    threadId: string,
+    params: Record<string, unknown>,
+    workflowList: boolean,
+  ): Promise<TurnRecord | null> {
+    for (;;) {
+      const runningTurnId = this.activeTurnByThread.get(threadId)
+      if (!runningTurnId || this.store.getTurn(runningTurnId)?.status !== 'inProgress') return null
+      if (workflowList) throw new Error('/workflows list can run once the current turn finishes')
+      try {
+        await this.turnSteer(peer, { ...params, expectedTurnId: runningTurnId })
+      } catch (error) {
+        if (this.activeTurnByThread.get(threadId) === runningTurnId) throw error
+        // That turn ended meanwhile: join the one after it, if any.
+        continue
+      }
+      return this.store.getTurn(runningTurnId)
+    }
+  }
+
+  // Runs a turn and ends it if the run fails. Until both are done, something
+  // still owns the turn and will end it.
+  private launchRuntimeTurn(
+    peer: RpcPeer,
+    thread: ThreadRecord,
+    turn: TurnRecord,
+    prompt: string,
+    params: Record<string, unknown>,
+  ): void {
+    this.runtimeRuns.add(turn.id)
+    void this.runRuntimeTurn(peer, thread, turn, prompt, params)
+      .catch((error) => {
+        this.failTurn(peer, thread.id, turn, error)
+      })
+      .finally(() => this.runtimeRuns.delete(turn.id))
   }
 
   private completeWorkflowListTurn(peer: RpcPeer, thread: ThreadRecord, turn: TurnRecord): void {
@@ -5168,9 +5211,7 @@ export class CodexClaudeAppServer {
       outputSchema: null,
       _continuation: true,
     }
-    void this.runRuntimeTurn(peer, thread, turn, '', params).catch((error) =>
-      this.failTurn(peer, threadId, turn, error),
-    )
+    this.launchRuntimeTurn(peer, thread, turn, '', params)
   }
 
   private handleSessionReleased(threadId: string, liveTaskIds: string[]): void {
@@ -5431,13 +5472,48 @@ export class CodexClaudeAppServer {
       this.store.appendItem(activeTurnId, item)
       this.emitItemLifecycle(this.peerForThread(threadId), threadId, activeTurnId, item)
     }
-    const steered = await this.runtime.steer(threadId, prompt, {
+    const steered = await this.steerRunningTurn(threadId, activeTurnId, prompt, {
       imageInputs: images,
       onAccepted: accept,
     })
     if (steered === false) throw new Error('no active turn to steer')
     if (steered === undefined) accept()
     return { turnId: activeTurnId }
+  }
+
+  // The runtime holds no turn for a running one for a moment while its
+  // session comes up or the turn finishes; input waits that out. A turn whose
+  // run has already returned will never end by itself. It is ended here, so
+  // the input starts a new turn rather than being refused until the user
+  // stops the thread.
+  private async steerRunningTurn(
+    threadId: string,
+    turnId: string,
+    prompt: string,
+    options: RuntimeSteerOptions,
+  ): Promise<boolean | undefined> {
+    const deadline = Date.now() + STEER_WAIT_MS
+    for (;;) {
+      const steered = await this.runtime.steer(threadId, prompt, options)
+      if (steered !== false || this.activeTurnByThread.get(threadId) !== turnId) return steered
+      if (!this.runtimeRuns.has(turnId)) {
+        this.endLostTurn(threadId, turnId)
+        return false
+      }
+      if (Date.now() >= deadline) return false
+      await sleep(STEER_RETRY_MS)
+    }
+  }
+
+  private endLostTurn(threadId: string, turnId: string): void {
+    debugLog('turn.lost', { threadId, turnId })
+    const turn = this.store.getTurn(turnId)
+    if (!turn) {
+      this.clearActiveTurn(threadId)
+      return
+    }
+    const error = new Error('Claude stopped working on this turn before it finished.')
+    this.failTurn(this.peerForThread(threadId), threadId, turn, error)
   }
 
   private configRead(): unknown {
@@ -6735,8 +6811,19 @@ export class CodexClaudeAppServer {
     const turnId = this.activeTurnByThread.get(threadId)
     const existed = this.activeTurnByThread.delete(threadId)
     if (turnId) this.closeStreamingItemsByTurn.delete(turnId)
-    const settled = turnId ? this.store.getTurn(turnId) : null
-    this.settleGoalTurn(threadId, settled)
+    let settled: TurnRecord | null = null
+    try {
+      settled = turnId ? this.store.getTurn(turnId) : null
+      this.settleGoalTurn(threadId, settled)
+    } catch (error) {
+      // The thread is free either way; a locked state database only costs
+      // the goal's time accounting for this turn.
+      debugLog('turn.settle_failed', {
+        threadId,
+        turnId,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
     // Let the settled turn's notifications go out first. Claude's own
     // follow-up comes before the queue and goal continuation.
     if (this.pendingAutonomousTurns.delete(threadId)) {
@@ -6758,7 +6845,15 @@ export class CodexClaudeAppServer {
   // ended, e.g. through turn/interrupt.
   private failTurn(peer: RpcPeer, threadId: string, turn: TurnRecord, error: Error): boolean {
     const completed = this.endTurn(turn, 'failed', { message: error.message })
-    if (!completed) return false
+    if (!completed) {
+      // Its end was recorded, but whatever ended it never let go of the
+      // thread.
+      if (this.activeTurnByThread.get(threadId) === turn.id) {
+        this.clearActiveTurn(threadId)
+        this.setThreadStatus(peer, threadId, { type: 'idle' })
+      }
+      return false
+    }
     this.notify(peer, {
       method: 'error',
       params: { threadId, turnId: turn.id, willRetry: false, error: { message: error.message } },

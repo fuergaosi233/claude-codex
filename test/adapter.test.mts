@@ -5478,6 +5478,58 @@ test('turn/start during a running turn joins that turn instead of orphaning it',
   }
 })
 
+test('input for a turn whose session is still coming up waits for it instead of failing', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  try {
+    const threadId = await startMockThread(reader, proc)
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: textInput('slow start, then hold this turn until released') },
+      }),
+    )
+    const turnId = (await reader.nextResponse(2)).result.turn.id
+    // The runtime has no turn to steer into yet. Refusing the input here
+    // would leave the App showing an error for a turn that runs fine.
+    proc.stdin.write(
+      json({
+        id: 3,
+        method: 'turn/start',
+        params: { threadId, clientUserMessageId: 'client-early-1', input: textInput('release') },
+      }),
+    )
+    const seen: any[] = []
+    const reply = await awaitMessage(reader, (message) => message.id === 3, seen)
+    assert.equal(reply.error, undefined)
+    assert.equal(reply.result.turn.id, turnId)
+    const completed = await awaitMessage(
+      reader,
+      (message) => message.method === 'turn/completed',
+      seen,
+    )
+    assert.equal(completed.params.turn.id, turnId)
+    assert.equal(completed.params.turn.status, 'completed')
+    const joined = seen.find((message) =>
+      isUserMessageItem(message, 'item/started', 'client-early-1'),
+    )
+    assert.equal(joined?.params.turnId, turnId)
+    seen.push(...(await readQuiet(reader, 200)))
+    assert.deepEqual(
+      seen
+        .filter((message) => message.method === 'turn/started' && message.params.turn.id !== turnId)
+        .map((message) => message.params.turn.id),
+      [],
+      'no second turn starts',
+    )
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('thread/queue holds follow-ups during a turn and dispatches them in order', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawnMockAdapter(home)
