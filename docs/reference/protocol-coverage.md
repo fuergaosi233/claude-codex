@@ -12,12 +12,16 @@ Implemented as real remote/runtime behavior:
 - **Projects and attachments** — `project/*` and `thread/attachment/*`, kept in
   the adapter's SQLite store.
 - **Claude runtime** — query, session resume/fork, partial text streaming,
-  interrupt, MCP config, allowed tools, add dirs, file checkpointing.
+  interrupt, model and effort switches within a running turn, MCP config,
+  allowed tools, add dirs, file checkpointing.
+- **Turn input** — user input, and the `toolOutput` of a thread handoff as a
+  `functionCallOutput` item.
 - **Approval bridge** — `Bash` → command approval; `Edit` / `Write` /
-  `MultiEdit` → file-change approval with diffs.
+  `MultiEdit` → file-change approval with diffs; MCP elicitation → the App's
+  form or link prompt.
 - **Streaming** — turn started/completed, thread status changes, agent text
   deltas, reasoning deltas, command output deltas, file patches, generic tool
-  item completion, and aggregated git diff updates.
+  item completion, hook runs, model reroutes, and aggregated git diff updates.
 - **Remote utilities** — file read/write/list/metadata/copy/remove/watch,
   command exec with stdin/terminate, process spawn/stdin/kill, fuzzy file
   search, direct MCP stdio/HTTP tool and resource calls.

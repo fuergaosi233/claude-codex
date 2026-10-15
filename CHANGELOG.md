@@ -74,6 +74,33 @@ versioning or publishing metadata.
   server failed also stops the CLI turn behind it.
 - An ephemeral `thread/fork`, which the App uses to describe a thread, stays
   out of `thread/list`.
+- The adapter advertises app-server `0.159.0-alpha.12.1`, the Codex build of
+  Codex App 26.930, so every feature gate of that App is on.
+  `CLAUDE_CODEX_COMPAT_VERSION` still overrides it, and
+  `docs/reference/app-compat.md` lists what the gates change, including the
+  two that also depend on the App's server-side flags.
+- A `turn/start` carrying `toolOutput` instead of input (a thread handoff, or
+  a message from another thread) prompts Claude with its text and images and
+  records it as a `functionCallOutput` item, instead of starting a turn with
+  an empty prompt.
+- `thread/timeline/list` serves the newest page first and pages back, as Codex
+  does, instead of starting from the oldest entries.
+- `turn/settings/update` switches a running turn's model and effort in place,
+  and accepts the `user` reviewer the App sends when permissions change during
+  a turn, instead of failing on any change. An unknown model fails instead of
+  falling back to the thread's model.
+- Claude Code's hook runs show as `hook/started` / `hook/completed` in the
+  turn's hook summary, with the settings file that configures them and a
+  blocked status for a hook that blocks; `hooks/list` also lists `SessionEnd`,
+  `SubagentStart` and `SubagentStop` hooks.
+- A switch to a fallback model after a refusal shows as `model/rerouted` for a
+  cyber-safety refusal and as a warning otherwise, and a refusal with no
+  fallback as a warning.
+- An MCP server can ask the user for input: its elicitation becomes
+  `mcpServer/elicitation/request`, a form or a link in the App, and the answer
+  goes back to the server.
+- `mcpServerStatus/list` honours `serverName`, and `mcpServer/resource/read`
+  answers with the `originCallId` the protocol requires.
 
 ### Provider and multi-agent boundaries
 
@@ -170,3 +197,7 @@ versioning or publishing metadata.
 - No support is included for personal subscription sharing, credential pooling,
   browser cookie/session-token reuse, private provider endpoints, or provider
   bypass behavior.
+- The App's dynamic tools (the worktree tools of its `threadAttachments`
+  gate), MCP tool-call progress, incremental Bash output, and Claude Code
+  plugin skills in the "/" popup are not included. Hook runs are shown live
+  but not kept in history.

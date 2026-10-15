@@ -66,6 +66,13 @@ export const APP_RULES: readonly AppRule[] = [
     verify: 'A sent message shows once; a queued one shows when it starts.',
   },
   {
+    id: 'tool-output-turns',
+    app: "With the turnToolOutput gate on, sends a thread handoff or a message from another thread as turn/start with empty input and the text in toolOutput (also while a turn runs), and shows a functionCallOutput item as that turn's user message.",
+    adapter:
+      'Prompts Claude with the toolOutput text and images, and records it as a functionCallOutput item.',
+    verify: 'Hand a chat off to a new thread: the handoff text shows and Claude answers it.',
+  },
+  {
     id: 'steer-errors',
     app: 'Matches turn/steer error texts: "no active turn to steer" makes it send the message as a new turn, and "expected active turn id `X` but found `Y`" makes it retry against Y.',
     adapter: 'Fails turn/steer with exactly these texts.',
@@ -137,10 +144,10 @@ export const APP_RULES: readonly AppRule[] = [
   },
 ]
 
-// The methods the App starts calling once the app-server version turns a
-// feature gate on (the gate table is in its bundle; see
-// scripts/app-baseline.json). check:app-upgrade flags a gate the adapter's
-// version turns on while one of these has no case.
+// The methods the App starts calling, or sends new parameters to, once the
+// app-server version turns a feature gate on (the gate table is in its
+// bundle; see scripts/app-baseline.json). check:app-upgrade flags a gate the
+// adapter's version turns on while one of these has no case.
 export const GATED_METHODS: Readonly<Record<string, readonly string[]>> = {
   appRead: ['app/read'],
   diagnostics: ['server/diagnostics'],
@@ -150,6 +157,8 @@ export const GATED_METHODS: Readonly<Record<string, readonly string[]>> = {
     'account/gatewayOAuth/cancel',
   ],
   mcpEventStream: ['mcpServer/event/stream/start', 'mcpServer/event/stream/stop'],
+  mcpResourceReadOriginCallId: ['mcpServer/resource/read'],
+  mcpServerStatusByName: ['mcpServerStatus/list'],
   projects: [
     'project/list',
     'project/read',
@@ -159,9 +168,11 @@ export const GATED_METHODS: Readonly<Record<string, readonly string[]>> = {
     'project/delete',
     'project/move',
   ],
-  reasoningEffortUpdates: ['turn/settings/update'],
+  // The verified App never reads this gate.
+  reasoningEffortUpdates: [],
   rolloutCompression: ['rollout/compress'],
-  serviceTierForTurn: ['turn/settings/update'],
+  // A serviceTier on the heartbeat's turn/start, which Claude ignores.
+  serviceTierForTurn: ['turn/start'],
   threadAttachments: [
     'thread/attachment/add',
     'thread/attachment/list',
@@ -178,6 +189,7 @@ export const GATED_METHODS: Readonly<Record<string, readonly string[]>> = {
   threadRevert: ['thread/revert'],
   threadTimeline: ['thread/timeline/list'],
   turnApprovalsReviewer: ['turn/settings/update'],
+  turnToolOutput: ['turn/start'],
 }
 
 // App rule: subagent-completed-kind

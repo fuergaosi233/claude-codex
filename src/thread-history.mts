@@ -3,6 +3,7 @@
 // turns come from the store whole, so cursors are positions in them.
 
 import type { ThreadItem, TurnRecord } from './types.mjs'
+import { toolOutputInput } from './util.mjs'
 
 export type SortDirection = 'asc' | 'desc'
 
@@ -122,7 +123,9 @@ export type TimelineEntry =
     }
 
 // thread/timeline/list: each turn as its start, its items and, once it ended,
-// its completion, numbered in order. A cursor is the position to start at.
+// its completion, numbered in order. Like Codex, the first page is the newest
+// stretch and nextCursor leads to older entries; a cursor is the position a
+// page ends before.
 export function pageTimeline(
   turns: TurnRecord[],
   params: { cursor: unknown; limit: number | null },
@@ -149,11 +152,14 @@ export function pageTimeline(
         durationMs: turn.durationMs,
       })
   }
-  const start = offsetCursor(params.cursor, 'timeline')
-  const end = params.limit == null ? entries.length : start + params.limit
+  const end =
+    params.cursor == null
+      ? entries.length
+      : Math.min(offsetCursor(params.cursor, 'timeline'), entries.length)
+  const start = params.limit == null ? 0 : Math.max(0, end - params.limit)
   return {
     data: entries.slice(start, end),
-    nextCursor: end < entries.length ? String(end) : null,
+    nextCursor: start > 0 ? String(start) : null,
     // Realtime voice never runs here.
     activeRealtimeSessionAtPageStart: null,
   }
@@ -163,10 +169,14 @@ export function pageTimeline(
 // Claude's answers. Commentary between tool calls, tool output and reasoning
 // are not searched.
 export function visibleMessageText(item: ThreadItem): string | null {
-  if (item.type === 'userMessage')
-    return (
-      item.content.flatMap((part) => (part.type === 'text' ? [part.text] : [])).join('\n') || null
-    )
+  const input =
+    item.type === 'userMessage'
+      ? item.content
+      : item.type === 'functionCallOutput'
+        ? toolOutputInput(item.output)
+        : null
+  if (input)
+    return input.flatMap((part) => (part.type === 'text' ? [part.text] : [])).join('\n') || null
   if (item.type === 'agentMessage' && item.phase !== 'commentary') return item.text || null
   return null
 }

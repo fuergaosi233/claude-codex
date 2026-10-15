@@ -12,10 +12,11 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 | Remote transport | Supported | SSH starts `codex app-server --listen unix://` + `proxy`; the shim reports a Codex-compatible version/user agent. |
 | Thread lifecycle | Supported | start/resume/fork/archive/list/read/delete + turn listing, backed by SQLite + Claude session ids. `thread/delete` also removes the thread's subagents, ending its running background agents first; an unknown thread fails with Codex's missing-rollout text so the App's `missingRolloutRecovery` retry succeeds. |
 | Rollback / revert | Supported | `thread/rollback` and `thread/revert` drop turns and make Claude forget them: the next turn resumes the newest remaining turn's checkpoint in a forked session (a fork's own start point when none remain). Turns from before checkpoints keep Claude's context. |
-| History paging & search | Supported | `thread/turns/list` pages either way from a turn cursor; `thread/items/list` and `thread/timeline/list` page items and turn events. `thread/search` matches names, previews and visible message text; `thread/searchOccurrences` serves find-in-conversation. |
+| History paging & search | Supported | `thread/turns/list` pages either way from a turn cursor; `thread/items/list` pages items, and `thread/timeline/list` pages turn events from the newest back, as Codex does. `thread/search` matches names, previews and visible message text; `thread/searchOccurrences` serves find-in-conversation. |
 | Projects | Supported | `project/*` keeps projects and thread membership in SQLite, with `project/changed` and `thread/project/updated` notifications. |
 | Normal chat | Supported | `turn/start` streams Claude text/reasoning into Codex agentMessage/reasoning items. |
 | Steering / interrupt | Supported | `turn/steer` and `turn/interrupt` route to the active Claude client. A rejected steer uses Codex's error texts so the App falls back or retries, and a `turn/start` that races a running turn joins it. Input sent while a turn is still starting waits for it, and a turn whose runtime run has returned is ended instead of blocking the thread. |
+| Handoffs | Supported | A `turn/start` with `toolOutput` instead of input (a thread handoff, or a message from another thread) prompts Claude with its text and images and is recorded as a `functionCallOutput` item, which the App shows as the user's message. Sent during a turn, it joins that turn. |
 | Goals | Supported | `thread/goal/*` keeps the thread working with hidden continuation turns, counts tokens and time, and stops on budget, usage limits or a turn without progress. Claude gets `get_goal` / `create_goal` / `update_goal` through an in-process MCP server. |
 | Message queue | Supported | `thread/queue/*` holds follow-ups during a turn and sends them in order when the thread goes idle; after an interrupt they wait for `thread/queue/start`. The App uses it from app-server `0.148.0-alpha.14` (see `CLAUDE_CODEX_COMPAT_VERSION`). |
 | Token usage | Supported | SDK ResultMessage usage → TokenUsageBreakdown, pushed as `thread/tokenUsage/updated` (cumulative + last turn). The context gauge follows the main loop's latest API call; subagent and workflow tokens add to the total only. |
@@ -53,7 +54,9 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 | Background subagents | Supported | `run_in_background` agents keep running across turns: the Claude session stays open while they run, a finished agent's report wakes the parent with a new turn, `SendMessage` resumes an agent, and the child's Stop button ends it. |
 | Subagent control | Supported | Interrupting a turn stops the workflows it launched (Claude Code also stops the background agents it launched, and they wake no turn); stopping a foreground child from its own thread ends just that child, as interrupted. `SendMessage` and `TaskStop` on any child agent render as Codex `sendInput` / `closeAgent` calls, and the parent's own tools and text beside an Agent call keep their cards. `/workflows` also lists the workflows Claude ran on its own. |
 | Ephemeral / threadSource | Supported | `ephemeral: true` threads (title-gen, memory-consolidation, subagents, and the forks the App describes a thread in) persist but are excluded from `thread/list` unless `includeEphemeral: true`. `threadSource` round-trips. |
-| Claude side events | Supported | rate_limit / hook / subagent / compaction events summarized into structured notice lines. |
+| Claude side events | Supported | rate_limit / subagent / compaction events summarized into structured notice lines. A switch to a fallback model after a refusal is reported as `model/rerouted` when Claude names a cyber-safety refusal and as a `warning` otherwise; a refusal with no fallback is a `warning`. Text Claude streamed before a fallback stays in the transcript. |
+| Hook runs | Supported | Claude Code's hook runs → `hook/started` / `hook/completed` with the Codex event name, the settings file that configures the event, and its outcome: exit code 2, a `block` decision or `continue: false` is `blocked`, with the reason as an entry. The App folds them into the turn's hook summary. Live only: history does not keep them. |
+| MCP elicitation | Supported | An MCP server asking the user for input → `mcpServer/elicitation/request`, as a form from its schema or a link to open; the App's accept, decline or cancel goes back to the server. A request outside a turn (from background work) is declined. |
 | Review mode | Supported (text) | `review/start` creates an in-progress review turn and routes the prompt through Claude. No native guardian finding items. |
 | Context compaction | Supported (summary) | `thread/compact/start` routes the summary prompt and emits contextCompaction items. No native persisted rollout compaction. |
 
@@ -61,7 +64,7 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| MCP config/status/tools | Supported | Reads Claude MCP config, passes servers into turns, calls stdio/HTTP tools directly. `mcpServerStatus/list` enumerates real `tools`/`resources`/`resourceTemplates` per server (10s cache, graceful empty fallback on spawn/timeout). |
+| MCP config/status/tools | Supported | Reads Claude MCP config, passes servers into turns, calls stdio/HTTP tools directly. `mcpServerStatus/list` enumerates real `tools`/`resources`/`resourceTemplates` per server (10s cache, graceful empty fallback on spawn/timeout), or one server's with `serverName`. `mcpServer/resource/read` answers `originCallId: null`: no hosted app scopes the read. |
 | Turn-item paging | Supported | `thread/turns/list` honors `itemsView` — `summary` (default: first userMessage + final agentMessage), `full`, and `notLoaded` — instead of always shipping every item. |
 | Skills & hooks | Supported | `skills/list` reads `.claude/skills/*/SKILL.md` (user+repo scope) and offers the CLI's built-in skills (`/simplify`, `/code-review`, …) as system skills that run as slash commands; `hooks/list` reads `settings.json` hooks, mapping Claude events to Codex `HookEventName` (unmappable events dropped). |
 | Fuzzy file search | Supported | One-shot `fuzzyFileSearch` plus the stateful session API (`sessionStart/Update/Stop`) that streams `fuzzyFileSearch/sessionUpdated` results and a final `sessionCompleted`. |
@@ -69,7 +72,7 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 | Command/process RPCs | Supported | `command/exec` and `process/spawn` implemented. |
 | Background terminals | Supported | Claude's background Bash shells are listed by `thread/backgroundTerminals/list` and stopped by `terminate`/`clean`. The CLI runs them, so there is no OS pid or usage. |
 | Thread attachments | Supported | `thread/attachment/*` keeps the App's per-thread JSON (archived worktree, linked pull requests). |
-| Running-turn settings | Partial | `turn/settings/update` reports `applied` when nothing changes and fails on a model, effort or other change: a running Claude turn keeps its settings until the next `turn/start`. |
+| Running-turn settings | Supported | `turn/settings/update` switches the running turn's model and effort in place; the next turn runs on its own settings again. A model must be one `model/list` offers for the thread's backend. The reviewer is always the user, so only `approvalsReviewer: "user"` is accepted, and `summary` and `serviceTier` have no Claude counterpart. The verified App sends only the reviewer, when permissions change during a turn. |
 
 ## Not applicable / unsupported
 
@@ -81,23 +84,25 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 | Remote control / passkeys | Unsupported | `remoteControl/*` reports a disabled installation; `userVerification/*` reports the provider unavailable, with the error data the App reads. |
 | External agent import | Stub | `externalAgentConfig/detect` and import return empty; the import histories the App records are kept and listed. |
 | Windows sandbox | Unsupported | Target deployment is Linux/macOS; methods return not configured. |
+| Dynamic tools | Unsupported | `dynamicTools` on `thread/start` (the App's worktree tools, with its `threadAttachments` gate on) are not offered to Claude. See [Codex App compatibility](/reference/app-compat#what-the-gates-change). |
+| MCP tool progress | Unsupported | The SDK reports no progress for an MCP call, so `item/mcpToolCall/progress` is never sent; the call's card shows its result when it ends. |
+| Plugin skills | Unsupported | `skills/list` lists the user's, the repository's and the CLI's built-in skills, not those of Claude Code plugins. |
 
 ## Protocol version
 
-The adapter advertises codex app-server protocol **v2 @ 0.142.3** (via
-`codex --version` and the `initialize` userAgent; override with
-`CLAUDE_CODEX_COMPAT_VERSION`). The 0.130 → 0.142 delta is additive and
-backward-compatible: new optional request methods (`thread/search`,
-`thread/delete`, `account/usage/read`, `plugin/*`, `remoteControl/*`,
-`environment/add`, …) plus widened enums (`ReasoningEffort` → free-form string,
-new `AuthMode` / `WebSearchMode` variants). Every client request Codex App
-26.930 can send has a handler; where Claude Code has no equivalent it answers
-with an empty, disabled or `unavailable` result rather than an error (see
-[Codex App compatibility](/reference/app-compat)). Regenerate the reference schema under `generated/` with
-`npm run generate:schema` (needs a matching `codex` on PATH).
+The adapter advertises codex app-server protocol **v2 @ 0.159.0-alpha.12.1**
+(via `codex --version` and the `initialize` userAgent; override with
+`CLAUDE_CODEX_COMPAT_VERSION`), the Codex build of the verified App. The App
+turns its feature gates on by this version, so every gate that build knows is
+on; [Codex App compatibility](/reference/app-compat#feature-gates-and-claude-codex-compat-version)
+lists what they change. Every client request Codex App 26.930 can send has a
+handler; where Claude Code has no equivalent it answers with an empty,
+disabled or `unavailable` result rather than an error. Regenerate the
+reference schema under `generated/` with `npm run generate:schema` (needs a
+matching `codex` on PATH).
 
-Because the adapter now reports the same version as a real `codex`, it appends a
-distinguishing suffix: `codex --version` prints `codex-cli 0.142.3
+Because the adapter reports the same version as a real `codex`, it appends a
+distinguishing suffix: `codex --version` prints `codex-cli 0.159.0-alpha.12.1
 (claude-codex)` and the `initialize` userAgent carries `claude-codex` in its
 originator field. The version number stays first so the App's semver probe still
 parses it. Set `CLAUDE_CODEX_VERSION_SUFFIX=""` to behave exactly like upstream

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { NativeClaudeRuntime } from '../src/native-runtime.mjs'
-import type { RuntimeEvent, RuntimeTurnContext } from '../src/types.mjs'
+import type { RuntimeEvent, RuntimeTurnContext, RuntimeTurnSettings } from '../src/types.mjs'
 
 const context: RuntimeTurnContext = {
   threadId: 'thread',
@@ -212,4 +212,271 @@ test('ordinary subscription limit updates are quiet and real warnings retain con
     level: 'warning',
     message: 'Retry after 30 seconds.',
   })
+})
+
+function system(subtype: string, fields: Record<string, unknown>) {
+  return { type: 'system', subtype, ...fields }
+}
+
+test('native hook lifecycle frames become hook runs with Codex statuses', async () => {
+  const hook = (id: string, fields: Record<string, unknown>) =>
+    system('hook_response', {
+      hook_id: id,
+      hook_name: `PreToolUse:${id}`,
+      hook_event: 'PreToolUse',
+      output: '',
+      stdout: '',
+      stderr: '',
+      ...fields,
+    })
+  const events = await collect([
+    system('hook_started', {
+      hook_id: 'ok',
+      hook_name: 'PreToolUse:Bash',
+      hook_event: 'PreToolUse',
+    }),
+    hook('ok', { outcome: 'success', exit_code: 0 }),
+    hook('exit2', { outcome: 'error', exit_code: 2, stderr: 'no rm -rf\n' }),
+    hook('crash', { outcome: 'error', exit_code: 1, stderr: 'boom' }),
+    hook('json', {
+      outcome: 'success',
+      exit_code: 0,
+      stdout: JSON.stringify({
+        decision: 'block',
+        reason: 'lint first',
+        systemMessage: 'heads up',
+      }),
+    }),
+    hook('halt', {
+      outcome: 'success',
+      exit_code: 0,
+      stdout: JSON.stringify({ continue: false, stopReason: 'done for today' }),
+    }),
+    hook('cancel', { outcome: 'cancelled' }),
+    system('hook_progress', { hook_id: 'ok', hook_event: 'PreToolUse', stdout: 'tick' }),
+  ])
+  assert.deepEqual(events, [
+    { type: 'hook_run', hookId: 'ok', hookEvent: 'PreToolUse', status: 'running', entries: [] },
+    { type: 'hook_run', hookId: 'ok', hookEvent: 'PreToolUse', status: 'completed', entries: [] },
+    {
+      type: 'hook_run',
+      hookId: 'exit2',
+      hookEvent: 'PreToolUse',
+      status: 'blocked',
+      entries: [{ kind: 'feedback', text: 'no rm -rf' }],
+    },
+    {
+      type: 'hook_run',
+      hookId: 'crash',
+      hookEvent: 'PreToolUse',
+      status: 'failed',
+      entries: [{ kind: 'error', text: 'boom' }],
+    },
+    {
+      type: 'hook_run',
+      hookId: 'json',
+      hookEvent: 'PreToolUse',
+      status: 'blocked',
+      entries: [
+        { kind: 'warning', text: 'heads up' },
+        { kind: 'feedback', text: 'lint first' },
+      ],
+    },
+    {
+      type: 'hook_run',
+      hookId: 'halt',
+      hookEvent: 'PreToolUse',
+      status: 'blocked',
+      entries: [{ kind: 'stop', text: 'done for today' }],
+    },
+    { type: 'hook_run', hookId: 'cancel', hookEvent: 'PreToolUse', status: 'stopped', entries: [] },
+  ])
+})
+
+test('native refusal fallbacks and warning banners surface without ending the turn', async () => {
+  const fallback = (fields: Record<string, unknown>) =>
+    system('model_refusal_fallback', {
+      trigger: 'refusal',
+      direction: 'retry',
+      original_model: 'claude-a',
+      fallback_model: 'claude-b',
+      request_id: null,
+      content: 'Switched to claude-b.',
+      ...fields,
+    })
+  const events = await collect([
+    fallback({ scope: 'session', api_refusal_category: 'cyber' }),
+    fallback({ api_refusal_category: null, content: '' }),
+    fallback({ scope: 'local', content: 'A subagent switched models.' }),
+    fallback({ direction: 'revert', content: 'Back on claude-a.' }),
+    system('model_refusal_no_fallback', { original_model: 'claude-a', content: 'Refused.' }),
+    system('informational', { level: 'info', content: 'transcript only' }),
+    system('informational', { level: 'warning', content: 'Stop hook blocked continuation' }),
+  ])
+  assert.deepEqual(events, [
+    {
+      type: 'model_rerouted',
+      fromModel: 'claude-a',
+      toModel: 'claude-b',
+      category: 'cyber',
+      message: 'Switched to claude-b.',
+    },
+    {
+      type: 'model_rerouted',
+      fromModel: 'claude-a',
+      toModel: 'claude-b',
+      category: null,
+      message: 'Claude switched from claude-a to claude-b after a refusal.',
+    },
+    { type: 'notice', level: 'warning', message: 'A subagent switched models.' },
+    { type: 'notice', level: 'warning', message: 'Back on claude-a.' },
+    { type: 'notice', level: 'warning', message: 'Refused.' },
+    { type: 'notice', level: 'warning', message: 'Stop hook blocked continuation' },
+  ])
+})
+
+test('native MCP elicitations reach the turn handler, and are declined without one', async () => {
+  const elicit = async (handled: boolean) => {
+    const runtime = new NativeClaudeRuntime()
+    const answers: unknown[] = []
+    Reflect.set(runtime, 'sdk', {
+      query: async function* ({ options }: { options: Record<string, any> }) {
+        const signal = new AbortController().signal
+        answers.push(
+          await options.onElicitation(
+            {
+              serverName: 'db',
+              message: 'Which table?',
+              mode: 'form',
+              requestedSchema: { type: 'object', properties: { table: { type: 'string' } } },
+            },
+            { signal, requestId: 'r1' },
+          ),
+        )
+        answers.push(
+          await options.onElicitation(
+            { serverName: 'db', message: 'Sign in', mode: 'url', url: 'https://example.com' },
+            { signal, requestId: 'r2' },
+          ),
+        )
+        yield { type: 'result', subtype: 'success', result: 'done' }
+      },
+    })
+    const requests: unknown[] = []
+    await runtime.runTurn(context, {
+      onEvent: async () => {},
+      onPermissionRequest: async () => ({ decision: 'accept' }),
+      ...(handled
+        ? {
+            onElicitationRequest: async (request) => {
+              requests.push(request)
+              return request.mode === 'form'
+                ? { action: 'accept' as const, content: { table: 'users' } }
+                : { action: 'cancel' as const }
+            },
+          }
+        : {}),
+    })
+    return { answers, requests }
+  }
+  const handled = await elicit(true)
+  assert.deepEqual(handled.requests, [
+    {
+      serverName: 'db',
+      message: 'Which table?',
+      mode: 'form',
+      requestedSchema: { type: 'object', properties: { table: { type: 'string' } } },
+      url: null,
+      elicitationId: null,
+    },
+    {
+      serverName: 'db',
+      message: 'Sign in',
+      mode: 'url',
+      requestedSchema: null,
+      url: 'https://example.com',
+      elicitationId: null,
+    },
+  ])
+  assert.deepEqual(handled.answers, [
+    { action: 'accept', content: { table: 'users' } },
+    { action: 'cancel' },
+  ])
+  const unhandled = await elicit(false)
+  assert.deepEqual(unhandled.answers, [{ action: 'decline' }, { action: 'decline' }])
+})
+
+test('turn settings switch the running turn in place, and the next turn restores its own', async () => {
+  const runtime = new NativeClaudeRuntime()
+  const calls: unknown[] = []
+  const outcomes: unknown[] = []
+  let failModel = false
+  Reflect.set(runtime, 'sdk', {
+    query: () => {
+      const messages = (async function* () {
+        const update = (turnId: string, settings: RuntimeTurnSettings) =>
+          runtime
+            .updateTurnSettings('thread', turnId, settings)
+            .catch((error: Error) => error.message)
+        outcomes.push(await update('turn', { model: 'opus', effort: 'high' }))
+        // Unchanged settings send nothing.
+        outcomes.push(await update('turn', { model: 'opus', effort: 'high' }))
+        outcomes.push(await update('other-turn', { effort: 'low' }))
+        failModel = true
+        outcomes.push(await update('turn', { model: 'haiku' }))
+        yield { type: 'result', subtype: 'success', result: 'done' }
+      })()
+      return Object.assign(messages, {
+        setModel: async (model?: string) => {
+          calls.push(['setModel', model])
+          if (failModel) throw new Error('unknown model')
+        },
+        applyFlagSettings: async (settings: unknown) => {
+          calls.push(['applyFlagSettings', settings])
+        },
+      })
+    },
+  })
+  await runtime.runTurn(
+    { ...context, model: 'sonnet', effort: 'medium' },
+    {
+      onEvent: async () => {},
+      onPermissionRequest: async () => ({ decision: 'accept' }),
+    },
+  )
+  assert.deepEqual(outcomes, [
+    true,
+    true,
+    false,
+    'Claude Code rejected the model switch: unknown model',
+  ])
+  assert.deepEqual(calls, [
+    ['setModel', 'opus'],
+    ['applyFlagSettings', { effortLevel: 'high' }],
+    ['setModel', 'haiku'],
+  ])
+  assert.equal(await runtime.updateTurnSettings('thread', 'turn', { effort: 'low' }), false)
+
+  // A later turn on the same live session puts its own model and effort back.
+  const restored: unknown[] = []
+  const query = {
+    setModel: async (model?: string) => {
+      restored.push(['setModel', model])
+    },
+    applyFlagSettings: async (settings: unknown) => {
+      restored.push(['applyFlagSettings', settings])
+    },
+    setPermissionMode: async () => {},
+  }
+  const session = { query, model: 'opus', effort: 'high', permissionMode: 'bypassPermissions' }
+  const apply = Reflect.get(runtime, 'applySessionSettings') as (
+    session: unknown,
+    context: RuntimeTurnContext,
+  ) => Promise<void>
+  await apply.call(runtime, session, { ...context, model: 'sonnet', effort: null })
+  assert.deepEqual(restored, [
+    ['setModel', 'sonnet'],
+    ['applyFlagSettings', { effortLevel: null }],
+  ])
+  assert.equal(session.effort, null)
 })

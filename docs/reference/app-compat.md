@@ -24,6 +24,7 @@ line a rule touches.
 | `bedrock-account` | filters the model picker through its OpenAI allowlist unless `account/read` returns a Bedrock account | the picker lists the Claude models |
 | `skills-popup` | fills the "/" popup from `skills/list` and sends a picked skill as a `[$name](path)` link | `/simplify` is listed and runs |
 | `optimistic-user-message` | draws its own user message for every `turn/start` it sends | a message shows once; a queued one when it starts |
+| `tool-output-turns` | with `turnToolOutput` on, sends a thread handoff or a message from another thread as a `turn/start` with empty input and the text in `toolOutput`, and shows a `functionCallOutput` item as that turn's user message | a chat handed off to a new thread shows the text, and Claude answers it |
 | `steer-errors` | matches `turn/steer` error texts to fall back to a new turn or retry another turn id | a message sent as a turn ends still arrives |
 | `steer-bubble` | settles the steering bubble when a `userMessage` item carries its `clientUserMessageId` | a steer shows once, in the transcript |
 | `subagent-completed-kind` | renders the completed `subAgentActivity` kind from 26.930 without declaring it | a finished subagent shows as done |
@@ -94,25 +95,57 @@ is clean and the rules hold:
 
 The App decides which features to use from the app-server version in the
 `initialize` userAgent, which the adapter takes from
-`CLAUDE_CODEX_COMPAT_VERSION` (default `0.142.3`). Two consequences:
+`CLAUDE_CODEX_COMPAT_VERSION`. The default, `0.159.0-alpha.12.1`, is the Codex
+build of the verified App (`codexVersion` in `scripts/app-baseline.json`), so
+every gate in its table is on and the App calls the methods behind them.
+`GATED_METHODS` in `src/app-compat.mts` maps each gate to the requests it adds
+or changes, and `test/app-compat.test.mts` checks that every one has a `case`.
+Gates follow from the version alone; they cannot be turned on or off one by
+one. Run the upgrade check with the variable set to see which gates a version
+turns on:
 
-- At the default, the App keeps queued messages in the window instead of using
-  the server-side queue (`thread/queue/*`), which needs `0.148.0-alpha.14` or
-  later. The upgrade check notes this.
-- A higher version turns on more gates, and the App starts calling the methods
-  behind them. `GATED_METHODS` in `src/app-compat.mts` maps each gate to those
-  methods, and `test/app-compat.test.mts` checks that every one has a `case`.
-  Run the upgrade check with the variable set to see which gates a version
-  turns on:
+```sh
+CLAUDE_CODEX_COMPAT_VERSION=0.149.0-alpha.4.1 npm run check:app-upgrade -- --app /Applications/Codex.app
+```
 
-  ```sh
-  CLAUDE_CODEX_COMPAT_VERSION=0.149.0-alpha.4.1 npm run check:app-upgrade -- --app /Applications/Codex.app
-  ```
+A lower version keeps the App on its older paths. Below `0.148.0-alpha.14`, for
+one, it keeps queued messages in the window instead of using the server-side
+queue (`thread/queue/*`); the upgrade check notes this.
 
 Every client request the verified App can send has a `case`. Where Claude Code
 has no counterpart, the answer says so instead of failing: an empty list, a
 disabled status (remote control), an `unavailable` error the App knows
 (passkey verification), or `null` for what the adapter does not track (token
-counts in `account/usage/read`). Some gates are best left off anyway:
-`threadAttachments` also turns on the App's managed worktree cleanup, which
-needs a ChatGPT sign-in.
+counts in `account/usage/read`).
+
+### What the gates change
+
+Most gates change nothing the adapter sees, or turn on features that need a
+ChatGPT account or an OpenAI model provider. These are the ones the adapter
+answers in a particular way:
+
+| Gate | With it on, the App… | The adapter… |
+| --- | --- | --- |
+| `turnToolOutput` | sends a thread handoff or a message from another thread as `turn/start` with empty `input` and the text in `toolOutput` | prompts Claude with it and records a `functionCallOutput` item (rule `tool-output-turns`) |
+| `turnApprovalsReviewer` | follows a permission change during a turn with `turn/settings/update` carrying the new `approvalsReviewer` | accepts `user`, the only reviewer it has; any other is rejected, which the App only logs |
+| `threadTimeline` | can read history with `thread/timeline/list`, newest page first | pages from the newest entry back |
+| `mcpServerStatusByName` | passes `serverName` to `mcpServerStatus/list` | lists only that server |
+| `mcpResourceReadOriginCallId` | checks `originCallId` on a resource read from a hosted app | answers `null`; Claude's MCP servers are not hosted apps |
+| `serviceTierForTurn`, `turnTrigger` | add fields to the heartbeat's `turn/start` | ignores them |
+| `threadAttachments` | records a chat's managed worktrees as thread attachments, cleans them up when it is archived, and offers worktree tools | keeps the attachments; see below |
+
+Two of them also depend on a flag the App reads from its server (Statsig),
+which the bundle does not show and which can change without an App release:
+
+- **`threadTimeline`** is used only when the App's history-timeline flag is
+  on as well. Otherwise the App reads `thread/turns/list`, as before. The
+  adapter serves both.
+- **`threadAttachments`** adds the worktree tools (`create_worktree`,
+  `attach_worktree`, `list_artifacts` and others) to `thread/start` as
+  `dynamicTools`. The adapter does not offer dynamic tools to Claude. With one
+  more flag on, the App starts a chat in worktree mode in the local checkout
+  and leaves creating the worktree to the agent's `create_worktree` call, so
+  with Claude the task would run in the local checkout. If that happens, set
+  `CLAUDE_CODEX_COMPAT_VERSION` below `0.155.0-alpha.2`. Archiving and the
+  worktree cleanup do not need a ChatGPT sign-in: the App takes the owner from
+  `account/read`, and `requiresOpenaiAuth: false` there is enough.

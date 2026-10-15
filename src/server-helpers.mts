@@ -46,6 +46,7 @@ import {
   resolveClaudeEffort,
   resolveClaudeModel,
   textFromInput,
+  toolOutputInput,
 } from './util.mjs'
 import { maybeCreateThreadWorktree } from './worktree.mjs'
 
@@ -268,10 +269,17 @@ export function reviewPrompt(target: unknown): string {
 export function compactSummary(thread: ThreadRecord, turns: TurnRecord[]): string {
   const snippets = turns
     .flatMap((turn) => turn.items)
-    .filter((item) => item.type === 'userMessage' || item.type === 'agentMessage')
+    .filter(
+      (item) =>
+        item.type === 'userMessage' ||
+        item.type === 'functionCallOutput' ||
+        item.type === 'agentMessage',
+    )
     .slice(-12)
     .map((item) => {
       if (item.type === 'userMessage') return 'User: ' + textFromInput(item.content).slice(0, 500)
+      if (item.type === 'functionCallOutput')
+        return 'User: ' + textFromInput(toolOutputInput(item.output)).slice(0, 500)
       if (item.type === 'agentMessage') return 'Assistant: ' + item.text.slice(0, 500)
       return ''
     })

@@ -189,6 +189,24 @@ test('thread history pages turns, items and the timeline', async () => {
       timeline.data.map((entry: any) => entry.position),
       timeline.data.map((_: unknown, index: number) => index),
     )
+    // Paged the way the App loads it: newest page first, then older ones,
+    // never the same cursor twice.
+    const pages: any[][] = []
+    const cursors = new Set<string>()
+    let cursor: string | null = null
+    do {
+      const page: any = await server.request('thread/timeline/list', { threadId, cursor, limit: 4 })
+      pages.push(page.data)
+      cursor = page.nextCursor
+      if (cursor != null) {
+        assert.ok(!cursors.has(cursor))
+        cursors.add(cursor)
+      }
+    } while (cursor != null)
+    assert.ok(pages.length > 1)
+    assert.equal(pages[0]?.at(-1).type, 'turnCompleted')
+    assert.equal(pages[0]?.at(-1).turnId, turns[2])
+    assert.deepEqual(pages.toReversed().flat(), timeline.data)
   })
 })
 
@@ -398,30 +416,125 @@ test('background shells are listed and stopped as background terminals', async (
   })
 })
 
-test('turn/settings/update applies only to the running turn, and only as a no-op', async () => {
+test('turn/settings/update switches model and effort for the running turn only', async () => {
   await withServer(async (server) => {
     const threadId = await server.startThread()
     const ended = await server.runTurn(threadId, 'short')
-    assert.deepEqual(await server.request('turn/settings/update', { threadId, turnId: ended }), {
-      status: 'targetUnavailable',
-    })
+    assert.deepEqual(
+      await server.request('turn/settings/update', { threadId, turnId: ended, effort: 'high' }),
+      { status: 'targetUnavailable' },
+    )
 
-    // The mock streams its echo of a long prompt for a second or so.
     const from = server.mark()
-    const { turn } = await server.startTurn(threadId, `settings ${'x'.repeat(400)}`)
-    assert.deepEqual(await server.request('turn/settings/update', { threadId, turnId: turn.id }), {
+    const { turn } = await server.startTurn(threadId, 'hold this turn until released')
+    await server.waitFor('item/agentMessage/delta', (params) => params.turnId === turn.id, from)
+    const update = (settings: Record<string, unknown>) =>
+      server.request('turn/settings/update', { threadId, turnId: turn.id, ...settings })
+    // The user already reviews every approval.
+    assert.deepEqual(await update({ approvalsReviewer: 'user' }), { status: 'applied' })
+    await assert.rejects(
+      update({ approvalsReviewer: 'auto_review', summary: 'detailed' }),
+      /a running Claude turn cannot change approvalsReviewer auto_review, summary/,
+    )
+    await assert.rejects(update({ effort: 'extreme' }), /unsupported effort: extreme/)
+    await assert.rejects(update({ model: 'claude-opus-9' }), /unknown model: claude-opus-9/)
+    assert.deepEqual(await update({ model: 'Opus', effort: 'high' }), {
       status: 'applied',
     })
-    await assert.rejects(
-      server.request('turn/settings/update', {
-        threadId,
-        turnId: turn.id,
-        model: 'claude-opus-5-5',
-        effort: 'high',
-      }),
-      /a running Claude turn cannot change model, effort/,
-    )
+    await server.request('turn/steer', {
+      threadId,
+      expectedTurnId: turn.id,
+      input: [{ type: 'text', text: 'release', text_elements: [] }],
+    })
     await server.waitFor('turn/completed', (params) => params.turn.id === turn.id, from)
+    assert.match(
+      (await server.reply(threadId, turn.id)) ?? '',
+      /released on model=opus effort=high$/,
+    )
+  })
+})
+
+test('a turn/start carrying toolOutput prompts Claude with it and records a functionCallOutput', async () => {
+  await withServer(async (server) => {
+    const threadId = await server.startThread()
+    const handoff = {
+      name: 'handoff_thread',
+      namespace: 'codex_app',
+      output: 'Continue the parser refactor from these notes.',
+    }
+    const from = server.mark()
+    const { turn } = await server.request('turn/start', {
+      threadId,
+      input: [],
+      toolOutput: handoff,
+      clientUserMessageId: 'client-handoff',
+    })
+    await server.waitFor('turn/completed', (params) => params.turn.id === turn.id, from)
+    assert.equal(
+      await server.reply(threadId, turn.id),
+      'Claude Code adapter mock response for: Continue the parser refactor from these notes.',
+    )
+    // The App drew the message itself when it sent the turn.
+    assert.deepEqual(
+      server
+        .notified('item/started', from)
+        .filter((params) => params.item.type === 'functionCallOutput'),
+      [],
+    )
+    const { thread } = await server.request('thread/read', { threadId, includeTurns: true })
+    const { id, ...recorded } = thread.turns[0].items[0]
+    assert.equal(typeof id, 'string')
+    assert.deepEqual(recorded, { type: 'functionCallOutput', ...handoff })
+    assert.equal(thread.preview, handoff.output)
+    const summary = await server.request('thread/turns/list', { threadId, itemsView: 'summary' })
+    assert.deepEqual(
+      summary.data[0].items.map((item: any) => item.type),
+      ['functionCallOutput', 'agentMessage'],
+    )
+
+    // Content items: Claude reads the text (and any images).
+    const second = server.mark()
+    const { turn: next } = await server.request('turn/start', {
+      threadId,
+      input: [],
+      toolOutput: {
+        name: 'send_message',
+        namespace: null,
+        output: [
+          { type: 'input_text', text: 'A note from another thread.' },
+          { type: 'encrypted_content', encrypted_content: 'opaque' },
+        ],
+      },
+    })
+    await server.waitFor('turn/completed', (params) => params.turn.id === next.id, second)
+    assert.equal(
+      await server.reply(threadId, next.id),
+      'Claude Code adapter mock response for: A note from another thread.',
+    )
+  })
+})
+
+test('toolOutput sent while a turn runs joins that turn as its input', async () => {
+  await withServer(async (server) => {
+    const threadId = await server.startThread()
+    const from = server.mark()
+    const { turn } = await server.startTurn(threadId, 'hold this turn until released')
+    await server.waitFor('item/agentMessage/delta', (params) => params.turnId === turn.id, from)
+    // The held turn ends once Claude reads "release" from the tool output.
+    const joined = await server.request('turn/start', {
+      threadId,
+      input: [],
+      toolOutput: { name: 'send_message', namespace: null, output: 'please release now' },
+    })
+    assert.equal(joined.turn.id, turn.id)
+    await server.waitFor('turn/completed', (params) => params.turn.id === turn.id, from)
+    const started = await server.waitFor(
+      'item/started',
+      (params) => params.item.type === 'functionCallOutput',
+      from,
+    )
+    assert.equal(started.turnId, turn.id)
+    assert.equal(started.item.output, 'please release now')
   })
 })
 
