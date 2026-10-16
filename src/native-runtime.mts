@@ -1,6 +1,6 @@
 import { copyFileSync, existsSync, mkdirSync, readdirSync, realpathSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { basename, dirname, isAbsolute, join } from 'node:path'
 
 // Extended cache TTL for 1-hour prompt caching
 if (!process.env.ANTHROPIC_BETAS) {
@@ -62,7 +62,7 @@ import type {
   UserInputAnswers,
   UserInputQuestion,
 } from './types.mjs'
-import { debugLog, newId } from './util.mjs'
+import { debugLog, isPathInside, newId } from './util.mjs'
 import { parseWorkflowCommand, workflowRuntimePrompt } from './workflow-command.mjs'
 import {
   defaultWorkflowTranscriptRoots,
@@ -657,6 +657,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       // matches the previous behaviour of skipping the canUseTool round-trip
       // entirely for those modes.
       if (autoAllow) return { behavior: 'allow' }
+      if (readsWithin(toolName, input, context.readableRoots)) return { behavior: 'allow' }
 
       const requestId = `${context.threadId}:${context.turnId}:${toolName}:${toolUseId}`
       // Subagent-aware approval suppression: when Claude is mid-subagent we
@@ -2595,6 +2596,29 @@ function autoAllowsTools(context: RuntimeTurnContext): boolean {
       (context.approvalPolicy === 'never' || context.sandboxMode === 'danger-full-access')) ||
     mode === 'dontAsk'
   )
+}
+
+// A Read of a file inside one of `roots`, after resolving symlinks.
+export function readsWithin(
+  toolName: string,
+  input: Record<string, unknown>,
+  roots: readonly string[] | undefined,
+): boolean {
+  const target = input.file_path
+  if (toolName !== 'Read' || !roots?.length) return false
+  if (typeof target !== 'string' || !isAbsolute(target)) return false
+  const path = realPath(target)
+  return roots.some((root) => isPathInside(realPath(root), path))
+}
+
+// `path` with symlinks resolved as far as it exists.
+function realPath(path: string): string {
+  try {
+    return realpathSync(path)
+  } catch {
+    const parent = dirname(path)
+    return parent === path ? path : join(realPath(parent), basename(path))
+  }
 }
 
 // Options a live CLI process cannot change in place. A turn whose signature

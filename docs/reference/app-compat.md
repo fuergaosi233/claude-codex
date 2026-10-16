@@ -37,6 +37,7 @@ line a rule touches.
 | `rate-limit-banner` | shows a banner for every `account/rateLimits/updated` | no banner after an ordinary reply |
 | `projects` | holds project writes until `project/list` answers, and matches the `project not found` and deleted-key error texts | a project and a chat moved into it survive an App restart |
 | `delete-missing-rollout` | retries `thread/delete` with `missingRolloutRecovery` after `no rollout found for thread id <id>` | deleting all archived chats empties the list |
+| `inline-visualizations` | renders an HTML fragment from a `::codex-inline-vis{path="…"}` line, reading it only for a UUIDv7 thread id, and installs its bundled `visualize` plugin with `plugin/install` each time it starts | in a new chat, a chart Claude is asked for renders inside the reply |
 
 The full text of each rule, including the adapter side, is in
 `src/app-compat.mts`.

@@ -1,7 +1,8 @@
 import { constants } from 'node:fs'
 import { lstat, open, realpath } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { basename, isAbsolute, join, normalize, relative, resolve, sep } from 'node:path'
+import { basename, isAbsolute, join, normalize, resolve, sep } from 'node:path'
+import { isPathInside } from './util.mjs'
 
 export interface WorkflowLaunchInfo {
   taskId: string
@@ -283,11 +284,6 @@ function trustedTranscriptRoot(path: string, roots: string[]): string | null {
     .map((root) => resolve(root))
     .sort((left, right) => right.length - left.length)
   return normalizedRoots.find((root) => isPathInside(root, path)) ?? null
-}
-
-function isPathInside(root: string, path: string): boolean {
-  const child = relative(root, path)
-  return child !== '' && child !== '..' && !child.startsWith(`..${sep}`) && !isAbsolute(child)
 }
 
 async function readJournalEntries(

@@ -3536,6 +3536,13 @@ test('Task subagent emits the canonical activity lifecycle and leaves wait as th
     )
     assert.ok(childThreadStarted, 'subagent must emit child thread/started for live navigation')
     assert.equal(childThreadStarted.id, childThreadId)
+    // Child ids are UUIDv7 like every thread id; the nickname takes the
+    // random tail, not the timestamp shared by agents spawned together.
+    assert.match(childThreadId, /^[0-9a-f]{8}-[0-9a-f]{4}-7/)
+    assert.equal(
+      childThreadStarted.agentNickname,
+      `agent-${childThreadId.replace(/-/g, '').slice(-12)}`,
+    )
     assert.equal(
       childThreadStarted.parentThreadId,
       threadId,

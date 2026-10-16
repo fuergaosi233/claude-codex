@@ -2,6 +2,7 @@ import { type ChildProcess, execFile, spawn } from 'node:child_process'
 import { type FSWatcher, readFileSync, watch, writeFileSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import { promisify } from 'node:util'
+import type { AppSkill } from './claude-capabilities.mjs'
 import { callMcpTool, readMcpConfig, readMcpResource } from './mcp.mjs'
 import type { SessionStore } from './store.mjs'
 import type {
@@ -573,6 +574,36 @@ const desktopPresentationPrompt = [
   'Existing generated images can be embedded with Markdown image syntax and an absolute file path. Raw HTML, SVG, and React code are not automatically executable artifacts; do not promise an interactive artifact merely by emitting its source.',
 ].join('\n')
 
+// Claude Code loads skills only from its own folders, so the Codex App's
+// plugin skills are listed the way Codex lists skills: by name, description
+// and file, for Claude to read when a request calls for one.
+function appSkillsPrompt(skills: readonly AppSkill[]): string {
+  return [
+    '# Codex App skills',
+    "These skills come with the Codex App. Each is a folder holding a SKILL.md and the files it refers to. When a request matches a skill's description, read its SKILL.md in full with the Read tool before starting, then follow it, resolving the relative paths it mentions against its folder. Leave a skill unread when no request calls for it.",
+    ...skills.map((skill) => `- ${skill.name}: ${skill.description} (file: ${skill.path})`),
+  ].join('\n')
+}
+
+// The line the App renders a visualization from, and where to save it.
+// App rule: inline-visualizations
+function inlineVisualizationPrompt(dir: string): string {
+  return [
+    '# Inline visualizations',
+    'The Codex App renders an HTML fragment inside the conversation when your final reply has a line of its own, outside any code fence, of this form:',
+    '::codex-inline-vis{path="/absolute/path/to/name.html"}',
+    'Write the visualization content reference that the visualize skill describes in this form instead, adding mode="wide" only where the skill calls for wide mode.',
+    visualizationDirNote(dir),
+  ].join('\n')
+}
+
+// Where the App reads this conversation's visualization fragments from. A
+// side conversation keeps its parent's system prompt, so it gets this line
+// with its own directory in the turn prompt instead.
+export function visualizationDirNote(dir: string): string {
+  return `Save the visualization fragments for this conversation in ${dir}; the App reads them from there.`
+}
+
 // Assemble the per-thread system prompt addendum from Codex App's instruction
 // surface. Sidecar concatenates this onto Claude's default system prompt so
 // the user's project / developer / personality settings actually take effect.
@@ -581,11 +612,17 @@ export function buildSystemPromptAddendum(input: {
   developerInstructions: string | null
   personality: string | null
   desktopPresentation?: boolean
+  // Codex App plugin skills Claude can run, and the thread's directory for
+  // inline visualizations when its visualize skill is among them.
+  appSkills?: readonly AppSkill[]
+  visualizationDir?: string | null
   // AGENTS.md and the Claude Code files the CLI does not read itself.
   projectInstructions?: string | null
 }): string | null {
   const sections: string[] = []
   if (input.desktopPresentation) sections.push(desktopPresentationPrompt)
+  if (input.appSkills?.length) sections.push(appSkillsPrompt(input.appSkills))
+  if (input.visualizationDir) sections.push(inlineVisualizationPrompt(input.visualizationDir))
   const project = (input.projectInstructions ?? '').trim()
   if (project) sections.push(project)
   const base = (input.baseInstructions ?? '').trim()

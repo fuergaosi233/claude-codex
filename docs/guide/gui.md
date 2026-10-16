@@ -32,6 +32,55 @@ Selecting it does not itself enable plan mode, so an ordinary conversation may
 correctly run on Sonnet. Choose **Claude Opus** to use Opus throughout. See the
 [Claude Code model configuration](https://code.claude.com/docs/en/model-config#opusplan-model-setting).
 
+## Inline visualizations
+
+With the default native Claude Agent SDK backend, Claude can answer with a
+chart, a diagram or a small interactive explainer that the Codex App renders
+inside the conversation, the same way it does for Codex. Ask for one ("show
+this as a chart", "draw the flow") or let Claude offer one where it helps.
+
+**How Claude finds the skill.** Each time it starts, the App installs its
+bundled plugins with `plugin/install`. The adapter remembers the `visualize`
+plugin (in `config.json` under its state folder, so it survives restarts) and
+lists the plugin's skill in the system prompt of each Claude thread, by name,
+description and `SKILL.md` path, together with the line the App renders and the
+thread's visualization folder. When a request calls for a visualization, Claude
+reads the skill with its Read tool and follows it. Reads inside the skill's
+folder and the thread's visualization folder need no approval; writes follow
+the thread's approval policy as usual.
+
+**What renders.** Claude writes an HTML fragment to a file and puts a line of
+its own in its final reply, outside any code fence:
+
+```text
+::codex-inline-vis{path="/absolute/path/to/sales-by-region.html"}
+```
+
+The App loads the fragment into its visualization sandbox, styled with its
+theme. Claude adds `mode="wide"` to the line where the skill asks for a wide
+layout.
+
+**New chats only.** The App finds a thread's visualizations through the
+creation date in its id, and reads them only for UUIDv7 ids, which is what
+Codex issues. The adapter issues UUIDv7 ids for new threads, forks and
+subagents. Chats it created before that keep working but cannot render inline
+visualizations, so Claude is not offered the skill there; start a new chat to
+use it.
+
+**File rules.** The App reads a fragment only when:
+
+- its file name matches `^[a-z0-9]+(-[a-z0-9]+)*\.html$`, such as
+  `sales-by-region.html`;
+- its path is absolute and lies inside the thread's visualization folder,
+  `<CODEX_HOME>/visualizations/<YYYY>/<MM>/<DD>/<thread id>/` (`CODEX_HOME`
+  defaults to `~/.codex`; the date is the thread's creation date in UTC),
+  inside the thread's workspace or writable roots, or
+  in `/tmp` where the thread's sandbox allows it, with no symlink on the way;
+- it is at most 5,000,000 bytes.
+
+The prompt asks Claude to save fragments in the thread's visualization folder,
+which meets the location rule. A fragment that breaks a rule does not render.
+
 ## Localhost GUI testing on macOS
 
 For localhost GUI testing, the adapter is launched by SSH and the in-process TS
