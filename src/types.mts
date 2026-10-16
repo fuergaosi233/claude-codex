@@ -220,10 +220,21 @@ export interface QueuedSubmission {
   clientUserMessageId: string | null
 }
 
+// Codex's TurnToolOutput. `output` is a string or Responses API content items
+// (input_text, input_image, ...).
+export interface TurnToolOutput {
+  name: string
+  namespace: string | null
+  output: string | Array<Record<string, unknown>>
+}
+
 export type ThreadItem =
   // clientId echoes turn/start's or turn/steer's clientUserMessageId so the
   // App can reconcile its optimistic copy of the message.
   | { type: 'userMessage'; id: string; content: UserInput[]; clientId?: string }
+  // A codex_app tool result that turn/start carried in place of user input,
+  // such as a thread handoff. The App shows it as the turn's user message.
+  | ({ type: 'functionCallOutput'; id: string } & TurnToolOutput)
   | { type: 'agentMessage'; id: string; text: string; phase: string | null; memoryCitation: null }
   | { type: 'plan'; id: string; text: string }
   | { type: 'reasoning'; id: string; summary: string[]; content: string[] }
@@ -487,12 +498,23 @@ export type RuntimeEvent =
       numTurns: number | null
       costUsd: number | null
     }
+  // A Claude Code hook run began or ended; `hookId` pairs the two.
   | {
-      type: 'hook'
-      hookName: string
-      status: string | null
-      decision: string | null
-      message: string | null
+      type: 'hook_run'
+      hookId: string
+      // Claude's event name (PreToolUse, Stop, ...).
+      hookEvent: string
+      status: HookRunStatus
+      entries: HookOutputEntry[]
+    }
+  // A refusal moved the session onto a fallback model. `category` is the
+  // API's refusal category ('cyber', 'bio', ...) when it reported one.
+  | {
+      type: 'model_rerouted'
+      fromModel: string
+      toModel: string
+      category: string | null
+      message: string
     }
   | { type: 'completed'; claudeSessionId?: string | null; result?: string | null; success: boolean }
   | { type: 'error'; message: string }
@@ -508,6 +530,30 @@ export interface UserInputQuestion {
   isOther: boolean
   isSecret: boolean
   options: Array<{ label: string; description: string }> | null
+}
+
+// Codex's HookRunStatus and HookOutputEntry.
+export type HookRunStatus = 'running' | 'completed' | 'failed' | 'blocked' | 'stopped'
+
+export interface HookOutputEntry {
+  kind: 'warning' | 'stop' | 'feedback' | 'context' | 'error'
+  text: string
+}
+
+// An MCP server asked the user for input (MCP elicitation): a form described
+// by `requestedSchema`, or a URL to open in the browser.
+export interface ElicitationRequest {
+  serverName: string
+  message: string
+  mode: 'form' | 'url'
+  requestedSchema: Record<string, unknown> | null
+  url: string | null
+  elicitationId: string | null
+}
+
+export interface ElicitationResponse {
+  action: 'accept' | 'decline' | 'cancel'
+  content?: Record<string, unknown>
 }
 
 export interface UserInputAnswers {
@@ -550,6 +596,13 @@ export interface RuntimeHandlers {
   onUserInputRequest?(
     event: Extract<RuntimeEvent, { type: 'user_input_request' }>,
   ): Promise<UserInputAnswers>
+  // Routed when an MCP server elicits input. The server bridges it to
+  // Codex's `mcpServer/elicitation/request`; `signal` aborts when Claude
+  // gives up waiting. When absent the runtime declines.
+  onElicitationRequest?(
+    request: ElicitationRequest,
+    signal: AbortSignal,
+  ): Promise<ElicitationResponse>
 }
 
 export interface RuntimeTaskUsage {
@@ -618,6 +671,12 @@ export interface RuntimeSteerOptions {
   onAccepted?: () => void
 }
 
+// turn/settings/update: model and effort for the rest of a running turn.
+export interface RuntimeTurnSettings {
+  model?: string
+  effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+}
+
 // A background task of a live session: a backgrounded Bash shell
 // (`local_bash`), agent or workflow, with the tool call that started it.
 export interface RuntimeLiveTask {
@@ -638,6 +697,14 @@ export interface ClaudeRuntime {
   ): Promise<boolean | undefined>
   interrupt(threadId: string): Promise<void>
   stop(): Promise<void>
+  // Switch the running turn's model or effort until it ends; the next turn
+  // runs on its own settings again. Resolves false when the thread is not
+  // running that turn.
+  updateTurnSettings?(
+    threadId: string,
+    turnId: string,
+    settings: RuntimeTurnSettings,
+  ): Promise<boolean>
   setBackgroundListener?(listener: RuntimeBackgroundListener): void
   // Stop one background task of the thread's live session. Resolves false
   // when no live session owns the task.

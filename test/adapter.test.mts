@@ -2689,15 +2689,22 @@ test('baseInstructions / developerInstructions / personality flow into the syste
   }
 })
 
-test('Claude hook events are rendered as Codex hookPrompt ThreadItems', async () => {
+test('Claude hook runs are reported as Codex hook/started and hook/completed', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const project = await mkdtemp(join(tmpdir(), 'claude-codex-hooks-'))
+  const settings = join(project, '.claude', 'settings.json')
+  await mkdir(join(project, '.claude'), { recursive: true })
+  await writeFile(
+    settings,
+    JSON.stringify({ hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ command: 'true' }] }] } }),
+  )
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
   })
   const reader = new JsonLineReader(proc)
   try {
-    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: project } }))
     const start = await reader.nextResponse(1)
     const threadId = start.result.thread.id
 
@@ -2708,34 +2715,147 @@ test('Claude hook events are rendered as Codex hookPrompt ThreadItems', async ()
         params: { threadId, input: [{ type: 'text', text: 'hook check', text_elements: [] }] },
       }),
     )
-    await reader.nextResponse(2)
+    const turnId = (await reader.nextResponse(2)).result.turn.id
 
-    let hookItem: any = null
+    const hookMessages: any[] = []
+    const itemTypes: string[] = []
     for (let i = 0; i < 200; i += 1) {
       const message = await reader.next()
-      if (message.method === 'item/started' && message.params.item.type === 'hookPrompt')
-        hookItem = message.params.item
+      if (message.method === 'hook/started' || message.method === 'hook/completed')
+        hookMessages.push(message)
+      if (message.method === 'item/started') itemTypes.push(message.params.item.type)
       if (message.method === 'turn/completed') break
     }
-    assert.ok(hookItem, 'hook event should produce a hookPrompt ThreadItem')
-    const fragmentTexts = (hookItem.fragments as Array<{ text: string }>).map((f) => f.text)
-    assert.ok(
-      fragmentTexts.some((t) => /Hook · PreToolUse/.test(t)),
-      'fragments should include the hook name',
+    // The Notification hook has no Codex event name and is dropped.
+    assert.deepEqual(
+      hookMessages.map((message) => message.method),
+      ['hook/started', 'hook/completed'],
     )
-    assert.ok(
-      fragmentTexts.some((t) => /status: started/.test(t)),
-      'fragments should include the status',
+    const [started, completed] = hookMessages
+    assert.equal(started.params.threadId, threadId)
+    assert.equal(started.params.turnId, turnId)
+    assert.deepEqual(
+      {
+        id: started.params.run.id,
+        eventName: started.params.run.eventName,
+        status: started.params.run.status,
+        source: started.params.run.source,
+        sourcePath: started.params.run.sourcePath,
+        scope: started.params.run.scope,
+        completedAt: started.params.run.completedAt,
+      },
+      {
+        id: 'mock-hook',
+        eventName: 'preToolUse',
+        status: 'running',
+        source: 'project',
+        sourcePath: settings,
+        scope: 'turn',
+        completedAt: null,
+      },
     )
-    assert.ok(
-      fragmentTexts.some((t) => /decision: allow/.test(t)),
-      'fragments should include the decision',
-    )
+    assert.equal(completed.params.run.id, 'mock-hook')
+    assert.equal(completed.params.run.status, 'blocked')
+    assert.deepEqual(completed.params.run.entries, [
+      { kind: 'feedback', text: 'Bash about to run echo hi' },
+    ])
+    assert.equal(typeof completed.params.run.completedAt, 'number')
+    assert.equal(typeof completed.params.run.durationMs, 'number')
+    // Hook runs are not transcript items.
+    assert.equal(itemTypes.includes('hookPrompt'), false)
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+    await rm(project, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
+
+for (const mode of ['form', 'url'] as const) {
+  test(`MCP ${mode} elicitations are bridged to mcpServer/elicitation/request`, async () => {
+    const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+    const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+    })
+    const reader = new JsonLineReader(proc)
+    try {
+      proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+      const threadId = (await reader.nextResponse(1)).result.thread.id
+      const prompt = mode === 'url' ? 'elicitation check url' : 'elicitation check'
+      proc.stdin.write(
+        json({
+          id: 2,
+          method: 'turn/start',
+          params: { threadId, input: [{ type: 'text', text: prompt, text_elements: [] }] },
+        }),
+      )
+      const turnId = (await reader.nextResponse(2)).result.turn.id
+
+      let request: any = null
+      let waiting = false
+      while (request == null) {
+        const message = await reader.next()
+        if (
+          message.method === 'thread/status/changed' &&
+          message.params.status.activeFlags?.includes('waitingOnUserInput')
+        )
+          waiting = true
+        if (message.method === 'mcpServer/elicitation/request') request = message
+      }
+      assert.equal(waiting, true)
+      const expected =
+        mode === 'url'
+          ? {
+              threadId,
+              turnId,
+              serverName: 'mock-mcp',
+              message: 'Sign in to continue',
+              mode: 'url',
+              url: 'https://example.com/auth',
+              elicitationId: 'mock-elicitation',
+            }
+          : {
+              threadId,
+              turnId,
+              serverName: 'mock-mcp',
+              message: 'Pick a region',
+              mode: 'form',
+              requestedSchema: {
+                type: 'object',
+                properties: { region: { type: 'string' } },
+                required: ['region'],
+              },
+            }
+      assert.deepEqual(request.params, expected)
+
+      const result =
+        mode === 'url'
+          ? { action: 'decline', content: null, _meta: null }
+          : { action: 'accept', content: { region: 'eu' }, _meta: null }
+      proc.stdin.write(json({ jsonrpc: '2.0', id: request.id, result }))
+
+      let resolved = false
+      let text = ''
+      for (let i = 0; i < 200; i += 1) {
+        const message = await reader.next()
+        if (message.method === 'serverRequest/resolved' && message.params.requestId === request.id)
+          resolved = true
+        if (message.method === 'item/agentMessage/delta') text += message.params.delta
+        if (message.method === 'turn/completed') break
+      }
+      assert.equal(resolved, true)
+      assert.equal(
+        text,
+        mode === 'url'
+          ? 'elicitation={"action":"decline"}'
+          : 'elicitation={"action":"accept","content":{"region":"eu"}}',
+      )
+    } finally {
+      proc.kill()
+      await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+    }
+  })
+}
 
 test('thread/compact/start drives Claude (summary model) instead of the local stringified summary', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
@@ -7315,6 +7435,7 @@ test('mcp status list reflects configured Claude SDK MCP servers', async () => {
       CLAUDE_CODEX_MOCK: '1',
       CLAUDE_CODEX_MCP_SERVERS: JSON.stringify({
         demo: { type: 'stdio', command: 'node', args: ['mcp.js'] },
+        other: { type: 'stdio', command: 'node', args: ['other.js'] },
       }),
       NODE_NO_WARNINGS: '1',
     },
@@ -7324,7 +7445,10 @@ test('mcp status list reflects configured Claude SDK MCP servers', async () => {
     proc.stdin.write(json({ id: 1, method: 'mcpServerStatus/list', params: {} }))
     const response = await reader.nextResponse(1)
     // Codex v2 McpServerStatus shape: { name, tools, resources, resourceTemplates, authStatus }.
-    assert.equal(response.result.data[0].name, 'demo')
+    assert.deepEqual(
+      response.result.data.map((server: any) => server.name),
+      ['demo', 'other'],
+    )
     assert.deepEqual(response.result.data[0].tools, {})
     assert.deepEqual(response.result.data[0].resources, [])
     assert.deepEqual(response.result.data[0].resourceTemplates, [])
@@ -7333,6 +7457,16 @@ test('mcp status list reflects configured Claude SDK MCP servers', async () => {
         response.result.data[0].authStatus,
       ),
     )
+    // serverName narrows the list to that server.
+    proc.stdin.write(
+      json({ id: 2, method: 'mcpServerStatus/list', params: { serverName: 'other' } }),
+    )
+    const one = await reader.nextResponse(2)
+    assert.deepEqual(
+      one.result.data.map((server: any) => server.name),
+      ['other'],
+    )
+    assert.equal(one.result.nextCursor, null)
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -7371,12 +7505,19 @@ test('direct MCP stdio resource and tool calls work', async () => {
       json({
         id: 2,
         method: 'mcpServer/resource/read',
-        params: { threadId: 't', server: 'fixture', uri: 'fixture://resource' },
+        params: {
+          threadId: 't',
+          server: 'fixture',
+          uri: 'fixture://resource',
+          originCallId: 'call-1',
+        },
       }),
     )
     const resource = await reader.nextResponse(2)
     assert.equal(resource.result.contents[0].uri, 'fixture://resource')
     assert.equal(resource.result.contents[0].text, 'resource-ok')
+    // No hosted app scoped the read.
+    assert.equal(resource.result.originCallId, null)
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })

@@ -153,13 +153,22 @@ test('pageTimeline numbers turn starts, items and completions in order', () => {
     ],
   )
   assert.equal(all.activeRealtimeSessionAtPageStart, null)
-  const page = pageTimeline(turns, { cursor: '2', limit: 2 })
-  assert.deepEqual(
-    page.data.map((entry) => entry.position),
-    [2, 3],
-  )
-  assert.equal(page.nextCursor, '4')
-  assert.equal(pageTimeline(turns, { cursor: '4', limit: 2 }).nextCursor, null)
+  assert.equal(all.nextCursor, null)
+
+  // The first page is the newest stretch, in order; each cursor leads to
+  // older entries until the oldest page.
+  const positions = (page: { data: Array<{ position: number }> }) =>
+    page.data.map((entry) => entry.position)
+  const newest = pageTimeline(turns, { cursor: null, limit: 2 })
+  assert.deepEqual(positions(newest), [3, 4])
+  assert.equal(newest.nextCursor, '3')
+  const older = pageTimeline(turns, { cursor: newest.nextCursor, limit: 2 })
+  assert.deepEqual(positions(older), [1, 2])
+  assert.equal(older.nextCursor, '1')
+  const oldest = pageTimeline(turns, { cursor: older.nextCursor, limit: 2 })
+  assert.deepEqual(positions(oldest), [0])
+  assert.equal(oldest.nextCursor, null)
+  assert.throws(() => pageTimeline(turns, { cursor: 'x', limit: 2 }), /invalid timeline cursor/)
 })
 
 test('pageLimit and offsetCursor accept only what the server hands out', () => {

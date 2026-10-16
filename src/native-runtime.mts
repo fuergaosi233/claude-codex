@@ -46,7 +46,10 @@ import { echoedUuids, TurnInput, type TurnInputMessage } from './native-turn-inp
 import { readTaskResult } from './task-output.mjs'
 import type {
   ClaudeRuntime,
+  ElicitationResponse,
   GoalToolHandlers,
+  HookOutputEntry,
+  HookRunStatus,
   ImageInput,
   PermissionDecision,
   RuntimeBackgroundListener,
@@ -55,6 +58,7 @@ import type {
   RuntimeSteerOptions,
   RuntimeTaskUsage,
   RuntimeTurnContext,
+  RuntimeTurnSettings,
   UserInputAnswers,
   UserInputQuestion,
 } from './types.mjs'
@@ -158,6 +162,7 @@ interface LiveSession {
   signature: string
   lastContext: RuntimeTurnContext
   model: string | null
+  effort: string | null
   permissionMode: string
   // The turn currently receiving the session's messages.
   current: PendingTurn | null
@@ -283,6 +288,39 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     // Accepted once the CLI starts consuming it (command_lifecycle `started`)
     // or, on CLIs without lifecycle frames, once a result echoes it.
     if (options.onAccepted) session.steers.set(uuid, options.onAccepted)
+    return true
+  }
+
+  async updateTurnSettings(
+    threadId: string,
+    turnId: string,
+    settings: RuntimeTurnSettings,
+  ): Promise<boolean> {
+    const pending = this.turns.get(turnId)
+    if (!pending || pending.resolved || pending.context.threadId !== threadId) return false
+    const session = pending.session
+    if (session.closed) return false
+    // Not serialized with turn attachment: a turn waiting on an approval
+    // holds that chain. The next turn attaching to this session puts its own
+    // settings back (applySessionSettings).
+    const query = session.query as Query & {
+      setModel?: (model?: string) => Promise<void>
+      applyFlagSettings?: (settings: { effortLevel?: string | null }) => Promise<void>
+    }
+    if (settings.model && settings.model !== session.model) {
+      if (!query.setModel) throw new Error('this Claude Code cannot switch models mid-turn')
+      session.model = settings.model
+      await sessionControl(query.setModel(settings.model), 'model switch')
+    }
+    if (settings.effort && settings.effort !== session.effort) {
+      if (!query.applyFlagSettings)
+        throw new Error('this Claude Code cannot change effort mid-turn')
+      session.effort = settings.effort
+      await sessionControl(
+        query.applyFlagSettings({ effortLevel: settings.effort }),
+        'effort change',
+      )
+    }
     return true
   }
 
@@ -536,6 +574,10 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (mode !== 'plan' && mode !== 'bypassPermissions') {
       opts.canUseTool = this.makeCanUseTool(sessionRef)
     }
+    // MCP elicitations go to the App in every mode: they ask the user for
+    // data, not for permission.
+    opts.onElicitation = (request: Record<string, unknown>, options: { signal: AbortSignal }) =>
+      this.elicit(sessionRef, request, options.signal)
 
     // Project + developer + personality instructions ride along as a system
     // prompt append, preserving Claude Code's built-in preset.
@@ -646,6 +688,36 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }
   }
 
+  private async elicit(
+    sessionRef: () => LiveSession | null,
+    request: Record<string, unknown>,
+    signal: AbortSignal,
+  ): Promise<ElicitationResponse> {
+    const pending = sessionRef()?.current
+    // Between turns (a background task's MCP call) there is nowhere to ask.
+    if (!pending || pending.resolved || !pending.handlers.onElicitationRequest)
+      return { action: 'decline' }
+    const url = stringOrNull(request.url)
+    const mode = request.mode === 'url' && url ? 'url' : 'form'
+    const schema = request.requestedSchema
+    try {
+      return await pending.handlers.onElicitationRequest(
+        {
+          serverName: String(request.serverName ?? ''),
+          message: String(request.message ?? ''),
+          mode,
+          requestedSchema:
+            schema && typeof schema === 'object' ? (schema as Record<string, unknown>) : null,
+          url: mode === 'url' ? url : null,
+          elicitationId: stringOrNull(request.elicitationId),
+        },
+        signal,
+      )
+    } catch {
+      return { action: 'cancel' }
+    }
+  }
+
   private openSession(
     sdk: ClaudeSdk,
     context: RuntimeTurnContext,
@@ -672,6 +744,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         signature: sessionSignature(context),
         lastContext: context,
         model: context.model,
+        effort: context.effort ?? null,
         permissionMode: derivePermissionMode(
           context.approvalPolicy,
           context.sandboxMode,
@@ -833,11 +906,23 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     const query = session.query as Query & {
       setModel?: (model?: string) => Promise<void>
       setPermissionMode?: (mode: string) => Promise<void>
+      applyFlagSettings?: (settings: { effortLevel?: string | null }) => Promise<void>
     }
     if (context.model && context.model !== session.model && query.setModel) {
       session.model = context.model
       await settlesWithin(
         query.setModel(context.model).catch(() => {}),
+        SESSION_CONTROL_TIMEOUT_MS,
+      )
+    }
+    // Effort is part of the session signature, so only a turn pinned to this
+    // session by background work, or one after a mid-turn change, gets here
+    // with a different effort. null is the model's default.
+    const effort = context.effort ?? null
+    if (effort !== session.effort && query.applyFlagSettings) {
+      session.effort = effort
+      await settlesWithin(
+        query.applyFlagSettings({ effortLevel: effort }).catch(() => {}),
         SESSION_CONTROL_TIMEOUT_MS,
       )
     }
@@ -1423,10 +1508,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         await this.handleResult(pending, message)
         break
       default:
-        // Hook events, rate-limit notifications, etc. Many of them surface as
-        // their own SDKMessage variants in recent SDK builds. Convert to a
-        // generic notice + (for hook events) a structured hook event so the
-        // server can render a hookPrompt timeline item.
+        // Rate-limit notifications and other non-system frames.
         await this.handleOther(pending, type, message)
     }
   }
@@ -1446,6 +1528,44 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
           .catch(() => {})
       const sessionId = String(message.session_id ?? '')
       if (sessionId) await pending.handlers.onEvent({ type: 'session', claudeSessionId: sessionId })
+      return
+    }
+    if (subtype === 'hook_started' || subtype === 'hook_response') {
+      const hookId = stringOrNull(message.hook_id)
+      const hookEvent = stringOrNull(message.hook_event)
+      if (!hookId || !hookEvent) return
+      const run =
+        subtype === 'hook_started'
+          ? { status: 'running' as const, entries: [] }
+          : hookRunOutcome(message)
+      await pending.handlers.onEvent({ type: 'hook_run', hookId, hookEvent, ...run })
+      return
+    }
+    if (subtype === 'model_refusal_fallback') {
+      const text = stringOrNull(message.content)
+      // 'local' fell back for a subagent only, and 'revert' returns to the
+      // original model: the session's model did not move away.
+      if (message.scope === 'local' || message.direction === 'revert') {
+        if (text)
+          await pending.handlers.onEvent({ type: 'notice', level: 'warning', message: text })
+        return
+      }
+      const fromModel = String(message.original_model ?? '')
+      const toModel = String(message.fallback_model ?? '')
+      await pending.handlers.onEvent({
+        type: 'model_rerouted',
+        fromModel,
+        toModel,
+        category: stringOrNull(message.api_refusal_category),
+        message: text ?? `Claude switched from ${fromModel} to ${toModel} after a refusal.`,
+      })
+      return
+    }
+    if (subtype === 'model_refusal_no_fallback' || subtype === 'informational') {
+      const text = stringOrNull(message.content)
+      // Informational lines below 'warning' are transcript chatter.
+      if (!text || (subtype === 'informational' && message.level !== 'warning')) return
+      await pending.handlers.onEvent({ type: 'notice', level: 'warning', message: text })
       return
     }
     if (subtype === 'permission_denied') {
@@ -2223,19 +2343,49 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       })
       return
     }
-    if (type === 'hook' || type === 'hook_event' || type === 'system_hook_event') {
-      const hookName = String(message.hook_event_name ?? message.hook_name ?? 'hook')
-      const status = stringOrNull(message.status) ?? stringOrNull(message.subtype)
-      const decision = stringOrNull(message.decision) ?? stringOrNull(message.permission_decision)
-      const text = stringOrNull(message.message) ?? stringOrNull(message.reason)
-      await pending.handlers.onEvent({
-        type: 'hook',
-        hookName,
-        status,
-        decision,
-        message: text,
-      })
-    }
+  }
+}
+
+// A finished hook as Codex reports one. Exit code 2 is Claude Code's blocking
+// exit (stderr goes back to Claude); a command hook can also block or stop
+// the turn through its JSON output.
+function hookRunOutcome(message: Record<string, unknown>): {
+  status: HookRunStatus
+  entries: HookOutputEntry[]
+} {
+  const stderr = String(message.stderr ?? '').trim()
+  if (message.outcome === 'cancelled') return { status: 'stopped', entries: [] }
+  if (message.exit_code === 2)
+    return { status: 'blocked', entries: stderr ? [{ kind: 'feedback', text: stderr }] : [] }
+  if (message.outcome === 'error') {
+    const text = stderr || String(message.output ?? '').trim()
+    return { status: 'failed', entries: text ? [{ kind: 'error', text }] : [] }
+  }
+  const output = parseHookOutput(message.stdout ?? message.output)
+  const entries: HookOutputEntry[] = []
+  const systemMessage = stringOrNull(output.systemMessage)
+  if (systemMessage) entries.push({ kind: 'warning', text: systemMessage })
+  if (output.continue === false) {
+    const reason = stringOrNull(output.stopReason)
+    if (reason) entries.push({ kind: 'stop', text: reason })
+    return { status: 'blocked', entries }
+  }
+  if (output.decision === 'block') {
+    const reason = stringOrNull(output.reason)
+    if (reason) entries.push({ kind: 'feedback', text: reason })
+    return { status: 'blocked', entries }
+  }
+  return { status: 'completed', entries }
+}
+
+function parseHookOutput(value: unknown): Record<string, unknown> {
+  const text = String(value ?? '').trim()
+  if (!text.startsWith('{')) return {}
+  try {
+    const parsed = JSON.parse(text)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
+  } catch {
+    return {}
   }
 }
 
@@ -2345,6 +2495,22 @@ async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Prom
   } finally {
     if (timer) clearTimeout(timer)
   }
+}
+
+// A control request whose failure the caller reports.
+async function sessionControl(request: Promise<void>, what: string): Promise<void> {
+  let failure: unknown = null
+  const settled = await settlesWithin(
+    request.catch((error: unknown) => {
+      failure = error
+    }),
+    SESSION_CONTROL_TIMEOUT_MS,
+  )
+  if (failure != null)
+    throw new Error(
+      `Claude Code rejected the ${what}: ${failure instanceof Error ? failure.message : String(failure)}`,
+    )
+  if (!settled) throw new Error(`Claude Code did not confirm the ${what} in time`)
 }
 
 // The context window of the model that ran the main loop, as the CLI reports

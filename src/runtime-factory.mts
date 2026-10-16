@@ -15,6 +15,7 @@ import type {
   RuntimeLiveTask,
   RuntimeSteerOptions,
   RuntimeTurnContext,
+  RuntimeTurnSettings,
 } from './types.mjs'
 import { debugLog } from './util.mjs'
 
@@ -82,6 +83,18 @@ class SelectableRuntime implements ClaudeRuntime {
   ): Promise<boolean | undefined> {
     const runtime = this.activeRuntimeByThread.get(threadId) ?? this.runtimeFor(this.config.type)
     return runtime.steer(threadId, prompt, options)
+  }
+
+  async updateTurnSettings(
+    threadId: string,
+    turnId: string,
+    settings: RuntimeTurnSettings,
+  ): Promise<boolean> {
+    const runtime = this.activeRuntimeByThread.get(threadId)
+    if (!runtime) return false
+    if (!runtime.updateTurnSettings)
+      throw new Error('this backend cannot change the settings of a running turn')
+    return runtime.updateTurnSettings(threadId, turnId, settings)
   }
 
   async interrupt(threadId: string): Promise<void> {

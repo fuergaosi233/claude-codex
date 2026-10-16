@@ -113,25 +113,51 @@ const HOOK_EVENT_MAP: Record<string, string> = {
   PreCompact: 'preCompact',
   PostCompact: 'postCompact',
   SessionStart: 'sessionStart',
+  SessionEnd: 'sessionEnd',
   UserPromptSubmit: 'userPromptSubmit',
+  SubagentStart: 'subagentStart',
+  SubagentStop: 'subagentStop',
   Stop: 'stop',
+}
+
+export function codexHookEventName(claudeEvent: string): string | null {
+  return HOOK_EVENT_MAP[claudeEvent] ?? null
+}
+
+function hookSettingsFiles(cwd: string): Array<{ path: string; source: 'user' | 'project' }> {
+  return [
+    { path: join(homedir(), '.claude', 'settings.json'), source: 'user' },
+    { path: join(cwd, '.claude', 'settings.json'), source: 'project' },
+    { path: join(cwd, '.claude', 'settings.local.json'), source: 'project' },
+  ]
+}
+
+// Where a running hook most likely came from: the first settings file that
+// configures its event. Plugin, managed and SDK hooks live elsewhere and
+// report `unknown`.
+export function claudeHookSource(
+  cwd: string,
+  claudeEvent: string,
+): { source: 'user' | 'project' | 'unknown'; sourcePath: string } {
+  for (const { path, source } of hookSettingsFiles(cwd)) {
+    if (!existsSync(path)) continue
+    try {
+      const matchers = asRecord(asRecord(JSON.parse(readFileSync(path, 'utf8'))).hooks)[claudeEvent]
+      if (Array.isArray(matchers) && matchers.length > 0) return { source, sourcePath: path }
+    } catch {
+      // hooks/list reports unreadable settings; a run just stays unattributed.
+    }
+  }
+  return { source: 'unknown', sourcePath: join(homedir(), '.claude', 'settings.json') }
 }
 
 export function listClaudeHooks(params: Record<string, unknown>): HooksListEntry[] {
   const roots = cwdsFromParams(params)
-  const userSources = [
-    { path: join(homedir(), '.claude', 'settings.json'), source: 'user' as const },
-  ]
   return roots.map((cwd) => {
-    const sources = [
-      ...userSources,
-      { path: join(cwd, '.claude', 'settings.json'), source: 'project' as const },
-      { path: join(cwd, '.claude', 'settings.local.json'), source: 'project' as const },
-    ]
     const hooks: HookMetadata[] = []
     const errors: Array<{ path: string; message: string }> = []
     let order = 0
-    for (const { path, source } of sources) {
+    for (const { path, source } of hookSettingsFiles(cwd)) {
       if (!existsSync(path)) continue
       let parsed: Record<string, unknown>
       try {

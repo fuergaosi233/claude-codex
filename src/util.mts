@@ -11,7 +11,7 @@ import {
 } from 'node:fs'
 import { homedir, platform, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
-import type { ImageInput } from './types.mjs'
+import type { ImageInput, TurnToolOutput, UserInput } from './types.mjs'
 
 export function nowSeconds(): number {
   return Math.floor(Date.now() / 1000)
@@ -126,13 +126,13 @@ export function platformOs(): string {
 }
 
 // Codex app-server protocol version the adapter advertises (codex --version /
-// initialize userAgent). Bump alongside the generated schema (`npm run
-// generate:schema`). The 0.130 -> 0.142 delta is additive/widening (new
-// optional methods + enum variants), so reporting 0.142 stays compatible with
-// older Codex App builds while satisfying newer ones' minimum-version probe.
-// Override per host with CLAUDE_CODEX_COMPAT_VERSION.
+// initialize userAgent). The App turns its feature gates on by this version,
+// so it is the Codex build of the verified App (codexVersion in
+// scripts/app-baseline.json): every gate that build knows is on, and
+// check:app-upgrade checks each against the adapter. Older App builds only
+// check a minimum version. Override per host with CLAUDE_CODEX_COMPAT_VERSION.
 // App rule: feature-gates
-const DEFAULT_CODEX_COMPAT_VERSION = '0.142.3'
+const DEFAULT_CODEX_COMPAT_VERSION = '0.159.0-alpha.12.1'
 
 export function codexCompatVersion(): string {
   return (
@@ -183,6 +183,39 @@ export function textFromInput(input: unknown): string {
     })
     .filter(Boolean)
     .join('\n')
+}
+
+export function turnToolOutputFromParams(value: unknown): TurnToolOutput | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const record = value as Record<string, unknown>
+  if (typeof record.name !== 'string') return null
+  const output =
+    typeof record.output === 'string'
+      ? record.output
+      : Array.isArray(record.output)
+        ? record.output.filter(
+            (part): part is Record<string, unknown> =>
+              !!part && typeof part === 'object' && !Array.isArray(part),
+          )
+        : null
+  if (output === null) return null
+  return {
+    name: record.name,
+    namespace: typeof record.namespace === 'string' ? record.namespace : null,
+    output,
+  }
+}
+
+// What Claude reads for a tool result: its text and images, as user input.
+export function toolOutputInput(output: TurnToolOutput['output']): UserInput[] {
+  if (typeof output === 'string') return output ? [{ type: 'text', text: output }] : []
+  return output.flatMap((part): UserInput[] => {
+    if (part.type === 'input_text' && typeof part.text === 'string')
+      return [{ type: 'text', text: part.text }]
+    if (part.type === 'input_image' && typeof part.image_url === 'string')
+      return [{ type: 'image', url: part.image_url }]
+    return []
+  })
 }
 
 // Split UserInput[] into the text prompt + a list of image inputs ready to

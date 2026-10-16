@@ -7,6 +7,7 @@ import type {
   RuntimeLiveTask,
   RuntimeSteerOptions,
   RuntimeTurnContext,
+  RuntimeTurnSettings,
 } from './types.mjs'
 import { sleep } from './util.mjs'
 
@@ -16,6 +17,10 @@ const MOCK_FOREGROUND_AGENT_ID = 'deadbeefcafef00d'
 export class MockRuntime implements ClaudeRuntime {
   private interrupted = new Set<string>()
   private running = new Set<string>()
+  // The running turn of each thread, and the settings turn/settings/update
+  // gave it.
+  private runningTurns = new Map<string, string>()
+  private turnSettings = new Map<string, RuntimeTurnSettings>()
   private listener: RuntimeBackgroundListener | null = null
   private backgroundTasks = new Map<string, { threadId: string; timer: NodeJS.Timeout }>()
   // What Claude says, unprompted, once a background agent reports back.
@@ -36,11 +41,24 @@ export class MockRuntime implements ClaudeRuntime {
     // still draining): input cannot reach the turn yet.
     if (/slow start/i.test(context.prompt)) await sleep(500)
     this.running.add(context.threadId)
+    this.runningTurns.set(context.threadId, context.turnId)
     try {
       await this.playTurn(context, handlers)
     } finally {
       this.running.delete(context.threadId)
+      this.runningTurns.delete(context.threadId)
+      this.turnSettings.delete(context.turnId)
     }
+  }
+
+  async updateTurnSettings(
+    threadId: string,
+    turnId: string,
+    settings: RuntimeTurnSettings,
+  ): Promise<boolean> {
+    if (this.runningTurns.get(threadId) !== turnId) return false
+    this.turnSettings.set(turnId, { ...this.turnSettings.get(turnId), ...settings })
+    return true
   }
 
   private async playTurn(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void> {
@@ -158,7 +176,14 @@ export class MockRuntime implements ClaudeRuntime {
         await sleep(10)
       }
       this.steered.delete(context.threadId)
-      await handlers.onEvent({ type: 'text_delta', delta: ' released' })
+      const settings = this.turnSettings.get(context.turnId)
+      this.turnSettings.delete(context.turnId)
+      await handlers.onEvent({
+        type: 'text_delta',
+        delta: settings
+          ? ` released on model=${settings.model ?? 'unchanged'} effort=${settings.effort ?? 'unchanged'}`
+          : ' released',
+      })
       await handlers.onEvent({ type: 'completed', success: true, result: 'released' })
       return
     }
@@ -335,15 +360,46 @@ export class MockRuntime implements ClaudeRuntime {
     }
 
     if (/hook check/i.test(context.prompt)) {
+      const hook = { type: 'hook_run' as const, hookId: 'mock-hook', hookEvent: 'PreToolUse' }
+      await handlers.onEvent({ ...hook, status: 'running', entries: [] })
       await handlers.onEvent({
-        type: 'hook',
-        hookName: 'PreToolUse',
-        status: 'started',
-        decision: 'allow',
-        message: 'Bash about to run echo hi',
+        ...hook,
+        status: 'blocked',
+        entries: [{ kind: 'feedback', text: 'Bash about to run echo hi' }],
+      })
+      // Codex has no name for Notification hooks, so they never reach the App.
+      await handlers.onEvent({
+        type: 'hook_run',
+        hookId: 'mock-notification',
+        hookEvent: 'Notification',
+        status: 'completed',
+        entries: [],
       })
       await handlers.onEvent({ type: 'text_delta', delta: 'hook check done' })
       await handlers.onEvent({ type: 'completed', success: true, result: 'hook check' })
+      return
+    }
+
+    if (/elicitation check/i.test(context.prompt)) {
+      const url = /elicitation check url/i.test(context.prompt)
+      const response = await handlers.onElicitationRequest?.(
+        {
+          serverName: 'mock-mcp',
+          message: url ? 'Sign in to continue' : 'Pick a region',
+          mode: url ? 'url' : 'form',
+          requestedSchema: url
+            ? null
+            : { type: 'object', properties: { region: { type: 'string' } }, required: ['region'] },
+          url: url ? 'https://example.com/auth' : null,
+          elicitationId: url ? 'mock-elicitation' : null,
+        },
+        new AbortController().signal,
+      )
+      await handlers.onEvent({
+        type: 'text_delta',
+        delta: `elicitation=${JSON.stringify(response)}`,
+      })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'elicitation check' })
       return
     }
 

@@ -263,15 +263,15 @@ test('reasoning appears once and completes before visible prose', async () => {
   assert.ok(reasoningDone >= 0 && answerStart > reasoningDone)
 })
 
-test('hooks, approval and user questions retain their structured timeline items', async () => {
+test('approval and user questions retain their structured timeline items around hook runs', async () => {
   const { messages, turn } = await present(async (handlers) => {
     await handlers.onEvent({ type: 'text_delta', delta: 'Before hook.' })
     await handlers.onEvent({
-      type: 'hook',
-      hookName: 'PreToolUse',
-      status: 'done',
-      decision: null,
-      message: 'Checked',
+      type: 'hook_run',
+      hookId: 'pre',
+      hookEvent: 'PreToolUse',
+      status: 'completed',
+      entries: [],
     })
     await handlers.onEvent({ type: 'message_boundary' })
     await handlers.onEvent({ type: 'text_delta', delta: 'Before approval.' })
@@ -306,7 +306,6 @@ test('hooks, approval and user questions retain their structured timeline items'
     [
       'userMessage',
       'agentMessage',
-      'hookPrompt',
       'agentMessage',
       'commandExecution',
       'agentMessage',
@@ -330,10 +329,10 @@ test('hook telemetry and duplicate tools do not split a final Markdown response'
       { type: 'tool_use', toolUseId: 'read', toolName: 'Read', input: { file_path: 'app.ts' } },
       { type: 'tool_result', toolUseId: 'read', content: 'file content' },
       { type: 'text_delta', delta: '**Final' },
-      { type: 'hook', hookName: 'Stop', status: 'done', decision: null, message: null },
+      { type: 'hook_run', hookId: 'stop', hookEvent: 'Stop', status: 'completed', entries: [] },
       { type: 'tool_use', toolUseId: 'read', toolName: 'Read', input: { file_path: 'app.ts' } },
       { type: 'text_delta', delta: ' answer**' },
-      { type: 'hook', hookName: 'Stop', status: 'done', decision: null, message: null },
+      { type: 'hook_run', hookId: 'stop', hookEvent: 'Stop', status: 'completed', entries: [] },
       { type: 'completed', success: true },
     ]),
   )
