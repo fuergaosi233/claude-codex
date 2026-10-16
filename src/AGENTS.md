@@ -12,6 +12,9 @@ Adapter internals. All files are `.mts` ESM, compiled to `dist/*.mjs`. See the
 - `store.mts` — SQLite thread/turn persistence via `node:sqlite` (Node 24+).
 - `types.mts` — shared protocol/runtime types.
 - `util.mts` — shared helpers.
+- `app-compat.mts` — App rules: Codex App behavior the adapter relies on beyond
+  the protocol schema. Code that depends on one is tagged `// App rule: <id>`;
+  keep tags and rules in step (see `docs/reference/app-compat.md`).
 - `mcp.mts` — MCP stdio/HTTP tool & resource calls.
 - `worktree.mts` — optional per-thread git worktree isolation.
 

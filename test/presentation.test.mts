@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { CodexClaudeAppServer } from '../src/server.mjs'
+import { parseSubagentTrailer } from '../src/server-helpers.mjs'
 import { SessionStore } from '../src/store.mjs'
 import type {
   ClaudeRuntime,
@@ -17,7 +18,7 @@ import type {
 type CapturedMessage = { method?: string; id?: unknown; params?: any; result?: any; error?: any }
 
 async function present(
-  run: (handlers: RuntimeHandlers) => Promise<void>,
+  run: (handlers: RuntimeHandlers, turn: { interrupt: () => Promise<void> }) => Promise<void>,
   params: Record<string, unknown> = {},
 ) {
   const directory = await mkdtemp(join(tmpdir(), 'claude-presentation-'))
@@ -30,7 +31,15 @@ async function present(
     finish = resolve
   })
   const runtime: ClaudeRuntime = {
-    runTurn: async (_context, handlers) => run(handlers),
+    runTurn: async (context, handlers) =>
+      run(handlers, {
+        interrupt: () =>
+          server.handle(peer, {
+            id: 9,
+            method: 'turn/interrupt',
+            params: { threadId: context.threadId },
+          }) as Promise<void>,
+      }),
     steer: async () => {},
     interrupt: async () => {},
     stop: async () => {},
@@ -372,4 +381,108 @@ test('plan output retains its native plan item and complete Markdown', async () 
   assert.equal(plans[0]?.text, '## Plan\n\n1. Inspect\n2. Implement')
   assert.equal(assistantItems(turn.items).length, 0)
   assert.equal(messages.filter((message) => message.method === 'item/completed').length, 1)
+})
+
+test('an interrupt completes the message or plan still streaming before the turn', async () => {
+  for (const planMode of [false, true]) {
+    const { messages, turn, replay } = await present(
+      async (handlers, { interrupt }) => {
+        await handlers.onEvent({ type: 'text_delta', delta: 'Started the workflow.' })
+        await interrupt()
+      },
+      { planMode },
+    )
+    assert.equal(turn.status, 'interrupted')
+    const type = planMode ? 'plan' : 'agentMessage'
+    const order = messages
+      .filter(
+        (message) => message.method === 'item/completed' || message.method === 'turn/completed',
+      )
+      .map((message) => message.params.item?.type ?? message.method)
+    assert.deepEqual(order, [type, 'turn/completed'])
+    const live = messages.find((message) => message.method === 'item/completed')?.params.item
+    assert.equal(live.text, 'Started the workflow.')
+    assert.deepEqual(
+      replay.items.find((item: ThreadItem) => item.type === type),
+      live,
+    )
+  }
+})
+
+test('a turn that ends early fails the tool calls still running before the turn', async () => {
+  for (const ending of ['interrupt', 'error'] as const) {
+    const { messages, turn, replay } = await present(async (handlers, { interrupt }) => {
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId: 'sleep',
+        toolName: 'Bash',
+        input: { command: 'sleep 10' },
+      })
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId: 'read',
+        toolName: 'Read',
+        input: { file_path: 'notes.md' },
+      })
+      await handlers.onEvent({ type: 'tool_result', toolUseId: 'read', content: 'notes' })
+      if (ending === 'error') throw new Error('Claude exited')
+      await interrupt()
+      // The result that arrives after the interrupt is dropped.
+      await handlers.onEvent({ type: 'tool_result', toolUseId: 'sleep', content: 'late' })
+    })
+    assert.equal(turn.status, ending === 'interrupt' ? 'interrupted' : 'failed')
+    const order = messages
+      .filter(
+        (message) => message.method === 'item/completed' || message.method === 'turn/completed',
+      )
+      .map((message) =>
+        message.params.item
+          ? `${message.params.item.type}:${message.params.item.status}`
+          : message.method,
+      )
+    assert.deepEqual(order, ['mcpToolCall:completed', 'commandExecution:failed', 'turn/completed'])
+    const live = messages.find(
+      (message) =>
+        message.method === 'item/completed' && message.params.item.type === 'commandExecution',
+    )?.params.item
+    assert.equal(live.exitCode, null)
+    assert.equal(typeof live.durationMs, 'number')
+    assert.deepEqual(
+      replay.items.find((item: ThreadItem) => item.type === 'commandExecution'),
+      live,
+    )
+  }
+})
+
+test('subagent results keep only the report, in both CLI trailer formats', () => {
+  const legacy = parseSubagentTrailer(
+    "found it\nagentId: a1b2c3d4e5f6a7b8 (use SendMessage with to: 'a1b2c3d4e5f6a7b8' to continue this agent)\n<usage>total_tokens: 12\ntool_uses: 1\nduration_ms: 3</usage>",
+  )
+  assert.deepEqual(legacy, {
+    cleanText: 'found it',
+    agentId: 'a1b2c3d4e5f6a7b8',
+    usage: { totalTokens: 12, toolUses: 1, durationMs: 3 },
+  })
+
+  const framed = parseSubagentTrailer(
+    [
+      '  SECURITY WARNING: a note for the parent model.',
+      '[Subagent hand-back] The text below is the final report of a subagent. The report follows:',
+      '  Done.',
+      '  [Subagent hand-back] quoted by the agent, so it stays',
+      '  ',
+      '    nested indent',
+      "agentId: aef61b963198d372e (use SendMessage with to: 'aef61b963198d372e', summary: '<5-10 word recap>' to continue this agent)",
+      'worktreePath: /tmp/wt',
+      'worktreeBranch: agent-wt',
+      '<usage>subagent_tokens: 18437',
+      'tool_uses: 1',
+      'duration_ms: 97082</usage>',
+    ].join('\n'),
+  )
+  assert.deepEqual(framed, {
+    cleanText: 'Done.\n[Subagent hand-back] quoted by the agent, so it stays\n\n  nested indent',
+    agentId: 'aef61b963198d372e',
+    usage: { totalTokens: 18437, toolUses: 1, durationMs: 97082 },
+  })
 })

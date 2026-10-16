@@ -131,6 +131,7 @@ export function platformOs(): string {
 // optional methods + enum variants), so reporting 0.142 stays compatible with
 // older Codex App builds while satisfying newer ones' minimum-version probe.
 // Override per host with CLAUDE_CODEX_COMPAT_VERSION.
+// App rule: feature-gates
 const DEFAULT_CODEX_COMPAT_VERSION = '0.142.3'
 
 export function codexCompatVersion(): string {

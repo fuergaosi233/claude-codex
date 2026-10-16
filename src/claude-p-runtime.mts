@@ -67,7 +67,7 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
     }
   }
 
-  async steer(): Promise<void> {
+  async steer(): Promise<undefined> {
     throw new Error('claude-p runtime does not support turn/steer; start a new turn instead')
   }
 
@@ -102,7 +102,7 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
     // still emit the previous assistant result in stdout, so keep resume
     // opt-in until that upstream behavior is stable.
     const resume = this.options.resume ? claudePResumeId(context.claudeSessionId) : null
-    if (resume && !context.forkSession) args.push('--resume', resume)
+    if (resume && !context.forkSession && !context.resumeSessionAt) args.push('--resume', resume)
     const allowedTools = allowedToolsForContext(context)
     if (allowedTools) args.push('--allowedTools', allowedTools)
     if (

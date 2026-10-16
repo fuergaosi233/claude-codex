@@ -112,6 +112,43 @@ export interface ThreadRecord {
   baseInstructions: string | null
   developerInstructions: string | null
   personality: string | null
+  // The project the thread belongs to. Read-only here: upsertThread leaves it
+  // alone, so a stale record saved after a turn cannot undo an assignment
+  // made meanwhile. Assign through SessionStore.setThreadProject.
+  projectId?: string | null
+}
+
+// Codex `Project`: a named group of threads with workspace roots. Times are
+// Unix seconds; recencyAt is the newest unarchived member thread's update.
+export interface ProjectRecord {
+  id: string
+  name: string
+  roots: Array<{ path: string }>
+  metadata: Record<string, string>
+  position: number
+  createdAt: number
+  updatedAt: number
+  recencyAt: number | null
+}
+
+// Codex `ThreadAttachment`: App-owned JSON kept with a thread (its archived
+// worktree, linked pull requests), unique per (type, identityKey).
+export interface ThreadAttachmentRecord {
+  id: string
+  attachmentType: string
+  identityKey: string
+  payload: unknown
+  createdAt: number
+}
+
+// Codex `ExternalAgentConfigImportHistory`: one finished import the App
+// recorded, with what it brought over and what failed.
+export interface ImportHistoryRecord {
+  importId: string
+  providerId: string | null
+  completedAtMs: number
+  successes: unknown[]
+  failures: unknown[]
 }
 
 export interface ThreadSectionAppearance {
@@ -157,8 +194,36 @@ export type UserInput =
   | { type: 'skill'; name: string; path: string }
   | { type: 'mention'; name: string; path: string }
 
+export type ThreadGoalStatus =
+  | 'active'
+  | 'paused'
+  | 'blocked'
+  | 'usageLimited'
+  | 'budgetLimited'
+  | 'complete'
+
+export interface ThreadGoal {
+  threadId: string
+  objective: string
+  status: ThreadGoalStatus
+  tokenBudget: number | null
+  tokensUsed: number
+  timeUsedSeconds: number
+  createdAt: number
+  updatedAt: number
+}
+
+// A follow-up the App queued server-side (thread/queue/*) while a turn ran.
+export interface QueuedSubmission {
+  id: string
+  input: UserInput[]
+  clientUserMessageId: string | null
+}
+
 export type ThreadItem =
-  | { type: 'userMessage'; id: string; content: UserInput[] }
+  // clientId echoes turn/start's or turn/steer's clientUserMessageId so the
+  // App can reconcile its optimistic copy of the message.
+  | { type: 'userMessage'; id: string; content: UserInput[]; clientId?: string }
   | { type: 'agentMessage'; id: string; text: string; phase: string | null; memoryCitation: null }
   | { type: 'plan'; id: string; text: string }
   | { type: 'reasoning'; id: string; summary: string[]; content: string[] }
@@ -311,6 +376,9 @@ export interface RuntimeTurnContext {
   effort: string | null
   claudeSessionId: string | null
   forkSession: boolean
+  // Resume claudeSessionId only up to this transcript entry, in a forked
+  // session (thread rewind or fork). Backends that cannot truncate ignore it.
+  resumeSessionAt?: string | null
   mcpServers: unknown | null
   allowedTools: string[] | null
   addDirs: string[]
@@ -333,6 +401,22 @@ export interface RuntimeTurnContext {
   // encoded; image (URL) is passed through as-is. Sidecar reshapes the
   // Claude SDK query into a multimodal user message when this is non-empty.
   imageInputs: ImageInput[]
+  // Attach to a turn Claude already started on its own (a background task
+  // reported back) instead of sending `prompt`. Only meaningful after the
+  // runtime called RuntimeBackgroundListener.onAutonomousTurn for the thread.
+  continuation?: boolean
+  // The thread has a goal: expose Codex's goal tools (get_goal, create_goal,
+  // update_goal) to Claude. Backends without in-process tools ignore it.
+  goalTools?: GoalToolHandlers | null
+}
+
+// Each handler returns the text of the tool result; a thrown Error becomes an
+// error result. They outlive the turn (a live session keeps its tools), so
+// they must resolve the thread's state when called, not when created.
+export interface GoalToolHandlers {
+  getGoal(): Promise<string>
+  createGoal(objective: string, tokenBudget: number | null): Promise<string>
+  updateGoal(status: string): Promise<string>
 }
 
 export interface ImageInput {
@@ -344,15 +428,33 @@ export interface ImageInput {
   displayPath: string
 }
 
+// A point in a Claude session transcript: resuming `sessionId` at
+// `messageUuid` restores exactly the context Claude had there.
+export interface ClaudeCheckpoint {
+  sessionId: string
+  messageUuid: string
+}
+
 export type RuntimeEvent =
   | { type: 'session'; claudeSessionId: string }
+  // Claude wrote a top-level transcript entry; the newest one of a turn is
+  // where a rewind back to that turn resumes.
+  | { type: 'checkpoint'; claudeSessionId: string; messageUuid: string }
   // A new top-level model response is beginning, not a streamed content block.
   | { type: 'message_boundary' }
   | { type: 'text_delta'; delta: string }
   | { type: 'reasoning_delta'; delta: string }
   | { type: 'tool_use'; toolUseId: string; toolName: string; input: Record<string, unknown> }
   | { type: 'tool_output_delta'; toolUseId: string; delta: string }
-  | { type: 'tool_result'; toolUseId: string; content: unknown; isError?: boolean }
+  | {
+      type: 'tool_result'
+      toolUseId: string
+      content: unknown
+      isError?: boolean
+      // Claude Code's structured tool result (e.g. Agent `async_launched`,
+      // SendMessage `resumedAgentId`) when the backend exposes it.
+      structured?: Record<string, unknown> | null
+    }
   | {
       type: 'permission_request'
       requestId: string
@@ -367,7 +469,17 @@ export type RuntimeEvent =
       questions: UserInputQuestion[]
     }
   | { type: 'notice'; level: 'info' | 'warning' | 'error'; message: string }
-  | { type: 'usage'; usage: Record<string, unknown> }
+  // A result's usage. `child` marks tokens a subagent or workflow spent:
+  // they add to the thread's total, not to its context window.
+  | {
+      type: 'usage'
+      usage: Record<string, unknown>
+      contextWindow?: number | null
+      child?: boolean
+    }
+  // One API call of the main loop, before the turn's result settles its
+  // usage. A message can be reported again with a larger count.
+  | { type: 'usage_progress'; messageId: string; usage: Record<string, unknown> }
   | {
       type: 'metrics'
       durationMs: number | null
@@ -440,9 +552,108 @@ export interface RuntimeHandlers {
   ): Promise<UserInputAnswers>
 }
 
+export interface RuntimeTaskUsage {
+  totalTokens: number
+  toolUses: number
+  durationMs: number
+}
+
+// Claude Code task lifecycle (background agents, background shells, ...).
+// A background task outlives the turn that launched it, so these events are
+// routed per thread rather than through a turn's handlers.
+export type RuntimeTaskEvent =
+  | {
+      type: 'task_started'
+      taskId: string
+      toolUseId: string | null
+      taskType: string | null
+      description: string
+      subagentType: string | null
+      prompt: string | null
+      backgrounded: boolean | null
+    }
+  | {
+      type: 'task_progress'
+      taskId: string
+      toolUseId: string | null
+      description: string
+      summary: string | null
+      lastToolName: string | null
+      usage: RuntimeTaskUsage | null
+    }
+  | {
+      type: 'task_updated'
+      taskId: string
+      status: string | null
+      backgrounded: boolean | null
+      error: string | null
+    }
+  | {
+      type: 'task_notification'
+      taskId: string
+      toolUseId: string | null
+      status: 'completed' | 'failed' | 'stopped'
+      summary: string
+      // The task's final report when the backend can recover it (for local
+      // agents: the last assistant message of the sidechain transcript).
+      result: string | null
+      usage: RuntimeTaskUsage | null
+    }
+
+export interface RuntimeBackgroundListener {
+  onTaskEvent(threadId: string, event: RuntimeTaskEvent): Promise<void> | void
+  // Claude began a turn without a user prompt (a background task reported
+  // back). The server opens a parent turn and calls runTurn with
+  // `continuation: true` to receive it.
+  onAutonomousTurn(threadId: string): void
+  // The thread's live session ended. `liveTaskIds` are the background tasks
+  // it still tracked as running; nothing will report on them any more.
+  onSessionReleased(threadId: string, liveTaskIds: string[]): void
+}
+
+export interface RuntimeSteerOptions {
+  imageInputs?: ImageInput[]
+  // Fires once the backend starts consuming the message (Claude Code folds a
+  // steer in at the next tool-round boundary, or runs it as its own turn).
+  onAccepted?: () => void
+}
+
+// A background task of a live session: a backgrounded Bash shell
+// (`local_bash`), agent or workflow, with the tool call that started it.
+export interface RuntimeLiveTask {
+  taskId: string
+  taskType: string | null
+  toolUseId: string | null
+}
+
 export interface ClaudeRuntime {
   runTurn(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void>
-  steer(threadId: string, prompt: string): Promise<void>
+  // false: no running turn took the message. true: delivered, and
+  // options.onAccepted fires once it is consumed. undefined: delivered by a
+  // backend that cannot tell when it is consumed.
+  steer(
+    threadId: string,
+    prompt: string,
+    options?: RuntimeSteerOptions,
+  ): Promise<boolean | undefined>
   interrupt(threadId: string): Promise<void>
   stop(): Promise<void>
+  setBackgroundListener?(listener: RuntimeBackgroundListener): void
+  // Stop one background task of the thread's live session. Resolves false
+  // when no live session owns the task.
+  stopTask?(threadId: string, taskId: string): Promise<boolean>
+  // Background tasks still running in the thread's live session.
+  liveTasks?(threadId: string): RuntimeLiveTask[]
+  // True while a session outlives its turns: background tasks are running or
+  // Claude may still answer one that just reported back.
+  hasBackgroundWork?(): boolean
+  // True when Claude already produced output for a turn nobody has claimed
+  // yet; the server answers it with a `continuation: true` turn.
+  hasPendingContinuation?(threadId: string): boolean
+  // True when the backend drops a subagent's own events itself, so whatever
+  // reaches the server while an Agent call is open belongs to the parent.
+  filtersNestedEvents?(threadId: string): boolean
+  // Close the thread's live session, background tasks included, so its next
+  // turn starts a new one: the thread's history was rewound or deleted.
+  resetSession?(threadId: string): void
 }

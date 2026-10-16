@@ -1,5 +1,10 @@
 import assert from 'node:assert/strict'
-import { type ChildProcess, execFileSync, spawn } from 'node:child_process'
+import {
+  type ChildProcess,
+  type ChildProcessWithoutNullStreams,
+  execFileSync,
+  spawn,
+} from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
@@ -32,6 +37,12 @@ test('server dispatch covers current Codex app-server client method surface', as
     'thread/goal/set',
     'thread/goal/get',
     'thread/goal/clear',
+    'thread/queue/add',
+    'thread/queue/list',
+    'thread/queue/update',
+    'thread/queue/delete',
+    'thread/queue/reorder',
+    'thread/queue/start',
     'thread/metadata/update',
     'thread/section/move',
     'threadSection/list',
@@ -1985,18 +1996,20 @@ test('startup recovery repairs stale items on already-terminal turns and is idem
   }
 })
 
-test('startup recovery removes legacy activity markers from completed subagent turns', async () => {
+test('startup recovery keeps markers of finished agents and ends the ones it cut off', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const store = new SessionStore(join(home, 'state.sqlite'))
   const threadId = randomUUID()
   const turnId = randomUUID()
-  const childThreadId = randomUUID()
-  try {
+  const finished = randomUUID()
+  const cutOff = randomUUID()
+  const now = Math.floor(Date.now() / 1000)
+  const thread = (id: string, preview: string) =>
     store.upsertThread({
-      id: threadId,
-      sessionId: threadId,
-      forkedFromId: null,
-      preview: 'legacy activity history',
+      id,
+      sessionId: id,
+      forkedFromId: id === threadId ? null : threadId,
+      preview,
       name: null,
       archived: false,
       cwd: process.cwd(),
@@ -2005,13 +2018,13 @@ test('startup recovery removes legacy activity markers from completed subagent t
       modelProvider: 'claude-code',
       claudeSessionId: null,
       source: 'appServer',
-      createdAt: Math.floor(Date.now() / 1000) - 2,
-      updatedAt: Math.floor(Date.now() / 1000) - 2,
+      createdAt: now - 5,
+      updatedAt: now - 5,
       status: { type: 'active', activeFlags: [] },
       approvalPolicy: 'on-request',
       sandboxMode: 'workspace-write',
-      ephemeral: false,
-      threadSource: 'user',
+      ephemeral: id !== threadId,
+      threadSource: id === threadId ? 'user' : 'subagent',
       agentRole: null,
       agentNickname: null,
       baseInstructions: null,
@@ -2020,52 +2033,93 @@ test('startup recovery removes legacy activity markers from completed subagent t
       runtimeBackend: 'claude',
       codexSessionId: null,
     })
+  const childTurn = (id: string, status: 'completed' | 'inProgress') =>
+    store.upsertTurn({
+      id: randomUUID(),
+      threadId: id,
+      status,
+      startedAt: now - 4,
+      completedAt: status === 'completed' ? now - 1 : null,
+      durationMs: status === 'completed' ? 3000 : null,
+      items: [],
+      diff: '',
+      error: null,
+    })
+  const spawn = (id: string) => ({
+    type: 'collabAgentToolCall' as const,
+    id: randomUUID(),
+    tool: 'spawnAgent' as const,
+    status: 'completed' as const,
+    senderThreadId: threadId,
+    receiverThreadIds: [id],
+    prompt: 'work',
+    model: null,
+    reasoningEffort: null,
+    agentsStates: { [id]: { status: 'running' as const, message: null } },
+  })
+  const activity = (id: string, kind: 'started' | 'completed') => ({
+    type: 'subAgentActivity' as const,
+    id: randomUUID(),
+    kind,
+    agentThreadId: id,
+    agentPath: `/root/${id.slice(0, 8)}`,
+  })
+  try {
+    thread(threadId, 'background agents across a restart')
+    thread(finished, 'finished')
+    thread(cutOff, 'cut off')
+    childTurn(finished, 'completed')
+    childTurn(cutOff, 'inProgress')
     store.upsertTurn({
       id: turnId,
       threadId,
       status: 'completed',
-      startedAt: Math.floor(Date.now() / 1000) - 2,
-      completedAt: Math.floor(Date.now() / 1000) - 1,
+      startedAt: now - 5,
+      completedAt: now - 4,
       durationMs: 1000,
       items: [
-        {
-          type: 'subAgentActivity',
-          id: randomUUID(),
-          kind: 'started',
-          agentThreadId: childThreadId,
-          agentPath: '/root/legacy',
-        },
-        {
-          type: 'subAgentActivity',
-          id: randomUUID(),
-          kind: 'completed',
-          agentThreadId: childThreadId,
-          agentPath: '/root/legacy',
-        },
+        spawn(finished),
+        activity(finished, 'started'),
+        spawn(cutOff),
+        activity(cutOff, 'started'),
         {
           type: 'collabAgentToolCall',
           id: randomUUID(),
           tool: 'wait',
-          status: 'completed',
+          status: 'failed',
           senderThreadId: threadId,
-          receiverThreadIds: [childThreadId],
+          receiverThreadIds: [cutOff],
           prompt: null,
           model: null,
           reasoningEffort: null,
-          agentsStates: { [childThreadId]: { status: 'completed', message: null } },
+          agentsStates: { [cutOff]: { status: 'running', message: null } },
         },
+        activity(finished, 'completed'),
       ],
       diff: '',
       error: null,
     })
 
-    assert.equal(store.recoverStaleInProgressTurns(), 1)
+    assert.ok(store.recoverStaleInProgressTurns() >= 2)
     const recovered = store.getTurn(turnId)
     assert.ok(recovered)
-    assert.equal(
-      recovered.items.some((item) => item.type === 'subAgentActivity'),
-      false,
+    const marks = recovered.items.map((item) =>
+      item.type === 'subAgentActivity'
+        ? `${item.agentThreadId === finished ? 'finished' : 'cutOff'}:${item.kind}`
+        : item.type === 'collabAgentToolCall'
+          ? `${item.tool}:${item.status}:${Object.entries(item.agentsStates)
+              .map(([id, state]) => `${id === finished ? 'finished' : 'cutOff'}=${state?.status}`)
+              .join(',')}`
+          : item.type,
     )
+    assert.deepEqual(marks, [
+      'spawnAgent:completed:finished=running',
+      'finished:started',
+      'spawnAgent:completed:cutOff=errored',
+      'cutOff:interrupted',
+      'wait:failed:cutOff=errored',
+      'finished:completed',
+    ])
     assert.equal(store.getThread(threadId)?.status.type, 'idle')
     assert.equal(store.recoverStaleInProgressTurns(), 0)
   } finally {
@@ -2172,6 +2226,8 @@ test('remote shim launches daemon and proxy with Codex-compatible commands', {
     env: {
       ...process.env,
       CODEX_HOME: home,
+      // The shim sources a runtime env; keep the developer's own out of it.
+      CLAUDE_CODEX_RUNTIME_ENV: join(home, 'runtime.env'),
       CLAUDE_CODEX_ADAPTER: adapter,
       CLAUDE_CODEX_MOCK: '1',
       NODE_NO_WARNINGS: '1',
@@ -2182,6 +2238,8 @@ test('remote shim launches daemon and proxy with Codex-compatible commands', {
     env: {
       ...process.env,
       CODEX_HOME: home,
+      // The shim sources a runtime env; keep the developer's own out of it.
+      CLAUDE_CODEX_RUNTIME_ENV: join(home, 'runtime.env'),
       CLAUDE_CODEX_ADAPTER: adapter,
       CLAUDE_CODEX_MOCK: '1',
       NODE_NO_WARNINGS: '1',
@@ -2467,6 +2525,49 @@ test('Claude thinking maps to Codex reasoning content without a duplicate summar
     assert.equal(sawContent, true)
     assert.deepEqual(completedReasoning.summary, [])
     assert.deepEqual(completedReasoning.content, ['mock thinking'])
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('the context gauge follows the last API call and child tokens add to the total', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  try {
+    const threadId = await startMockThread(reader, proc)
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: textInput('context usage check') },
+      }),
+    )
+    await reader.nextResponse(2)
+    const turn = await readUntil(
+      reader,
+      (message) => message.method === 'turn/completed' && message.params.threadId === threadId,
+    )
+    const updates = turn
+      .filter((m) => m.method === 'thread/tokenUsage/updated')
+      .map((m) => m.params.tokenUsage)
+    const lastCall = {
+      inputTokens: 30,
+      cachedInputTokens: 120,
+      outputTokens: 50,
+      reasoningOutputTokens: 0,
+      totalTokens: 200,
+    }
+    assert.equal(updates.length, 2)
+    // Codex's last_token_usage is one response, which is what fills the
+    // context; the result's sum over both calls would not be.
+    assert.deepEqual(updates[0].last, lastCall)
+    assert.equal(updates[0].total.totalTokens, 320)
+    assert.equal(updates[0].modelContextWindow, 200_000)
+    assert.deepEqual(updates[1].last, lastCall, 'child tokens leave the gauge alone')
+    assert.equal(updates[1].total.totalTokens, 1320)
+    assert.equal(updates[1].modelContextWindow, 200_000)
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -3179,6 +3280,7 @@ test('Task subagent emits the canonical activity lifecycle and leaves wait as th
     let childAgentMessageText = ''
     let childTurnCompleted: any = null
     let liveChildRead: any = null
+    let childTokenUsage: any = null
     let leakedInnerItems = 0
     const subagentActivityStarted = new Map<string, any>()
     const subagentActivities: any[] = []
@@ -3198,7 +3300,7 @@ test('Task subagent emits the canonical activity lifecycle and leaves wait as th
           json({
             id: 50,
             method: 'thread/read',
-            // The bundled Codex cc panel uses includeTurns:false while it
+            // The bundled Codex App panel uses includeTurns:false while it
             // opens a child. The adapter must still hydrate this subagent.
             params: { threadId: message.params.threadId, includeTurns: false },
           }),
@@ -3248,8 +3350,11 @@ test('Task subagent emits the canonical activity lifecycle and leaves wait as th
         if (message.params.threadId === threadId) break
         childTurnCompleted = message.params.turn
       }
+      if (message.method === 'thread/tokenUsage/updated' && message.params.threadId !== threadId)
+        childTokenUsage = message.params.tokenUsage
     }
-
+    // The `<usage>subagent_tokens: N` trailer becomes the child's usage.
+    assert.equal(childTokenUsage?.total.totalTokens, 4242)
     // Native V2 uses activity items for liveness and leaves wait/completed as
     // the final parent item. Closing an already-finished child makes older App
     // reducers discard that completed state and fall back to "started".
@@ -3421,22 +3526,32 @@ test('Task subagent emits the canonical activity lifecycle and leaves wait as th
       /subagent final summary/,
       'the real subagent body must still be there',
     )
+    assert.equal(
+      childAgent.text,
+      'subagent final summary\n\n```\nindented detail\n```',
+      'the hand-back frame and its indentation should be gone',
+    )
 
-    // A same-process late-opened parent must replay a terminal activity, not
-    // the stale started marker that drives the App spinner.
+    // A reload replays the activity cards this client saw live, in order, so
+    // the completed marker still lands before wait/completed.
     proc.stdin.write(
       json({ id: 8, method: 'thread/turns/list', params: { threadId, itemsView: 'full' } }),
     )
     const liveParentTurns = await reader.nextResponse(8)
-    const liveActivityKinds = (liveParentTurns.result.data as any[])
+    const replayed = (liveParentTurns.result.data as any[])
       .flatMap((turn: any) => turn.items ?? [])
-      .filter((item: any) => item.type === 'subAgentActivity')
-      .map((item: any) => item.kind)
+      .filter(
+        (item: any) => item.type === 'subAgentActivity' || item.type === 'collabAgentToolCall',
+      )
+      .map((item: any) =>
+        item.type === 'subAgentActivity' ? `activity:${item.kind}` : `collab:${item.tool}`,
+      )
     assert.deepEqual(
-      liveActivityKinds,
-      [],
-      'same-process parent history must not retain capability-specific activity markers',
+      replayed.filter((entry: string) => entry.startsWith('activity:')),
+      ['activity:started', 'activity:completed'],
+      'parent history must keep the activity cards the client saw live',
     )
+    assert.ok(replayed.indexOf('activity:completed') < replayed.indexOf('collab:wait'))
 
     assert.equal(leakedInnerItems, 0, 'inner Bash tool calls should not appear at the parent level')
     assert.doesNotMatch(
@@ -3538,8 +3653,9 @@ test('Task subagent emits the canonical activity lifecycle and leaves wait as th
 
     // Restart the adapter and replay the parent turn from SQLite. The bundled
     // App reduces items in persisted order, so wait/completed must still be
-    // the last subagent state after a cold restart. Activity markers are
-    // live-only extensions; the durable history stays capability-neutral.
+    // the last subagent state after a cold restart. This connection never
+    // initializes, so it reads like a legacy client and gets no started or
+    // completed activity markers it could not have been sent live.
     const exited = once(proc, 'exit')
     proc.kill()
     await exited
@@ -3597,7 +3713,7 @@ test('Task subagent emits the canonical activity lifecycle and leaves wait as th
         json({
           id: 3,
           method: 'thread/read',
-          // Cold-open follows the same metadata-only request as Codex cc.
+          // Cold-open follows the same metadata-only request as the Codex App.
           params: { threadId: childThreadId, includeTurns: false },
         }),
       )
@@ -3636,7 +3752,7 @@ test('Task subagent emits the canonical activity lifecycle and leaves wait as th
   }
 })
 
-test('Codex cc 26.818 settles subagents without the unsupported completed activity kind', async () => {
+test('Codex App 26.818 settles subagents without the unsupported completed activity kind', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -3706,7 +3822,7 @@ test('Codex cc 26.818 settles subagents without the unsupported completed activi
     assert.deepEqual(
       activityKinds,
       [],
-      'Codex cc 26.818 must use spawnAgent/wait lifecycle instead of an unsupported started marker',
+      'Codex App 26.818 must use spawnAgent/wait lifecycle instead of an unsupported started marker',
     )
     assert.ok(childPromptStarted)
     assert.ok(childPromptCompleted)
@@ -3800,7 +3916,7 @@ test('subagent without a terminal result emits interrupted activity and failed w
     assert.equal(
       sawClose,
       true,
-      'legacy Codex cc needs closeAgent to clear an orphaned child spinner',
+      'legacy Codex App needs closeAgent to clear an orphaned child spinner',
     )
     assert.deepEqual(activityKinds, ['interrupted'])
     assert.ok(childTurnCompleted)
@@ -3817,6 +3933,913 @@ test('subagent without a terminal result emits interrupted activity and failed w
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
+
+test('server stop keeps a background report from opening a parent turn after it', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  try {
+    const result = execFileSync(
+      process.execPath,
+      [
+        '--no-warnings',
+        '--input-type=module',
+        '-e',
+        `
+      import { join } from 'node:path'
+      import { CodexClaudeAppServer } from './dist/src/server.mjs'
+      import { SessionStore } from './dist/src/store.mjs'
+
+      process.env.CLAUDE_CODEX_HOME = ${JSON.stringify(home)}
+      let listener
+      let launches = 0
+      const server = new CodexClaudeAppServer(
+        new SessionStore(join(${JSON.stringify(home)}, 'state.sqlite')),
+        {
+          setBackgroundListener: (value) => {
+            listener = value
+          },
+          hasPendingContinuation: () => true,
+          runTurn: async (context) => {
+            launches += 1
+            if (launches > 1) return new Promise(() => {})
+            // A background agent reports while this turn runs, so its
+            // continuation waits for the turn to clear.
+            listener.onAutonomousTurn(context.threadId)
+            throw new Error('turn failed')
+          },
+          async steer() {},
+          async interrupt() {},
+          async stop() {},
+        },
+      )
+      const messages = []
+      let stopping
+      const peer = {
+        id: 'peer',
+        send: (message) => {
+          messages.push(message)
+          // The adapter stops the moment the turn ends, before the
+          // continuation's tick.
+          if (message.method === 'turn/completed') stopping ??= server.stop()
+        },
+        close() {},
+      }
+      await server.handle(peer, {
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), persistExtendedHistory: false },
+      })
+      const threadId = messages.find((message) => message.id === 1).result.thread.id
+      await server.handle(peer, {
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: [{ type: 'text', text: 'go', text_elements: [] }] },
+      })
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      await stopping
+      process.stdout.write(JSON.stringify({ stopped: Boolean(stopping), launches }))
+    `,
+      ],
+      { cwd: resolve('.'), encoding: 'utf8', stdio: 'pipe' },
+    )
+    assert.deepEqual(JSON.parse(result), { stopped: true, launches: 1 })
+  } finally {
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('background Agent outlives the parent turn, wakes the parent, and resumes on SendMessage', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  const parentTurnCompleted = (threadId: string) => (message: any) =>
+    message.method === 'turn/completed' && message.params.threadId === threadId
+  try {
+    proc.stdin.write(json(codex930Initialize(0)))
+    await reader.nextResponse(0)
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const threadId = (await reader.nextResponse(1)).result.thread.id
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'background subagent check delay=600', text_elements: [] }],
+        },
+      }),
+    )
+    const firstTurnId = (await reader.nextResponse(2)).result.turn.id
+
+    // The launching turn settles while the child keeps running.
+    const launch = await readUntil(reader, parentTurnCompleted(threadId))
+    const spawned = launch.find(
+      (m) => m.method === 'item/completed' && m.params.item.tool === 'spawnAgent',
+    )
+    const childThreadId = String(spawned?.params.item.receiverThreadIds[0] ?? '')
+    assert.ok(childThreadId)
+    assert.equal(
+      launch.some(
+        (m) =>
+          (m.method === 'item/started' || m.method === 'item/completed') &&
+          m.params.item.tool === 'wait',
+      ),
+      false,
+      'a run_in_background agent gets no wait: nothing waits on it, and closing one marks it done',
+    )
+    assert.equal(launch.some(parentTurnCompleted(childThreadId)), false)
+    assert.deepEqual(activityKinds(launch, threadId), ['started'])
+
+    // The report completes the child, then Claude answers in a turn of its own.
+    const report = await readUntil(reader, parentTurnCompleted(threadId))
+    const childDone = report.findIndex(parentTurnCompleted(childThreadId))
+    assert.ok(childDone >= 0)
+    assert.equal(report[childDone].params.turn.status, 'completed')
+    assert.ok(
+      report.some(
+        (m) =>
+          m.method === 'item/agentMessage/delta' &&
+          m.params.threadId === childThreadId &&
+          m.params.delta === 'background report body',
+      ),
+    )
+    const wake = report.findIndex(
+      (m) => m.method === 'turn/started' && m.params.threadId === threadId,
+    )
+    assert.ok(wake > childDone, 'Claude answering the report opens a new parent turn')
+    const wakeTurnId = report[wake].params.turn.id
+    assert.notEqual(wakeTurnId, firstTurnId)
+    const wakeItems = report
+      .filter(
+        (m) =>
+          m.method === 'item/completed' &&
+          m.params.threadId === threadId &&
+          m.params.turnId === wakeTurnId,
+      )
+      .map((m) => m.params.item)
+    assert.ok(
+      wakeItems.some(
+        (item) =>
+          item.type === 'subAgentActivity' &&
+          item.kind === 'completed' &&
+          item.agentThreadId === childThreadId,
+      ),
+    )
+    assert.ok(
+      wakeItems.some(
+        (item) =>
+          item.type === 'agentMessage' &&
+          /Background agent reported: background report body/.test(item.text),
+      ),
+    )
+    assert.equal(report.at(-1).params.turn.status, 'completed')
+
+    proc.stdin.write(json({ id: 3, method: 'thread/read', params: { threadId } }))
+    const parent = (await reader.nextResponse(3)).result.thread
+    assert.equal(parent.turns.length, 2)
+    assert.equal(
+      parent.turns[0].items.some(
+        (item: any) => item.type === 'collabAgentToolCall' && item.tool === 'wait',
+      ),
+      false,
+      'no dangling wait in persisted history',
+    )
+    proc.stdin.write(json({ id: 4, method: 'thread/read', params: { threadId: childThreadId } }))
+    const child = (await reader.nextResponse(4)).result.thread
+    assert.equal(child.agentNickname, 'a0b1c2d3e4f5a6b7')
+    assert.equal(child.turns[0].status, 'completed')
+
+    // SendMessage to the agent is Codex's sendInput and reopens the child.
+    proc.stdin.write(
+      json({
+        id: 5,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'background message check delay=600', text_elements: [] }],
+        },
+      }),
+    )
+    await reader.nextResponse(5)
+    const sent = await readUntil(reader, parentTurnCompleted(threadId))
+    const sendInput = sent.find(
+      (m) => m.method === 'item/completed' && m.params.item.tool === 'sendInput',
+    )?.params.item
+    assert.ok(sendInput)
+    assert.deepEqual(sendInput.receiverThreadIds, [childThreadId])
+    assert.equal(sendInput.prompt, 'dig deeper')
+    assert.equal(sendInput.agentsStates[childThreadId].status, 'running')
+    assert.equal(
+      sent.some((m) => m.method === 'item/started' && m.params.item.type === 'mcpToolCall'),
+      false,
+      'SendMessage must not render as a generic tool call',
+    )
+    const resumed = sent.find(
+      (m) => m.method === 'turn/started' && m.params.threadId === childThreadId,
+    )
+    assert.ok(resumed)
+    assert.ok(
+      sent.some(
+        (m) =>
+          m.method === 'item/completed' &&
+          m.params.threadId === childThreadId &&
+          m.params.item.type === 'userMessage' &&
+          m.params.item.content[0].text === 'dig deeper',
+      ),
+    )
+    assert.deepEqual(activityKinds(sent, threadId), ['interacted'])
+
+    const followUp = await readUntil(reader, parentTurnCompleted(threadId))
+    const resumedDone = followUp.find(parentTurnCompleted(childThreadId))
+    assert.equal(resumedDone?.params.turn.id, resumed.params.turn.id)
+    assert.equal(resumedDone?.params.turn.status, 'completed')
+    assert.ok(
+      followUp.some(
+        (m) =>
+          m.method === 'item/completed' &&
+          m.params.threadId === threadId &&
+          m.params.item.type === 'agentMessage' &&
+          /follow-up report/.test(m.params.item.text),
+      ),
+    )
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('SendMessage to a finished foreground agent reopens it like a background one', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  const turnCompleted = (threadId: string) => (message: any) =>
+    message.method === 'turn/completed' && message.params.threadId === threadId
+  try {
+    proc.stdin.write(json(codex930Initialize(0)))
+    await reader.nextResponse(0)
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const threadId = (await reader.nextResponse(1)).result.thread.id
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: [{ type: 'text', text: 'subagent check', text_elements: [] }] },
+      }),
+    )
+    await reader.nextResponse(2)
+    const ran = await readUntil(reader, turnCompleted(threadId))
+    const childThreadId = String(
+      ran.find((m) => m.method === 'item/completed' && m.params.item.tool === 'spawnAgent')?.params
+        .item.receiverThreadIds[0] ?? '',
+    )
+    assert.ok(childThreadId)
+
+    proc.stdin.write(
+      json({
+        id: 3,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'foreground message check delay=300', text_elements: [] }],
+        },
+      }),
+    )
+    await reader.nextResponse(3)
+    const sent = await readUntil(reader, turnCompleted(threadId))
+    const sendInput = sent.find(
+      (m) => m.method === 'item/completed' && m.params.item.tool === 'sendInput',
+    )?.params.item
+    assert.ok(sendInput, 'SendMessage to a foreground agent is a sendInput, not a plain card')
+    assert.deepEqual(sendInput.receiverThreadIds, [childThreadId])
+    assert.equal(
+      sent.some((m) => m.method === 'item/started' && m.params.item.type === 'mcpToolCall'),
+      false,
+    )
+    const reopened = sent.find(
+      (m) => m.method === 'turn/started' && m.params.threadId === childThreadId,
+    )
+    assert.ok(reopened, 'the child gets a new turn for the message')
+    assert.deepEqual(activityKinds(sent, threadId), ['interacted'])
+
+    // The report settles the reopened turn and wakes the parent.
+    const report = await readUntil(reader, turnCompleted(threadId))
+    const reopenedDone = report.find(turnCompleted(childThreadId))
+    assert.equal(reopenedDone?.params.turn.id, reopened.params.turn.id)
+    assert.equal(reopenedDone?.params.turn.status, 'completed')
+    assert.ok(
+      report.some(
+        (m) =>
+          m.method === 'item/completed' &&
+          m.params.threadId === threadId &&
+          m.params.item.type === 'subAgentActivity' &&
+          m.params.item.kind === 'completed' &&
+          m.params.item.agentThreadId === childThreadId,
+      ),
+    )
+
+    proc.stdin.write(json({ id: 4, method: 'thread/read', params: { threadId: childThreadId } }))
+    const child = (await reader.nextResponse(4)).result.thread
+    assert.deepEqual(
+      child.turns.map((turn: any) => turn.status),
+      ['completed', 'completed'],
+    )
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('TaskStop on a background agent is a closeAgent that ends the child as interrupted', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  const turnCompleted = (threadId: string) => (message: any) =>
+    message.method === 'turn/completed' && message.params.threadId === threadId
+  try {
+    proc.stdin.write(json(codex930Initialize(0)))
+    await reader.nextResponse(0)
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const threadId = (await reader.nextResponse(1)).result.thread.id
+    const startTurn = (id: number, text: string) =>
+      proc.stdin.write(
+        json({
+          id,
+          method: 'turn/start',
+          params: { threadId, input: [{ type: 'text', text, text_elements: [] }] },
+        }),
+      )
+    startTurn(2, 'background subagent check delay=5000')
+    await reader.nextResponse(2)
+    const launch = await readUntil(reader, turnCompleted(threadId))
+    const childThreadId = String(
+      launch.find((m) => m.method === 'item/completed' && m.params.item.tool === 'spawnAgent')
+        ?.params.item.receiverThreadIds[0] ?? '',
+    )
+    assert.ok(childThreadId)
+
+    startTurn(3, 'background close check')
+    await reader.nextResponse(3)
+    const stopped = await readUntil(reader, turnCompleted(threadId))
+    const close = stopped.find(
+      (m) => m.method === 'item/completed' && m.params.item.tool === 'closeAgent',
+    )?.params.item
+    assert.ok(close, 'TaskStop on an agent is a closeAgent, not a plain card')
+    assert.equal(close.status, 'completed')
+    assert.deepEqual(close.receiverThreadIds, [childThreadId])
+    assert.equal(close.agentsStates[childThreadId].status, 'interrupted')
+    assert.equal(
+      stopped.some((m) => m.method === 'item/started' && m.params.item.type === 'mcpToolCall'),
+      false,
+    )
+    assert.equal(stopped.find(turnCompleted(childThreadId))?.params.turn.status, 'interrupted')
+    assert.deepEqual(activityKinds(stopped, threadId), ['interrupted'])
+    assert.equal(stopped.at(-1).params.turn.status, 'completed')
+
+    proc.stdin.write(json({ id: 4, method: 'thread/read', params: { threadId: childThreadId } }))
+    const child = (await reader.nextResponse(4)).result.thread
+    assert.equal(child.turns.at(-1).status, 'interrupted')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('a tool Claude runs beside an Agent call keeps its own card', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  try {
+    const threadId = await startMockThread(reader, proc)
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: textInput('parallel agent tool check') },
+      }),
+    )
+    await reader.nextResponse(2)
+    const turn = await readUntil(
+      reader,
+      (message) => message.method === 'turn/completed' && message.params.threadId === threadId,
+    )
+    const parentItems = turn
+      .filter((m) => m.method === 'item/completed' && m.params.threadId === threadId)
+      .map((m) => m.params.item)
+    const shell = parentItems.find((item) => item.type === 'commandExecution')
+    assert.equal(shell?.status, 'completed', 'the parallel Bash call must not be swallowed')
+    assert.ok(parentItems.some((item) => item.tool === 'spawnAgent'))
+    assert.ok(parentItems.some((item) => item.tool === 'wait' && item.status === 'completed'))
+    assert.ok(
+      parentItems.some((item) => item.type === 'agentMessage' && item.text === 'both finished'),
+    )
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('an agent backgrounded mid-wait closes the wait without marking the child done', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  const turnCompleted = (threadId: string) => (message: any) =>
+    message.method === 'turn/completed' && message.params.threadId === threadId
+  try {
+    proc.stdin.write(json(codex930Initialize(0)))
+    await reader.nextResponse(0)
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const threadId = (await reader.nextResponse(1)).result.thread.id
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'auto background check delay=600', text_elements: [] }],
+        },
+      }),
+    )
+    await reader.nextResponse(2)
+    const launch = await readUntil(reader, turnCompleted(threadId))
+    const waits = launch.filter(
+      (m) =>
+        (m.method === 'item/started' || m.method === 'item/completed') &&
+        m.params.item.tool === 'wait',
+    )
+    assert.deepEqual(
+      waits.map((m) => `${m.method}:${m.params.item.status}`),
+      ['item/started:inProgress', 'item/completed:failed'],
+      'the wait began and must end, not vanish',
+    )
+    const waitEnd = waits[1].params.item
+    const childThreadId = waitEnd.receiverThreadIds[0]
+    // A completed wait would mark every working agent done in the App roster.
+    assert.equal(waitEnd.agentsStates[childThreadId].status, 'running')
+    assert.equal(launch.some(turnCompleted(childThreadId)), false)
+
+    const report = await readUntil(reader, turnCompleted(threadId))
+    assert.equal(report.find(turnCompleted(childThreadId))?.params.turn.status, 'completed')
+
+    proc.stdin.write(json({ id: 3, method: 'thread/read', params: { threadId } }))
+    const parent = (await reader.nextResponse(3)).result.thread
+    const persistedWait = parent.turns[0].items.find(
+      (item: any) => item.type === 'collabAgentToolCall' && item.tool === 'wait',
+    )
+    assert.equal(persistedWait?.status, 'failed', 'reload shows the wait the App saw close')
+    assert.equal(persistedWait?.agentsStates[childThreadId].status, 'running')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('stopping a background child interrupts it without waking the parent', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json(codex930Initialize(0)))
+    await reader.nextResponse(0)
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const threadId = (await reader.nextResponse(1)).result.thread.id
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [
+            { type: 'text', text: 'background subagent check delay=30000', text_elements: [] },
+          ],
+        },
+      }),
+    )
+    await reader.nextResponse(2)
+    const launch = await readUntil(
+      reader,
+      (m) => m.method === 'turn/completed' && m.params.threadId === threadId,
+    )
+    const childStarted = launch.find(
+      (m) => m.method === 'turn/started' && m.params.threadId !== threadId,
+    )
+    const childThreadId = childStarted.params.threadId
+
+    // Codex sends turn/interrupt to every child with an in-progress turn.
+    proc.stdin.write(
+      json({
+        id: 3,
+        method: 'turn/interrupt',
+        params: { threadId: childThreadId, turnId: childStarted.params.turn.id },
+      }),
+    )
+    const stopped = await readUntil(reader, (m) => m.id === 3 && m.method == null)
+    const childDone = stopped.find(
+      (m) => m.method === 'turn/completed' && m.params.threadId === childThreadId,
+    )
+    assert.equal(childDone?.params.turn.status, 'interrupted')
+
+    // The parent had no turn to carry the activity; the next one does.
+    proc.stdin.write(
+      json({
+        id: 4,
+        method: 'turn/start',
+        params: { threadId, input: [{ type: 'text', text: 'hello', text_elements: [] }] },
+      }),
+    )
+    await reader.nextResponse(4)
+    const next = await readUntil(
+      reader,
+      (m) => m.method === 'turn/completed' && m.params.threadId === threadId,
+    )
+    assert.deepEqual(activityKinds(next, threadId), ['interrupted'])
+    assert.equal(
+      next.filter((m) => m.method === 'turn/started' && m.params.threadId === threadId).length,
+      1,
+      'only the user turn runs; a stopped agent does not wake Claude',
+    )
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('deleting a thread stops its running background child and ends the child turn first', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json(codex930Initialize(0)))
+    await reader.nextResponse(0)
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const threadId = (await reader.nextResponse(1)).result.thread.id
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [
+            { type: 'text', text: 'background subagent check delay=30000', text_elements: [] },
+          ],
+        },
+      }),
+    )
+    await reader.nextResponse(2)
+    const launch = await readUntil(
+      reader,
+      (m) => m.method === 'turn/completed' && m.params.threadId === threadId,
+    )
+    const childThreadId = launch.find(
+      (m) => m.method === 'turn/started' && m.params.threadId !== threadId,
+    ).params.threadId
+
+    proc.stdin.write(json({ id: 3, method: 'thread/delete', params: { threadId } }))
+    const deleted = await readUntil(reader, (m) => m.id === 3 && m.method == null)
+    assert.equal(deleted.at(-1).error, undefined)
+    const childDone = deleted.findIndex(
+      (m) => m.method === 'turn/completed' && m.params.threadId === childThreadId,
+    )
+    const childGone = deleted.findIndex(
+      (m) => m.method === 'thread/deleted' && m.params.threadId === childThreadId,
+    )
+    assert.notEqual(childDone, -1, 'the running child turn must end')
+    assert.equal(deleted[childDone].params.turn.status, 'interrupted')
+    assert.ok(childDone < childGone, 'the child turn ends before its thread goes')
+    assert.ok(deleted.some((m) => m.method === 'thread/deleted' && m.params.threadId === threadId))
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('stopping a foreground child ends it as interrupted and the parent carries on', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json(codex930Initialize(0)))
+    await reader.nextResponse(0)
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const threadId = (await reader.nextResponse(1)).result.thread.id
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: textInput('foreground stop check') },
+      }),
+    )
+    await reader.nextResponse(2)
+    const launch = await readUntil(
+      reader,
+      (m) => m.method === 'item/started' && m.params.item?.tool === 'wait',
+    )
+    const childStarted = launch.find(
+      (m) => m.method === 'turn/started' && m.params.threadId !== threadId,
+    )
+    const childThreadId = childStarted.params.threadId
+
+    proc.stdin.write(
+      json({
+        id: 3,
+        method: 'turn/interrupt',
+        params: { threadId: childThreadId, turnId: childStarted.params.turn.id },
+      }),
+    )
+    const rest = await readUntil(
+      reader,
+      (m) => m.method === 'turn/completed' && m.params.threadId === threadId,
+    )
+    const childDone = rest.filter(
+      (m) => m.method === 'turn/completed' && m.params.threadId === childThreadId,
+    )
+    assert.deepEqual(
+      childDone.map((m) => m.params.turn.status),
+      ['interrupted'],
+      'the child ends once, as interrupted, and its late result does not overwrite it',
+    )
+    const parentDone = rest.find(
+      (m) => m.method === 'turn/completed' && m.params.threadId === threadId,
+    )
+    assert.equal(parentDone.params.turn.status, 'completed', 'the parent turn keeps going')
+    const waitEnd = rest.find(
+      (m) => m.method === 'item/completed' && m.params.item?.tool === 'wait',
+    ).params.item
+    assert.equal(waitEnd.agentsStates[childThreadId].status, 'interrupted')
+    assert.deepEqual(activityKinds(rest, threadId), ['interrupted'])
+
+    proc.stdin.write(
+      json({
+        id: 4,
+        method: 'thread/read',
+        params: { threadId: childThreadId, includeTurns: true },
+      }),
+    )
+    const child = (await reader.nextResponse(4)).result.thread
+    assert.equal(child.turns.at(-1).status, 'interrupted')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+// Codex App 26.930's subagent roster reducer (app-initial I5t), reduced to the
+// status it shows per agent for one parent turn's items.
+function appRoster(items: any[], isTurnLive: boolean): Map<string, string> {
+  const fromState: Record<string, string> = {
+    pendingInit: 'waiting',
+    running: 'working',
+    completed: 'done',
+    interrupted: 'done',
+    shutdown: 'done',
+    errored: 'failed',
+    notFound: 'failed',
+  }
+  const busy = (status: string) => status === 'waiting' || status === 'working'
+  const roster = new Map<string, string>()
+  const status = (id: string) => roster.get(id) ?? 'working'
+  for (const item of items) {
+    if (item.type === 'subAgentActivity') {
+      const ended = item.kind === 'completed' || item.kind === 'interrupted'
+      roster.set(item.agentThreadId, ended ? 'done' : 'working')
+      continue
+    }
+    if (item.type !== 'collabAgentToolCall') continue
+    const spawning = ['spawnAgent', 'sendInput', 'resumeAgent'].includes(item.tool)
+    for (const id of item.receiverThreadIds)
+      roster.set(id, item.status !== 'failed' && spawning ? 'working' : status(id))
+    for (const [id, state] of Object.entries<any>(item.agentsStates ?? {}))
+      roster.set(id, fromState[state.status] ?? status(id))
+    if (item.tool === 'wait' && item.status === 'completed')
+      for (const [id, value] of roster) if (busy(value)) roster.set(id, 'done')
+  }
+  if (!isTurnLive) for (const [id, value] of roster) if (busy(value)) roster.set(id, 'done')
+  return roster
+}
+
+// The parent thread's items as the App holds them: first appearance order,
+// latest state.
+function liveItems(messages: any[], threadId: string): any[] {
+  const items = new Map<string, any>()
+  for (const m of messages)
+    if (
+      (m.method === 'item/started' || m.method === 'item/completed') &&
+      m.params.threadId === threadId
+    )
+      items.set(m.params.item.id, m.params.item)
+  return [...items.values()]
+}
+
+test('a foreground agent finishing beside a background one leaves the background agent working', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  const turnCompleted = (threadId: string) => (message: any) =>
+    message.method === 'turn/completed' && message.params.threadId === threadId
+  try {
+    proc.stdin.write(json(codex930Initialize(0)))
+    await reader.nextResponse(0)
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const threadId = (await reader.nextResponse(1)).result.thread.id
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'mixed agents check delay=400', text_elements: [] }],
+        },
+      }),
+    )
+    await reader.nextResponse(2)
+    const launch = await readUntil(reader, turnCompleted(threadId))
+    const spawned = launch
+      .filter((m) => m.method === 'item/completed' && m.params.item.tool === 'spawnAgent')
+      .map((m) => m.params.item)
+    const bgChild = String(
+      spawned.find((item) => item.prompt === 'sleep then report')?.receiverThreadIds[0],
+    )
+    const fgChild = String(
+      spawned.find((item) => item.prompt === 'answer now')?.receiverThreadIds[0],
+    )
+    const waitEnd = launch.findIndex(
+      (m) => m.method === 'item/completed' && m.params.item.tool === 'wait',
+    )
+    assert.ok(waitEnd >= 0, 'the foreground agent is waited on')
+    const wait = launch[waitEnd].params.item
+    assert.deepEqual(wait.receiverThreadIds, [fgChild])
+    assert.equal(wait.agentsStates[fgChild].status, 'completed')
+    assert.equal(wait.status, 'failed', 'a completed wait would end the background agent too')
+    assert.equal(launch.some(turnCompleted(bgChild)), false)
+
+    const roster = appRoster(liveItems(launch.slice(0, waitEnd + 1), threadId), true)
+    assert.equal(roster.get(fgChild), 'done')
+    assert.equal(roster.get(bgChild), 'working')
+
+    const report = await readUntil(reader, turnCompleted(threadId))
+    const childDone = report.find(turnCompleted(bgChild))
+    assert.equal(childDone?.params.turn.status, 'completed')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('the first of two foreground agents to finish does not end the other in the App roster', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json(codex930Initialize(0)))
+    await reader.nextResponse(0)
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const threadId = (await reader.nextResponse(1)).result.thread.id
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'sibling agents check', text_elements: [] }],
+        },
+      }),
+    )
+    await reader.nextResponse(2)
+    const turn = await readUntil(
+      reader,
+      (m) => m.method === 'turn/completed' && m.params.threadId === threadId,
+    )
+    const child = (prompt: string) =>
+      String(
+        turn.find(
+          (m) =>
+            m.method === 'item/completed' &&
+            m.params.item.tool === 'spawnAgent' &&
+            m.params.item.prompt === prompt,
+        )?.params.item.receiverThreadIds[0],
+      )
+    const quick = child('quick agent')
+    const slow = child('slow agent')
+    const waitEnds = turn
+      .map((m, index) => ({ m, index }))
+      .filter(({ m }) => m.method === 'item/completed' && m.params.item.tool === 'wait')
+    assert.equal(waitEnds.length, 2)
+    const [first, second] = waitEnds
+    assert.deepEqual(first?.m.params.item.receiverThreadIds, [quick])
+    assert.equal(first?.m.params.item.status, 'failed')
+    assert.equal(first?.m.params.item.agentsStates[quick].status, 'completed')
+    const midway = appRoster(liveItems(turn.slice(0, (first?.index ?? 0) + 1), threadId), true)
+    assert.equal(midway.get(quick), 'done')
+    assert.equal(midway.get(slow), 'working')
+
+    assert.deepEqual(second?.m.params.item.receiverThreadIds, [slow])
+    assert.equal(second?.m.params.item.status, 'completed', 'the last agent closes normally')
+    const settled = appRoster(liveItems(turn, threadId), false)
+    assert.deepEqual([settled.get(quick), settled.get(slow)], ['done', 'done'])
+
+    proc.stdin.write(json({ id: 3, method: 'thread/read', params: { threadId } }))
+    const persisted = (await reader.nextResponse(3)).result.thread.turns[0].items
+    const persistedWaits = persisted.filter((item: any) => item.tool === 'wait')
+    assert.deepEqual(
+      persistedWaits.map((item: any) => item.status).sort(),
+      ['completed', 'failed'],
+      'reload shows the same wait states the App saw live',
+    )
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('initialize reports an unverified desktop App build as a config warning', async () => {
+  const warningsFor = async (version: string): Promise<any[]> => {
+    const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+    const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+    })
+    const reader = new JsonLineReader(proc)
+    try {
+      proc.stdin.write(
+        json({
+          id: 0,
+          method: 'initialize',
+          params: {
+            clientInfo: { name: 'codex_desktop', title: 'Codex Desktop', version },
+            capabilities: { experimentalApi: true },
+          },
+        }),
+      )
+      proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+      const seen = await readUntil(reader, (message) => message.id === 1 && message.method == null)
+      return seen.filter((message) => message.method === 'configWarning')
+    } finally {
+      proc.kill()
+      await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+    }
+  }
+
+  assert.deepEqual(await warningsFor('26.930.21537'), [])
+  const [warning, ...rest] = await warningsFor('26.1015.100')
+  assert.equal(rest.length, 0)
+  assert.match(warning.params.summary, /Codex App 26\.1015\.100/)
+  assert.match(warning.params.details, /26\.930\.21537/)
+})
+
+function codex930Initialize(id: number) {
+  return {
+    id,
+    method: 'initialize',
+    params: {
+      clientInfo: { name: 'Codex Desktop', title: 'Codex Desktop', version: '26.930.21537' },
+      capabilities: { experimentalApi: true },
+    },
+  }
+}
+
+async function readUntil(
+  reader: JsonLineReader,
+  stop: (message: any) => boolean,
+  limit = 800,
+): Promise<any[]> {
+  const seen: any[] = []
+  for (let i = 0; i < limit; i += 1) {
+    const message = await reader.next()
+    seen.push(message)
+    if (stop(message)) return seen
+  }
+  throw new Error('readUntil: condition not met')
+}
+
+function activityKinds(messages: any[], threadId: string): string[] {
+  return messages
+    .filter(
+      (m) =>
+        m.method === 'item/completed' &&
+        m.params.threadId === threadId &&
+        m.params.item.type === 'subAgentActivity',
+    )
+    .map((m) => m.params.item.kind)
+}
 
 test('bare /workflows lists prior workflow runs without invoking the model', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
@@ -3869,6 +4892,44 @@ test('bare /workflows lists prior workflow runs without invoking the model', asy
     assert.match(listText, /1 agent\(s\)/)
     assert.match(listText, /subagent check/)
     assert.doesNotMatch(listText, /Claude Code adapter mock response/)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('/workflows also lists the workflows Claude ran without the command', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const threadId = (await reader.nextResponse(1)).result.thread.id
+    const prompts = ['run the model workflow check', 'plain question', '/workflows']
+    let listText = ''
+    for (const [index, text] of prompts.entries()) {
+      const id = index + 2
+      proc.stdin.write(
+        json({ id, method: 'turn/start', params: { threadId, input: textInput(text) } }),
+      )
+      await reader.nextResponse(id)
+      const messages = await readUntil(
+        reader,
+        (m) => m.method === 'turn/completed' && m.params.threadId === threadId,
+      )
+      listText = messages
+        .filter((m) => m.method === 'item/agentMessage/delta' && m.params.threadId === threadId)
+        .map((m) => m.params.delta)
+        .join('')
+    }
+
+    assert.match(listText, /Workflow runs in this task:/)
+    assert.match(listText, /completed · 1 agent\(s\) · run the model workflow check/)
+    assert.match(listText, /\(workflow, completed\)/)
+    assert.doesNotMatch(listText, /plain question/)
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -4285,70 +5346,609 @@ test('generic Claude tools complete as Codex mcpToolCall items', async () => {
   }
 })
 
-test('turn/steer appends user input to an active Claude turn', async () => {
-  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
-  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+function spawnMockAdapter(home: string): ChildProcessWithoutNullStreams {
+  return spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
   })
+}
+
+async function awaitMessage(
+  reader: JsonLineReader,
+  done: (message: any) => boolean,
+  seen: any[] = [],
+): Promise<any> {
+  for (let i = 0; i < 5000; i += 1) {
+    const message = await reader.next()
+    seen.push(message)
+    if (done(message)) return message
+  }
+  throw new Error('expected message never arrived')
+}
+
+// Collects everything that arrives until the adapter stays quiet for `ms`.
+async function readQuiet(reader: JsonLineReader, ms: number): Promise<any[]> {
+  const seen: any[] = []
+  for (;;) {
+    const message = await reader.nextWithin(ms)
+    if (message == null) return seen
+    seen.push(message)
+  }
+}
+
+// Waits for `turns` turns to complete, then reads until the adapter stays quiet
+// for `ms`: a slow runner still sees every expected turn, and a turn too many
+// still shows up.
+async function readTurns(reader: JsonLineReader, turns: number, ms: number): Promise<any[]> {
+  const seen: any[] = []
+  for (let i = 0; i < turns; i += 1) {
+    await awaitMessage(reader, (message) => message.method === 'turn/completed', seen)
+  }
+  seen.push(...(await readQuiet(reader, ms)))
+  return seen
+}
+
+async function startMockThread(
+  reader: JsonLineReader,
+  proc: ChildProcessWithoutNullStreams,
+): Promise<string> {
+  proc.stdin.write(
+    json({
+      id: 1,
+      method: 'thread/start',
+      params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false },
+    }),
+  )
+  const start = await reader.nextResponse(1)
+  return start.result.thread.id
+}
+
+function textInput(text: string): unknown[] {
+  return [{ type: 'text', text, text_elements: [] }]
+}
+
+function isUserMessageItem(message: any, method: string, clientId: string): boolean {
+  return (
+    message.method === method &&
+    message.params.item.type === 'userMessage' &&
+    message.params.item.clientId === clientId
+  )
+}
+
+test('turn/steer appends user input to an active Claude turn', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
   const reader = new JsonLineReader(proc)
   try {
+    const threadId = await startMockThread(reader, proc)
+
+    proc.stdin.write(
+      json({ id: 2, method: 'turn/steer', params: { threadId, input: textInput('too early') } }),
+    )
+    const early = await reader.nextResponse(2)
+    assert.equal(early.error.message, 'no active turn to steer')
+
     proc.stdin.write(
       json({
-        id: 1,
-        method: 'thread/start',
-        params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false },
+        id: 3,
+        method: 'turn/start',
+        params: { threadId, input: textInput('slow turn for steering') },
       }),
     )
-    const start = await reader.nextResponse(1)
-    const threadId = start.result.thread.id
+    const turnId = (await reader.nextResponse(3)).result.turn.id
+    await awaitMessage(reader, (message) => message.method === 'item/agentMessage/delta')
 
+    proc.stdin.write(
+      json({
+        id: 4,
+        method: 'turn/steer',
+        params: { threadId, expectedTurnId: 'stale-turn', input: textInput('mismatch') },
+      }),
+    )
+    const mismatch = await reader.nextResponse(4)
+    assert.equal(
+      mismatch.error.message,
+      `expected active turn id \`stale-turn\` but found \`${turnId}\``,
+    )
+
+    proc.stdin.write(
+      json({
+        id: 5,
+        method: 'turn/steer',
+        params: {
+          threadId,
+          expectedTurnId: turnId,
+          clientUserMessageId: 'client-steer-1',
+          input: textInput('steered input'),
+        },
+      }),
+    )
+    const seen: any[] = []
+    const steer = await awaitMessage(reader, (message) => message.id === 5, seen)
+    assert.equal(steer.result.turnId, turnId)
+    await awaitMessage(reader, (message) => message.method === 'turn/completed', seen)
+    // The accepted steer surfaces as a userMessage carrying the App's id, so
+    // the App can settle its pending steering bubble.
+    const started = seen.find((message) =>
+      isUserMessageItem(message, 'item/started', 'client-steer-1'),
+    )
+    assert.equal(started?.params.turnId, turnId)
+    assert.equal(started?.params.item.content[0].text, 'steered input')
+    assert.ok(
+      seen.some((message) => isUserMessageItem(message, 'item/completed', 'client-steer-1')),
+    )
+
+    proc.stdin.write(
+      json({ id: 6, method: 'thread/turns/items/list', params: { threadId, turnId } }),
+    )
+    const items = await reader.nextResponse(6)
+    assert.equal(
+      items.result.data.some(
+        (item: any) => item.type === 'userMessage' && item.content?.[0]?.text === 'steered input',
+      ),
+      true,
+    )
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('turn/start during a running turn joins that turn instead of orphaning it', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  try {
+    const threadId = await startMockThread(reader, proc)
     proc.stdin.write(
       json({
         id: 2,
         method: 'turn/start',
         params: {
           threadId,
-          input: [{ type: 'text', text: 'slow turn for steering', text_elements: [] }],
+          input: textInput('hold this turn until released while another turn/start arrives'),
         },
       }),
     )
-    const started = await reader.nextResponse(2)
-    const turnId = started.result.turn.id
+    const turnId = (await reader.nextResponse(2)).result.turn.id
+    const seen: any[] = []
+    await awaitMessage(reader, (message) => message.method === 'item/agentMessage/delta', seen)
 
     proc.stdin.write(
       json({
         id: 3,
-        method: 'turn/steer',
-        params: {
-          threadId,
-          expectedTurnId: turnId,
-          input: [{ type: 'text', text: 'steered input', text_elements: [] }],
-        },
+        method: 'turn/start',
+        params: { threadId, clientUserMessageId: 'client-late-1', input: textInput('late input') },
       }),
     )
-    const steer = await reader.nextResponse(3)
-    assert.equal(steer.result.turnId, turnId)
+    proc.stdin.write(
+      json({
+        id: 4,
+        method: 'turn/start',
+        params: { threadId, input: textInput('/workflows') },
+      }),
+    )
+    // The refusal can answer first: the joined input waits for Claude to take
+    // it in.
+    const replies = new Map<number, any>()
+    await awaitMessage(
+      reader,
+      (message) => {
+        if (message.id === 3 || message.id === 4) replies.set(message.id, message)
+        return replies.size === 2
+      },
+      seen,
+    )
+    assert.equal(replies.get(3).result.turn.id, turnId)
+    assert.equal(
+      replies.get(4).error.message,
+      '/workflows list can run once the current turn finishes',
+    )
+    proc.stdin.write(
+      json({
+        id: 5,
+        method: 'turn/steer',
+        params: { threadId, expectedTurnId: turnId, input: textInput('release') },
+      }),
+    )
+    const completed = await awaitMessage(
+      reader,
+      (message) => message.method === 'turn/completed',
+      seen,
+    )
+    assert.equal(completed.params.turn.id, turnId)
+    seen.push(...(await readQuiet(reader, 200)))
+    assert.deepEqual(
+      seen
+        .filter((message) => message.method === 'turn/started' && message.params.turn.id !== turnId)
+        .map((message) => message.params.turn.id),
+      [],
+      'no second turn starts',
+    )
+    const joined = seen.find((message) =>
+      isUserMessageItem(message, 'item/started', 'client-late-1'),
+    )
+    assert.equal(joined?.params.turnId, turnId)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
 
-    let completed = false
-    for (let i = 0; i < 500; i += 1) {
-      const message = await reader.next()
-      if (message.method === 'turn/completed') {
-        completed = true
-        break
-      }
-    }
-    assert.equal(completed, true)
+test('input for a turn whose session is still coming up waits for it instead of failing', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  try {
+    const threadId = await startMockThread(reader, proc)
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: textInput('slow start, then hold this turn until released') },
+      }),
+    )
+    const turnId = (await reader.nextResponse(2)).result.turn.id
+    // The runtime has no turn to steer into yet. Refusing the input here
+    // would leave the App showing an error for a turn that runs fine.
+    proc.stdin.write(
+      json({
+        id: 3,
+        method: 'turn/start',
+        params: { threadId, clientUserMessageId: 'client-early-1', input: textInput('release') },
+      }),
+    )
+    const seen: any[] = []
+    const reply = await awaitMessage(reader, (message) => message.id === 3, seen)
+    assert.equal(reply.error, undefined)
+    assert.equal(reply.result.turn.id, turnId)
+    const completed = await awaitMessage(
+      reader,
+      (message) => message.method === 'turn/completed',
+      seen,
+    )
+    assert.equal(completed.params.turn.id, turnId)
+    assert.equal(completed.params.turn.status, 'completed')
+    const joined = seen.find((message) =>
+      isUserMessageItem(message, 'item/started', 'client-early-1'),
+    )
+    assert.equal(joined?.params.turnId, turnId)
+    seen.push(...(await readQuiet(reader, 200)))
+    assert.deepEqual(
+      seen
+        .filter((message) => message.method === 'turn/started' && message.params.turn.id !== turnId)
+        .map((message) => message.params.turn.id),
+      [],
+      'no second turn starts',
+    )
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('thread/queue holds follow-ups during a turn and dispatches them in order', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  const call = async (id: number, method: string, params: Record<string, unknown>) => {
+    proc.stdin.write(json({ id, method, params }))
+    return reader.nextResponse(id)
+  }
+  try {
+    const threadId = await startMockThread(reader, proc)
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: textInput('slow turn before the queue drains') },
+      }),
+    )
+    await awaitMessage(reader, (message) => message.method === 'item/agentMessage/delta')
+
+    const add = (id: number, text: string, clientUserMessageId: string) =>
+      call(id, 'thread/queue/add', { threadId, input: textInput(text), clientUserMessageId })
+    const first = (await add(3, 'queued one', 'client-1')).result.queuedSubmission
+    const second = (await add(4, 'queued two', 'client-2')).result.queuedSubmission
+    const third = (await add(5, 'queued three', 'client-3')).result.queuedSubmission
+    assert.equal(first.clientUserMessageId, 'client-1')
+    assert.deepEqual(first.input, textInput('queued one'))
+
+    const empty = await call(6, 'thread/queue/add', { threadId, input: [] })
+    assert.match(empty.error.message, /must not be empty/)
+
+    await call(7, 'thread/queue/reorder', { threadId, queuedSubmissionIds: [second.id] })
+    const edited = await call(8, 'thread/queue/update', {
+      threadId,
+      queuedSubmissionId: third.id,
+      input: textInput('queued three edited'),
+    })
+    assert.deepEqual(edited.result.queuedSubmission.input, textInput('queued three edited'))
+    const list = await call(9, 'thread/queue/list', { threadId, cursor: null })
+    assert.deepEqual(
+      list.result.data.map((entry: any) => entry.id),
+      [second.id, first.id, third.id],
+    )
+    assert.equal(list.result.nextCursor, null)
+    assert.equal(
+      (await call(10, 'thread/queue/delete', { threadId, queuedSubmissionId: third.id })).result
+        .deleted,
+      true,
+    )
+    assert.equal(
+      (await call(11, 'thread/queue/delete', { threadId, queuedSubmissionId: third.id })).result
+        .deleted,
+      false,
+    )
+
+    // The queue drains head first once the running turn settles: one user
+    // turn per submission, each publishing its message with the client id.
+    const seen: any[] = []
+    let completedTurns = 0
+    await awaitMessage(
+      reader,
+      (message) => message.method === 'turn/completed' && ++completedTurns === 3,
+      seen,
+    )
+    const userMessages = seen
+      .filter(
+        (message) =>
+          message.method === 'item/started' && message.params.item.type === 'userMessage',
+      )
+      .map((message) => message.params.item.clientId)
+    assert.deepEqual(userMessages, ['client-2', 'client-1'])
+    assert.ok(seen.some((message) => message.method === 'thread/queue/changed'))
+
+    const drained = await call(12, 'thread/queue/list', { threadId, cursor: null })
+    assert.deepEqual(drained.result.data, [])
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('thread/queue pauses after an interrupt until thread/queue/start', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  const call = async (id: number, method: string, params: Record<string, unknown>) => {
+    proc.stdin.write(json({ id, method, params }))
+    return reader.nextResponse(id)
+  }
+  try {
+    const threadId = await startMockThread(reader, proc)
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: textInput('slow turn that the user stops') },
+      }),
+    )
+    const turnId = (await reader.nextResponse(2)).result.turn.id
+    await awaitMessage(reader, (message) => message.method === 'item/agentMessage/delta')
+    const queued = (
+      await call(3, 'thread/queue/add', {
+        threadId,
+        input: textInput('held message'),
+        clientUserMessageId: 'client-held',
+      })
+    ).result.queuedSubmission
+    await call(4, 'turn/interrupt', { threadId, turnId })
+
+    const quiet = await readQuiet(reader, 400)
+    assert.equal(
+      quiet.some((message) => message.method === 'turn/started'),
+      false,
+    )
+    const held = await call(5, 'thread/queue/list', { threadId, cursor: null })
+    assert.deepEqual(
+      held.result.data.map((entry: any) => entry.id),
+      [queued.id],
+    )
+
+    const started = await call(6, 'thread/queue/start', {
+      threadId,
+      queuedSubmissionId: queued.id,
+    })
+    assert.equal(typeof started.result.turn.id, 'string')
+    const seen: any[] = []
+    await awaitMessage(reader, (message) => message.method === 'turn/completed', seen)
+    assert.ok(seen.some((message) => isUserMessageItem(message, 'item/started', 'client-held')))
+    const drained = await call(7, 'thread/queue/list', { threadId, cursor: null })
+    assert.deepEqual(drained.result.data, [])
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('thread/goal/set keeps the thread working until the model completes the goal', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  const call = async (id: number, method: string, params: Record<string, unknown>) => {
+    proc.stdin.write(json({ id, method, params }))
+    return reader.nextResponse(id)
+  }
+  try {
+    const threadId = await startMockThread(reader, proc)
+    const missing = await call(2, 'thread/goal/set', { threadId, status: 'paused' })
+    assert.match(missing.error.message, /no goal exists/)
 
     proc.stdin.write(
-      json({ id: 4, method: 'thread/turns/items/list', params: { threadId, turnId } }),
+      json({
+        id: 3,
+        method: 'thread/goal/set',
+        params: { threadId, objective: 'goal complete check', status: 'active' },
+      }),
     )
-    const items = await reader.nextResponse(4)
+    const seen: any[] = []
+    const set = await awaitMessage(reader, (message) => message.id === 3, seen)
+    assert.equal(set.result.goal.status, 'active')
+    assert.equal(set.result.goal.tokenBudget, null)
+    const started = await awaitMessage(reader, (message) => message.method === 'turn/started', seen)
+    const turnId = started.params.turn.id
+    await awaitMessage(reader, (message) => message.method === 'turn/completed', seen)
+    const updates = seen
+      .filter((message) => message.method === 'thread/goal/updated')
+      .map((message) => message.params)
+    const finished = updates.at(-1)
+    assert.equal(finished.goal.status, 'complete')
+    assert.equal(finished.goal.tokensUsed, 145)
+    assert.equal(finished.turnId, turnId)
+    // Claude reports usage with the result, after update_goal already marked
+    // the goal complete; the turn's tokens still land on the goal.
     assert.equal(
-      items.result.data.some(
-        (item: any) => item.type === 'userMessage' && item.content?.[0]?.text === 'steered input',
+      updates.filter((update) => update.goal.status === 'complete')[0].goal.tokensUsed,
+      0,
+    )
+
+    // A completed goal ends the run; nothing else starts.
+    const quiet = await readQuiet(reader, 400)
+    assert.equal(
+      quiet.some((message) => message.method === 'turn/started'),
+      false,
+    )
+    // The continuation prompt is hidden: no user message on the turn.
+    const items = await call(4, 'thread/turns/items/list', { threadId, turnId })
+    assert.equal(
+      items.result.data.some((item: any) => item.type === 'userMessage'),
+      false,
+    )
+    const get = await call(5, 'thread/goal/get', { threadId })
+    assert.equal(get.result.goal.status, 'complete')
+    const clear = await call(6, 'thread/goal/clear', { threadId })
+    assert.equal(clear.result.cleared, true)
+    assert.equal((await call(7, 'thread/goal/get', { threadId })).result.goal, null)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('goal continuation stops when a hidden turn makes no progress or exhausts the budget', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  const call = async (id: number, method: string, params: Record<string, unknown>) => {
+    proc.stdin.write(json({ id, method, params }))
+    return reader.nextResponse(id)
+  }
+  const countTurns = (messages: any[]) =>
+    messages.filter((message) => message.method === 'turn/started').length
+  try {
+    const threadId = await startMockThread(reader, proc)
+    await call(2, 'thread/goal/set', { threadId, objective: 'keep going', status: 'active' })
+    // One hidden continuation with no tool work, then the run stops.
+    const first = await readTurns(reader, 1, 500)
+    assert.equal(countTurns(first), 1)
+    assert.equal((await call(3, 'thread/goal/get', { threadId })).result.goal.status, 'active')
+
+    // A user turn gives the goal another continuation.
+    proc.stdin.write(
+      json({ id: 4, method: 'turn/start', params: { threadId, input: textInput('nudge') } }),
+    )
+    const nudged = await readTurns(reader, 2, 500)
+    assert.equal(countTurns(nudged), 2)
+
+    // A budget the continuation overruns stops the goal.
+    await call(5, 'thread/goal/set', { threadId, tokenBudget: 300, status: 'active' })
+    const budgeted = await readTurns(reader, 1, 500)
+    assert.equal(countTurns(budgeted), 1)
+    const goal = (await call(6, 'thread/goal/get', { threadId })).result.goal
+    assert.equal(goal.status, 'budgetLimited')
+    assert.equal(goal.tokensUsed, 435)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('a goal budget that runs out mid-turn steers the model to wrap up and ends the run', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  const call = async (id: number, method: string, params: Record<string, unknown>) => {
+    proc.stdin.write(json({ id, method, params }))
+    return reader.nextResponse(id)
+  }
+  try {
+    const threadId = await startMockThread(reader, proc)
+    await call(2, 'thread/goal/set', {
+      threadId,
+      objective: 'goal budget steer check',
+      tokenBudget: 300,
+      status: 'active',
+    })
+    const run = await readTurns(reader, 1, 600)
+    assert.equal(run.filter((message) => message.method === 'turn/started').length, 1)
+    const limitedAt = run.findIndex(
+      (message) =>
+        message.method === 'thread/goal/updated' && message.params.goal.status === 'budgetLimited',
+    )
+    const completedAt = run.findIndex((message) => message.method === 'turn/completed')
+    assert.ok(limitedAt >= 0 && limitedAt < completedAt, 'the budget runs out inside the turn')
+    assert.ok(
+      run.some(
+        (message) =>
+          message.method === 'item/agentMessage/delta' &&
+          message.params.delta === 'wrapping up on budget',
       ),
-      true,
+      'the running turn got the budget-limit steer',
+    )
+    const goal = (await call(3, 'thread/goal/get', { threadId })).result.goal
+    assert.equal(goal.status, 'budgetLimited')
+    // 420 streamed, then the result settles the turn at 510.
+    assert.equal(goal.tokensUsed, 510)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('editing the goal objective mid-turn steers the running turn instead of starting another', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  try {
+    const threadId = await startMockThread(reader, proc)
+    const seen: any[] = []
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'thread/goal/set',
+        params: { threadId, objective: 'goal objective steer check', status: 'active' },
+      }),
+    )
+    await awaitMessage(reader, (message) => message.method === 'turn/started', seen)
+    const objective = 'goal objective steer check: revised objective'
+    proc.stdin.write(json({ id: 3, method: 'thread/goal/set', params: { threadId, objective } }))
+    const edit = await awaitMessage(
+      reader,
+      (message) => message.id === 3 && message.method == null,
+      seen,
+    )
+    assert.equal(edit.result.goal.objective, objective)
+    assert.equal(edit.result.goal.status, 'active')
+    const ended = seen.some((message) => message.method === 'turn/completed')
+    seen.push(...(await readTurns(reader, ended ? 0 : 1, 600)))
+
+    assert.ok(
+      seen.some(
+        (message) =>
+          message.method === 'item/agentMessage/delta' &&
+          message.params.delta === 'now on the revised objective',
+      ),
+      'the running turn got the edited objective',
+    )
+    assert.equal(seen.filter((message) => message.method === 'turn/started').length, 1)
+    assert.equal(seen.filter((message) => message.method === 'turn/completed').length, 1)
+    assert.ok(
+      !seen.some(
+        (message) =>
+          message.method === 'item/started' && message.params.item.type === 'userMessage',
+      ),
+      'the steer stays hidden',
     )
   } finally {
     proc.kill()
@@ -5963,6 +7563,76 @@ test('skills/list and hooks/list surface Claude Code skills and settings hooks',
   }
 })
 
+test('Claude Code built-in commands are listed as skills and run as slash commands', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const adapterDir = join(home, 'adapter')
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      CODEX_HOME: home,
+      HOME: home,
+      CLAUDE_CODEX_HOME: adapterDir,
+      CLAUDE_CODEX_MOCK: '1',
+      NODE_NO_WARNINGS: '1',
+    },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'skills/list', params: { cwds: [home] } }))
+    const skills = await reader.nextResponse(1)
+    const simplify = skills.result.data[0].skills.find(
+      (skill: Record<string, unknown>) => skill.name === 'simplify',
+    )
+    assert.ok(simplify, 'expected /simplify in the App skill list')
+    assert.equal(simplify.scope, 'system')
+    assert.equal(simplify.enabled, true)
+    assert.match(simplify.shortDescription, /^Review the changed code for reuse/)
+    assert.equal(simplify.path, join(adapterDir, 'claude-commands', 'simplify', 'SKILL.md'))
+    // The App opens `path` when the chip is clicked.
+    assert.match(await readFile(simplify.path, 'utf8'), /runs `\/simplify \[<target>\]`/)
+
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'initialize',
+        params: { clientInfo: { name: 'test', title: 'Test', version: '0' }, capabilities: null },
+      }),
+    )
+    await reader.nextResponse(2)
+    proc.stdin.write(json({ id: 3, method: 'thread/start', params: { cwd: home } }))
+    const threadId = (await reader.nextResponse(3)).result.thread.id
+    // What the composer sends after the user picks /simplify and types.
+    const text = `[$simplify](${simplify.path}) focus on the parser`
+    proc.stdin.write(
+      json({
+        id: 4,
+        method: 'turn/start',
+        params: { threadId, input: [{ type: 'text', text, text_elements: [] }] },
+      }),
+    )
+    const seen: any[] = []
+    await awaitMessage(reader, (message) => message.method === 'turn/completed', seen)
+    const reply = seen
+      .filter((message) => message.method === 'item/agentMessage/delta')
+      .map((message) => message.params.delta)
+      .join('')
+    assert.match(reply, /mock response for: \/simplify focus on the parser$/)
+    // The transcript keeps what the user sent.
+    proc.stdin.write(
+      json({ id: 5, method: 'thread/read', params: { threadId, includeTurns: true } }),
+    )
+    const read = await reader.nextResponse(5)
+    const userMessage = read.result.thread.turns[0].items.find(
+      (item: Record<string, unknown>) => item.type === 'userMessage',
+    )
+    assert.equal(userMessage?.content[0].text, text)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('direct MCP HTTP tool calls work', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const httpServer = http.createServer((req, res) => {
@@ -6101,6 +7771,23 @@ class JsonLineReader {
       const msg = await this.next()
       if (msg.id === id && msg.method == null) return msg
     }
+  }
+
+  // Resolves null when nothing arrives within `ms`.
+  nextWithin(ms: number): Promise<any> {
+    const existing = this.queue.shift()
+    if (existing) return Promise.resolve(existing)
+    return new Promise((resolve) => {
+      const waiter = (value: any): void => {
+        clearTimeout(timer)
+        resolve(value)
+      }
+      const timer = setTimeout(() => {
+        this.waiters = this.waiters.filter((entry) => entry !== waiter)
+        resolve(null)
+      }, ms)
+      this.waiters.push(waiter)
+    })
   }
 
   private push(chunk: string): void {

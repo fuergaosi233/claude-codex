@@ -8,7 +8,14 @@ import {
   type RuntimeConfig,
   resolveRuntimeConfig,
 } from './runtime-config.mjs'
-import type { ClaudeRuntime, RuntimeHandlers, RuntimeTurnContext } from './types.mjs'
+import type {
+  ClaudeRuntime,
+  RuntimeBackgroundListener,
+  RuntimeHandlers,
+  RuntimeLiveTask,
+  RuntimeSteerOptions,
+  RuntimeTurnContext,
+} from './types.mjs'
 import { debugLog } from './util.mjs'
 
 export function createRuntime(): ClaudeRuntime {
@@ -24,6 +31,7 @@ export function createRuntime(): ClaudeRuntime {
 class SelectableRuntime implements ClaudeRuntime {
   private runtimes = new Map<RuntimeBackendType, ClaudeRuntime>()
   private activeRuntimeByThread = new Map<string, ClaudeRuntime>()
+  private listener: RuntimeBackgroundListener | null = null
   private readonly config: RuntimeConfig
 
   constructor(config: RuntimeConfig) {
@@ -67,9 +75,13 @@ class SelectableRuntime implements ClaudeRuntime {
     }
   }
 
-  async steer(threadId: string, prompt: string): Promise<void> {
+  async steer(
+    threadId: string,
+    prompt: string,
+    options?: RuntimeSteerOptions,
+  ): Promise<boolean | undefined> {
     const runtime = this.activeRuntimeByThread.get(threadId) ?? this.runtimeFor(this.config.type)
-    await runtime.steer(threadId, prompt)
+    return runtime.steer(threadId, prompt, options)
   }
 
   async interrupt(threadId: string): Promise<void> {
@@ -85,10 +97,47 @@ class SelectableRuntime implements ClaudeRuntime {
     await Promise.allSettled([...this.runtimes.values()].map((runtime) => runtime.stop()))
   }
 
+  setBackgroundListener(listener: RuntimeBackgroundListener): void {
+    this.listener = listener
+    for (const runtime of this.runtimes.values()) runtime.setBackgroundListener?.(listener)
+  }
+
+  // A background task outlives the turn that started it, so the runtime that
+  // owns it is no longer recorded as the thread's active one; ask them all.
+  async stopTask(threadId: string, taskId: string): Promise<boolean> {
+    for (const runtime of this.runtimes.values()) {
+      if (await runtime.stopTask?.(threadId, taskId)) return true
+    }
+    return false
+  }
+
+  liveTasks(threadId: string): RuntimeLiveTask[] {
+    return [...this.runtimes.values()].flatMap((runtime) => runtime.liveTasks?.(threadId) ?? [])
+  }
+
+  hasBackgroundWork(): boolean {
+    return [...this.runtimes.values()].some((runtime) => runtime.hasBackgroundWork?.() === true)
+  }
+
+  filtersNestedEvents(threadId: string): boolean {
+    return this.activeRuntimeByThread.get(threadId)?.filtersNestedEvents?.(threadId) === true
+  }
+
+  hasPendingContinuation(threadId: string): boolean {
+    return [...this.runtimes.values()].some(
+      (runtime) => runtime.hasPendingContinuation?.(threadId) === true,
+    )
+  }
+
+  resetSession(threadId: string): void {
+    for (const runtime of this.runtimes.values()) runtime.resetSession?.(threadId)
+  }
+
   private runtimeFor(type: RuntimeBackendType): ClaudeRuntime {
     const existing = this.runtimes.get(type)
     if (existing) return existing
     const runtime = instantiateRuntime(this.config, type)
+    if (this.listener) runtime.setBackgroundListener?.(this.listener)
     this.runtimes.set(type, runtime)
     return runtime
   }

@@ -16,6 +16,7 @@ import http from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
+import * as z from 'zod'
 import { ClaudePTranscriptRuntime } from '../src/claude-p-runtime.mjs'
 import {
   HttpAgentRuntime,
@@ -125,30 +126,66 @@ test('native SDK runtime maps manual /workflows prompts to the human workflow tr
   assert.deepEqual(messages[0].origin, { kind: 'human' })
 
   const buildOptions = Reflect.get(runtime, 'buildOptions')
-  const options = buildOptions.call(runtime, {}, context, new AbortController())
+  const session = { current: { context, handlers: {}, resolved: false }, lastContext: context }
+  const options = buildOptions.call(runtime, {}, context, new AbortController(), () => session)
   // Pinned launchers reject --settings, so workflows are enabled by env alone.
   assert.equal(options.settings, undefined)
   assert.equal(options.env.CLAUDE_CODE_WORKFLOWS, '1')
+  assert.equal(options.env.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS, '1')
   assert.equal(options.permissionMode, 'default')
   assert.equal(options.allowDangerouslySkipPermissions, undefined)
   assert.equal(typeof options.canUseTool, 'function')
-  const turns = Reflect.get(runtime, 'turns') as Map<string, unknown>
-  turns.set(context.turnId, { handlers: {} })
-  try {
-    assert.deepEqual(
-      await options.canUseTool(
-        'Bash',
-        { command: 'true' },
-        {
-          toolUseID: 'tool',
-          signal: new AbortController().signal,
-        },
-      ),
-      { behavior: 'allow' },
-    )
-  } finally {
-    turns.delete(context.turnId)
+  assert.deepEqual(
+    await options.canUseTool(
+      'Bash',
+      { command: 'true' },
+      {
+        toolUseID: 'tool',
+        signal: new AbortController().signal,
+      },
+    ),
+    { behavior: 'allow' },
+  )
+})
+
+test('native SDK runtime approves goal tools without shadowing canUseTool', async () => {
+  const runtime = new NativeClaudeRuntime()
+  Reflect.set(runtime, 'zod', z)
+  const sdk = {
+    tool: (...args: unknown[]) => args,
+    createSdkMcpServer: (config: Record<string, unknown>) => ({ type: 'sdk', ...config }),
   }
+  const goalTools = {
+    getGoal: async () => '{}',
+    createGoal: async () => '{}',
+    updateGoal: async () => '{}',
+  }
+  const buildOptions = Reflect.get(runtime, 'buildOptions')
+  const build = (overrides: Partial<RuntimeTurnContext>) =>
+    buildOptions.call(
+      runtime,
+      sdk,
+      nativeTurnContext({ prompt: 'work on the goal', goalTools, ...overrides }),
+      new AbortController(),
+      () => null,
+    )
+
+  const options = build({ approvalPolicy: 'on-request', sandboxMode: 'workspace-write' })
+  assert.ok(options.mcpServers.codex_goal)
+  assert.equal(options.allowedTools?.includes('mcp__codex_goal') ?? false, false)
+  const signal = new AbortController().signal
+  // Even with no turn to ask in, goal bookkeeping is allowed while other
+  // tools still need the user.
+  assert.deepEqual(
+    await options.canUseTool('mcp__codex_goal__update_goal', { status: 'complete' }, { signal }),
+    { behavior: 'allow' },
+  )
+  assert.equal((await options.canUseTool('Bash', { command: 'true' }, { signal })).behavior, 'deny')
+
+  // Plan mode installs no callback, so the server rides on allowedTools.
+  const plan = build({ planMode: true })
+  assert.equal(plan.canUseTool, undefined)
+  assert.ok(plan.allowedTools.includes('mcp__codex_goal'))
 })
 
 test('explicit native SDK bypass includes the required dangerous opt-in flag', () => {
@@ -179,6 +216,11 @@ test('workflow command parser keeps list and run semantics distinct', () => {
     prompt: 'inspect the adapter',
   })
   assert.equal(parseWorkflowCommand('/workflowsx inspect'), null)
+  assert.deepEqual(parseWorkflowCommand('/workflows list'), { type: 'list' })
+  assert.deepEqual(parseWorkflowCommand('/workflows list the open bugs'), {
+    type: 'run',
+    prompt: 'list the open bugs',
+  })
   assert.equal(workflowRuntimePrompt('/workflows'), '/workflows')
 
   const runtime = new NativeClaudeRuntime()
@@ -1857,32 +1899,54 @@ test('workflow journal monitor does not commit started bookkeeping after stop', 
 
 test('native SDK permission allow result carries original input for SDK validation', async () => {
   const runtime = new NativeClaudeRuntime()
-  const turns = Reflect.get(runtime, 'turns')
-  assert.ok(turns instanceof Map)
   const input = { command: 'printf ok' }
   const requests: unknown[] = []
-  turns.set('turn', {
+  const context = { threadId: 'thread', turnId: 'turn' }
+  const current = {
+    context,
+    resolved: false,
     handlers: {
       onPermissionRequest: async (event: unknown) => {
         requests.push(event)
         return { decision: 'accept' }
       },
     },
-  })
-
-  try {
-    const makeCanUseTool = Reflect.get(runtime, 'makeCanUseTool')
-    assert.equal(typeof makeCanUseTool, 'function')
-    const canUseTool = makeCanUseTool.call(runtime, { threadId: 'thread', turnId: 'turn' }, false)
-    const result = await canUseTool('Bash', input, {
-      toolUseID: 'tool',
-      signal: new AbortController().signal,
-    })
-    assert.deepEqual(result, { behavior: 'allow', updatedInput: input })
-    assert.equal(requests.length, 1)
-  } finally {
-    turns.delete('turn')
   }
+
+  const makeCanUseTool = Reflect.get(runtime, 'makeCanUseTool')
+  assert.equal(typeof makeCanUseTool, 'function')
+  const canUseTool = makeCanUseTool.call(runtime, () => ({ current, lastContext: context }))
+  const result = await canUseTool('Bash', input, {
+    toolUseID: 'tool',
+    signal: new AbortController().signal,
+  })
+  assert.deepEqual(result, { behavior: 'allow', updatedInput: input })
+  assert.equal(requests.length, 1)
+})
+
+test('native SDK permission request between turns falls back to the standing policy', async () => {
+  const runtime = new NativeClaudeRuntime()
+  const makeCanUseTool = Reflect.get(runtime, 'makeCanUseTool')
+  const options = { toolUseID: 'tool', signal: new AbortController().signal }
+  const ask = (lastContext: RuntimeTurnContext) =>
+    makeCanUseTool.call(runtime, () => ({ current: null, lastContext }))
+  assert.deepEqual(
+    await ask(nativeTurnContext({ approvalPolicy: 'never' }))('Bash', { command: 'true' }, options),
+    { behavior: 'allow' },
+  )
+  assert.equal(
+    (
+      await ask(
+        nativeTurnContext({ approvalPolicy: 'on-request', sandboxMode: 'workspace-write' }),
+      )('Bash', { command: 'true' }, options)
+    ).behavior,
+    'deny',
+  )
+  assert.equal(
+    (await ask(nativeTurnContext({ approvalPolicy: 'never' }))('AskUserQuestion', {}, options))
+      .behavior,
+    'deny',
+  )
 })
 
 test('HTTP agent runtime streams agentapi-compatible message updates', async () => {
@@ -2128,7 +2192,9 @@ test('claude-p runtime runs each turn in its own cwd', async () => {
   const runtime = new ClaudePTranscriptRuntime({
     command,
     extraArgs: [],
-    timeoutMs: 2_000,
+    // Generous: node cold starts can take seconds when the suite runs in
+    // parallel, and the fake answers as soon as it is up.
+    timeoutMs: 20_000,
     skipPermissions: false,
     resume: false,
   })
@@ -2200,7 +2266,8 @@ test('claude-p runtime timeout terminates spawned process tree', async () => {
   const runtime = new ClaudePTranscriptRuntime({
     command,
     extraArgs: [],
-    timeoutMs: 1_000,
+    // Long enough for a loaded machine to start the fake and its grandchild.
+    timeoutMs: 3_000,
     skipPermissions: false,
     resume: false,
   })
@@ -2475,21 +2542,23 @@ test('HTTP agent runtime keeps recoverable SSE fallback out of the conversation'
 test('agentapi runtime polls running terminal output before final status-only screen', async () => {
   let status: 'running' | 'stable' = 'stable'
   let messages: Array<{ id: number; role: 'agent'; content: string; time: string }> = []
+  let sawRunningScreen = false
   const server = http.createServer((req, res) => {
     if (req.method === 'GET' && req.url === '/messages') {
+      // The screen settles to a status-only line once the runtime has read
+      // the running screen, whatever its poll timing.
+      if (status === 'running' && messages.length > 0) sawRunningScreen = true
       res.setHeader('content-type', 'application/json')
       res.end(JSON.stringify({ messages }))
       return
     }
     if (req.method === 'GET' && req.url === '/status') {
-      res.setHeader('content-type', 'application/json')
-      res.end(JSON.stringify({ status }))
-      return
-    }
-    if (req.method === 'POST' && req.url === '/message') {
-      req.resume()
-      status = 'running'
-      setTimeout(() => {
+      if (sawRunningScreen) {
+        messages = [
+          { id: 1, role: 'agent', content: '✻ Cooked for 1s', time: new Date().toISOString() },
+        ]
+        status = 'stable'
+      } else if (status === 'running') {
         messages = [
           {
             id: 1,
@@ -2498,13 +2567,14 @@ test('agentapi runtime polls running terminal output before final status-only sc
             time: new Date().toISOString(),
           },
         ]
-      }, 20)
-      setTimeout(() => {
-        messages = [
-          { id: 1, role: 'agent', content: '✻ Cooked for 1s', time: new Date().toISOString() },
-        ]
-        status = 'stable'
-      }, 80)
+      }
+      res.setHeader('content-type', 'application/json')
+      res.end(JSON.stringify({ status }))
+      return
+    }
+    if (req.method === 'POST' && req.url === '/message') {
+      req.resume()
+      status = 'running'
       res.setHeader('content-type', 'application/json')
       res.end(JSON.stringify({ ok: true }))
       return

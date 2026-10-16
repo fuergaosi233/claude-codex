@@ -1,17 +1,167 @@
 import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import type { ClaudeRuntime, RuntimeHandlers, RuntimeTurnContext } from './types.mjs'
+import type {
+  ClaudeRuntime,
+  RuntimeBackgroundListener,
+  RuntimeHandlers,
+  RuntimeLiveTask,
+  RuntimeSteerOptions,
+  RuntimeTurnContext,
+} from './types.mjs'
 import { sleep } from './util.mjs'
+
+const MOCK_BACKGROUND_AGENT_ID = 'a0b1c2d3e4f5a6b7'
+const MOCK_FOREGROUND_AGENT_ID = 'deadbeefcafef00d'
 
 export class MockRuntime implements ClaudeRuntime {
   private interrupted = new Set<string>()
+  private running = new Set<string>()
+  private listener: RuntimeBackgroundListener | null = null
+  private backgroundTasks = new Map<string, { threadId: string; timer: NodeJS.Timeout }>()
+  // What Claude says, unprompted, once a background agent reports back.
+  private continuations = new Map<string, string>()
+  private steered = new Map<string, string[]>()
+  // Foreground agents waiting to be stopped by task id.
+  private foregroundStops = new Map<string, () => void>()
+  // Threads whose scenario plays the native runtime, which drops a
+  // subagent's own events before they reach the server.
+  private nestedFiltered = new Set<string>()
+  // resetSession calls per thread, echoed by the rewind check scenario.
+  private resets = new Map<string, number>()
+  // Background Bash shells by task id.
+  private shells = new Map<string, { threadId: string; toolUseId: string }>()
 
   async runTurn(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void> {
+    // A session slow to come up (the CLI's, while an interrupted turn is
+    // still draining): input cannot reach the turn yet.
+    if (/slow start/i.test(context.prompt)) await sleep(500)
+    this.running.add(context.threadId)
+    try {
+      await this.playTurn(context, handlers)
+    } finally {
+      this.running.delete(context.threadId)
+    }
+  }
+
+  private async playTurn(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void> {
     this.interrupted.delete(context.threadId)
+    // Resuming at a checkpoint forks the session, like the CLI does.
+    const sessionId =
+      context.claudeSessionId && context.resumeSessionAt
+        ? `${context.claudeSessionId}~${context.turnId}`
+        : (context.claudeSessionId ?? `mock-${context.threadId}`)
+    await handlers.onEvent({ type: 'session', claudeSessionId: sessionId })
     await handlers.onEvent({
-      type: 'session',
-      claudeSessionId: context.claudeSessionId ?? `mock-${context.threadId}`,
+      type: 'checkpoint',
+      claudeSessionId: sessionId,
+      messageUuid: `${context.turnId}-entry`,
     })
+
+    if (/rewind check/i.test(context.prompt)) {
+      const text = `resumed ${context.claudeSessionId ?? 'nothing'} at ${context.resumeSessionAt ?? 'end'} after ${this.resets.get(context.threadId) ?? 0} resets`
+      await handlers.onEvent({ type: 'text_delta', delta: text })
+      await handlers.onEvent({ type: 'completed', success: true, result: text })
+      return
+    }
+
+    if (context.continuation) {
+      const text = this.continuations.get(context.threadId) ?? null
+      this.continuations.delete(context.threadId)
+      if (text) await handlers.onEvent({ type: 'text_delta', delta: text })
+      await handlers.onEvent({ type: 'completed', success: true, result: text })
+      return
+    }
+
+    // Goal continuation (hidden internal-context prompt). Its template text
+    // would trip the keyword branches below, so answer it first: report usage,
+    // and finish the goal when the objective asks for it.
+    if (context.prompt.includes('<codex_internal_context>')) {
+      if (
+        /goal objective steer check/i.test(context.prompt) &&
+        !/revised objective/i.test(context.prompt)
+      ) {
+        // Still running when the user edits the objective, so the edit has to
+        // reach this turn as a steer.
+        let edit: string | undefined
+        for (let i = 0; i < 200 && !edit; i += 1) {
+          await sleep(10)
+          edit = this.steered
+            .get(context.threadId)
+            ?.find((prompt) => prompt.includes('objective was edited'))
+        }
+        this.steered.delete(context.threadId)
+        await handlers.onEvent({
+          type: 'text_delta',
+          delta: edit?.includes('revised objective')
+            ? 'now on the revised objective'
+            : 'never steered',
+        })
+        await handlers.onEvent({ type: 'usage', usage: { input_tokens: 40, output_tokens: 10 } })
+        await handlers.onEvent({ type: 'completed', success: true, result: 'switched' })
+        return
+      }
+      if (/goal budget steer check/i.test(context.prompt)) {
+        // One long API call overruns the budget before the turn's result.
+        await handlers.onEvent({
+          type: 'usage_progress',
+          messageId: 'mock-call-1',
+          usage: { input_tokens: 400, output_tokens: 20 },
+        })
+        await sleep(20)
+        const steers = this.steered.get(context.threadId) ?? []
+        this.steered.delete(context.threadId)
+        const wrapUp = steers.some((prompt) => prompt.includes('has reached its token budget'))
+        await handlers.onEvent({
+          type: 'text_delta',
+          delta: wrapUp ? 'wrapping up on budget' : 'kept working',
+        })
+        await handlers.onEvent({ type: 'usage', usage: { input_tokens: 450, output_tokens: 60 } })
+        await handlers.onEvent({ type: 'completed', success: true, result: 'wrapped up' })
+        return
+      }
+      if (/goal complete check/i.test(context.prompt) && context.goalTools) {
+        const toolUseId = `goal-${Date.now()}`
+        await handlers.onEvent({
+          type: 'tool_use',
+          toolUseId,
+          toolName: 'mcp__codex_goal__update_goal',
+          input: { status: 'complete' },
+        })
+        const result = await context.goalTools.updateGoal('complete')
+        await handlers.onEvent({ type: 'tool_result', toolUseId, content: result })
+      }
+      await handlers.onEvent({ type: 'text_delta', delta: 'goal continuation' })
+      // Like the CLI, usage arrives with the result, after any goal tool call.
+      await handlers.onEvent({
+        type: 'usage',
+        usage: {
+          input_tokens: 100,
+          output_tokens: 40,
+          cache_read_input_tokens: 10,
+          cache_creation_input_tokens: 5,
+        },
+      })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'goal continuation' })
+      return
+    }
+
+    // Keeps running until a steer says "release", so a test can count on the
+    // turn still running when its next requests arrive.
+    if (/hold this turn until released/i.test(context.prompt)) {
+      await handlers.onEvent({ type: 'text_delta', delta: 'holding' })
+      for (let i = 0; i < 1000; i += 1) {
+        if (this.interrupted.has(context.threadId)) {
+          await handlers.onEvent({ type: 'completed', success: false, result: 'interrupted' })
+          return
+        }
+        if (this.steered.get(context.threadId)?.some((prompt) => /release/i.test(prompt))) break
+        await sleep(10)
+      }
+      this.steered.delete(context.threadId)
+      await handlers.onEvent({ type: 'text_delta', delta: ' released' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'released' })
+      return
+    }
 
     if (/approval|permission|bash/i.test(context.prompt)) {
       const toolUseId = `tool-${Date.now()}`
@@ -248,6 +398,287 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    if (/background subagent check/i.test(context.prompt)) {
+      // Claude Code's run_in_background Agent: the call returns at once with
+      // `async_launched`; the agent reports later through a task
+      // notification, which also makes Claude answer on its own.
+      const toolUseId = `task-${Date.now()}`
+      const agentId = MOCK_BACKGROUND_AGENT_ID
+      const prompt = 'survey the repo'
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId,
+        toolName: 'Agent',
+        input: { description: 'mock background agent', prompt, run_in_background: true },
+      })
+      await this.listener?.onTaskEvent(context.threadId, {
+        type: 'task_started',
+        taskId: agentId,
+        toolUseId,
+        taskType: 'local_agent',
+        description: 'mock background agent',
+        subagentType: null,
+        prompt,
+        backgrounded: true,
+      })
+      await handlers.onEvent({
+        type: 'tool_result',
+        toolUseId,
+        content: `Async agent launched successfully.\nagentId: ${agentId}`,
+        structured: { isAsync: true, status: 'async_launched', agentId, prompt },
+      })
+      this.scheduleBackgroundReport(
+        context.threadId,
+        agentId,
+        toolUseId,
+        'background report body',
+        backgroundDelayMs(context.prompt),
+      )
+      await handlers.onEvent({ type: 'text_delta', delta: 'agent launched in background' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'launched' })
+      return
+    }
+
+    if (/auto background check/i.test(context.prompt)) {
+      // A foreground Agent that Claude Code moves to the background while
+      // the parent is still waiting on it (auto-background after a timeout).
+      const toolUseId = `task-${Date.now()}`
+      const agentId = MOCK_BACKGROUND_AGENT_ID
+      const prompt = 'long survey'
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId,
+        toolName: 'Agent',
+        input: { description: 'mock slow agent', prompt },
+      })
+      await sleep(50)
+      await handlers.onEvent({
+        type: 'tool_result',
+        toolUseId,
+        content: `Async agent launched successfully.\nagentId: ${agentId}`,
+        structured: { isAsync: true, status: 'async_launched', agentId, prompt },
+      })
+      this.scheduleBackgroundReport(
+        context.threadId,
+        agentId,
+        toolUseId,
+        'auto background report',
+        backgroundDelayMs(context.prompt),
+      )
+      await handlers.onEvent({ type: 'text_delta', delta: 'agent moved to background' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'backgrounded' })
+      return
+    }
+
+    if (/foreground stop check/i.test(context.prompt)) {
+      // A foreground Agent call. Stopping its task makes the call return
+      // early with an error, and the parent goes on without it.
+      const toolUseId = `task-${Date.now()}`
+      const taskId = 'mock-foreground-task'
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId,
+        toolName: 'Agent',
+        input: { description: 'mock foreground agent', prompt: 'take your time' },
+      })
+      const stopped = new Promise<void>((resolve) => this.foregroundStops.set(taskId, resolve))
+      await this.listener?.onTaskEvent(context.threadId, {
+        type: 'task_started',
+        taskId,
+        toolUseId,
+        taskType: 'local_agent',
+        description: 'mock foreground agent',
+        subagentType: null,
+        prompt: 'take your time',
+        backgrounded: false,
+      })
+      await stopped
+      await handlers.onEvent({
+        type: 'tool_result',
+        toolUseId,
+        content: '[Request interrupted by user for tool use]',
+        isError: true,
+      })
+      await handlers.onEvent({ type: 'text_delta', delta: 'carried on without it' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'carried on without it' })
+      return
+    }
+
+    if (/parallel agent tool check/i.test(context.prompt)) {
+      // One assistant message calls Agent and Bash together. Claude runs them
+      // side by side; the Bash call is the parent's own.
+      this.nestedFiltered.add(context.threadId)
+      const agentId = `task-${Date.now()}`
+      const bashId = `bash-${Date.now()}`
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId: agentId,
+        toolName: 'Agent',
+        input: { description: 'mock parallel agent', prompt: 'look around' },
+      })
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId: bashId,
+        toolName: 'Bash',
+        input: { command: 'echo beside', description: 'parallel shell' },
+      })
+      await handlers.onEvent({ type: 'tool_result', toolUseId: bashId, content: 'beside' })
+      await handlers.onEvent({ type: 'tool_result', toolUseId: agentId, content: 'agent report' })
+      await handlers.onEvent({ type: 'text_delta', delta: 'both finished' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'both finished' })
+      return
+    }
+
+    if (/mixed agents check/i.test(context.prompt)) {
+      // One message launches a background agent and a foreground one. The
+      // foreground agent finishes inside the turn; the background one reports
+      // after it.
+      const bgId = `task-bg-${Date.now()}`
+      const fgId = `task-fg-${Date.now()}`
+      const agentId = MOCK_BACKGROUND_AGENT_ID
+      const prompt = 'sleep then report'
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId: bgId,
+        toolName: 'Agent',
+        input: { description: 'mock background agent', prompt, run_in_background: true },
+      })
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId: fgId,
+        toolName: 'Agent',
+        input: { description: 'mock foreground agent', prompt: 'answer now' },
+      })
+      await handlers.onEvent({
+        type: 'tool_result',
+        toolUseId: bgId,
+        content: `Async agent launched successfully.\nagentId: ${agentId}`,
+        structured: { isAsync: true, status: 'async_launched', agentId, prompt },
+      })
+      this.scheduleBackgroundReport(
+        context.threadId,
+        agentId,
+        bgId,
+        'mixed background report',
+        backgroundDelayMs(context.prompt),
+      )
+      await sleep(50)
+      await handlers.onEvent({ type: 'tool_result', toolUseId: fgId, content: 'foreground report' })
+      await handlers.onEvent({ type: 'text_delta', delta: 'foreground done, background running' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'mixed' })
+      return
+    }
+
+    if (/sibling agents check/i.test(context.prompt)) {
+      // Two foreground agents launched in one message; the first one to
+      // finish must not end the other.
+      const firstId = `task-a-${Date.now()}`
+      const secondId = `task-b-${Date.now()}`
+      for (const [toolUseId, description] of [
+        [firstId, 'quick agent'],
+        [secondId, 'slow agent'],
+      ] as const) {
+        await handlers.onEvent({
+          type: 'tool_use',
+          toolUseId,
+          toolName: 'Agent',
+          input: { description, prompt: description },
+        })
+      }
+      await sleep(30)
+      await handlers.onEvent({ type: 'tool_result', toolUseId: firstId, content: 'quick report' })
+      await sleep(30)
+      await handlers.onEvent({ type: 'tool_result', toolUseId: secondId, content: 'slow report' })
+      await handlers.onEvent({ type: 'text_delta', delta: 'both agents reported' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'siblings' })
+      return
+    }
+
+    if (/background shell check/i.test(context.prompt)) {
+      // A Bash call Claude runs in the background: the call returns at once
+      // and the shell stays live until it is stopped.
+      const toolUseId = `shell-${Date.now()}`
+      const taskId = `bash-${this.shells.size + 1}`
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId,
+        toolName: 'Bash',
+        input: { command: 'npm run dev', run_in_background: true },
+      })
+      this.shells.set(taskId, { threadId: context.threadId, toolUseId })
+      await handlers.onEvent({
+        type: 'tool_result',
+        toolUseId,
+        content: `Command running in background with ID: ${taskId}`,
+      })
+      await handlers.onEvent({ type: 'text_delta', delta: 'dev server started' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'started' })
+      return
+    }
+
+    if (/background close check/i.test(context.prompt)) {
+      // Claude stops its own background agent; no notification follows.
+      const toolUseId = `stop-${Date.now()}`
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId,
+        toolName: 'TaskStop',
+        input: { task_id: MOCK_BACKGROUND_AGENT_ID },
+      })
+      const task = this.backgroundTasks.get(MOCK_BACKGROUND_AGENT_ID)
+      if (task) clearTimeout(task.timer)
+      this.backgroundTasks.delete(MOCK_BACKGROUND_AGENT_ID)
+      await handlers.onEvent({
+        type: 'tool_result',
+        toolUseId,
+        content: `Successfully stopped task: ${MOCK_BACKGROUND_AGENT_ID}`,
+        isError: !task,
+      })
+      await handlers.onEvent({ type: 'text_delta', delta: 'stopped it' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'stopped it' })
+      return
+    }
+
+    if (/(background|foreground) message check/i.test(context.prompt)) {
+      // A foreground agent is the one `subagent check` ran; the CLI resumes
+      // it in the background just the same.
+      const toolUseId = `send-${Date.now()}`
+      const agentId = /foreground/i.test(context.prompt)
+        ? MOCK_FOREGROUND_AGENT_ID
+        : MOCK_BACKGROUND_AGENT_ID
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId,
+        toolName: 'SendMessage',
+        input: { to: agentId, message: 'dig deeper' },
+      })
+      await this.listener?.onTaskEvent(context.threadId, {
+        type: 'task_started',
+        taskId: agentId,
+        toolUseId,
+        taskType: 'local_agent',
+        description: 'mock background agent',
+        subagentType: null,
+        prompt: 'dig deeper',
+        backgrounded: true,
+      })
+      await handlers.onEvent({
+        type: 'tool_result',
+        toolUseId,
+        content: `Agent "${agentId}" was resumed in the background.`,
+      })
+      this.scheduleBackgroundReport(
+        context.threadId,
+        agentId,
+        toolUseId,
+        'follow-up report',
+        backgroundDelayMs(context.prompt),
+      )
+      await handlers.onEvent({ type: 'text_delta', delta: 'message sent' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'sent' })
+      return
+    }
+
     if (/orphan subagent check/i.test(context.prompt)) {
       const taskId = `task-${Date.now()}`
       await handlers.onEvent({
@@ -257,6 +688,26 @@ export class MockRuntime implements ClaudeRuntime {
         input: { description: 'orphaned mock subagent', prompt: 'investigate disconnect' },
       })
       await handlers.onEvent({ type: 'completed', success: true, result: 'missing tool result' })
+      return
+    }
+
+    if (/model workflow check/i.test(context.prompt)) {
+      // Claude runs a workflow of its own accord: the native runtime shows it
+      // as an agent with the workflow role.
+      const toolUseId = `workflow-${Date.now()}`
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId,
+        toolName: 'Agent',
+        input: {
+          description: 'Workflow: review',
+          prompt: 'review the diff',
+          subagent_type: 'workflow',
+        },
+      })
+      await handlers.onEvent({ type: 'tool_result', toolUseId, content: 'review done' })
+      await handlers.onEvent({ type: 'text_delta', delta: 'workflow finished' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'workflow finished' })
       return
     }
 
@@ -289,20 +740,27 @@ export class MockRuntime implements ClaudeRuntime {
         toolUseId: innerToolId,
         content: 'inner result',
       })
-      // Mirror the real claude-agent-sdk Task tool result format: actual body
-      // followed by an `agentId: ...` line and a `<usage>` block. The server
-      // should strip both from the visible agentMessage and route the values
-      // into agentNickname + tokenUsage instead.
+      // Mirror the CLI 2.1.283 Task tool result: the report inside its
+      // hand-back frame (every line indented, a harness note above it),
+      // then an `agentId: ...` line and a `<usage>` block. The server should
+      // show only the report and route the values into agentNickname +
+      // tokenUsage instead.
+      const report = ['subagent final summary', '', '```', 'indented detail', '```']
+      const handback = [
+        '  [harness: a note for the parent model]',
+        '[Subagent hand-back] The text below is the final report of a subagent this session delegated to. The report follows:',
+        ...report.map((line) => `  ${line}`),
+      ].join('\n')
       const trailer = [
-        "agentId: deadbeefcafef00d (use SendMessage with to: 'deadbeefcafef00d' to continue this agent)",
-        '<usage>total_tokens: 4242',
+        `agentId: ${MOCK_FOREGROUND_AGENT_ID} (use SendMessage with to: '${MOCK_FOREGROUND_AGENT_ID}', summary: '<5-10 word recap>' to continue this agent)`,
+        '<usage>subagent_tokens: 4242',
         'tool_uses: 7',
         'duration_ms: 31415</usage>',
       ].join('\n')
       await handlers.onEvent({
         type: 'tool_result',
         toolUseId: taskId,
-        content: `subagent final summary\n${trailer}`,
+        content: `${handback}\n${trailer}`,
       })
       await handlers.onEvent({ type: 'text_delta', delta: 'main agent summary' })
       await handlers.onEvent({ type: 'completed', success: true, result: 'subagent check' })
@@ -353,6 +811,30 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    if (/context usage check/i.test(context.prompt)) {
+      // Two API calls, then the result that sums them, then what a workflow's
+      // agents spent beside the main loop.
+      await handlers.onEvent({
+        type: 'usage_progress',
+        messageId: 'call-1',
+        usage: { input_tokens: 100, output_tokens: 20 },
+      })
+      await handlers.onEvent({
+        type: 'usage_progress',
+        messageId: 'call-2',
+        usage: { input_tokens: 30, cache_read_input_tokens: 120, output_tokens: 50 },
+      })
+      await handlers.onEvent({ type: 'text_delta', delta: 'measured' })
+      await handlers.onEvent({
+        type: 'usage',
+        usage: { input_tokens: 130, cache_read_input_tokens: 120, output_tokens: 70 },
+        contextWindow: 200_000,
+      })
+      await handlers.onEvent({ type: 'usage', usage: { output_tokens: 1000 }, child: true })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'measured' })
+      return
+    }
+
     if (/usage check/i.test(context.prompt)) {
       await handlers.onEvent({
         type: 'usage',
@@ -391,9 +873,121 @@ export class MockRuntime implements ClaudeRuntime {
     this.interrupted.add(threadId)
   }
 
-  async steer(_threadId: string, _prompt: string): Promise<void> {}
+  // Claude takes a steer at its next tool-round boundary.
+  async steer(threadId: string, prompt: string, options?: RuntimeSteerOptions): Promise<boolean> {
+    if (!this.running.has(threadId)) return false
+    this.steered.set(threadId, [...(this.steered.get(threadId) ?? []), prompt])
+    setImmediate(() => options?.onAccepted?.())
+    return true
+  }
 
-  async stop(): Promise<void> {}
+  filtersNestedEvents(threadId: string): boolean {
+    return this.nestedFiltered.has(threadId)
+  }
+
+  async stop(): Promise<void> {
+    for (const { timer } of this.backgroundTasks.values()) clearTimeout(timer)
+    this.backgroundTasks.clear()
+    this.shells.clear()
+  }
+
+  setBackgroundListener(listener: RuntimeBackgroundListener): void {
+    this.listener = listener
+  }
+
+  async stopTask(threadId: string, taskId: string): Promise<boolean> {
+    const foreground = this.foregroundStops.get(taskId)
+    if (foreground) {
+      this.foregroundStops.delete(taskId)
+      setImmediate(foreground)
+      return true
+    }
+    const shell = this.shells.get(taskId)
+    if (shell?.threadId === threadId) {
+      this.shells.delete(taskId)
+      return true
+    }
+    const task = this.backgroundTasks.get(taskId)
+    if (!task || task.threadId !== threadId) return false
+    clearTimeout(task.timer)
+    this.backgroundTasks.delete(taskId)
+    // Claude reports the stop asynchronously, and passively: no wakeup.
+    setImmediate(() => {
+      void this.listener?.onTaskEvent(threadId, {
+        type: 'task_notification',
+        taskId,
+        toolUseId: null,
+        status: 'stopped',
+        summary: 'Agent stopped',
+        result: null,
+        usage: null,
+      })
+    })
+    return true
+  }
+
+  liveTasks(threadId: string): RuntimeLiveTask[] {
+    const agents = [...this.backgroundTasks]
+      .filter(([, task]) => task.threadId === threadId)
+      .map(([taskId]) => ({ taskId, taskType: 'local_agent', toolUseId: null }))
+    const shells = [...this.shells]
+      .filter(([, shell]) => shell.threadId === threadId)
+      .map(([taskId, shell]) => ({ taskId, taskType: 'local_bash', toolUseId: shell.toolUseId }))
+    return [...agents, ...shells]
+  }
+
+  hasBackgroundWork(): boolean {
+    return this.backgroundTasks.size > 0 || this.continuations.size > 0
+  }
+
+  hasPendingContinuation(threadId: string): boolean {
+    return this.continuations.has(threadId)
+  }
+
+  resetSession(threadId: string): void {
+    this.resets.set(threadId, (this.resets.get(threadId) ?? 0) + 1)
+  }
+
+  private scheduleBackgroundReport(
+    threadId: string,
+    taskId: string,
+    toolUseId: string,
+    report: string,
+    delayMs: number,
+  ): void {
+    const timer = setTimeout(async () => {
+      this.backgroundTasks.delete(taskId)
+      const listener = this.listener
+      if (!listener) return
+      await listener.onTaskEvent(threadId, {
+        type: 'task_progress',
+        taskId,
+        toolUseId,
+        description: 'mock background agent',
+        summary: null,
+        lastToolName: 'Read',
+        usage: { totalTokens: 1200, toolUses: 3, durationMs: delayMs },
+      })
+      await listener.onTaskEvent(threadId, {
+        type: 'task_notification',
+        taskId,
+        toolUseId,
+        status: 'completed',
+        summary: 'Agent "mock background agent" completed',
+        result: report,
+        usage: { totalTokens: 2400, toolUses: 5, durationMs: delayMs },
+      })
+      this.continuations.set(threadId, `Background agent reported: ${report}`)
+      listener.onAutonomousTurn(threadId)
+    }, delayMs)
+    this.backgroundTasks.set(taskId, { threadId, timer })
+  }
+}
+
+// `... check delay=5000` keeps the agent running long enough to interact.
+function backgroundDelayMs(prompt: string): number {
+  const match = prompt.match(/\bdelay=(\d+)/)
+  return match ? Number(match[1]) : 150
 }
 
 function fileChangeFromPrompt(context: RuntimeTurnContext): {

@@ -96,7 +96,7 @@ test('turn input stamps each send with a client uuid and ends on close', async (
   const next = reader.next()
   input.close()
   assert.deepEqual(await next, { done: true, value: undefined })
-  assert.equal(input.send(message('late')), false)
+  assert.equal(input.send(message('late')), null)
 })
 
 test('turn input drops sends still queued when the turn closes', async () => {

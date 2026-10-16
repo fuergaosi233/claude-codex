@@ -41,6 +41,39 @@ versioning or publishing metadata.
   `CLAUDE_CODEX_STATE_DB_TIMEOUT_MS`) instead of failing at once, and a turn
   whose final write still fails ends with `turn/completed` instead of staying
   in progress with an unhandled rejection.
+- Goals, steer and the message queue follow the Codex App: `thread/goal/*`
+  with continuation turns, token and time budgets and goal tools for Claude;
+  steer errors in Codex's wording; `thread/queue/*`; and a `turn/start` that
+  races a running turn joins it instead of orphaning it.
+- The context gauge follows the main loop's latest API call, like Codex's
+  `last_token_usage`, and tokens spent by subagents and workflows count toward
+  the thread total without moving the gauge or goal progress.
+- A turn that ends early completes the message still streaming and fails the
+  tool calls still running before `turn/completed`, instead of leaving them
+  in progress in the App.
+- The adapter stops Claude CLI processes a previous adapter on the same state
+  dir left running, matching pid, start time and command line before
+  signalling (`CLAUDE_CODEX_REAP_ORPHANED_CLI=0` turns it off).
+- The App's "/" popup offers Claude Code's built-in skills (`/simplify`,
+  `/code-review`, …) from the list the CLI reports, and a picked one runs as
+  the CLI's slash command.
+- Every client request the Codex App can send now has a handler. New real
+  ones: `project/*`, `thread/delete` (with its subagents), `thread/rollback`
+  and `thread/revert` that also rewind Claude's session, `thread/search` and
+  `thread/searchOccurrences`, item and timeline paging, `thread/attachment/*`,
+  background shell listing and termination, `turn/settings/update`,
+  `account/usage/read` from local history, import history, and server
+  diagnostics. Remote control and passkey verification answer disabled and
+  unavailable instead of failing.
+- Fixed `thread/turns/list` paging and ordering, and `thread/list` /
+  `thread/search` pages that skipped threads updated in the same second as the
+  last one shown.
+- Input sent while a turn is still starting waits up to 10 s for it instead
+  of failing with `no active turn to steer`, a turn whose runtime run has
+  returned is ended instead of holding the thread until Stop, and a turn the
+  server failed also stops the CLI turn behind it.
+- An ephemeral `thread/fork`, which the App uses to describe a thread, stays
+  out of `thread/list`.
 
 ### Provider and multi-agent boundaries
 
@@ -62,6 +95,19 @@ versioning or publishing metadata.
 - Added tests proving built-in descriptors validate cleanly, unsupported
   credential labels are not projected as allowed, and secret-like descriptor
   text is redacted from public projection results.
+- Background subagents (`run_in_background` Agent calls) keep running across
+  turns, as Codex App 26.930 shows them: the Claude session stays open while
+  they run, a finished agent's report wakes the parent with a new turn,
+  `SendMessage` resumes an agent, and the child's Stop button ends it.
+- Subagents behave the way the Codex App draws them: the parent's own tools
+  beside an Agent call keep their cards, interrupts stop workflows and single
+  children as Codex does, `SendMessage` / `TaskStop` map to agent calls, the
+  CLI 2.1.283 hand-back report and usage trailer are parsed, and a finishing
+  child no longer clears its still-running siblings from the roster.
+- Deleting a thread ends its running background agents first, so each child
+  turn completes as interrupted; stopping a turn no longer wakes the thread to
+  acknowledge the background agents Claude Code stopped with it; and
+  `/workflows` lists the workflows Claude ran on its own.
 
 ### Rust-first protocol groundwork
 
@@ -105,6 +151,13 @@ versioning or publishing metadata.
 - Documentation changes should run `npm run docs:build`.
 - Credentialed smoke and acceptance checks remain opt-in and must use
   credentials already owned by the local user or organization on the host.
+- `npm run check:app-upgrade -- --app <bundle>` checks a new Codex App build
+  against `scripts/app-baseline.json`: the protocol its bundled `codex`
+  generates, the feature gates on at the reported version and whether every
+  method behind them has a handler, and the clientInfo names. The App
+  behaviors the adapter relies on are App rules in `src/app-compat.mts`, tagged
+  in the code and kept in sync by `test/app-compat.test.mts`; an App build not
+  yet checked gets a config warning. See `docs/reference/app-compat.md`.
 
 ### Still experimental or not yet included
 

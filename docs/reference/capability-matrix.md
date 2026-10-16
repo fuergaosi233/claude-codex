@@ -10,10 +10,15 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 | Area | Status | Notes |
 | --- | --- | --- |
 | Remote transport | Supported | SSH starts `codex app-server --listen unix://` + `proxy`; the shim reports a Codex-compatible version/user agent. |
-| Thread lifecycle | Supported | start/resume/fork/archive/list/read + turn listing, backed by SQLite + Claude session ids. |
+| Thread lifecycle | Supported | start/resume/fork/archive/list/read/delete + turn listing, backed by SQLite + Claude session ids. `thread/delete` also removes the thread's subagents, ending its running background agents first; an unknown thread fails with Codex's missing-rollout text so the App's `missingRolloutRecovery` retry succeeds. |
+| Rollback / revert | Supported | `thread/rollback` and `thread/revert` drop turns and make Claude forget them: the next turn resumes the newest remaining turn's checkpoint in a forked session (a fork's own start point when none remain). Turns from before checkpoints keep Claude's context. |
+| History paging & search | Supported | `thread/turns/list` pages either way from a turn cursor; `thread/items/list` and `thread/timeline/list` page items and turn events. `thread/search` matches names, previews and visible message text; `thread/searchOccurrences` serves find-in-conversation. |
+| Projects | Supported | `project/*` keeps projects and thread membership in SQLite, with `project/changed` and `thread/project/updated` notifications. |
 | Normal chat | Supported | `turn/start` streams Claude text/reasoning into Codex agentMessage/reasoning items. |
-| Steering / interrupt | Supported | `turn/steer` and `turn/interrupt` route to the active Claude client. |
-| Token usage | Supported | SDK ResultMessage usage → TokenUsageBreakdown, pushed as `thread/tokenUsage/updated` (cumulative + last turn). |
+| Steering / interrupt | Supported | `turn/steer` and `turn/interrupt` route to the active Claude client. A rejected steer uses Codex's error texts so the App falls back or retries, and a `turn/start` that races a running turn joins it. Input sent while a turn is still starting waits for it, and a turn whose runtime run has returned is ended instead of blocking the thread. |
+| Goals | Supported | `thread/goal/*` keeps the thread working with hidden continuation turns, counts tokens and time, and stops on budget, usage limits or a turn without progress. Claude gets `get_goal` / `create_goal` / `update_goal` through an in-process MCP server. |
+| Message queue | Supported | `thread/queue/*` holds follow-ups during a turn and sends them in order when the thread goes idle; after an interrupt they wait for `thread/queue/start`. The App uses it from app-server `0.148.0-alpha.14` (see `CLAUDE_CODEX_COMPAT_VERSION`). |
+| Token usage | Supported | SDK ResultMessage usage → TokenUsageBreakdown, pushed as `thread/tokenUsage/updated` (cumulative + last turn). The context gauge follows the main loop's latest API call; subagent and workflow tokens add to the total only. |
 
 ## Runtime selection
 
@@ -45,7 +50,9 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 | Bash output | Supported | Forwarded as command output on completion (SDK has no incremental tool-output streaming). |
 | Generic Claude tools | Supported | Non-command/file tools → mcpToolCall items under the `claude-code` pseudo server. |
 | Subagent (Task) | Supported | Task spawns an ephemeral child thread and emits native `subAgentActivity` lifecycle events (capability-gated `completed`) plus `spawnAgent`/`wait` tool state; inner events are hidden, and the final result lands as one agentMessage on the child thread. |
-| Ephemeral / threadSource | Supported | `ephemeral: true` threads (title-gen, memory-consolidation, subagents) persist but are excluded from `thread/list` unless `includeEphemeral: true`. `threadSource` round-trips. |
+| Background subagents | Supported | `run_in_background` agents keep running across turns: the Claude session stays open while they run, a finished agent's report wakes the parent with a new turn, `SendMessage` resumes an agent, and the child's Stop button ends it. |
+| Subagent control | Supported | Interrupting a turn stops the workflows it launched (Claude Code also stops the background agents it launched, and they wake no turn); stopping a foreground child from its own thread ends just that child, as interrupted. `SendMessage` and `TaskStop` on any child agent render as Codex `sendInput` / `closeAgent` calls, and the parent's own tools and text beside an Agent call keep their cards. `/workflows` also lists the workflows Claude ran on its own. |
+| Ephemeral / threadSource | Supported | `ephemeral: true` threads (title-gen, memory-consolidation, subagents, and the forks the App describes a thread in) persist but are excluded from `thread/list` unless `includeEphemeral: true`. `threadSource` round-trips. |
 | Claude side events | Supported | rate_limit / hook / subagent / compaction events summarized into structured notice lines. |
 | Review mode | Supported (text) | `review/start` creates an in-progress review turn and routes the prompt through Claude. No native guardian finding items. |
 | Context compaction | Supported (summary) | `thread/compact/start` routes the summary prompt and emits contextCompaction items. No native persisted rollout compaction. |
@@ -56,10 +63,13 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 | --- | --- | --- |
 | MCP config/status/tools | Supported | Reads Claude MCP config, passes servers into turns, calls stdio/HTTP tools directly. `mcpServerStatus/list` enumerates real `tools`/`resources`/`resourceTemplates` per server (10s cache, graceful empty fallback on spawn/timeout). |
 | Turn-item paging | Supported | `thread/turns/list` honors `itemsView` — `summary` (default: first userMessage + final agentMessage), `full`, and `notLoaded` — instead of always shipping every item. |
-| Skills & hooks | Supported | `skills/list` reads `.claude/skills/*/SKILL.md` (user+repo scope); `hooks/list` reads `settings.json` hooks, mapping Claude events to Codex `HookEventName` (unmappable events dropped). |
+| Skills & hooks | Supported | `skills/list` reads `.claude/skills/*/SKILL.md` (user+repo scope) and offers the CLI's built-in skills (`/simplify`, `/code-review`, …) as system skills that run as slash commands; `hooks/list` reads `settings.json` hooks, mapping Claude events to Codex `HookEventName` (unmappable events dropped). |
 | Fuzzy file search | Supported | One-shot `fuzzyFileSearch` plus the stateful session API (`sessionStart/Update/Stop`) that streams `fuzzyFileSearch/sessionUpdated` results and a final `sessionCompleted`. |
 | Filesystem RPCs | Supported | `fs/readFile`, write, metadata, list, remove, copy, watch/unwatch (Codex v2-shaped). |
 | Command/process RPCs | Supported | `command/exec` and `process/spawn` implemented. |
+| Background terminals | Supported | Claude's background Bash shells are listed by `thread/backgroundTerminals/list` and stopped by `terminate`/`clean`. The CLI runs them, so there is no OS pid or usage. |
+| Thread attachments | Supported | `thread/attachment/*` keeps the App's per-thread JSON (archived worktree, linked pull requests). |
+| Running-turn settings | Partial | `turn/settings/update` reports `applied` when nothing changes and fails on a model, effort or other change: a running Claude turn keeps its settings until the next `turn/start`. |
 
 ## Not applicable / unsupported
 
@@ -67,8 +77,9 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 | --- | --- | --- |
 | Realtime audio | Unsupported | No Claude audio channel; methods ack so capability probe doesn't error; listVoices returns empty. |
 | Plugins/marketplace/apps | N/A | No Codex plugin marketplace; methods return empty schema-shaped responses. (Claude skills/hooks are surfaced — see Utilities.) |
-| Account/rate limits/auth | N/A | Claude manages its own auth; account/OpenAI-auth panels report null/empty. |
-| External agent import | Stub | `externalAgentConfig/detect` and import return empty. |
+| Account/rate limits/auth | N/A | Claude manages its own auth; account/OpenAI-auth panels report null/empty. `account/usage/read` reports the longest turn and day streaks from local history, with token counts `null`. |
+| Remote control / passkeys | Unsupported | `remoteControl/*` reports a disabled installation; `userVerification/*` reports the provider unavailable, with the error data the App reads. |
+| External agent import | Stub | `externalAgentConfig/detect` and import return empty; the import histories the App records are kept and listed. |
 | Windows sandbox | Unsupported | Target deployment is Linux/macOS; methods return not configured. |
 
 ## Protocol version
@@ -79,12 +90,11 @@ The adapter advertises codex app-server protocol **v2 @ 0.142.3** (via
 backward-compatible: new optional request methods (`thread/search`,
 `thread/delete`, `account/usage/read`, `plugin/*`, `remoteControl/*`,
 `environment/add`, …) plus widened enums (`ReasoningEffort` → free-form string,
-new `AuthMode` / `WebSearchMode` variants). The new methods are
-OpenAI-account / plugin / remote-control surfaces with no Claude Code
-equivalent; unimplemented methods return a JSON-RPC error, which Codex App
-treats as "unsupported" for these optional features. Regenerate the reference
-schema under `generated/` with `npm run generate:schema` (needs a matching
-`codex` on PATH).
+new `AuthMode` / `WebSearchMode` variants). Every client request Codex App
+26.930 can send has a handler; where Claude Code has no equivalent it answers
+with an empty, disabled or `unavailable` result rather than an error (see
+[Codex App compatibility](/reference/app-compat)). Regenerate the reference schema under `generated/` with
+`npm run generate:schema` (needs a matching `codex` on PATH).
 
 Because the adapter now reports the same version as a real `codex`, it appends a
 distinguishing suffix: `codex --version` prints `codex-cli 0.142.3
@@ -117,6 +127,10 @@ codex.
   ∈ pending/inProgress/completed); the checklist tool is not also surfaced as a
   timeline item. Plan-mode prose stays on the separate `plan` ThreadItem +
   `item/plan/delta` channel.
+- A turn that ends early (interrupt, failure, subagent watchdog) completes
+  what Claude was still streaming as commentary and fails the tool calls still
+  running, before `turn/completed`, so no card keeps spinning in a stopped
+  turn.
 
 ## Robustness notes
 
@@ -127,6 +141,11 @@ codex.
   "not a git repository" from real errors) rather than swallowed.
 - Per-thread in-memory state (command approvals, token usage, goals, elicitation
   counts) is released when a thread is archived.
+- A Claude CLI that outlives its adapter (killed, or slow to exit after
+  SIGTERM) is stopped by the next adapter on the same state dir before it
+  serves, so it cannot keep appending to a transcript about to be resumed.
+  Only processes whose pid, start time and command line match the record are
+  signalled.
 
 ## Next targets
 
