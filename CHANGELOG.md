@@ -34,6 +34,10 @@ versioning or publishing metadata.
 - Kept compatibility-only account, plugin, marketplace, realtime, and other
   OpenAI-specific surfaces inert or schema-shaped where Claude Code has no
   equivalent.
+- Writes to the state database wait out another connection's lock (5 s,
+  `CLAUDE_CODEX_STATE_DB_TIMEOUT_MS`) instead of failing at once, and a turn
+  whose final write still fails ends with `turn/completed` instead of staying
+  in progress with an unhandled rejection.
 
 ### Provider and multi-agent boundaries
 
