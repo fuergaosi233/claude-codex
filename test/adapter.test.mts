@@ -856,7 +856,7 @@ test('config writes persist across adapter restarts', async () => {
       await once(second, 'exit')
     }
   } finally {
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -908,7 +908,7 @@ test('invalid persisted model selections are repaired to a selectable model', as
       await once(proc, 'exit')
     }
   } finally {
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -981,7 +981,7 @@ test('Fable and Opus picker aliases reach the runtime without changing plan mode
   } finally {
     proc.kill()
     await once(proc, 'exit')
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -1009,7 +1009,7 @@ for (const configuredModels of ['sonnet', '["sonnet"]', '[{"id":"sonnet"}]']) {
     } finally {
       proc.kill()
       await once(proc, 'exit')
-      await rm(home, { recursive: true, force: true })
+      await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
     }
   })
 }
@@ -1134,7 +1134,7 @@ test('Codex app config payload model and effort map into Claude runtime context'
     assert.equal(text, 'model=haiku effort=xhigh')
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -1378,7 +1378,7 @@ test('stateful HTTP bridge runtimes keep Codex title-generation turns local', as
     assert.doesNotMatch(logText, /"http\.bridge\.ensure\.start"/)
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -1541,7 +1541,7 @@ test('unix daemon keeps active turns alive across peer reconnect', async () => {
     assert.equal(await waitForExit(proc, 2000), 0)
   } finally {
     proc.kill()
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -4660,7 +4660,7 @@ test('turn interrupt completes requested in-progress turn after reconnect', asyn
       { cwd: resolve('.'), stdio: 'pipe' },
     )
   } finally {
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -4819,7 +4819,7 @@ test('runtime settlement cannot overwrite an interrupted turn', async () => {
       { cwd: resolve('.'), stdio: 'pipe' },
     )
   } finally {
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -4911,7 +4911,7 @@ test('subagent watchdog terminalizes a runtime that never returns', async () => 
       { cwd: resolve('.'), stdio: 'pipe' },
     )
   } finally {
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -5006,7 +5006,7 @@ test('workflow watchdog terminalizes a launch that never publishes a result', as
       { cwd: resolve('.'), stdio: 'pipe' },
     )
   } finally {
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -5090,7 +5090,7 @@ test('workflow watchdog disarms when the original Workflow tool result arrives',
       { cwd: resolve('.'), stdio: 'pipe' },
     )
   } finally {
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -5179,16 +5179,15 @@ test('server shutdown terminalizes active child turns before closing the store',
       { cwd: resolve('.'), stdio: 'pipe' },
     )
   } finally {
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
-test('interrupt during final git diff cannot overwrite an interrupted turn', async () => {
-  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+// A repo whose `git diff` blocks until the release file exists, so a test can
+// act while the adapter waits on a turn's diff. The done file marks its return.
+async function blockingGitDiff(home: string): Promise<{ repo: string; env: NodeJS.ProcessEnv }> {
   const repo = join(home, 'repo')
   const bin = join(home, 'bin')
-  const diffStarted = join(home, 'git-diff-started')
-  const diffRelease = join(home, 'git-diff-release')
   await mkdir(repo, { recursive: true })
   await mkdir(bin, { recursive: true })
   execFileSync('git', ['init'], { cwd: repo, stdio: 'ignore' })
@@ -5206,6 +5205,7 @@ test('interrupt during final git diff cannot overwrite an interrupted turn', asy
       '  : > "$CLAUDE_CODEX_TEST_GIT_DIFF_STARTED"',
       '  while [ ! -f "$CLAUDE_CODEX_TEST_GIT_DIFF_RELEASE" ]; do sleep 0.01; done',
       "  printf 'diff --git a/file b/file\\n--- a/file\\n+++ b/file\\n@@ -1 +1 @@\\n-old\\n+new\\n'",
+      '  : > "$CLAUDE_CODEX_TEST_GIT_DIFF_DONE"',
       '  exit 0',
       'fi',
       'exec "$CLAUDE_CODEX_REAL_GIT" "$@"',
@@ -5213,6 +5213,22 @@ test('interrupt during final git diff cannot overwrite an interrupted turn', asy
     ].join('\n'),
   )
   await chmod(fakeGit, 0o755)
+  return {
+    repo,
+    env: {
+      ...process.env,
+      PATH: `${bin}:${process.env.PATH ?? ''}`,
+      CLAUDE_CODEX_REAL_GIT: realGit,
+      CLAUDE_CODEX_TEST_GIT_DIFF_STARTED: join(home, 'git-diff-started'),
+      CLAUDE_CODEX_TEST_GIT_DIFF_RELEASE: join(home, 'git-diff-release'),
+      CLAUDE_CODEX_TEST_GIT_DIFF_DONE: join(home, 'git-diff-done'),
+    },
+  }
+}
+
+test('interrupt during final git diff cannot overwrite an interrupted turn', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const { repo, env } = await blockingGitDiff(home)
 
   try {
     execFileSync(
@@ -5240,7 +5256,7 @@ test('interrupt during final git diff cannot overwrite an interrupted turn', asy
       const peer = { id: 'peer', send: (message) => messages.push(message), close() {} }
       const response = (id) => messages.find((message) => 'id' in message && message.id === id)
       const waitFor = async (condition) => {
-        for (let attempt = 0; attempt < 200; attempt += 1) {
+        for (let attempt = 0; attempt < 1000; attempt += 1) {
           if (condition()) return
           await new Promise((resolve) => setTimeout(resolve, 5))
         }
@@ -5270,6 +5286,9 @@ test('interrupt during final git diff cannot overwrite an interrupted turn', asy
         params: { threadId, turnId },
       })
       writeFileSync(process.env.CLAUDE_CODEX_TEST_GIT_DIFF_RELEASE, 'continue')
+      // Assert only once the diff has returned, so its late result is what
+      // gets checked rather than a loaded machine's slow fake git.
+      await waitFor(() => existsSync(process.env.CLAUDE_CODEX_TEST_GIT_DIFF_DONE))
       await new Promise((resolve) => setTimeout(resolve, 50))
 
       assert.equal(store.getTurn(turnId)?.status, 'interrupted')
@@ -5302,20 +5321,273 @@ test('interrupt during final git diff cannot overwrite an interrupted turn', asy
       await server.stop()
     `,
       ],
-      {
-        cwd: resolve('.'),
-        stdio: 'pipe',
-        env: {
-          ...process.env,
-          PATH: `${bin}:${process.env.PATH ?? ''}`,
-          CLAUDE_CODEX_REAL_GIT: realGit,
-          CLAUDE_CODEX_TEST_GIT_DIFF_STARTED: diffStarted,
-          CLAUDE_CODEX_TEST_GIT_DIFF_RELEASE: diffRelease,
-        },
-      },
+      { cwd: resolve('.'), stdio: 'pipe', env },
     )
   } finally {
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('server stop during final git diff leaves the closed store alone', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const { repo, env } = await blockingGitDiff(home)
+
+  try {
+    // The diff finishes after stop() closed SQLite. A turn that touched the
+    // store then would throw from its failure path and crash the process.
+    const turnId = execFileSync(
+      process.execPath,
+      [
+        '--no-warnings',
+        '--input-type=module',
+        '-e',
+        `
+      import { existsSync, writeFileSync } from 'node:fs'
+      import { join } from 'node:path'
+      import { CodexClaudeAppServer } from './dist/src/server.mjs'
+      import { SessionStore } from './dist/src/store.mjs'
+
+      process.env.CLAUDE_CODEX_HOME = ${JSON.stringify(home)}
+      const store = new SessionStore(join(${JSON.stringify(home)}, 'state.sqlite'))
+      const server = new CodexClaudeAppServer(store, {
+        async runTurn() {},
+        async steer() {},
+        async interrupt() {},
+        async stop() {},
+      })
+      const messages = []
+      const peer = { id: 'peer', send: (message) => messages.push(message), close() {} }
+      const response = (id) => messages.find((message) => 'id' in message && message.id === id)
+      const waitFor = async (condition) => {
+        for (let attempt = 0; attempt < 1000; attempt += 1) {
+          if (condition()) return
+          await new Promise((resolve) => setTimeout(resolve, 5))
+        }
+        throw new Error('timed out waiting for final git diff')
+      }
+
+      await server.handle(peer, {
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: ${JSON.stringify(repo)}, persistExtendedHistory: false },
+      })
+      const threadId = response(1).result.thread.id
+      await server.handle(peer, {
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'stop during final diff', text_elements: [] }],
+        },
+      })
+      const turnId = response(2).result.turn.id
+      await waitFor(() => existsSync(process.env.CLAUDE_CODEX_TEST_GIT_DIFF_STARTED))
+
+      await server.stop()
+      writeFileSync(process.env.CLAUDE_CODEX_TEST_GIT_DIFF_RELEASE, 'continue')
+      process.stdout.write(turnId)
+    `,
+      ],
+      { cwd: resolve('.'), encoding: 'utf8', stdio: 'pipe', env },
+    )
+
+    const store = new SessionStore(join(home, 'state.sqlite'))
+    try {
+      const turn = store.getTurn(turnId)
+      assert.equal(turn?.status, 'interrupted')
+      assert.equal(turn?.diff, '')
+    } finally {
+      store.close()
+    }
+  } finally {
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('adapter exits on SIGTERM even when stopping fails to record the running turn', {
+  timeout: 30_000,
+}, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  let stderr = ''
+  proc.stderr.setEncoding('utf8')
+  proc.stderr.on('data', (chunk: string) => {
+    stderr += chunk
+  })
+  try {
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), persistExtendedHistory: false, permissions: ':workspace' },
+      }),
+    )
+    const threadId = (await reader.nextResponse(1)).result.thread.id
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'please run approval bash', text_elements: [] }],
+        },
+      }),
+    )
+    await reader.nextResponse(2)
+    // The turn stays in progress until its approval is answered.
+    await nextNotification(reader, 'item/commandExecution/requestApproval')
+
+    // With its database deleted, stop() cannot record the interrupted turn,
+    // as when a test removes the adapter's home before the signal lands.
+    await rm(join(home, 'claude-codex-adapter', 'state.sqlite'))
+    proc.kill('SIGTERM')
+    assert.equal(await waitForExit(proc, 20_000), 1, 'the adapter must not linger')
+    assert.match(stderr, /\[claude-codex-adapter\] shutdown failed: /)
+  } finally {
+    await stopProcess(proc)
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('server stop still stops the runtime when the running turn cannot be recorded', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  try {
+    const result = execFileSync(
+      process.execPath,
+      [
+        '--no-warnings',
+        '--input-type=module',
+        '-e',
+        `
+      import { rmSync } from 'node:fs'
+      import { join } from 'node:path'
+      import { CodexClaudeAppServer } from './dist/src/server.mjs'
+      import { SessionStore } from './dist/src/store.mjs'
+
+      process.env.CLAUDE_CODEX_HOME = ${JSON.stringify(home)}
+      const dbPath = join(${JSON.stringify(home)}, 'state.sqlite')
+      let runtimeStopped = false
+      const server = new CodexClaudeAppServer(new SessionStore(dbPath), {
+        runTurn: () => new Promise(() => {}),
+        async steer() {},
+        async interrupt() {},
+        async stop() {
+          runtimeStopped = true
+        },
+      })
+      const messages = []
+      const peer = { id: 'peer', send: (message) => messages.push(message), close() {} }
+      const response = (id) => messages.find((message) => 'id' in message && message.id === id)
+
+      await server.handle(peer, {
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), persistExtendedHistory: false },
+      })
+      await server.handle(peer, {
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId: response(1).result.thread.id,
+          input: [{ type: 'text', text: 'never finishes', text_elements: [] }],
+        },
+      })
+      rmSync(dbPath)
+      const error = await server.stop().then(
+        () => null,
+        (error) => error.message,
+      )
+      process.stdout.write(JSON.stringify({ error, runtimeStopped }))
+    `,
+      ],
+      { cwd: resolve('.'), encoding: 'utf8', stdio: 'pipe' },
+    )
+    const { error, runtimeStopped } = JSON.parse(result)
+    assert.notEqual(error, null, 'recording the interrupted turn fails without its database')
+    assert.equal(runtimeStopped, true)
+  } finally {
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('server stop keeps a queued turn, review or compaction from starting', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  try {
+    const result = execFileSync(
+      process.execPath,
+      [
+        '--no-warnings',
+        '--input-type=module',
+        '-e',
+        `
+      import { join } from 'node:path'
+      import { CodexClaudeAppServer } from './dist/src/server.mjs'
+      import { SessionStore } from './dist/src/store.mjs'
+
+      process.env.CLAUDE_CODEX_HOME = ${JSON.stringify(home)}
+      const launches = []
+      const server = new CodexClaudeAppServer(
+        new SessionStore(join(${JSON.stringify(home)}, 'state.sqlite')),
+        {
+          runTurn: (context) => {
+            launches.push(context.purpose)
+            return new Promise(() => {})
+          },
+          async steer() {},
+          async interrupt() {},
+          async stop() {},
+        },
+      )
+      const messages = []
+      const peer = { id: 'peer', send: (message) => messages.push(message), close() {} }
+      const response = (id) => messages.find((message) => 'id' in message && message.id === id)
+
+      const threadIds = []
+      for (const id of [1, 2, 3]) {
+        await server.handle(peer, {
+          id,
+          method: 'thread/start',
+          params: { cwd: process.cwd(), persistExtendedHistory: false },
+        })
+        threadIds.push(response(id).result.thread.id)
+      }
+      // Each of these answers first and starts on the next tick, after stop().
+      await server.handle(peer, {
+        id: 4,
+        method: 'turn/start',
+        params: {
+          threadId: threadIds[0],
+          input: [{ type: 'text', text: 'never starts', text_elements: [] }],
+        },
+      })
+      await server.handle(peer, {
+        id: 5,
+        method: 'review/start',
+        params: {
+          threadId: threadIds[1],
+          delivery: 'inline',
+          target: { type: 'custom', instructions: 'never starts' },
+        },
+      })
+      await server.handle(peer, {
+        id: 6,
+        method: 'thread/compact/start',
+        params: { threadId: threadIds[2] },
+      })
+      await server.stop()
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      process.stdout.write(JSON.stringify({ launches }))
+    `,
+      ],
+      { cwd: resolve('.'), encoding: 'utf8', stdio: 'pipe' },
+    )
+    assert.deepEqual(JSON.parse(result).launches, [], 'nothing reaches Claude after stop')
+  } finally {
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
@@ -6112,6 +6384,6 @@ test('thread sections paginate without losing entries at page boundaries', async
   } finally {
     proc.kill()
     await once(proc, 'exit')
-    await rm(home, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })

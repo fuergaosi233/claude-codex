@@ -255,14 +255,22 @@ export class CodexClaudeAppServer {
   async stop(): Promise<void> {
     if (this.stopped) return
     this.stopped = true
-    // Child turns are created directly from Task/Workflow events and are not
-    // registered in activeTurnByThread. Finalize them before aborting the
-    // runtime or closing SQLite, otherwise stdio EOF can leave child turns
-    // persisted as inProgress until a later restart recovery pass.
-    this.finalizeActiveSubagentsForShutdown('server stopped')
-    this.completeActiveTurns('interrupted', { message: 'server stopped' })
-    await this.runtime.stop()
-    this.store.close()
+    try {
+      // Child turns are created directly from Task/Workflow events and are not
+      // registered in activeTurnByThread. Finalize them before aborting the
+      // runtime or closing SQLite, otherwise stdio EOF can leave child turns
+      // persisted as inProgress until a later restart recovery pass.
+      this.finalizeActiveSubagentsForShutdown('server stopped')
+      this.completeActiveTurns('interrupted', { message: 'server stopped' })
+    } finally {
+      // A store that can no longer be written must not keep the Claude
+      // processes running.
+      try {
+        await this.runtime.stop()
+      } finally {
+        this.store.close()
+      }
+    }
   }
 
   hasActiveTurns(): boolean {
@@ -1421,6 +1429,9 @@ export class CodexClaudeAppServer {
     // lifecycle turn.
     const responseTurn = this.toLifecycleTurn(turn, [userItem])
     setImmediate(() => {
+      // stop() has already settled this turn; starting it now would launch
+      // Claude after the runtime stopped.
+      if (this.stopped) return
       this.notify(peer, {
         method: 'turn/started',
         params: { threadId, turn: this.toLifecycleTurn(turn) },
@@ -1485,6 +1496,9 @@ export class CodexClaudeAppServer {
     this.activeTurnByThread.set(threadId, turnId)
     this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
     setImmediate(() => {
+      // stop() has already settled this turn; starting it now would launch
+      // Claude after the runtime stopped.
+      if (this.stopped) return
       this.notify(peer, {
         method: 'turn/started',
         params: { threadId, turn: this.toLifecycleTurn(turn) },
@@ -1714,6 +1728,9 @@ export class CodexClaudeAppServer {
     const publicTurn = this.toLifecycleTurn(turn)
 
     setImmediate(() => {
+      // stop() has already settled this turn; starting it now would launch
+      // Claude after the runtime stopped.
+      if (this.stopped) return
       this.notify(peer, { method: 'turn/started', params: { threadId, turn: publicTurn } })
       for (const item of imageItems) {
         this.notify(peer, {
@@ -2122,6 +2139,7 @@ export class CodexClaudeAppServer {
       watchdogTimer.unref()
     }
     const turnIsActive = (): boolean =>
+      !this.stopped &&
       acceptRuntimeEvents &&
       this.store.getTurn(turn.id)?.status === 'inProgress' &&
       this.activeTurnByThread.get(thread.id) === turn.id
@@ -2733,7 +2751,7 @@ export class CodexClaudeAppServer {
                 params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
               })
             const diff = await gitDiff(thread.cwd)
-            if (this.store.getTurn(turn.id)?.status !== 'inProgress') return
+            if (this.stopped || this.store.getTurn(turn.id)?.status !== 'inProgress') return
             if (diff) {
               this.store.updateTurnDiff(turn.id, diff)
               this.notify(peer, {
@@ -2941,6 +2959,9 @@ export class CodexClaudeAppServer {
       : await runtimeOutcome
     disarmWatchdog()
     acceptRuntimeEvents = false
+    // stop() has already settled this turn and closes SQLite once the runtime
+    // stops, so a turn that winds down after that has nothing left to record.
+    if (this.stopped) return
     if (outcome.kind === 'timeout') {
       const timeoutSeconds = Math.ceil(watchdogTimeoutMs / 1000)
       const timeoutUnit = timeoutSeconds === 1 ? 'second' : 'seconds'
@@ -2979,7 +3000,7 @@ export class CodexClaudeAppServer {
     if (currentTurn && currentTurn.status !== 'inProgress') return
 
     const finalDiff = await gitDiff(thread.cwd)
-    if (this.store.getTurn(turn.id)?.status !== 'inProgress') return
+    if (this.stopped || this.store.getTurn(turn.id)?.status !== 'inProgress') return
     if (finalDiff) {
       this.store.updateTurnDiff(turn.id, finalDiff)
       this.notify(peer, {
