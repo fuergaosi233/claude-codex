@@ -597,7 +597,9 @@ export function codexProxyModelOptions(): Array<{
       .map((s) => s.trim())
       .filter(Boolean)
   } else {
-    const catalogCandidates = [join(homedir(), '.codex/model_catalog.json')]
+    // The App and its bundled codex share CODEX_HOME, which is not ~/.codex
+    // for every install.
+    const catalogCandidates = [join(codexHome(), 'model_catalog.json')]
     for (const p of catalogCandidates) {
       if (existsSync(p)) {
         try {
