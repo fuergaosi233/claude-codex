@@ -28,6 +28,9 @@ versioning or publishing metadata.
 
 ### Provider and multi-agent boundaries
 
+- `/workflows` runs turn workflows on with the CLI's `CLAUDE_CODE_WORKFLOWS`
+  switch instead of `--settings`, which pinned launchers reject, and respect a
+  user's `enableWorkflows: false`.
 - Added the provider and multi-agent loop boundaries RFC to separate runtime
   backends, provider metadata, agent-loop fidelity, credential ownership, and
   subscription/entitlement boundaries.
