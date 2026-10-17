@@ -8,6 +8,7 @@ import {
   claudeHookSession,
   claudeHookSpecs,
   hookOutput,
+  sessionEndBudgetSec,
 } from '../src/claude-hooks.mjs'
 import { NativeClaudeRuntime } from '../src/native-runtime.mjs'
 import type { HookOutput, SdkHooks } from '../src/sdk-hooks.mjs'
@@ -54,7 +55,7 @@ const spec = (overrides: Partial<ClaudeHookSpec>): ClaudeHookSpec => ({
   shell: 'sh',
   timeoutSec: 30,
   async: false,
-  once: false,
+  if: null,
   source: 'settings.json',
   ...overrides,
 })
@@ -117,8 +118,15 @@ test('Claude Code hooks are read from the user settings, and a trusted project o
           },
           { matcher: '*', hooks: [command('node', { args: ['log.mjs', '--all'], once: true })] },
         ],
-        UserPromptSubmit: [{ hooks: [command('context.sh', { async: true })] }],
-        Stop: [{ hooks: [command('rewake.sh', { asyncRewake: true, shell: 'bash' })] }],
+        UserPromptSubmit: [{ hooks: [command('context.sh', { async: true, if: ' ' })] }],
+        Stop: [
+          {
+            hooks: [
+              command('rewake.sh', { asyncRewake: true, shell: 'bash' }),
+              command('never.sh', { if: 'Bash(git *)' }),
+            ],
+          },
+        ],
         SessionEnd: [{ hooks: [command('cleanup.sh'), command('upload.sh', { timeout: 120 })] }],
         PreCompact: [{ hooks: [command('compact.sh')] }],
       }),
@@ -136,14 +144,17 @@ test('Claude Code hooks are read from the user settings, and a trusted project o
     const userSpecs = [
       spec({ matcher: 'Bash', command: 'guard.sh', timeoutSec: 5, source: user }),
       spec({
-        command: 'node',
-        args: ['log.mjs', '--all'],
-        once: true,
+        matcher: 'Bash',
+        command: 'filtered.sh',
+        if: 'Bash(git *)',
         timeoutSec: 600,
         source: user,
       }),
-      // Claude Code's defaults: 30 seconds for a prompt, a short budget for
-      // the end of a session that an explicit timeout raises to a minute.
+      // `once` means nothing in a settings file, as in Claude Code.
+      spec({ command: 'node', args: ['log.mjs', '--all'], timeoutSec: 600, source: user }),
+      // Claude Code's defaults: 30 seconds for a prompt, a second and a half
+      // for the end of a session unless the hook says otherwise. A blank
+      // `if` is none; one on an event that is not about a tool never runs.
       spec({
         event: 'UserPromptSubmit',
         command: 'context.sh',
@@ -160,7 +171,7 @@ test('Claude Code hooks are read from the user settings, and a trusted project o
         source: user,
       }),
       spec({ event: 'SessionEnd', command: 'cleanup.sh', timeoutSec: 1.5, source: user }),
-      spec({ event: 'SessionEnd', command: 'upload.sh', timeoutSec: 60, source: user }),
+      spec({ event: 'SessionEnd', command: 'upload.sh', timeoutSec: 120, source: user }),
     ]
     // No hooks unless asked for.
     for (const value of [undefined, '0', '1', 'true', 'all'])
@@ -190,7 +201,7 @@ test('Claude Code hooks are read from the user settings, and a trusted project o
       JSON.stringify({ disableAllHooks: true }),
     )
     assert.deepEqual(await read({ CLAUDE_CODEX_CLAUDE_HOOKS: 'project' }), [])
-    assert.equal((await read({ CLAUDE_CODEX_CLAUDE_HOOKS: 'user' })).length, 6)
+    assert.equal((await read({ CLAUDE_CODEX_CLAUDE_HOOKS: 'user' })).length, 7)
   } finally {
     await rm(root, { recursive: true, force: true })
   }
@@ -322,9 +333,8 @@ test('exit code 2 blocks a tool call and plain output only feeds the events that
   )
 })
 
-test('hooks time out, run in the background or once, as configured', async () => {
+test('hooks time out or run in the background, as configured', async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'claude-hooks-modes-')))
-  const count = join(root, 'count')
   const late = join(root, 'late')
   try {
     const session = claudeHookSession(
@@ -337,7 +347,6 @@ test('hooks time out, run in the background or once, as configured', async () =>
           command: "while :; do sleep 1; done; echo 'too late' >&2; exit 2",
         }),
         spec({ event: 'SessionEnd', async: true, command: `sleep 0.2; echo done > '${late}'` }),
-        spec({ event: 'SessionStart', once: true, command: `echo run >> '${count}'; echo ready` }),
       ],
       { projectDir: root, approvals: true },
     )
@@ -360,23 +369,6 @@ test('hooks time out, run in the background or once, as configured', async () =>
       await new Promise((resolve) => setTimeout(resolve, 50))
     }
     assert.equal(await readFile(late, 'utf8'), 'done\n')
-
-    const ready = {
-      hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: 'ready' },
-    }
-    assert.deepEqual(await call(hooks, 'SessionStart', {}), ready)
-    assert.deepEqual(await call(hooks, 'SessionStart', {}), {})
-    assert.equal(await readFile(count, 'utf8'), 'run\n')
-    // A new session runs it again.
-    const { hooks: next } = claudeHookSession(
-      [spec({ event: 'SessionStart', once: true, command: `echo run >> '${count}'` })],
-      {
-        projectDir: root,
-        approvals: true,
-      },
-    )
-    await call(next, 'SessionStart', {})
-    assert.equal(await readFile(count, 'utf8'), 'run\nrun\n')
   } finally {
     await rm(root, { recursive: true, force: true })
   }
@@ -390,10 +382,11 @@ test('a hook is done when its own process exits, and what it started keeps runni
     const { hooks } = claudeHookSession(
       [
         // The background process holds the hook's output open until told to
-        // go on, and then proves it was not killed.
+        // go on, and then proves it was not killed, not even by writing to
+        // that output after the hook is done.
         spec({
           event: 'Stop',
-          command: `(i=0; while [ ! -f '${go}' ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done; echo alive > '${alive}') & echo '{"systemMessage":"started"}'`,
+          command: `(i=0; while [ ! -f '${go}' ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done; echo more; echo more >&2; echo alive > '${alive}') & echo '{"systemMessage":"started"}'`,
         }),
         spec({ event: 'SessionStart', command: 'echo "$0"' }),
         spec({ event: 'UserPromptSubmit', shell: 'bash', command: 'echo "$0"' }),
@@ -432,6 +425,76 @@ test('a hook the CLI gives up on is stopped', async () => {
     setTimeout(() => controller.abort(), 100)
     assert.deepEqual(await pending, {})
     assert.ok(Date.now() - started < 3000)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("a hook's if is matched as an ask rule is, against the tool call", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'claude-hooks-if-')))
+  const log = join(root, 'log')
+  try {
+    const { hooks } = claudeHookSession(
+      [
+        spec({ if: 'Bash(git push:*)', command: `echo push >> '${log}'` }),
+        spec({ event: 'PostToolUse', if: 'Edit(src/**)', command: `echo edit >> '${log}'` }),
+      ],
+      { projectDir: root, approvals: true },
+    )
+    const ran = () =>
+      readFile(log, 'utf8').then(
+        (text) => text.trim().split('\n'),
+        () => [],
+      )
+    const bash = (command: string) =>
+      call(hooks, 'PreToolUse', { cwd: root, tool_name: 'Bash', tool_input: { command } })
+    await bash('git status')
+    await bash('git pull')
+    await call(hooks, 'PreToolUse', { cwd: root, tool_name: 'Read', tool_input: {} })
+    assert.deepEqual(await ran(), [])
+    await bash('npm test && git push origin main')
+    // A command line it cannot take apart runs the hook, as it asks.
+    await bash('git push origin "$(git branch --show-current)"')
+    assert.deepEqual(await ran(), ['push', 'push'])
+
+    const edit = (file: string) =>
+      call(hooks, 'PostToolUse', { cwd: root, tool_name: 'Edit', tool_input: { file_path: file } })
+    await edit(join(root, 'test', 'a.ts'))
+    await edit(join(root, 'src', 'deep', 'a.ts'))
+    assert.deepEqual(await ran(), ['push', 'push', 'edit'])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('the SessionEnd hooks of a session share one budget', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'claude-hooks-end-budget-')))
+  const sessionEnd = (timeoutSec: number) => spec({ event: 'SessionEnd', timeoutSec })
+  const budget = (specs: ClaudeHookSpec[], override?: string) =>
+    withEnv({ CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS: override }, () => sessionEndBudgetSec(specs))
+  try {
+    // The longest timeout, from a second and a half up to a minute, or what
+    // CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS says.
+    assert.equal(await budget([]), 1.5)
+    assert.equal(await budget([sessionEnd(1.5), sessionEnd(1)]), 1.5)
+    assert.equal(await budget([sessionEnd(10), sessionEnd(1.5), spec({ timeoutSec: 600 })]), 10)
+    assert.equal(await budget([sessionEnd(120), sessionEnd(30)]), 60)
+    assert.equal(await budget([sessionEnd(120)], '400'), 0.4)
+    assert.equal(await budget([sessionEnd(10)], 'soon'), 10)
+
+    // Each hook may wait half a minute, but not all together past the
+    // budget.
+    const session = claudeHookSession(
+      [
+        spec({ event: 'SessionEnd', timeoutSec: 30, command: 'sleep 20' }),
+        spec({ event: 'SessionEnd', timeoutSec: 30, command: 'sleep 20' }),
+      ],
+      { projectDir: root, approvals: true },
+    )
+    await call(session.hooks, 'UserPromptSubmit', { session_id: 'session' })
+    const started = Date.now()
+    await withEnv({ CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS: '400' }, () => session.end?.('other'))
+    assert.ok(Date.now() - started < 5000, 'the SessionEnd hooks outlived their budget')
   } finally {
     await rm(root, { recursive: true, force: true })
   }

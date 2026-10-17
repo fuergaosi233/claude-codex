@@ -192,9 +192,16 @@ the CLI matches it as it would a settings hook and the adapter runs it the way
 Claude Code does: with `sh -c` (`bash -c` for `shell: "bash"`, no shell in exec
 form with `args`), the hook input as JSON on stdin, `CLAUDE_PROJECT_DIR` set,
 its `timeout` (by default 10 minutes, 30 seconds for `UserPromptSubmit`, 1.5
-seconds for `SessionEnd`, where an explicit one goes up to a minute), `async`
-and `once` honored. A hook is done when its own process exits; a background
-process it started keeps running, while a hook that times out is killed with
+seconds for `SessionEnd`) and `async` honored. A session's `SessionEnd` hooks
+also share one budget, the longest of their timeouts from 1.5 seconds up to a
+minute, and `CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS` sets both, as in Claude
+Code. A hook's `if`, a permission rule such as `Bash(git *)`, is matched against
+the tool call as the adapter matches ask rules (so a command line it cannot take
+apart runs the hook); as in Claude Code, a hook with `if` on an event that is
+not about a tool never runs, and `once`, which Claude Code honors only for hooks
+a skill or agent defines, means nothing in a settings file. A hook is done when
+its own process exits; a background process it started keeps running and can
+still write to the hook's output, while a hook that times out is killed with
 everything it started. Exit 0 passes JSON output on (plain output becomes
 context for `UserPromptSubmit` and `SessionStart`), exit 2 blocks with stderr as
 the reason (for `SubagentStart`, `SessionStart` and `SessionEnd` it only shows
@@ -209,8 +216,8 @@ after the SDK has let go of them, so the adapter runs those two itself:
 `systemMessage` reaching Claude and the user along with that prompt;
 `SessionEnd`, with the reason `other`, when the CLI session is over, for a
 session that took a prompt. The CLI itself still runs `SessionStart` for
-`compact` and `clear`. Prompt, agent and HTTP hooks, `if` filters, PowerShell
-hooks, `asyncRewake`'s wake-up, `CLAUDE_ENV_FILE`, and other events (such as
+`compact` and `clear`. Prompt, agent and HTTP hooks, PowerShell hooks,
+`asyncRewake`'s wake-up, `CLAUDE_ENV_FILE`, and other events (such as
 `PreCompact`, whose output a callback cannot pass back, or `PermissionRequest`,
 which the Codex approval flow owns) are not carried over. Point
 `CLAUDE_CODEX_CLAUDE_CONFIG_DIR` only at a folder the CLI does not read itself,

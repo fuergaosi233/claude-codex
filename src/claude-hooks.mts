@@ -1,4 +1,6 @@
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
+import { Socket } from 'node:net'
+import { askRuleCovers } from './ask-rules.mjs'
 import {
   claudeProjectSettingsPaths,
   claudeTrustsProject,
@@ -38,11 +40,18 @@ import { debugLog } from './util.mjs'
 // SessionEnd once the CLI session is over. The CLI still calls SessionStart
 // for compact and clear.
 //
-// Not carried over: prompt, agent and http hooks, hooks filtered with
-// `if`, PowerShell hooks, the asyncRewake wake-up (such a hook just runs in
-// the background), CLAUDE_ENV_FILE, and the events whose outcome a callback
-// cannot express or that the Codex approval flow owns (PreCompact,
-// PermissionRequest and the rest).
+// A hook's `if`, a permission rule such as Bash(git *), is matched as the
+// adapter matches ask rules, erring towards running the hook where it
+// cannot take a command apart; as in Claude Code, only a tool event can meet
+// one, so a hook with `if` on any other event never runs. `once` means
+// nothing in a settings file, as in Claude Code, which honors it only for
+// the hooks a skill or agent defines.
+//
+// Not carried over: prompt, agent and http hooks, PowerShell hooks, the
+// asyncRewake wake-up (such a hook just runs in the background),
+// CLAUDE_ENV_FILE, and the events whose outcome a callback cannot express or
+// that the Codex approval flow owns (PreCompact, PermissionRequest and the
+// rest).
 
 export const CLAUDE_HOOK_EVENTS = [
   'PreToolUse',
@@ -63,11 +72,16 @@ const USER_ONLY_EVENTS = new Set(['SubagentStart', 'SessionStart', 'SessionEnd']
 // Plain output of a successful hook becomes context for these events.
 const CONTEXT_EVENTS = new Set(['UserPromptSubmit', 'SessionStart'])
 // Claude Code's defaults for a command hook: ten minutes, less for the
-// events that hold up the user. SessionEnd hooks share a short budget,
-// which an explicit timeout can raise to a minute.
+// events that hold up the user. Each SessionEnd hook gets a second and a
+// half unless it says otherwise, and together they get the longest of their
+// timeouts, from a second and a half up to a minute; as in Claude Code,
+// CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS sets both.
 const DEFAULT_TIMEOUT_SEC = 600
-const EVENT_TIMEOUT_SEC: Record<string, number> = { UserPromptSubmit: 30, SessionEnd: 1.5 }
+const EVENT_TIMEOUT_SEC: Record<string, number> = { UserPromptSubmit: 30 }
+const SESSION_END_DEFAULT_SEC = 1.5
 const SESSION_END_MAX_SEC = 60
+// The events a hook's `if` can apply to: those about a tool call.
+const TOOL_EVENTS = new Set(['PreToolUse', 'PostToolUse', 'PostToolUseFailure'])
 // How long a finished hook's output is still read: a background process it
 // started may hold its stdout open long after.
 const DRAIN_MS = 250
@@ -99,7 +113,8 @@ export interface ClaudeHookSpec {
   readonly shell: 'sh' | 'bash'
   readonly timeoutSec: number
   readonly async: boolean
-  readonly once: boolean
+  // The permission rule a tool call must match for the hook to run, or null.
+  readonly if: string | null
   // The settings file the hook came from.
   readonly source: string
 }
@@ -147,7 +162,7 @@ export function claudeHookSpecs(cwd: string, configDir: string): ClaudeHookSpec[
           const spec = hookSpec(path, event, matcher, asTable(handler))
           if (!spec) continue
           // Claude Code runs an identical command once.
-          const key = JSON.stringify([event, matcher, spec.command, spec.args])
+          const key = JSON.stringify([event, matcher, spec.shell, spec.command, spec.args, spec.if])
           if (seen.has(key)) continue
           seen.add(key)
           specs.push(spec)
@@ -172,22 +187,48 @@ function hookSpec(
   if (handler.type !== 'command') return skip(`${String(handler.type)} hooks are not supported`)
   const command = typeof handler.command === 'string' ? handler.command.trim() : ''
   if (!command) return skip('no command')
-  if (handler.if !== undefined) return skip('if filters are not supported')
   if (handler.shell === 'powershell') return skip('PowerShell hooks are not supported')
+  let condition: string | null = null
+  if (handler.if !== undefined) {
+    if (typeof handler.if !== 'string') return skip('if is not a permission rule')
+    condition = handler.if.trim() || null
+    if (condition && !TOOL_EVENTS.has(event)) return skip('if conditions apply to tool events only')
+  }
   const timeout = typeof handler.timeout === 'number' ? handler.timeout : Number.NaN
-  const fallback = EVENT_TIMEOUT_SEC[event] ?? DEFAULT_TIMEOUT_SEC
-  const timeoutSec = timeout > 0 ? timeout : fallback
+  const fallback =
+    event === 'SessionEnd'
+      ? (sessionEndOverrideSec() ?? SESSION_END_DEFAULT_SEC)
+      : (EVENT_TIMEOUT_SEC[event] ?? DEFAULT_TIMEOUT_SEC)
   return {
     event,
     matcher,
     command,
     args: Array.isArray(handler.args) ? stringList(handler.args) : null,
     shell: handler.shell === 'bash' ? 'bash' : 'sh',
-    timeoutSec: event === 'SessionEnd' ? Math.min(timeoutSec, SESSION_END_MAX_SEC) : timeoutSec,
+    timeoutSec: timeout > 0 ? timeout : fallback,
     async: handler.async === true || handler.asyncRewake === true,
-    once: handler.once === true,
+    if: condition,
     source,
   }
+}
+
+// CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS in seconds, or null when unset.
+function sessionEndOverrideSec(): number | null {
+  const raw = process.env.CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS?.trim() ?? ''
+  const ms = /^\d+$/.test(raw) ? Number(raw) : 0
+  return ms > 0 ? ms / 1000 : null
+}
+
+// How long a session's SessionEnd hooks get together, as Claude Code works
+// it out: what CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS says, or else the
+// longest of their timeouts, from a second and a half up to a minute.
+export function sessionEndBudgetSec(specs: readonly ClaudeHookSpec[]): number {
+  const override = sessionEndOverrideSec()
+  if (override !== null) return override
+  const timeouts = specs
+    .filter((spec) => spec.event === 'SessionEnd')
+    .map((spec) => spec.timeoutSec)
+  return Math.max(SESSION_END_DEFAULT_SEC, Math.min(Math.max(0, ...timeouts), SESSION_END_MAX_SEC))
 }
 
 export interface ClaudeHookOptions {
@@ -215,7 +256,7 @@ export interface ClaudeHookSession {
   readonly end: ((reason: string) => Promise<void>) | null
 }
 
-// The hooks of one CLI session. `once` hooks run once per session.
+// The hooks of one CLI session.
 export function claudeHookSession(
   specs: readonly ClaudeHookSpec[],
   options: ClaudeHookOptions,
@@ -224,17 +265,12 @@ export function claudeHookSession(
   const add = (event: string, matcher: HookMatcher): void => {
     hooks[event] = [...(hooks[event] ?? []), matcher]
   }
-  const ran = new Set<ClaudeHookSpec>()
   // An async hook runs in the background, its outcome only logged.
   const run = async (
     spec: ClaudeHookSpec,
     input: Record<string, unknown>,
     signal?: AbortSignal,
   ): Promise<HookOutput> => {
-    if (spec.once) {
-      if (ran.has(spec)) return {}
-      ran.add(spec)
-    }
     if (spec.async) {
       void runHookCommand(spec, input, options.projectDir).then((result) => logResult(spec, result))
       return {}
@@ -279,6 +315,7 @@ export function claudeHookSession(
     if (spec.event === 'SessionEnd') continue
     const callback: HookCallback = async (input, _toolUseId, { signal }) => {
       if (spec.event === 'SessionStart' && SESSION_ORIGINS.has(String(input.source))) return {}
+      if (spec.if && !conditionMet(spec.if, input, options.projectDir)) return {}
       return run(spec, input, signal)
     }
     const matcher: HookMatcher = { hooks: [callback], timeout: spec.timeoutSec }
@@ -292,9 +329,20 @@ export function claudeHookSession(
     ended = true
     const input = { ...session, hook_event_name: 'SessionEnd', reason }
     const due = ends.filter((spec) => matches(spec.matcher, reason))
-    await Promise.all(due.map((spec) => run(spec, input)))
+    // One budget for them all: what is still running when it is spent is
+    // stopped.
+    const budget = AbortSignal.timeout(sessionEndBudgetSec(ends) * 1000)
+    await Promise.all(due.map((spec) => run(spec, input, budget)))
   }
   return { hooks, end: ends.length > 0 ? end : null }
+}
+
+// Whether a tool call meets a hook's `if`: the call an ask rule written the
+// same way would cover. Relative paths start from the call's folder.
+function conditionMet(rule: string, input: Record<string, unknown>, projectDir: string): boolean {
+  const tool = typeof input.tool_name === 'string' ? input.tool_name : ''
+  const cwd = typeof input.cwd === 'string' && input.cwd ? input.cwd : projectDir
+  return askRuleCovers(rule, tool, asTable(input.tool_input) ?? {}, cwd)
 }
 
 // Whether a hook's matcher takes a query, as the CLI decides: every query
@@ -351,8 +399,10 @@ export interface HookCommandResult {
 // asks for bash, no shell in exec form), the hook input as JSON on stdin and
 // CLAUDE_PROJECT_DIR set. It is done when its own process exits, once the
 // output still on its way is read: a background process it started keeps
-// running. When it outlives its timeout or the CLI gives up on it, it is
-// killed with everything it started.
+// running, and what it still writes is read and dropped, so that it gets
+// no SIGPIPE, without holding the adapter open. When the hook outlives its
+// timeout or the CLI gives up on it, it is killed with everything it
+// started.
 export function runHookCommand(
   spec: ClaudeHookSpec,
   input: Record<string, unknown>,
@@ -417,10 +467,10 @@ export function runHookCommand(
     }, spec.timeoutSec * 1000)
     signal?.addEventListener('abort', abort, { once: true })
     child.stdout.on('data', (chunk: Buffer) => {
-      if (stdout.length < OUTPUT_LIMIT) stdout += chunk.toString('utf8')
+      if (!settled && stdout.length < OUTPUT_LIMIT) stdout += chunk.toString('utf8')
     })
     child.stderr.on('data', (chunk: Buffer) => {
-      if (stderr.length < OUTPUT_LIMIT) stderr += chunk.toString('utf8')
+      if (!settled && stderr.length < OUTPUT_LIMIT) stderr += chunk.toString('utf8')
     })
     child.on('error', (cause) => {
       error = cause.message
@@ -432,8 +482,12 @@ export function runHookCommand(
       clearTimeout(retry)
       signal?.removeEventListener('abort', abort)
       drain = setTimeout(() => {
-        child.stdout.destroy()
-        child.stderr.destroy()
+        // The pipes stay open for a background process that still writes
+        // to them, but no longer keep the adapter running.
+        for (const stream of [child.stdout, child.stderr]) {
+          stream.on('error', () => {})
+          if (stream instanceof Socket) stream.unref()
+        }
         finish(code)
       }, DRAIN_MS)
     })

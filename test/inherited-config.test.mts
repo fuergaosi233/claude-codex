@@ -1725,7 +1725,7 @@ test('inherited ask rules send the calls they cover to the approval prompt, over
     shell: 'sh' as const,
     timeoutSec: 30,
     async: false,
-    once: false,
+    if: null,
     source: 'settings.json',
   }
   const options = await withEnv({ CLAUDE_CODEX_PERMISSION_MODE: undefined }, () =>
@@ -1809,7 +1809,7 @@ test('the native runtime registers the Claude Code hooks with the SDK', async ()
     shell: 'sh' as const,
     timeoutSec: 30,
     async: false,
-    once: false,
+    if: null,
     source: 'settings.json',
   }
   const decision = async (overrides: Partial<RuntimeTurnContext>) => {
