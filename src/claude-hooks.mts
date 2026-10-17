@@ -62,6 +62,8 @@ const SESSION_END_MAX_SEC = 60
 // How long a finished hook's output is still read: a background process it
 // started may hold its stdout open long after.
 const DRAIN_MS = 250
+// How often a killed hook is killed again until it is gone.
+const KILL_RETRY_MS = 100
 const OUTPUT_LIMIT = 1024 * 1024
 const OUTPUT_KEYS = [
   'continue',
@@ -249,11 +251,13 @@ export function runHookCommand(
     let settled = false
     let timer: NodeJS.Timeout | undefined
     let drain: NodeJS.Timeout | undefined
+    let retry: NodeJS.Timeout | undefined
     const finish = (code: number | null) => {
       if (settled) return
       settled = true
       clearTimeout(timer)
       clearTimeout(drain)
+      clearTimeout(retry)
       signal?.removeEventListener('abort', abort)
       resolve({ code, stdout, stderr, timedOut, error, durationMs: Date.now() - started })
     }
@@ -271,6 +275,8 @@ export function runHookCommand(
       finish(null)
       return
     }
+    // The whole group, again until the shell is gone: macOS can miss a shell
+    // that is just forking, which then carries on after its killed command.
     const kill = () => {
       try {
         if (child.pid && process.platform !== 'win32') process.kill(-child.pid, 'SIGKILL')
@@ -278,6 +284,9 @@ export function runHookCommand(
       } catch {
         child.kill('SIGKILL')
       }
+      clearTimeout(retry)
+      retry = setTimeout(kill, KILL_RETRY_MS)
+      retry.unref()
     }
     const abort = () => kill()
     timer = setTimeout(() => {
@@ -298,6 +307,7 @@ export function runHookCommand(
     child.on('exit', (code) => {
       // Done: what it started is its own business now.
       clearTimeout(timer)
+      clearTimeout(retry)
       signal?.removeEventListener('abort', abort)
       drain = setTimeout(() => {
         child.stdout.destroy()
@@ -315,6 +325,8 @@ export function runHookCommand(
 // What a finished command tells the CLI, as Claude Code reads its exit code
 // and output.
 export function hookOutput(event: string, result: HookCommandResult, approvals = true): HookOutput {
+  // A hook that timed out is cancelled, whatever it printed.
+  if (result.timedOut) return {}
   if (result.code === 0) {
     const text = result.stdout.trim()
     const json = text.startsWith('{') ? jsonObject(text) : null

@@ -283,6 +283,8 @@ test('exit code 2 blocks a tool call and plain output only feeds the events that
   // JSON output counts on exit 0 only.
   assert.deepEqual(hookOutput('Stop', result(1, '{"decision":"block","reason":"x"}')), {})
   assert.deepEqual(hookOutput('PreToolUse', { ...result(null), timedOut: true }), {})
+  // Even when the shell outlived the kill and printed something.
+  assert.deepEqual(hookOutput('SessionStart', { ...result(0, 'late'), timedOut: true }), {})
   // Where only Codex approves, a hook's approval is dropped and its other
   // answers stay.
   const approving = result(
