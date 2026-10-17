@@ -1196,7 +1196,7 @@ test('Claude Code permission rules: the user rules apply, project deny rules alw
         permissions: {
           allow: ['Bash(npm test:*)', 'Read(/notes/**)', 'Read(//etc/hosts)', 'Bash(/bin/ls)'],
           deny: ['Read(./.env)', 'WebFetch', 'Edit(/settings.json)'],
-          ask: ['Bash(git push:*)'],
+          ask: ['Bash(git push:*)', 'Read(/secrets/**)'],
           defaultMode: 'bypassPermissions',
         },
       }),
@@ -1204,7 +1204,11 @@ test('Claude Code permission rules: the user rules apply, project deny rules alw
     await write(
       join(repo, '.claude', 'settings.json'),
       JSON.stringify({
-        permissions: { allow: ['Bash(make:*)'], deny: ['Bash(rm:*)', 'WebFetch'] },
+        permissions: {
+          allow: ['Bash(make:*)'],
+          deny: ['Bash(rm:*)', 'WebFetch'],
+          ask: ['Edit(/package.json)'],
+        },
       }),
     )
     await write(
@@ -1230,7 +1234,9 @@ test('Claude Code permission rules: the user rules apply, project deny rules alw
       // A project rule stays relative to the project.
       'Write(/dist/**)',
     ]
-    assert.deepEqual(await read(), { allow: userAllow, deny, ask: 1 })
+    // Ask rules hold tools back, so the project's apply untrusted too.
+    const ask = ['Bash(git push:*)', `Read(/${configDir}/secrets/**)`, 'Edit(/package.json)']
+    assert.deepEqual(await read(), { allow: userAllow, deny, ask })
 
     await write(
       join(configDir, '.claude.json'),
@@ -1239,13 +1245,13 @@ test('Claude Code permission rules: the user rules apply, project deny rules alw
     assert.deepEqual(await read(), {
       allow: [...userAllow, 'Bash(make:*)', 'Edit(/src/**)'],
       deny,
-      ask: 1,
+      ask,
     })
     // No settings, no rules.
     assert.deepEqual(claudePermissionRules(join(root, 'elsewhere'), join(root, 'empty')), {
       allow: [],
       deny: [],
-      ask: 0,
+      ask: [],
     })
   } finally {
     await rm(root, { recursive: true, force: true })
@@ -1259,7 +1265,9 @@ test('Claude threads get the permission rules only with the config folder bridge
   await mkdir(join(repo, '.git'), { recursive: true })
   await write(
     join(configDir, 'settings.json'),
-    JSON.stringify({ permissions: { allow: ['Bash(npm test:*)'], deny: ['WebFetch'] } }),
+    JSON.stringify({
+      permissions: { allow: ['Bash(npm test:*)'], deny: ['WebFetch'], ask: ['Bash(git push:*)'] },
+    }),
   )
   for (const bridged of [false, true])
     await withServer(
@@ -1272,11 +1280,13 @@ test('Claude threads get the permission rules only with the config folder bridge
         const started = await request('thread/start', { cwd: repo, model: 'sonnet' })
         const normal = await turn(started.thread.id)
         assert.deepEqual(normal.inheritedAllowedTools, bridged ? ['Bash(npm test:*)'] : null)
+        assert.deepEqual(normal.inheritedAskRules, bridged ? ['Bash(git push:*)'] : null)
         assert.deepEqual(normal.disallowedTools, bridged ? ['WebFetch'] : [])
         const summary = await turn(started.thread.id, {
           outputSchema: { type: 'object', properties: { summary: { type: 'string' } } },
         })
         assert.equal(summary.inheritedAllowedTools, null)
+        assert.equal(summary.inheritedAskRules, null)
       },
     )
   await rm(root, { recursive: true, force: true })
@@ -1299,6 +1309,47 @@ test('inherited allow rules stay out of plan mode and a read-only sandbox', asyn
     'Read',
   ])
   assert.ok(!(await allowed({ planMode: true })).includes(rule))
+})
+
+test('inherited ask rules send the calls they cover to the approval prompt, over allow rules and hooks', async () => {
+  const approve = {
+    event: 'PreToolUse',
+    matcher: null,
+    command:
+      'echo \'{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}\'',
+    args: null,
+    timeoutSec: 30,
+    async: false,
+    once: false,
+    source: 'settings.json',
+  }
+  const options = await withEnv({ CLAUDE_CODEX_PERMISSION_MODE: undefined }, () =>
+    sessionOptions({
+      approvalPolicy: 'on-request',
+      sandboxMode: 'workspace-write',
+      inheritedAllowedTools: ['Bash(git:*)'],
+      inheritedAskRules: ['Bash(git push:*)'],
+      claudeHooks: [approve],
+    }),
+  )
+  // The allow rule stays: the ask rule only takes precedence over it.
+  assert.ok(options.allowedTools.includes('Bash(git:*)'))
+  assert.equal(typeof options.canUseTool, 'function')
+  const decisions = async (command: string) => {
+    const input = { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command } }
+    const outputs = []
+    for (const matcher of options.hooks.PreToolUse)
+      for (const hook of matcher.hooks)
+        outputs.push(
+          (await hook(input, undefined, { signal: new AbortController().signal }))
+            .hookSpecificOutput?.permissionDecision ?? null,
+        )
+    return outputs
+  }
+  // The guard asks; the user's hook still approves, and the CLI takes the
+  // stricter of the two.
+  assert.deepEqual(await decisions('git fetch && git push origin main'), ['ask', 'allow'])
+  assert.deepEqual(await decisions('git status'), [null, 'allow'])
 })
 
 test('Claude threads run the Claude Code hooks only with the config folder bridged and the opt-in', async () => {

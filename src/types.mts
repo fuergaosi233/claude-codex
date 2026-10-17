@@ -405,6 +405,9 @@ export interface RuntimeTurnContext {
   // they do not apply in plan mode or a read-only sandbox, where Codex would
   // not let the tools run unasked.
   inheritedAllowedTools?: string[] | null
+  // Ask rules from the user's Claude Code settings: the calls they cover go
+  // to the permission prompt even when an allow rule covers them too.
+  inheritedAskRules?: string[] | null
   // Subagents by name, as the SDK's agents option takes them.
   agents?: Record<string, Record<string, unknown>> | null
   // Command hooks from the user's Claude Code settings, run as SDK hook

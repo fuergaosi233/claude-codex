@@ -333,6 +333,7 @@ export class MockRuntime implements ClaudeRuntime {
           mcpEnv: Object.keys(context.mcpEnv ?? {}),
           allowedTools: context.allowedTools ?? null,
           inheritedAllowedTools: context.inheritedAllowedTools ?? null,
+          inheritedAskRules: context.inheritedAskRules ?? null,
           claudeHooks: context.claudeHooks ?? null,
           disallowedTools: context.disallowedTools ?? null,
           mcpEnabledTools: context.mcpEnabledTools ?? null,

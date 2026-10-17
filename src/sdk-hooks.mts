@@ -1,3 +1,4 @@
+import { askRulesGuard } from './ask-rules.mjs'
 import { claudeHookMatchers } from './claude-hooks.mjs'
 import type { RuntimeTurnContext } from './types.mjs'
 
@@ -27,6 +28,10 @@ export function sdkHooks(context: RuntimeTurnContext, approvals = true): SdkHook
   }
   const enabled = context.mcpEnabledTools
   if (enabled && Object.keys(enabled).length > 0) add('PreToolUse', enabledToolsGuard(enabled))
+  // The CLI settles on the strictest PreToolUse decision (deny, then ask,
+  // then allow), so an ask rule holds even against a hook that approves.
+  const ask = context.inheritedAskRules
+  if (ask && ask.length > 0) add('PreToolUse', askRulesGuard(ask, context.cwd))
   if (context.claudeHooks && context.claudeHooks.length > 0) {
     const claude = claudeHookMatchers(context.claudeHooks, { projectDir: context.cwd, approvals })
     for (const [event, matchers] of Object.entries(claude))

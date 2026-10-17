@@ -3564,6 +3564,7 @@ export class CodexClaudeAppServer {
         mcpEnv: mcp.env,
         allowedTools: defaultAllowedTools(),
         inheritedAllowedTools: permissionRules?.allow ?? null,
+        inheritedAskRules: permissionRules?.ask ?? null,
         disallowedTools: [...mcp.toolRules.disallowedTools, ...(permissionRules?.deny ?? [])],
         mcpEnabledTools: mcp.toolRules.enabledTools,
         agents: inheritConfig ? inheritedAgents(turnCwd) : null,

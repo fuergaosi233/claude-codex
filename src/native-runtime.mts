@@ -2633,6 +2633,7 @@ function sessionSignature(context: RuntimeTurnContext): string {
     context.addDirs ?? [],
     context.allowedTools ?? [],
     inheritedAllowedTools(context),
+    context.inheritedAskRules ?? null,
     context.disallowedTools ?? [],
     context.mcpEnabledTools ?? null,
     context.agents ?? null,

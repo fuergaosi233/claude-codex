@@ -20,11 +20,12 @@ import { debugLog } from './util.mjs'
 // Subagents: with CLAUDE_CODEX_CLAUDE_CONFIG_DIR set, the user's and the
 // project's Claude Code agents (see claude-agents.mts).
 //
-// Permission rules: with CLAUDE_CODEX_CLAUDE_CONFIG_DIR set, the allow and
-// deny rules of the user's and the project's Claude Code settings. Deny
+// Permission rules: with CLAUDE_CODEX_CLAUDE_CONFIG_DIR set, the allow, ask
+// and deny rules of the user's and the project's Claude Code settings. Deny
 // rules always apply. Allow rules let a tool skip the Codex approval, so
-// the runtime drops them in plan mode and in a read-only sandbox. Ask
-// rules have no command-line form and are not applied.
+// the runtime drops them in plan mode and in a read-only sandbox. Ask rules
+// have no command-line form; a PreToolUse callback sends the calls they
+// cover to the Codex approval (see ask-rules.mts).
 //
 // Hooks: with CLAUDE_CODEX_CLAUDE_CONFIG_DIR set, on request only: the
 // command hooks of the user's Claude Code settings with
@@ -79,7 +80,7 @@ export function inheritedPermissionRules(cwd: string): ClaudePermissionRules | n
     cwd,
     allow: rules.allow.length,
     deny: rules.deny.length,
-    askNotApplied: rules.ask,
+    ask: rules.ask.length,
   })
   return rules
 }
