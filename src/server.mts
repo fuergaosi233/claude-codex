@@ -23,6 +23,7 @@ import {
 } from './goal-prompts.mjs'
 import { accountUsage, hostMethod, RpcError } from './host-methods.mjs'
 import { callMcpTool, listMcpServerStatuses, readMcpConfig, readMcpResource } from './mcp.mjs'
+import { projectInstructions } from './project-instructions.mjs'
 import { projectProviderLoopConfig } from './provider-loop-config.mjs'
 import {
   hasProviderLoopSelectionInput,
@@ -3402,6 +3403,9 @@ export class CodexClaudeAppServer {
       this.lastTurnParamsByThread.set(thread.id, rest)
     }
     const desktopPresentation = turnPurpose === 'normal' && thread.runtimeBackend !== 'codex'
+    // Codex reads AGENTS.md itself; Claude gets it, and the Claude Code files
+    // its CLI skips, in the prompt.
+    const instructions = desktopPresentation ? projectInstructions(thread.cwd).prompt : null
     // If this is a forked side-conversation (sidechat) that has different
     // developerInstructions from its parent, appending them to systemPromptAddendum
     // would mutate the system prompt prefix and invalidate the prefix KV cache
@@ -3419,6 +3423,7 @@ export class CodexClaudeAppServer {
           developerInstructions: parentDev,
           personality: parentThread?.personality ?? personality,
           desktopPresentation,
+          projectInstructions: instructions,
         })
         effectivePrompt = `<side-conversation-instructions>\n${developerInstructions}\n</side-conversation-instructions>\n\n${prompt}`
       } else {
@@ -3427,6 +3432,7 @@ export class CodexClaudeAppServer {
           developerInstructions,
           personality,
           desktopPresentation,
+          projectInstructions: instructions,
         })
       }
     } else {
@@ -3435,6 +3441,7 @@ export class CodexClaudeAppServer {
         developerInstructions,
         personality,
         desktopPresentation,
+        projectInstructions: instructions,
       })
     }
 
@@ -6696,7 +6703,8 @@ export class CodexClaudeAppServer {
       serviceTier: null,
       cwd: thread.cwd,
       runtimeWorkspaceRoots: [thread.cwd],
-      instructionSources: [],
+      instructionSources:
+        thread.runtimeBackend === 'codex' ? [] : projectInstructions(thread.cwd).sources,
       approvalPolicy: thread.approvalPolicy ?? 'never',
       approvalsReviewer: 'user',
       sandbox: sandboxEnvelope(thread.sandboxMode, thread.cwd),

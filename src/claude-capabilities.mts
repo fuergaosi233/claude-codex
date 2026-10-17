@@ -3,6 +3,7 @@ import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { claudeCommandManifest, firstSentence, listClaudeCommands } from './claude-commands.mjs'
+import { bridgedClaudeConfigDir, claudeSkillFolders } from './project-instructions.mjs'
 
 interface SkillMetadata {
   readonly name: string
@@ -46,7 +47,10 @@ interface HooksListEntry {
 
 export function listClaudeSkills(params: Record<string, unknown>): SkillsListEntry[] {
   const roots = cwdsFromParams(params)
-  const userSkills = readSkillDir(join(homedir(), '.claude', 'skills'), 'user')
+  const userSkills = readSkillDir(
+    join(bridgedClaudeConfigDir() ?? join(homedir(), '.claude'), 'skills'),
+    'user',
+  )
   const builtins = listClaudeCommands().map(
     (command): SkillMetadata => ({
       name: command.name,
@@ -58,11 +62,13 @@ export function listClaudeSkills(params: Record<string, unknown>): SkillsListEnt
     }),
   )
   return roots.map((cwd) => {
-    const repo = readSkillDir(join(cwd, '.claude', 'skills'), 'repo')
+    const repo = claudeSkillFolders(cwd).map((dir) =>
+      readSkillDir(join(dir, '.claude', 'skills'), 'repo'),
+    )
     return {
       cwd,
-      skills: [...userSkills.skills, ...repo.skills, ...builtins],
-      errors: [...userSkills.errors, ...repo.errors],
+      skills: [...userSkills.skills, ...repo.flatMap((entry) => entry.skills), ...builtins],
+      errors: [...userSkills.errors, ...repo.flatMap((entry) => entry.errors)],
     }
   })
 }

@@ -78,6 +78,21 @@ Markdown in streaming and history; it does not bundle a diagram renderer or a
 Claude Desktop Artifacts runtime. Arbitrary HTML/React code fences do not become
 interactive apps. Older clients may show Mermaid source instead of a diagram.
 
+### Project instructions
+
+Claude threads follow the same `AGENTS.md` files Codex would: the global one in
+`CODEX_HOME` (`AGENTS.override.md` first), then one per folder from the git root
+down to the thread's folder, within Codex's 32 KiB project budget. They reach
+Claude in the system prompt with Codex's framing, and the App lists them as the
+thread's instruction sources. Files Claude Code already reads itself through a
+`CLAUDE.md` import are not sent twice.
+
+When the Claude CLI runs with its setting sources turned off, set
+`CLAUDE_CODEX_CLAUDE_CONFIG_DIR` (usually `~/.claude`) to bring that Claude Code
+configuration along: the user and project `CLAUDE.md` files with their
+`@imports`, `CLAUDE.local.md`, `.claude/rules/` (rules scoped by `paths:` are
+listed for Claude to read when they apply), and the user and project skills.
+
 ### `/workflows` compatibility
 
 With the native Claude Agent SDK backend, `/workflows <task>` is translated to Claude's
