@@ -1,3 +1,4 @@
+import type { ClaudeHookSpec } from './claude-hooks.mjs'
 import type { RuntimeBackendType } from './runtime-config.mjs'
 
 export type JsonRpcId = string | number | null
@@ -403,6 +404,9 @@ export interface RuntimeTurnContext {
   inheritedAllowedTools?: string[] | null
   // Subagents by name, as the SDK's agents option takes them.
   agents?: Record<string, Record<string, unknown>> | null
+  // Command hooks from the user's Claude Code settings, run as SDK hook
+  // callbacks.
+  claudeHooks?: ClaudeHookSpec[] | null
   addDirs: string[]
   enableFileCheckpointing: boolean
   outputFormat: unknown | null

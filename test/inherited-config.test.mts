@@ -1059,3 +1059,74 @@ test('inherited allow rules stay out of plan mode and a read-only sandbox', asyn
   ])
   assert.ok(!(await allowed({ planMode: true })).includes(rule))
 })
+
+test('Claude threads run the Claude Code hooks only with the config folder bridged and the opt-in', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'inherited-hooks-server-'))
+  const configDir = join(root, 'claude-config')
+  const repo = join(root, 'repo')
+  await mkdir(join(repo, '.git'), { recursive: true })
+  await write(
+    join(configDir, 'settings.json'),
+    JSON.stringify({
+      hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: 'guard' }] }] },
+    }),
+  )
+  const cases: Array<[boolean, string | undefined]> = [
+    [false, 'user'],
+    [true, undefined],
+    [true, 'user'],
+  ]
+  for (const [bridged, scope] of cases) {
+    const runs = bridged && scope === 'user'
+    await withServer(
+      root,
+      {
+        CODEX_HOME: join(root, 'codex-home'),
+        CLAUDE_CODEX_CLAUDE_CONFIG_DIR: bridged ? configDir : undefined,
+        CLAUDE_CODEX_CLAUDE_HOOKS: scope,
+      },
+      async ({ request, turn }) => {
+        const started = await request('thread/start', { cwd: repo, model: 'sonnet' })
+        const normal = await turn(started.thread.id)
+        assert.deepEqual(
+          normal.claudeHooks?.map((hook) => [hook.event, hook.matcher, hook.command]) ?? null,
+          runs ? [['PreToolUse', 'Bash', 'guard']] : null,
+        )
+        const listed = await request('hooks/list', { cwds: [repo] })
+        const commands = listed.data[0].hooks.map((hook: { command: string }) => hook.command)
+        // hooks/list shows what the adapter runs.
+        if (bridged) assert.deepEqual(commands, runs ? ['guard'] : [])
+      },
+    )
+  }
+  await rm(root, { recursive: true, force: true })
+})
+
+test('the native runtime registers the Claude Code hooks with the SDK', async () => {
+  const hook = {
+    event: 'PreToolUse',
+    matcher: 'Bash',
+    command:
+      'echo \'{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}\'',
+    args: null,
+    timeoutSec: 30,
+    async: false,
+    once: false,
+    source: 'settings.json',
+  }
+  const decision = async (overrides: Partial<RuntimeTurnContext>) => {
+    const options = await withEnv({ CLAUDE_CODEX_PERMISSION_MODE: undefined }, () =>
+      sessionOptions({ claudeHooks: [hook], mcpEnabledTools: { mcp__docs__: [] }, ...overrides }),
+    )
+    // The enabled_tools guard comes first, then the user's hook.
+    assert.equal(options.hooks.PreToolUse.length, 2)
+    const matcher = options.hooks.PreToolUse[1]
+    assert.equal(matcher.matcher, 'Bash')
+    const output = await matcher.hooks[0]({ tool_name: 'Bash' }, undefined, {
+      signal: new AbortController().signal,
+    })
+    return output.hookSpecificOutput.permissionDecision ?? null
+  }
+  assert.equal(await decision({}), 'allow')
+  assert.equal(await decision({ approvalPolicy: 'on-request', sandboxMode: 'read-only' }), null)
+})

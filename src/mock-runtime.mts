@@ -331,6 +331,7 @@ export class MockRuntime implements ClaudeRuntime {
           mcpServers: context.mcpServers ?? null,
           allowedTools: context.allowedTools ?? null,
           inheritedAllowedTools: context.inheritedAllowedTools ?? null,
+          claudeHooks: context.claudeHooks ?? null,
           disallowedTools: context.disallowedTools ?? null,
           mcpEnabledTools: context.mcpEnabledTools ?? null,
           agents: context.agents ?? null,

@@ -536,7 +536,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (context.mcpServers && typeof context.mcpServers === 'object')
       opts.mcpServers = context.mcpServers
     if (context.agents && Object.keys(context.agents).length > 0) opts.agents = context.agents
-    const hooks = sdkHooks(context)
+    const hooks = sdkHooks(context, inheritedApprovals(context))
     if (hooks) opts.hooks = hooks
     let goalServer = false
     if (context.goalTools && this.zod && typeof sdk.createSdkMcpServer === 'function') {
@@ -2603,14 +2603,20 @@ function autoAllowsTools(context: RuntimeTurnContext): boolean {
   )
 }
 
-// The allow rules from the user's Claude Code settings that apply to a
-// turn. They let tools run without the Codex approval, so a read-only
-// sandbox and plan mode, which would stop those tools, drop them.
+// Whether the user's Claude Code config (allow rules, hooks) may let a tool
+// run without the Codex approval: not in a read-only sandbox or plan mode,
+// which would stop those tools.
+function inheritedApprovals(context: RuntimeTurnContext): boolean {
+  if (context.sandboxMode === 'read-only') return false
+  return (
+    derivePermissionMode(context.approvalPolicy, context.sandboxMode, context.planMode) !== 'plan'
+  )
+}
+
+// The allow rules from the user's Claude Code settings that apply to a turn.
 function inheritedAllowedTools(context: RuntimeTurnContext): string[] {
   const rules = context.inheritedAllowedTools ?? []
-  if (rules.length === 0 || context.sandboxMode === 'read-only') return []
-  const mode = derivePermissionMode(context.approvalPolicy, context.sandboxMode, context.planMode)
-  return mode === 'plan' ? [] : rules
+  return rules.length > 0 && inheritedApprovals(context) ? rules : []
 }
 
 // Options a live CLI process cannot change in place. A turn whose signature
@@ -2628,6 +2634,8 @@ function sessionSignature(context: RuntimeTurnContext): string {
     context.disallowedTools ?? [],
     context.mcpEnabledTools ?? null,
     context.agents ?? null,
+    context.claudeHooks ?? null,
+    context.claudeHooks?.length ? inheritedApprovals(context) : null,
     parseWorkflowCommand(context.prompt)?.type === 'run',
     context.planMode === true,
     configuredPermissionMode(),

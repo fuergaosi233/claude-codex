@@ -139,6 +139,31 @@ relative to the config folder, as in Claude Code. `permissions.ask`,
 ask rules outside a settings file, and the Codex approval policy and sandbox
 decide the mode and the folders.
 
+Its command hooks run only when asked for: they are often status or
+notification integrations for terminal sessions, and running them for every App
+chat would silently change what they do (a hook that waits for input would even
+hold up the turn). `CLAUDE_CODEX_CLAUDE_HOOKS=user` runs the hooks in the
+bridged folder's `settings.json`; `CLAUDE_CODEX_CLAUDE_HOOKS=project` also runs
+those of a trusted project's `.claude/settings.json` and
+`.claude/settings.local.json`, so a repository never runs a command on its own
+say; unset, `0` or any other value runs none. They run for `PreToolUse`,
+`PostToolUse`, `PostToolUseFailure`, `UserPromptSubmit`, `Stop`,
+`SubagentStart`, `SubagentStop`, `SessionStart`, `SessionEnd` and
+`Notification`. The adapter registers each command with the Claude Agent SDK;
+the CLI matches it as it would a settings hook and the adapter runs it the way
+Claude Code does: in your shell (or exec form with `args`), the hook input as
+JSON on stdin, `CLAUDE_PROJECT_DIR` set, its `timeout` (10 minutes by default),
+`async` and `once` honored. Exit 0 passes JSON output on (plain output becomes
+context for `UserPromptSubmit` and `SessionStart`), exit 2 blocks with stderr as
+the reason, other exits are non-blocking errors, and `disableAllHooks` turns
+them all off. In plan mode or a read-only sandbox a hook can still deny or ask
+but its approval is dropped, leaving the call to Codex. Prompt, agent
+and HTTP hooks, `if` filters, PowerShell hooks, `asyncRewake`'s wake-up,
+`CLAUDE_ENV_FILE`, and other events (such as `PreCompact`, whose output a
+callback cannot pass back, or `PermissionRequest`, which the Codex approval flow
+owns) are not carried over. Point `CLAUDE_CODEX_CLAUDE_CONFIG_DIR` only at a
+folder the CLI does not read itself, or its hooks run twice.
+
 ### `/workflows` compatibility
 
 With the native Claude Agent SDK backend, `/workflows <task>` is translated to Claude's

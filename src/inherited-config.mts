@@ -4,6 +4,7 @@ import {
   claudeMcpServers,
   claudePermissionRules,
 } from './claude-config.mjs'
+import { type ClaudeHookSpec, claudeHookSpecs } from './claude-hooks.mjs'
 import { codexMcpServers, type InheritedMcpServer } from './codex-config.mjs'
 import { bridgedClaudeConfigDir } from './project-instructions.mjs'
 import { debugLog } from './util.mjs'
@@ -24,6 +25,11 @@ import { debugLog } from './util.mjs'
 // rules always apply. Allow rules let a tool skip the Codex approval, so
 // the runtime drops them in plan mode and in a read-only sandbox. Ask
 // rules have no command-line form and are not applied.
+//
+// Hooks: with CLAUDE_CODEX_CLAUDE_CONFIG_DIR set, on request only: the
+// command hooks of the user's Claude Code settings with
+// CLAUDE_CODEX_CLAUDE_HOOKS=user, and also a trusted project's with
+// CLAUDE_CODEX_CLAUDE_HOOKS=project (see claude-hooks.mts).
 
 export function inheritedMcpServers(cwd: string | null): InheritedMcpServer[] {
   const bridged = bridgedClaudeConfigDir()
@@ -76,6 +82,20 @@ export function inheritedPermissionRules(cwd: string): ClaudePermissionRules | n
     askNotApplied: rules.ask,
   })
   return rules
+}
+
+// The Claude Code command hooks for a thread's folder, or null when there
+// are none to run.
+export function inheritedHooks(cwd: string): ClaudeHookSpec[] | null {
+  const bridged = bridgedClaudeConfigDir()
+  if (!bridged) return null
+  const hooks = claudeHookSpecs(cwd, bridged)
+  // Events and origins only: a command line can carry credentials.
+  logOnChange(`hooks:${cwd}`, 'inherited_hooks', {
+    cwd,
+    hooks: hooks.map((hook) => ({ event: hook.event, matcher: hook.matcher, source: hook.source })),
+  })
+  return hooks.length > 0 ? hooks : null
 }
 
 export interface McpToolRules {

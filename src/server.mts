@@ -22,7 +22,7 @@ import {
   MODEL_GOAL_STATUSES,
 } from './goal-prompts.mjs'
 import { accountUsage, hostMethod, RpcError } from './host-methods.mjs'
-import { inheritedAgents, inheritedPermissionRules } from './inherited-config.mjs'
+import { inheritedAgents, inheritedHooks, inheritedPermissionRules } from './inherited-config.mjs'
 import {
   callMcpTool,
   listMcpServerStatuses,
@@ -3537,8 +3537,8 @@ export class CodexClaudeAppServer {
     const resumeSessionAt = isCodexThread ? null : this.store.claudeResumeAt(thread.id)
     let resumedAtCheckpoint = false
     const turnCwd = stringOr(params.cwd, thread.cwd)
-    // A Claude thread's own turns also get the MCP servers, subagents and
-    // permission rules the Codex and Claude Code configs bring.
+    // A Claude thread's own turns also get the MCP servers, subagents,
+    // permission rules and hooks the Codex and Claude Code configs bring.
     const inheritConfig = desktopPresentation && !isCodexThread
     const mcp = readMcpConfig({ cwd: turnCwd, inherit: inheritConfig })
     const permissionRules = inheritConfig ? inheritedPermissionRules(turnCwd) : null
@@ -3561,6 +3561,7 @@ export class CodexClaudeAppServer {
         disallowedTools: [...mcp.toolRules.disallowedTools, ...(permissionRules?.deny ?? [])],
         mcpEnabledTools: mcp.toolRules.enabledTools,
         agents: inheritConfig ? inheritedAgents(turnCwd) : null,
+        claudeHooks: inheritConfig ? inheritedHooks(turnCwd) : null,
         addDirs: stringListFromEnv('CLAUDE_CODEX_ADD_DIRS', []),
         enableFileCheckpointing: process.env.CLAUDE_CODEX_ENABLE_FILE_CHECKPOINTING === '1',
         outputFormat: claudeOutputFormat(params.outputSchema),
