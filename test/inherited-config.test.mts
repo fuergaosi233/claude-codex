@@ -1318,6 +1318,7 @@ test('inherited ask rules send the calls they cover to the approval prompt, over
     command:
       'echo \'{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}\'',
     args: null,
+    shell: 'sh' as const,
     timeoutSec: 30,
     async: false,
     once: false,
@@ -1401,6 +1402,7 @@ test('the native runtime registers the Claude Code hooks with the SDK', async ()
     command:
       'echo \'{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}\'',
     args: null,
+    shell: 'sh' as const,
     timeoutSec: 30,
     async: false,
     once: false,

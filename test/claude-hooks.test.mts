@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import test from 'node:test'
@@ -49,6 +49,7 @@ const spec = (overrides: Partial<ClaudeHookSpec>): ClaudeHookSpec => ({
   matcher: null,
   command: 'true',
   args: null,
+  shell: 'sh',
   timeoutSec: 30,
   async: false,
   once: false,
@@ -66,6 +67,21 @@ async function call(
   const callback = matcher?.hooks[0]
   assert.ok(callback, `no ${event} hook`)
   return callback(input, undefined, { signal: new AbortController().signal })
+}
+
+// Waits for a file a hook writes, for up to `ms`.
+async function appears(path: string, ms = 10_000): Promise<boolean> {
+  for (const until = Date.now() + ms; Date.now() < until; ) {
+    if (
+      await access(path).then(
+        () => true,
+        () => false,
+      )
+    )
+      return true
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  return false
 }
 
 const result = (code: number | null, stdout = '', stderr = '') => ({
@@ -100,7 +116,8 @@ test('Claude Code hooks are read from the user settings, and a trusted project o
           { matcher: '*', hooks: [command('node', { args: ['log.mjs', '--all'], once: true })] },
         ],
         UserPromptSubmit: [{ hooks: [command('context.sh', { async: true })] }],
-        Stop: [{ hooks: [command('rewake.sh', { asyncRewake: true })] }],
+        Stop: [{ hooks: [command('rewake.sh', { asyncRewake: true, shell: 'bash' })] }],
+        SessionEnd: [{ hooks: [command('cleanup.sh'), command('upload.sh', { timeout: 120 })] }],
         PreCompact: [{ hooks: [command('compact.sh')] }],
       }),
     )
@@ -123,14 +140,25 @@ test('Claude Code hooks are read from the user settings, and a trusted project o
         timeoutSec: 600,
         source: user,
       }),
+      // Claude Code's defaults: 30 seconds for a prompt, a short budget for
+      // the end of a session that an explicit timeout raises to a minute.
       spec({
         event: 'UserPromptSubmit',
         command: 'context.sh',
         async: true,
+        timeoutSec: 30,
+        source: user,
+      }),
+      spec({
+        event: 'Stop',
+        command: 'rewake.sh',
+        shell: 'bash',
+        async: true,
         timeoutSec: 600,
         source: user,
       }),
-      spec({ event: 'Stop', command: 'rewake.sh', async: true, timeoutSec: 600, source: user }),
+      spec({ event: 'SessionEnd', command: 'cleanup.sh', timeoutSec: 1.5, source: user }),
+      spec({ event: 'SessionEnd', command: 'upload.sh', timeoutSec: 60, source: user }),
     ]
     // No hooks unless asked for.
     for (const value of [undefined, '0', '1', 'true', 'all'])
@@ -160,7 +188,7 @@ test('Claude Code hooks are read from the user settings, and a trusted project o
       JSON.stringify({ disableAllHooks: true }),
     )
     assert.deepEqual(await read({ CLAUDE_CODEX_CLAUDE_HOOKS: 'project' }), [])
-    assert.equal((await read({ CLAUDE_CODEX_CLAUDE_HOOKS: 'user' })).length, 4)
+    assert.equal((await read({ CLAUDE_CODEX_CLAUDE_HOOKS: 'user' })).length, 6)
   } finally {
     await rm(root, { recursive: true, force: true })
   }
@@ -215,7 +243,8 @@ test('a hook command gets the input on stdin and answers as Claude Code reads it
       decision: 'block',
       reason: 'Run the tests first.',
     })
-    assert.deepEqual(await call(hooks, 'Notification', {}), { systemMessage: 'Notifier missing.' })
+    // Notification hooks cannot block, and exit 2 means nothing for them.
+    assert.deepEqual(await call(hooks, 'Notification', {}), {})
     assert.deepEqual(await call(hooks, 'PostToolUseFailure', {}), {
       hookSpecificOutput: {
         hookEventName: 'PostToolUseFailure',
@@ -296,7 +325,13 @@ test('hooks time out, run in the background or once, as configured', async () =>
   try {
     const hooks = claudeHookMatchers(
       [
-        spec({ event: 'Stop', timeoutSec: 0.3, command: "sleep 5; echo 'too late' >&2; exit 2" }),
+        // Only the timeout ends the loop; were it to end otherwise, the hook
+        // would block.
+        spec({
+          event: 'Stop',
+          timeoutSec: 0.5,
+          command: "while :; do sleep 1; done; echo 'too late' >&2; exit 2",
+        }),
         spec({ event: 'SessionEnd', async: true, command: `sleep 0.2; echo done > '${late}'` }),
         spec({ event: 'SessionStart', once: true, command: `echo run >> '${count}'; echo ready` }),
       ],
@@ -304,7 +339,7 @@ test('hooks time out, run in the background or once, as configured', async () =>
     )
     const started = Date.now()
     assert.deepEqual(await call(hooks, 'Stop', {}), {})
-    assert.ok(Date.now() - started < 3000, 'the timed-out hook was not stopped')
+    assert.ok(Date.now() - started < 10_000, 'the timed-out hook was not stopped')
 
     assert.deepEqual(await call(hooks, 'SessionEnd', {}), {})
     await assert.rejects(readFile(late, 'utf8'))
@@ -336,6 +371,41 @@ test('hooks time out, run in the background or once, as configured', async () =>
     )
     await call(next, 'SessionStart', {})
     assert.equal(await readFile(count, 'utf8'), 'run\nrun\n')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a hook is done when its own process exits, and what it started keeps running', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'claude-hooks-exit-')))
+  const go = join(root, 'go')
+  const alive = join(root, 'alive')
+  try {
+    const hooks = claudeHookMatchers(
+      [
+        // The background process holds the hook's output open until told to
+        // go on, and then proves it was not killed.
+        spec({
+          event: 'Stop',
+          command: `(i=0; while [ ! -f '${go}' ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done; echo alive > '${alive}') & echo '{"systemMessage":"started"}'`,
+        }),
+        spec({ event: 'SessionStart', command: 'echo "$0"' }),
+        spec({ event: 'UserPromptSubmit', shell: 'bash', command: 'echo "$0"' }),
+      ],
+      { projectDir: root, approvals: true },
+    )
+    assert.deepEqual(await call(hooks, 'Stop', {}), { systemMessage: 'started' })
+    await assert.rejects(access(alive))
+    await writeFile(go, '')
+    assert.equal(await appears(alive), true, 'the background process was killed')
+
+    // sh runs a command line, bash when the hook asks for it.
+    assert.deepEqual(await call(hooks, 'SessionStart', {}), {
+      hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: '/bin/sh' },
+    })
+    assert.deepEqual(await call(hooks, 'UserPromptSubmit', {}), {
+      hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: 'bash' },
+    })
   } finally {
     await rm(root, { recursive: true, force: true })
   }

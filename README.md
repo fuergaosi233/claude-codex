@@ -172,12 +172,17 @@ runs none. They run for `PreToolUse`, `PostToolUse`, `PostToolUseFailure`,
 `UserPromptSubmit`, `Stop`, `SubagentStart`, `SubagentStop`, `SessionStart`,
 `SessionEnd` and `Notification`. The adapter registers each command with the
 Claude Agent SDK; the CLI matches it as it would a settings hook and the adapter
-runs it the way Claude Code does: in your shell (or exec form with `args`), the
-hook input as JSON on stdin, `CLAUDE_PROJECT_DIR` set, its `timeout` (10 minutes
-by default), `async` and `once` honored. Exit 0 passes JSON output on (plain
+runs it the way Claude Code does: with `sh -c` (`bash -c` for `shell: "bash"`,
+no shell in exec form with `args`), the hook input as JSON on stdin,
+`CLAUDE_PROJECT_DIR` set, its `timeout` (by default 10 minutes, 30 seconds for
+`UserPromptSubmit`, 1.5 seconds for `SessionEnd`, where an explicit one goes up
+to a minute), `async` and `once` honored. A hook is done when its own process
+exits; a background process it started keeps running, while a hook that times
+out is killed with everything it started. Exit 0 passes JSON output on (plain
 output becomes context for `UserPromptSubmit` and `SessionStart`), exit 2 blocks
-with stderr as the reason, other exits are non-blocking errors, and
-`disableAllHooks` turns them all off. In plan mode or a read-only sandbox a hook
+with stderr as the reason (for `SubagentStart`, `SessionStart` and `SessionEnd`
+it only shows stderr, for `Notification` it does nothing), other exits are
+non-blocking errors, and `disableAllHooks` turns them all off. In plan mode or a read-only sandbox a hook
 can still deny or ask but its approval is dropped, leaving the call to Codex.
 Prompt, agent and HTTP hooks, `if` filters, PowerShell hooks, `asyncRewake`'s
 wake-up, `CLAUDE_ENV_FILE`, and other events (such as `PreCompact`, whose output

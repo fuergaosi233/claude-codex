@@ -1,5 +1,4 @@
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
-import { basename } from 'node:path'
 import {
   claudeProjectSettingsPaths,
   claudeTrustsProject,
@@ -27,7 +26,8 @@ import { debugLog } from './util.mjs'
 // command with that input as JSON on stdin and turns its exit code and
 // output into the answer Claude Code would draw from them: exit 0 passes
 // JSON output on (plain output becomes context where Claude Code adds it),
-// exit 2 blocks, any other exit is a non-blocking error.
+// exit 2 blocks (or, for events that cannot block, shows stderr to the user
+// or nothing), any other exit is a non-blocking error.
 //
 // Not carried over: prompt, agent and http hooks, hooks filtered with
 // `if`, PowerShell hooks, the asyncRewake wake-up (such a hook just runs in
@@ -48,12 +48,20 @@ export const CLAUDE_HOOK_EVENTS = [
   'Notification',
 ] as const
 
-// Exit code 2 shows stderr to the user only for these events.
-const USER_ONLY_EVENTS = new Set(['SubagentStart', 'SessionStart', 'SessionEnd', 'Notification'])
+// Exit code 2 shows stderr to the user only for these events, and does
+// nothing for Notification.
+const USER_ONLY_EVENTS = new Set(['SubagentStart', 'SessionStart', 'SessionEnd'])
 // Plain output of a successful hook becomes context for these events.
 const CONTEXT_EVENTS = new Set(['UserPromptSubmit', 'SessionStart'])
-// Claude Code's default for a command hook.
+// Claude Code's defaults for a command hook: ten minutes, less for the
+// events that hold up the user. SessionEnd hooks share a short budget,
+// which an explicit timeout can raise to a minute.
 const DEFAULT_TIMEOUT_SEC = 600
+const EVENT_TIMEOUT_SEC: Record<string, number> = { UserPromptSubmit: 30, SessionEnd: 1.5 }
+const SESSION_END_MAX_SEC = 60
+// How long a finished hook's output is still read: a background process it
+// started may hold its stdout open long after.
+const DRAIN_MS = 250
 const OUTPUT_LIMIT = 1024 * 1024
 const OUTPUT_KEYS = [
   'continue',
@@ -72,6 +80,8 @@ export interface ClaudeHookSpec {
   readonly command: string
   // Exec form: command is the program, these its arguments; no shell.
   readonly args: string[] | null
+  // The shell for a command line: sh, or bash when the hook asks for it.
+  readonly shell: 'sh' | 'bash'
   readonly timeoutSec: number
   readonly async: boolean
   readonly once: boolean
@@ -150,12 +160,15 @@ function hookSpec(
   if (handler.if !== undefined) return skip('if filters are not supported')
   if (handler.shell === 'powershell') return skip('PowerShell hooks are not supported')
   const timeout = typeof handler.timeout === 'number' ? handler.timeout : Number.NaN
+  const fallback = EVENT_TIMEOUT_SEC[event] ?? DEFAULT_TIMEOUT_SEC
+  const timeoutSec = timeout > 0 ? timeout : fallback
   return {
     event,
     matcher,
     command,
     args: Array.isArray(handler.args) ? stringList(handler.args) : null,
-    timeoutSec: timeout > 0 ? timeout : DEFAULT_TIMEOUT_SEC,
+    shell: handler.shell === 'bash' ? 'bash' : 'sh',
+    timeoutSec: event === 'SessionEnd' ? Math.min(timeoutSec, SESSION_END_MAX_SEC) : timeoutSec,
     async: handler.async === true || handler.asyncRewake === true,
     once: handler.once === true,
     source,
@@ -210,10 +223,12 @@ export interface HookCommandResult {
   readonly durationMs: number
 }
 
-// Runs a hook command as Claude Code does: in a POSIX shell (exec form
-// without one), with the hook input as JSON on stdin, CLAUDE_PROJECT_DIR
-// set, and killed with its children when it outlives its timeout or the
-// CLI gives up on it.
+// Runs a hook command as Claude Code does: with sh -c (bash -c when the hook
+// asks for bash, no shell in exec form), the hook input as JSON on stdin and
+// CLAUDE_PROJECT_DIR set. It is done when its own process exits, once the
+// output still on its way is read: a background process it started keeps
+// running. When it outlives its timeout or the CLI gives up on it, it is
+// killed with everything it started.
 export function runHookCommand(
   spec: ClaudeHookSpec,
   input: Record<string, unknown>,
@@ -225,7 +240,7 @@ export function runHookCommand(
   const substitute = (text: string) => text.replaceAll('${CLAUDE_PROJECT_DIR}', projectDir)
   const [program, args] = spec.args
     ? [substitute(spec.command), spec.args.map(substitute)]
-    : [hookShell(), ['-c', spec.command]]
+    : [spec.shell === 'bash' ? 'bash' : '/bin/sh', ['-c', spec.command]]
   return new Promise((resolve) => {
     let stdout = ''
     let stderr = ''
@@ -233,10 +248,12 @@ export function runHookCommand(
     let error: string | null = null
     let settled = false
     let timer: NodeJS.Timeout | undefined
+    let drain: NodeJS.Timeout | undefined
     const finish = (code: number | null) => {
       if (settled) return
       settled = true
       clearTimeout(timer)
+      clearTimeout(drain)
       signal?.removeEventListener('abort', abort)
       resolve({ code, stdout, stderr, timedOut, error, durationMs: Date.now() - started })
     }
@@ -278,17 +295,21 @@ export function runHookCommand(
       error = cause.message
       finish(null)
     })
+    child.on('exit', (code) => {
+      // Done: what it started is its own business now.
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', abort)
+      drain = setTimeout(() => {
+        child.stdout.destroy()
+        child.stderr.destroy()
+        finish(code)
+      }, DRAIN_MS)
+    })
     child.on('close', (code) => finish(code))
     // A hook that does not read its input must not fail the write.
     child.stdin.on('error', () => {})
     child.stdin.end(`${JSON.stringify(input)}\n`)
   })
-}
-
-// Claude Code's shell for hooks: the user's, when it is a POSIX one.
-function hookShell(): string {
-  const shell = process.env.SHELL
-  return shell && /^(bash|zsh|sh)$/.test(basename(shell)) ? shell : '/bin/sh'
 }
 
 // What a finished command tells the CLI, as Claude Code reads its exit code
@@ -314,6 +335,7 @@ export function hookOutput(event: string, result: HookCommandResult, approvals =
     }
   if (event === 'PostToolUseFailure')
     return { hookSpecificOutput: { hookEventName: event, additionalContext: reason } }
+  if (event === 'Notification') return {}
   if (USER_ONLY_EVENTS.has(event)) return { systemMessage: reason }
   return { decision: 'block', reason }
 }
