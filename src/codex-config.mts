@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { statSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { gitRoot, readText, realPath } from './project-instructions.mjs'
 import { parseToml } from './toml.mjs'
 import { codexHome, debugLog } from './util.mjs'
@@ -86,18 +86,73 @@ export function codexTrustsProject(cwd: string): boolean {
   return false
 }
 
-// The working tree of the repository `cwd` belongs to; for a linked worktree,
-// the main checkout's.
+// The working tree of the repository `cwd` belongs to; for a linked worktree
+// git vouches for, the main checkout's.
 export function mainRepositoryRoot(cwd: string): string | null {
   const root = gitRoot(cwd)
   if (!root) return null
-  const pointer = readText(join(root, '.git'))
-  const gitDir = pointer && /^gitdir:\s*(.+)$/m.exec(pointer)?.[1]?.trim()
-  if (!gitDir) return root
-  const linked = resolve(root, gitDir)
+  const commonDir = linkedCommonDir(root)
+  return commonDir && basename(commonDir) === '.git' ? dirname(commonDir) : root
+}
+
+// A checkout's .git file is the checkout's to write: a folder can carry one
+// that names another, trusted repository's git folder, or a folder of its own
+// made up to look like one. So a pointer only counts as far as git's records
+// elsewhere vouch for it.
+
+// The main repository's git folder for the linked worktree at `root`, or null
+// unless git set the link up: the .git file names a folder outside the
+// checkout, under that git folder's worktrees/, whose gitdir file points back
+// at this .git file, as git writes them.
+export function linkedCommonDir(root: string): string | null {
+  const pointed = pointedGitDir(root)
+  if (!pointed) return null
+  const linked = realPath(pointed)
+  if (basename(dirname(linked)) !== 'worktrees') return null
   const common = readText(join(linked, 'commondir'))?.trim()
-  const commonDir = common ? resolve(linked, common) : linked
-  return basename(commonDir) === '.git' ? dirname(commonDir) : root
+  const back = readText(join(linked, 'gitdir'))?.trim()
+  if (!common || !back) return null
+  const commonDir = resolve(pointed, common)
+  if (dirname(linked) !== join(realPath(commonDir), 'worktrees')) return null
+  return realPath(resolve(linked, back)) === realPath(join(root, '.git')) ? commonDir : null
+}
+
+// Whether git set up the checkout at `root`: it has a .git folder, or its
+// .git file is a linked worktree's that git vouches for, or a submodule's,
+// naming a folder outside the checkout whose core.worktree is this checkout.
+export function gitVouchesForCheckout(root: string): boolean {
+  if (isDirectory(join(root, '.git'))) return true
+  if (linkedCommonDir(root)) return true
+  const pointed = pointedGitDir(root)
+  if (!pointed) return false
+  const linked = realPath(pointed)
+  const config = readText(join(linked, 'config')) ?? ''
+  const worktree = /^\s*worktree\s*=\s*(.+?)\s*$/m.exec(config)?.[1]
+  return worktree != null && realPath(resolve(linked, worktree)) === realPath(root)
+}
+
+// The folder a checkout's .git file names, when it is one outside the
+// checkout.
+function pointedGitDir(root: string): string | null {
+  const pointer = readText(join(root, '.git'))
+  const target = pointer && /^gitdir:\s*(.+)$/m.exec(pointer)?.[1]?.trim()
+  if (!target) return null
+  const dir = resolve(root, target)
+  return isDirectory(dir) && !within(realPath(root), realPath(dir)) ? dir : null
+}
+
+// Whether `path` is `dir` or inside it.
+function within(dir: string, path: string): boolean {
+  const rest = relative(dir, path)
+  return rest !== '..' && !rest.startsWith(`..${sep}`) && !isAbsolute(rest)
+}
+
+function isDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory()
+  } catch {
+    return false
+  }
 }
 
 function configLayers(cwd: string | null): ConfigLayer[] {

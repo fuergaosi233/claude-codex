@@ -5,6 +5,7 @@ import { dirname, join, relative, resolve } from 'node:path'
 import {
   asTable,
   codexTrustsProject,
+  gitVouchesForCheckout,
   type InheritedMcpServer,
   mainRepositoryRoot,
 } from './codex-config.mjs'
@@ -119,7 +120,8 @@ export function claudeTrustsProject(cwd: string, configDir: string): boolean {
 // the user's: checked into git, or reached through a symlinked .claude
 // folder. Claude Code keeps that file out of git for the user's own choices,
 // so approvals in a copy the repository supplies are not the user's. A git
-// that cannot tell counts as yes.
+// that cannot tell counts as yes, and so does a checkout whose .git file git
+// does not vouch for, since git would then read an index the folder made up.
 export function repositorySupplied(path: string): boolean {
   const folder = dirname(path)
   try {
@@ -129,6 +131,10 @@ export function repositorySupplied(path: string): boolean {
   }
   const root = gitRoot(dirname(folder))
   if (!root) return false
+  if (!gitVouchesForCheckout(root)) {
+    debugLog('claude_settings_git_pointer_unverified', { path })
+    return true
+  }
   // The repository at `root` and no other, whatever git variables the
   // adapter inherited, without the fsmonitor program its config can name.
   const env: NodeJS.ProcessEnv = Object.fromEntries(

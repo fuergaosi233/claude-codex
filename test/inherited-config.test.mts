@@ -20,12 +20,15 @@ import {
   claudeMcpServers,
   claudePermissionRules,
   claudeTrustsProject,
+  repositorySupplied,
 } from '../src/claude-config.mjs'
 import { claudeHookSpecs } from '../src/claude-hooks.mjs'
 import {
   codexMcpServers,
   codexTrustsProject,
+  gitVouchesForCheckout,
   type InheritedMcpServer,
+  mainRepositoryRoot,
 } from '../src/codex-config.mjs'
 import { notifyPayload } from '../src/codex-notify.mjs'
 import { mcpToolName, mcpToolRules } from '../src/inherited-config.mjs'
@@ -357,6 +360,7 @@ test('a trusted project adds its .codex/config.toml servers; a worktree follows 
     await mkdir(join(repo, '.git', 'worktrees', 'wt'), { recursive: true })
     await mkdir(cwd, { recursive: true })
     await write(join(repo, '.git', 'worktrees', 'wt', 'commondir'), '../..\n')
+    await write(join(repo, '.git', 'worktrees', 'wt', 'gitdir'), `${join(worktree, '.git')}\n`)
     await write(join(worktree, '.git'), `gitdir: ${join(repo, '.git', 'worktrees', 'wt')}\n`)
     const userConfig = `[mcp_servers.docs]
 command = "docs-mcp"
@@ -534,6 +538,7 @@ test('Claude Code trust covers the project itself, never a folder above it', asy
     await mkdir(join(nested, '.git'), { recursive: true })
     await mkdir(join(parent, 'plain'), { recursive: true })
     await write(join(repo, '.git', 'worktrees', 'wt', 'commondir'), '../..\n')
+    await write(join(repo, '.git', 'worktrees', 'wt', 'gitdir'), `${join(worktree, '.git')}\n`)
     await write(join(worktree, '.git'), `gitdir: ${join(repo, '.git', 'worktrees', 'wt')}\n`)
     const server = (command: string) => JSON.stringify({ mcpServers: { [command]: { command } } })
     await write(join(parent, '.mcp.json'), server('above'))
@@ -650,6 +655,110 @@ test('a settings.local.json the repository supplies approves and allows nothing'
     await rename(join(repo, '.claude'), join(root, 'elsewhere'))
     await symlink(join(root, 'elsewhere'), join(repo, '.claude'))
     assert.deepEqual(await read(), supplied)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a .git file counts only as far as git vouches for it', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'inherited-git-pointer-')))
+  const configDir = join(root, 'claude-config')
+  const codexHome = join(root, 'codex-home')
+  const trusted = join(root, 'trusted')
+  const git = (cwd: string, ...args: string[]) => {
+    const identity = ['-c', 'user.name=Test', '-c', 'user.email=test@example.com']
+    const ran = spawnSync('git', [...identity, ...args], { cwd, stdio: 'ignore' })
+    assert.equal(ran.status, 0, `git ${args.join(' ')}`)
+  }
+  const shipped = JSON.stringify({ permissions: { allow: ['Bash(*)'] } })
+  const trust = (...folders: string[]) =>
+    write(
+      join(configDir, '.claude.json'),
+      JSON.stringify({
+        projects: Object.fromEntries(
+          folders.map((folder) => [folder, { hasTrustDialogAccepted: true }]),
+        ),
+      }),
+    )
+  const read = (cwd: string) =>
+    withEnv({ ...clean, CODEX_HOME: codexHome }, async () => ({
+      main: mainRepositoryRoot(cwd),
+      codex: codexTrustsProject(cwd),
+      claude: claudeTrustsProject(cwd, configDir),
+      allow: claudePermissionRules(cwd, configDir).allow,
+    }))
+  try {
+    await write(join(trusted, 'README.md'), 'Trusted.\n')
+    git(trusted, 'init', '-q')
+    git(trusted, 'add', 'README.md')
+    git(trusted, 'commit', '-q', '-m', 'Initial commit')
+    await write(
+      join(codexHome, 'config.toml'),
+      `[projects.${q(trusted)}]\ntrust_level = "trusted"\n`,
+    )
+    await trust(trusted)
+
+    // A worktree git set up shares the main checkout's trust, and its own
+    // uncommitted settings are the user's.
+    const worktree = join(root, 'worktree')
+    git(trusted, 'worktree', 'add', '-q', worktree)
+    await write(join(worktree, '.claude', 'settings.local.json'), shipped)
+    assert.deepEqual(await read(worktree), {
+      main: trusted,
+      codex: true,
+      claude: true,
+      allow: ['Bash(*)'],
+    })
+
+    // A folder in the trusted checkout whose .git file names the checkout's
+    // own git folder is a repository of its own, trusted by nobody.
+    const nested = join(trusted, 'vendor')
+    await write(join(nested, '.git'), 'gitdir: ../.git\n')
+    await write(join(nested, '.claude', 'settings.json'), shipped)
+    await write(join(nested, '.claude', 'settings.local.json'), shipped)
+    assert.deepEqual(await read(nested), { main: nested, codex: false, claude: false, allow: [] })
+    assert.equal(repositorySupplied(join(nested, '.claude', 'settings.local.json')), true)
+
+    // A folder of its own made up to look like a linked worktree of the
+    // trusted repository: git would read the index it brings, where its
+    // settings.local.json is not checked in.
+    const forged = join(root, 'forged')
+    await write(join(forged, '.git'), 'gitdir: meta\n')
+    await write(join(forged, 'meta', 'commondir'), `${join(trusted, '.git')}\n`)
+    await write(join(forged, 'meta', 'HEAD'), 'ref: refs/heads/main\n')
+    await write(join(forged, 'meta', 'gitdir'), `${join(forged, '.git')}\n`)
+    await write(join(forged, '.claude', 'settings.local.json'), shipped)
+    assert.deepEqual(await read(forged), { main: forged, codex: false, claude: false, allow: [] })
+    // Even trusted itself, the file it brings is not the user's.
+    await trust(trusted, forged)
+    assert.deepEqual((await read(forged)).allow, [])
+    assert.equal(repositorySupplied(join(forged, '.claude', 'settings.local.json')), true)
+
+    // Nor does a link to the real worktree's folder in git count, since that
+    // folder points back at the worktree, not here.
+    const linked = join(root, 'linked')
+    const admin = join(trusted, '.git', 'worktrees', 'worktree')
+    await mkdir(linked, { recursive: true })
+    await symlink(admin, join(linked, 'meta'))
+    await write(join(linked, '.git'), 'gitdir: meta\n')
+    assert.equal(mainRepositoryRoot(linked), linked)
+    await rm(join(linked, 'meta'))
+    await write(join(linked, '.git'), `gitdir: ${admin}\n`)
+    assert.equal(mainRepositoryRoot(linked), linked)
+    assert.equal(gitVouchesForCheckout(linked), false)
+
+    // A submodule's folder in git names it as its working tree.
+    const sub = join(trusted, 'sub')
+    await write(
+      join(trusted, '.git', 'modules', 'sub', 'config'),
+      '[core]\n\tworktree = ../../../sub\n',
+    )
+    await write(join(sub, '.git'), 'gitdir: ../.git/modules/sub\n')
+    assert.equal(gitVouchesForCheckout(sub), true)
+    assert.equal(mainRepositoryRoot(sub), sub)
+    assert.equal(gitVouchesForCheckout(nested), false)
+    assert.equal(gitVouchesForCheckout(worktree), true)
+    assert.equal(gitVouchesForCheckout(trusted), true)
   } finally {
     await rm(root, { recursive: true, force: true })
   }

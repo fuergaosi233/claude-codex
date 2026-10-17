@@ -121,10 +121,13 @@ settings (`enabledMcpjsonServers` or `enableAllProjectMcpServers`). The project
 is trusted when Codex trusts it or the user accepted Claude Code's trust dialog
 for the project itself, that is the repository's main checkout (a worktree
 shares it) or the folder outside a repository; trust accepted for a folder above
-does not count. The checked-in `.claude/settings.json` cannot approve servers,
-and neither can a `.claude/settings.local.json` that is checked in or reached
-through a symlinked `.claude` folder, since that file then comes from the
-repository rather than the user. A server's `${VAR}` references are left for the
+does not count. A checkout's `.git` file is the checkout's to write, so it only
+leads to a main checkout when git's own records vouch for the link: the
+worktree's folder in that repository's `.git/worktrees` points back at it. The
+checked-in `.claude/settings.json` cannot approve servers, and neither can a
+`.claude/settings.local.json` that is checked in, reached through a symlinked
+`.claude` folder or in a checkout whose `.git` file git does not vouch for,
+since that file then comes from the repository rather than the user. A server's `${VAR}` references are left for the
 CLI to fill in from its environment, as it does for its own config files, and a
 local-scope server's `headersHelper` runs only in a trusted project. A Claude
 Code server wins a name over a Codex one, and `CLAUDE_CODEX_MCP_SERVERS` wins
