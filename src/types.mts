@@ -392,6 +392,9 @@ export interface RuntimeTurnContext {
   // session (thread rewind or fork). Backends that cannot truncate ignore it.
   resumeSessionAt?: string | null
   mcpServers: unknown | null
+  // Values the MCP server configs refer to as ${NAME}: they go in the CLI's
+  // environment, never on its command line with the configs.
+  mcpEnv?: Record<string, string> | null
   allowedTools: string[] | null
   // Tools Claude must not use, as permission rules (the CLI's --disallowedTools).
   disallowedTools?: string[] | null

@@ -102,79 +102,90 @@ because the Codex App writes its own desktop servers (such as a computer-use
 client and a Node REPL) into `config.toml` for Codex threads, and those would
 otherwise land in every Claude thread. Stdio servers keep their `args`, `env`,
 `env_vars` and `cwd`; streamable HTTP servers keep their headers and bearer
-token. A server with `enabled = false` stays off, `disabled_tools` are withheld
-from Claude, a call to a tool outside `enabled_tools` is refused, and
-`tool_timeout_sec` becomes the server's tool-call timeout. Codex OAuth logins,
-`startup_timeout_sec`, `required`, per-tool approval settings and the servers
-plugins bring are not carried over.
+token. The values `env_vars`, `env_http_headers` and `bearer_token_env_var` name
+reach the CLI in its environment, never on its command line, where the server
+configs go and any local process can read them (values written into the file
+itself are passed on as written); a launcher that rebuilds the CLI's environment
+from an allowlist drops them. A server with `enabled = false` stays off,
+`disabled_tools` are withheld from Claude, a call to a tool outside
+`enabled_tools` is refused, and `tool_timeout_sec` becomes the server's
+tool-call timeout. Codex OAuth logins, `startup_timeout_sec`, `required`,
+per-tool approval settings and the servers plugins bring are not carried over.
 
 With `CLAUDE_CODEX_CLAUDE_CONFIG_DIR` set, Claude threads start the Claude Code
-servers: user-scope servers and the project's local-scope servers from the global
-config file (`~/.claude.json` for `~/.claude`), and the project's `.mcp.json`
-servers once the project is trusted (in Codex or through Claude Code's trust
-dialog) and the server is approved in the user's own settings
-(`enabledMcpjsonServers` or `enableAllProjectMcpServers`; the checked-in
-`.claude/settings.json` cannot approve them). A Claude Code server wins a name
-over a Codex one, and `CLAUDE_CODEX_MCP_SERVERS` wins over both. Only the
-thread's own turns get these servers, not summaries or other internal turns;
-the App's MCP panel lists those of the thread it asks about.
+servers: user-scope servers and the project's local-scope servers from the
+global config file (`~/.claude.json` for `~/.claude`), and the servers of the
+project's `.mcp.json` files (from the repository root down to the thread's
+folder) once the project is trusted and the server is approved in the user's own
+settings (`enabledMcpjsonServers` or `enableAllProjectMcpServers`). The project
+is trusted when Codex trusts it or the user accepted Claude Code's trust dialog
+for the project itself, that is the repository's main checkout (a worktree
+shares it) or the folder outside a repository; trust accepted for a folder above
+does not count. The checked-in `.claude/settings.json` cannot approve servers,
+and neither can a `.claude/settings.local.json` that is checked in or reached
+through a symlinked `.claude` folder, since that file then comes from the
+repository rather than the user. A server's `${VAR}` references are left for the
+CLI to fill in from its environment, as it does for its own config files, and a
+local-scope server's `headersHelper` runs only in a trusted project. A Claude
+Code server wins a name over a Codex one, and `CLAUDE_CODEX_MCP_SERVERS` wins
+over both. Only the thread's own turns get these servers, not summaries or other
+internal turns; the App's MCP panel lists those of the thread it asks about.
 
 The bridged Claude Code folder also brings its subagents: `agents/*.md` in it,
 then `.claude/agents/*.md` from the git root down to the thread's folder, a
 project agent winning a name over a user agent. Their `name`, `description`,
 `tools`, `disallowedTools`, `model`, `skills`, `maxTurns`, `effort`, `memory`,
-`background`, `initialPrompt` and named `mcpServers` carry over; `permissionMode`,
-`hooks` and inline server definitions do not, since the Codex approval policy
-decides what runs.
+`background`, `initialPrompt` and named `mcpServers` carry over;
+`permissionMode`, `hooks` and inline server definitions do not, since the Codex
+approval policy decides what runs.
 
 Its permission rules apply as well. `permissions.deny` from the user's
 `settings.json` and the project's `.claude/settings.json` and
 `.claude/settings.local.json` always applies: a denied tool stays refused
 whatever the approval policy. `permissions.allow` lets matching tool calls run
 without a Codex approval prompt; the user's rules always count, a project's only
-once the project is trusted, and none in plan mode or a read-only sandbox,
-where Codex would not let those tools run unasked. A user rule's `/path` stays
-relative to the config folder, as in Claude Code. `permissions.ask`,
-`defaultMode` and `additionalDirectories` are not carried over: the CLI takes no
-ask rules outside a settings file, and the Codex approval policy and sandbox
-decide the mode and the folders.
+once the project is trusted (those of a `settings.local.json` the repository
+supplies never), and none in plan mode or a read-only sandbox, where Codex would
+not let those tools run unasked. A user rule's `/path` stays relative to the
+config folder, as in Claude Code. `permissions.ask`, `defaultMode` and
+`additionalDirectories` are not carried over: the CLI takes no ask rules outside
+a settings file, and the Codex approval policy and sandbox decide the mode and
+the folders.
 
-Its command hooks run only when asked for: they are often status or
-notification integrations for terminal sessions, and running them for every App
-chat would silently change what they do (a hook that waits for input would even
-hold up the turn). `CLAUDE_CODEX_CLAUDE_HOOKS=user` runs the hooks in the
-bridged folder's `settings.json`; `CLAUDE_CODEX_CLAUDE_HOOKS=project` also runs
-those of a trusted project's `.claude/settings.json` and
-`.claude/settings.local.json`, so a repository never runs a command on its own
-say; unset, `0` or any other value runs none. They run for `PreToolUse`,
-`PostToolUse`, `PostToolUseFailure`, `UserPromptSubmit`, `Stop`,
-`SubagentStart`, `SubagentStop`, `SessionStart`, `SessionEnd` and
-`Notification`. The adapter registers each command with the Claude Agent SDK;
-the CLI matches it as it would a settings hook and the adapter runs it the way
-Claude Code does: in your shell (or exec form with `args`), the hook input as
-JSON on stdin, `CLAUDE_PROJECT_DIR` set, its `timeout` (10 minutes by default),
-`async` and `once` honored. Exit 0 passes JSON output on (plain output becomes
-context for `UserPromptSubmit` and `SessionStart`), exit 2 blocks with stderr as
-the reason, other exits are non-blocking errors, and `disableAllHooks` turns
-them all off. In plan mode or a read-only sandbox a hook can still deny or ask
-but its approval is dropped, leaving the call to Codex. Prompt, agent
-and HTTP hooks, `if` filters, PowerShell hooks, `asyncRewake`'s wake-up,
-`CLAUDE_ENV_FILE`, and other events (such as `PreCompact`, whose output a
-callback cannot pass back, or `PermissionRequest`, which the Codex approval flow
-owns) are not carried over. Point `CLAUDE_CODEX_CLAUDE_CONFIG_DIR` only at a
-folder the CLI does not read itself, or its hooks run twice.
+Its command hooks run only when asked for: they are often status or notification
+integrations for terminal sessions, and running them for every App chat would
+silently change what they do (a hook that waits for input would even hold up the
+turn). `CLAUDE_CODEX_CLAUDE_HOOKS=user` runs the hooks in the bridged folder's
+`settings.json`; `CLAUDE_CODEX_CLAUDE_HOOKS=project` also runs those of a
+trusted project's `.claude/settings.json` and `.claude/settings.local.json`, so
+a repository never runs a command on its own say; unset, `0` or any other value
+runs none. They run for `PreToolUse`, `PostToolUse`, `PostToolUseFailure`,
+`UserPromptSubmit`, `Stop`, `SubagentStart`, `SubagentStop`, `SessionStart`,
+`SessionEnd` and `Notification`. The adapter registers each command with the
+Claude Agent SDK; the CLI matches it as it would a settings hook and the adapter
+runs it the way Claude Code does: in your shell (or exec form with `args`), the
+hook input as JSON on stdin, `CLAUDE_PROJECT_DIR` set, its `timeout` (10 minutes
+by default), `async` and `once` honored. Exit 0 passes JSON output on (plain
+output becomes context for `UserPromptSubmit` and `SessionStart`), exit 2 blocks
+with stderr as the reason, other exits are non-blocking errors, and
+`disableAllHooks` turns them all off. In plan mode or a read-only sandbox a hook
+can still deny or ask but its approval is dropped, leaving the call to Codex.
+Prompt, agent and HTTP hooks, `if` filters, PowerShell hooks, `asyncRewake`'s
+wake-up, `CLAUDE_ENV_FILE`, and other events (such as `PreCompact`, whose output
+a callback cannot pass back, or `PermissionRequest`, which the Codex approval
+flow owns) are not carried over. Point `CLAUDE_CODEX_CLAUDE_CONFIG_DIR` only at
+a folder the CLI does not read itself, or its hooks run twice.
 
 With `CLAUDE_CODEX_CODEX_NOTIFY=1`, the `notify` program of
 `CODEX_HOME/config.toml` runs when a Claude thread's turn completes, as Codex
 runs it for its own turns: the configured argv plus one JSON argument,
 `{"type":"agent-turn-complete", "thread-id", "turn-id", "cwd", "client",
-"input-messages", "last-assistant-message"}`. This is off by default because
-the Codex App sets `notify` to its own turn-ended program for Codex threads,
-which would otherwise be called after every Claude turn. The adapter does not
-wait for the program, ends it after 30 seconds and writes its stderr to the
-debug log. Summaries and other internal turns, and Codex model threads (whose
-own Codex runs it), do not notify; a project's `.codex/config.toml` cannot set
-it.
+"input-messages", "last-assistant-message"}`. This is off by default because the
+Codex App sets `notify` to its own turn-ended program for Codex threads, which
+would otherwise be called after every Claude turn. The adapter does not wait for
+the program, ends it after 30 seconds and writes its stderr to the debug log.
+Summaries and other internal turns, and Codex model threads (whose own Codex
+runs it), do not notify; a project's `.codex/config.toml` cannot set it.
 
 ### `/workflows` compatibility
 

@@ -10,6 +10,9 @@ export interface McpConfigSnapshot {
   startupStatuses: Array<{ name: string; status: string; error: string | null }>
   // The Codex config's tool lists for the inherited servers still in use.
   toolRules: McpToolRules
+  // Values the servers in use refer to as ${NAME}, for the CLI's
+  // environment (see codex-config.mts).
+  env: Record<string, string>
 }
 
 export interface McpConfigScope {
@@ -39,9 +42,11 @@ export function readMcpConfig(scope: McpConfigScope = {}): McpConfigSnapshot {
     }
   }
   const names = Object.keys(servers)
+  const used = inherited.filter((server) => servers[server.name] === server.config)
   const snapshot: McpConfigSnapshot = {
     sdkValue: names.length > 0 ? servers : null,
-    toolRules: mcpToolRules(inherited.filter((server) => servers[server.name] === server.config)),
+    toolRules: mcpToolRules(used),
+    env: Object.assign({}, ...used.map((server) => server.env ?? {})),
     listStatuses: names.map((name) => listStatusEntry(name)),
     // The adapter passes MCP servers straight to the Claude Agent SDK; it
     // does not run a separate startup handshake, so the optimistic terminal
@@ -72,7 +77,7 @@ export async function listMcpServerStatuses(
 ): Promise<Array<Record<string, unknown>>> {
   const snapshot = readMcpConfig(scope)
   const names = serverNames(snapshot.sdkValue)
-  const key = JSON.stringify(snapshot.sdkValue ?? null)
+  const key = JSON.stringify([snapshot.sdkValue ?? null, snapshot.env])
   if (statusCache && statusCache.key === key && Date.now() - statusCache.at < STATUS_CACHE_MS) {
     return statusCache.data
   }
@@ -307,6 +312,8 @@ async function fetchJsonRpc(
   return JSON.parse(trimmed)
 }
 
+// A server's config with its ${VAR} references filled in, as the CLI
+// would fill them in for the servers it starts.
 function getServerConfig(serverName: string, scope: McpConfigScope): Record<string, unknown> {
   const snapshot = readMcpConfig(scope)
   const value = snapshot.sdkValue
@@ -315,7 +322,40 @@ function getServerConfig(serverName: string, scope: McpConfigScope): Record<stri
   const config = (value as Record<string, unknown>)[serverName]
   if (!config || typeof config !== 'object' || Array.isArray(config))
     throw new Error(`unknown MCP server: ${serverName}`)
-  return config as Record<string, unknown>
+  return expandServerConfig(config as Record<string, unknown>, {
+    ...process.env,
+    ...snapshot.env,
+  })
+}
+
+// ${NAME} and ${NAME:-default} in the places the CLI expands them: a stdio
+// server's command, arguments and env, a remote server's url and headers.
+// A missing variable without a default stays as written. Like the CLI with
+// its own credentials, this never fills in Claude's own variables
+// (ANTHROPIC_*, CLAUDE_CODE_*), credentials among them.
+export function expandServerConfig(
+  config: Record<string, unknown>,
+  env: Record<string, string | undefined>,
+): Record<string, unknown> {
+  const expand = (text: string): string =>
+    text.replace(
+      /\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}/g,
+      (whole, name: string, fallback: string | undefined) => {
+        if (/^(ANTHROPIC_|CLAUDE_CODE_)/i.test(name)) return ''
+        const found = env[name]
+        if (found !== undefined) return found
+        return fallback ?? whole
+      },
+    )
+  const record = (value: unknown) =>
+    Object.fromEntries(Object.entries(stringRecord(value)).map(([key, raw]) => [key, expand(raw)]))
+  const out = { ...config }
+  if (typeof out.command === 'string') out.command = expand(out.command)
+  if (Array.isArray(out.args)) out.args = out.args.map((arg) => expand(String(arg)))
+  if (typeof out.url === 'string') out.url = expand(out.url)
+  if (out.env) out.env = record(out.env)
+  if (out.headers) out.headers = record(out.headers)
+  return out
 }
 
 function parseMcpValue(raw: string): unknown {

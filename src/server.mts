@@ -3561,6 +3561,7 @@ export class CodexClaudeAppServer {
         forkSession,
         resumeSessionAt,
         mcpServers: mcp.sdkValue,
+        mcpEnv: mcp.env,
         allowedTools: defaultAllowedTools(),
         inheritedAllowedTools: permissionRules?.allow ?? null,
         disallowedTools: [...mcp.toolRules.disallowedTools, ...(permissionRules?.deny ?? [])],

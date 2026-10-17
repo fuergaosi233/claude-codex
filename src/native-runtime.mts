@@ -527,7 +527,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }
     // session_state_changed tells a session that outlives its turn when the
     // CLI has finished answering everything queued (see maybeRelease).
-    opts.env = { ...process.env, CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1' }
+    opts.env = { ...process.env, ...context.mcpEnv, CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1' }
     if (context.addDirs && context.addDirs.length > 0) opts.additionalDirectories = context.addDirs
     const allowedTools = [...(context.allowedTools ?? []), ...inheritedAllowedTools(context)]
     if (allowedTools.length > 0) opts.allowedTools = allowedTools
@@ -2627,6 +2627,8 @@ function sessionSignature(context: RuntimeTurnContext): string {
     context.effort ?? null,
     context.systemPromptAddendum ?? '',
     context.mcpServers ?? null,
+    // Compared in memory only, never logged.
+    context.mcpEnv ?? null,
     context.goalTools ? GOAL_MCP_SERVER : null,
     context.addDirs ?? [],
     context.allowedTools ?? [],

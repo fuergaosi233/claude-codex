@@ -1,6 +1,7 @@
-import { statSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { lstatSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, join, relative, resolve } from 'node:path'
 import {
   asTable,
   codexTrustsProject,
@@ -20,8 +21,11 @@ import { debugLog } from './util.mjs'
 // project in the global config file; a later scope wins a name. A .mcp.json
 // server runs repository code, so it is used only in a project the user
 // trusts (in Codex, or through Claude Code's trust dialog) and only once the
-// user approved it in their own settings, never in settings checked into the
-// repository.
+// user approved it in their own settings, never in settings the repository
+// supplies. A server's ${VAR} references are left for the CLI to fill in
+// from its own environment, as it does for its own config files: the values
+// stay off its command line, and it keeps its own credentials and those it
+// never sends to a remote server out of them.
 
 type Table = Record<string, unknown>
 
@@ -97,55 +101,120 @@ function projectEntry(global: Table | null, cwd: string): Table | null {
 }
 
 // Codex trusts the project, or the user accepted Claude Code's trust dialog
-// for it or a folder above it.
+// for the project itself: the repository's main checkout (which a worktree
+// shares), or the folder outside a repository. As in Claude Code for the
+// settings that let a project run code or skip a prompt, trust accepted for
+// a folder above does not count.
 export function claudeTrustsProject(cwd: string, configDir: string): boolean {
   if (codexTrustsProject(cwd)) return true
   const projects = asTable(readJsonFile(claudeGlobalConfigPath(configDir))?.projects)
   if (!projects) return false
-  for (let dir = resolve(cwd); ; dir = dirname(dir)) {
-    for (const key of new Set([dir, realPath(dir)]))
-      if (asTable(projects[key])?.hasTrustDialogAccepted === true) return true
-    if (dirname(dir) === dir) return false
-  }
+  const folder = mainRepositoryRoot(cwd) ?? resolve(cwd)
+  for (const key of new Set([folder, realPath(folder)]))
+    if (asTable(projects[key])?.hasTrustDialogAccepted === true) return true
+  return false
 }
+
+// Whether a project's settings.local.json is the repository's rather than
+// the user's: checked into git, or reached through a symlinked .claude
+// folder. Claude Code keeps that file out of git for the user's own choices,
+// so approvals in a copy the repository supplies are not the user's. A git
+// that cannot tell counts as yes.
+export function repositorySupplied(path: string): boolean {
+  const folder = dirname(path)
+  try {
+    if (lstatSync(folder).isSymbolicLink()) return true
+  } catch {
+    return false
+  }
+  const root = gitRoot(dirname(folder))
+  if (!root) return false
+  // The repository at `root` and no other, whatever git variables the
+  // adapter inherited, without the fsmonitor program its config can name.
+  const env: NodeJS.ProcessEnv = Object.fromEntries(
+    Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')),
+  )
+  env.GIT_CEILING_DIRECTORIES = dirname(root)
+  env.GIT_OPTIONAL_LOCKS = '0'
+  const result = spawnSync(
+    'git',
+    ['-c', 'core.fsmonitor=false', 'ls-files', '--error-unmatch', '--', relative(root, path)],
+    { cwd: root, stdio: 'ignore', timeout: 5000, env },
+  )
+  if (result.status === 0) return true
+  if (result.status === 1) return false
+  debugLog('claude_settings_git_check_failed', { path, status: result.status })
+  return true
+}
+
+// The parts of the project's uncommitted settings files the user can rely
+// on: all of a file of their own, and only what takes something away from a
+// file the repository supplies.
+function localSettings(cwd: string): Array<{ settings: Table; own: boolean }> {
+  const out: Array<{ settings: Table; own: boolean }> = []
+  for (const path of claudeProjectSettingsPaths(cwd).local) {
+    const settings = readJsonFile(path)
+    if (!settings) continue
+    const own = !repositorySupplied(path)
+    if (!own && !ignoredLocal.has(path)) {
+      ignoredLocal.add(path)
+      debugLog('claude_settings_local_not_own', { path })
+    }
+    out.push({ settings, own })
+  }
+  return out
+}
+
+const ignoredLocal = new Set<string>()
 
 export function claudeMcpServers(cwd: string | null, configDir: string): InheritedMcpServer[] {
   const globalPath = claudeGlobalConfigPath(configDir)
   const global = readJsonFile(globalPath)
   const servers = new Map<string, InheritedMcpServer>()
-  const add = (source: string, table: unknown, approve?: (name: string) => boolean): void => {
+  const add = (
+    source: string,
+    table: unknown,
+    helpers: boolean,
+    approve?: (name: string) => boolean,
+  ): void => {
     for (const [name, raw] of Object.entries(asTable(table) ?? {})) {
       if (approve && !approve(name)) continue
-      const config = sdkServerConfig(raw)
+      const config = sdkServerConfig(name, raw, helpers)
       if (config) {
         servers.delete(name)
         servers.set(name, { name, source, config })
       } else debugLog('claude_mcp_server_skipped', { server: name, source })
     }
   }
-  add(globalPath, global?.mcpServers)
+  add(globalPath, global?.mcpServers, true)
   if (cwd) {
     const approved = projectServerApproval(cwd, configDir, global)
     if (approved)
-      for (const path of mcpJsonPaths(cwd)) add(path, readJsonFile(path)?.mcpServers, approved)
-    add(globalPath, projectEntry(global, cwd)?.mcpServers)
+      for (const path of mcpJsonPaths(cwd))
+        add(path, readJsonFile(path)?.mcpServers, true, approved)
+    // A local-scope server's headersHelper runs only in a trusted project,
+    // as in Claude Code.
+    const trusted = approved !== null || claudeTrustsProject(cwd, configDir)
+    add(globalPath, projectEntry(global, cwd)?.mcpServers, trusted)
   }
   return [...servers.values()]
 }
 
-// Every .mcp.json from the filesystem root down to the thread's folder; a
-// closer file wins a name.
+// Every .mcp.json from the repository root (the folder itself outside a
+// repository) down to the thread's folder; a closer file wins a name.
 function mcpJsonPaths(cwd: string): string[] {
+  const top = resolve(gitRoot(cwd) ?? cwd)
   const paths: string[] = []
-  for (let dir = resolve(cwd); dirname(dir) !== dir; dir = dirname(dir))
+  for (let dir = resolve(cwd); ; dir = dirname(dir)) {
     paths.unshift(join(dir, '.mcp.json'))
-  return paths
+    if (dir === top || dirname(dir) === dir) return paths
+  }
 }
 
 // Which .mcp.json servers may run, or null when none may: the project must
 // be trusted, and a server enabled by name or by enableAllProjectMcpServers
-// in the user's settings, the project's uncommitted settings or the global
-// config's project entry, and not disabled in any of them.
+// in the user's settings, the project's uncommitted settings of their own or
+// the global config's project entry, and not disabled in any of them.
 function projectServerApproval(
   cwd: string,
   configDir: string,
@@ -153,18 +222,19 @@ function projectServerApproval(
 ): ((name: string) => boolean) | null {
   if (!claudeTrustsProject(cwd, configDir)) return null
   const sources = [
-    readJsonFile(claudeUserSettingsPath(configDir)),
-    ...claudeProjectSettingsPaths(cwd).local.map(readJsonFile),
-    projectEntry(global, cwd),
+    { settings: readJsonFile(claudeUserSettingsPath(configDir)), own: true },
+    ...localSettings(cwd),
+    { settings: projectEntry(global, cwd), own: true },
   ]
   const enabled = new Set<string>()
   const disabled = new Set<string>()
   let all = false
-  for (const source of sources) {
-    if (!source) continue
-    if (source.enableAllProjectMcpServers === true) all = true
-    for (const name of stringList(source.enabledMcpjsonServers)) enabled.add(name)
-    for (const name of stringList(source.disabledMcpjsonServers)) disabled.add(name)
+  for (const { settings, own } of sources) {
+    if (!settings) continue
+    for (const name of stringList(settings.disabledMcpjsonServers)) disabled.add(name)
+    if (!own) continue
+    if (settings.enableAllProjectMcpServers === true) all = true
+    for (const name of stringList(settings.enabledMcpjsonServers)) enabled.add(name)
   }
   if (!all && enabled.size === 0) return null
   return (name) => !disabled.has(name) && (all || enabled.has(name))
@@ -183,7 +253,7 @@ export interface ClaudePermissionRules {
 // project's (the checked-in .claude/settings.json and the uncommitted
 // settings.local.json files). Deny rules only take tools away, so the
 // project's always apply; its allow rules only in a project the user
-// trusts.
+// trusts, and those of a settings.local.json only when it is the user's own.
 export function claudePermissionRules(cwd: string, configDir: string): ClaudePermissionRules {
   const allow = new Set<string>()
   const deny = new Set<string>()
@@ -197,9 +267,9 @@ export function claudePermissionRules(cwd: string, configDir: string): ClaudePer
     ask += stringList(permissions.ask).length
   }
   add(readJsonFile(claudeUserSettingsPath(configDir)), true, configDir)
-  const { shared, local } = claudeProjectSettingsPaths(cwd)
   const trusted = claudeTrustsProject(cwd, configDir)
-  for (const path of [shared, ...local]) add(readJsonFile(path), trusted, null)
+  add(readJsonFile(claudeProjectSettingsPaths(cwd).shared), trusted, null)
+  for (const { settings, own } of localSettings(cwd)) add(settings, trusted && own, null)
   return { allow: [...allow], deny: [...deny], ask }
 }
 
@@ -212,10 +282,14 @@ function anchoredRule(rule: string, root: string): string {
   return `${match[1]}(/${resolve(root)}/${match[2]})`
 }
 
-// A Claude Code server entry, with ${VAR} and ${VAR:-default} expanded from
-// the adapter's environment as the CLI would from its own. Transports the
-// SDK cannot pass on are skipped.
-function sdkServerConfig(raw: unknown): Record<string, unknown> | null {
+// A Claude Code server entry as the SDK takes it, its ${VAR} references
+// left for the CLI. Transports the SDK cannot pass on are skipped, and so
+// is a headersHelper that may not run.
+function sdkServerConfig(
+  name: string,
+  raw: unknown,
+  helpers: boolean,
+): Record<string, unknown> | null {
   const entry = asTable(raw)
   if (!entry) return null
   const type = typeof entry.type === 'string' ? entry.type : 'stdio'
@@ -225,39 +299,26 @@ function sdkServerConfig(raw: unknown): Record<string, unknown> | null {
     const env = stringRecord(entry.env)
     return {
       type: 'stdio',
-      command: expandVars(entry.command),
-      args: stringList(entry.args).map(expandVars),
-      ...(Object.keys(env).length > 0 ? { env: mapValues(env, expandVars) } : {}),
+      command: entry.command,
+      args: stringList(entry.args),
+      ...(Object.keys(env).length > 0 ? { env } : {}),
       ...timeout,
     }
   }
   if (type === 'http' || type === 'sse' || type === 'streamable-http') {
     if (typeof entry.url !== 'string' || !entry.url) return null
     const headers = stringRecord(entry.headers)
+    const helper = typeof entry.headersHelper === 'string' ? entry.headersHelper : null
+    if (helper && !helpers) debugLog('claude_mcp_headers_helper_skipped', { server: name })
     return {
       type: type === 'sse' ? 'sse' : 'http',
-      url: expandVars(entry.url),
-      ...(Object.keys(headers).length > 0 ? { headers: mapValues(headers, expandVars) } : {}),
-      ...(typeof entry.headersHelper === 'string' ? { headersHelper: entry.headersHelper } : {}),
+      url: entry.url,
+      ...(Object.keys(headers).length > 0 ? { headers } : {}),
+      ...(helper && helpers ? { headersHelper: helper } : {}),
       ...timeout,
     }
   }
   return null
-}
-
-function expandVars(value: string): string {
-  return value.replace(/\$\{([^}:]+)(?::-([^}]*))?\}/g, (whole, name: string, fallback) => {
-    const found = process.env[name]
-    if (found !== undefined) return found
-    return typeof fallback === 'string' ? fallback : whole
-  })
-}
-
-function mapValues(
-  record: Record<string, string>,
-  map: (value: string) => string,
-): Record<string, string> {
-  return Object.fromEntries(Object.entries(record).map(([key, value]) => [key, map(value)]))
 }
 
 export function stringList(value: unknown): string[] {

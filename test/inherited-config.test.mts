@@ -1,6 +1,16 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import {
+  copyFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import test from 'node:test'
@@ -9,7 +19,9 @@ import {
   claudeGlobalConfigPath,
   claudeMcpServers,
   claudePermissionRules,
+  claudeTrustsProject,
 } from '../src/claude-config.mjs'
+import { claudeHookSpecs } from '../src/claude-hooks.mjs'
 import {
   codexMcpServers,
   codexTrustsProject,
@@ -240,7 +252,7 @@ enabled_tools = ["read", "list"]
 url = "https://mcp.example.com/mcp"
 http_headers = { "X-Team" = "core" }
 env_http_headers = { "X-Key" = "DOCS_HEADER" }
-bearer_token_env_var = "DOCS_BEARER"
+bearer_token_env_var = "GITHUB_TOKEN"
 
 [mcp_servers.elsewhere]
 command = "remote-only"
@@ -265,7 +277,7 @@ command = "app-tools"
         REMOTE_ONLY: 'remote-value',
         UNSET_VAR: undefined,
         DOCS_HEADER: 'header-value',
-        DOCS_BEARER: 'bearer-value',
+        GITHUB_TOKEN: 'bearer-value',
       },
       async () => codexMcpServers(null),
     )
@@ -273,7 +285,18 @@ command = "app-tools"
       servers.map((server) => server.name),
       ['docs', 'local', 'remote'],
     )
+    // Values from the environment never land in the configs, which the SDK
+    // passes on the CLI's command line: the configs refer to them by a name
+    // of their own, and the CLI gets them in its environment.
+    const configs = JSON.stringify(servers.map((server) => server.config))
+    for (const secret of ['docs-token-value', 'header-value', 'bearer-value'])
+      assert.ok(!configs.includes(secret), `${secret} is in the server configs`)
     const found = byName(servers)
+    const alias = (server: InheritedMcpServer | undefined, value: string): string => {
+      const name = Object.entries(server?.env ?? {}).find(([, found]) => found === value)?.[0]
+      assert.match(name ?? '', /^CLAUDE_CODEX_MCP_[0-9A-F]{16}$/)
+      return `\${${name}}`
+    }
     assert.deepEqual(found.docs, {
       name: 'docs',
       source: join(codexHome, 'config.toml'),
@@ -281,11 +304,17 @@ command = "app-tools"
         type: 'stdio',
         command: 'docs-mcp',
         args: ['--stdio'],
-        env: { PATH: process.env.PATH, DOCS_TOKEN: 'docs-token-value', DOCS_MODE: 'fast' },
+        env: {
+          PATH: process.env.PATH,
+          DOCS_TOKEN: alias(found.docs, 'docs-token-value'),
+          DOCS_MODE: 'fast',
+        },
         timeout: 12500,
       },
       disabledTools: ['delete'],
+      env: found.docs?.env,
     })
+    assert.equal(Object.keys(found.docs?.env ?? {}).length, 1)
     assert.deepEqual(found.local?.enabledTools, ['read', 'list'])
     const local = configOf<{ command: string; args: string[] }>(found.local)
     assert.equal(local.command, '/bin/sh')
@@ -296,8 +325,13 @@ command = "app-tools"
     assert.deepEqual(found.remote?.config, {
       type: 'http',
       url: 'https://mcp.example.com/mcp',
-      headers: { 'X-Team': 'core', 'X-Key': 'header-value', Authorization: 'Bearer bearer-value' },
+      headers: {
+        'X-Team': 'core',
+        'X-Key': alias(found.remote, 'header-value'),
+        Authorization: `Bearer ${alias(found.remote, 'bearer-value')}`,
+      },
     })
+    assert.equal(found.local?.env, undefined)
 
     // Off unless asked for with exactly 1.
     for (const value of [undefined, '0', 'true', 'yes'])
@@ -440,10 +474,12 @@ test('Claude Code MCP servers come from the global config and approved .mcp.json
     assert.deepEqual(Object.keys(untrusted), ['remote', 'events', 'shared'])
     // The project's local scope wins over the user scope.
     assert.deepEqual(untrusted.shared?.config, { type: 'stdio', command: 'local-shared', args: [] })
+    // ${VAR} references are left for the CLI, which fills them in from its
+    // own environment.
     assert.deepEqual(untrusted.remote?.config, {
       type: 'http',
-      url: 'https://core.example.com/mcp',
-      headers: { Authorization: 'Bearer none', 'X-Other': '${MISSING_VAR}' },
+      url: 'https://${TEAM}.example.com/mcp',
+      headers: { Authorization: 'Bearer ${API_TOKEN:-none}', 'X-Other': '${MISSING_VAR}' },
     })
     assert.equal(configOf<{ type: string }>(untrusted.events).type, 'sse')
 
@@ -460,7 +496,7 @@ test('Claude Code MCP servers come from the global config and approved .mcp.json
     assert.deepEqual(trusted.fromRepo?.config, {
       type: 'stdio',
       command: 'repo-tool',
-      args: ['--team', 'core'],
+      args: ['--team', '${TEAM}'],
     })
     assert.equal(trusted.fromRepo?.source, join(repo, '.mcp.json'))
     // Servers the project brings stay off with no approval.
@@ -480,6 +516,173 @@ test('Claude Code MCP servers come from the global config and approved .mcp.json
       'disabled',
       'shared',
     ])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('Claude Code trust covers the project itself, never a folder above it', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'inherited-claude-trust-'))
+  const configDir = join(root, 'claude-config')
+  const parent = join(root, 'parent')
+  const repo = join(parent, 'repo')
+  const nested = join(repo, 'vendor', 'nested')
+  const worktree = join(root, 'worktree')
+  try {
+    await mkdir(join(repo, '.git', 'worktrees', 'wt'), { recursive: true })
+    await mkdir(join(repo, 'src'), { recursive: true })
+    await mkdir(join(nested, '.git'), { recursive: true })
+    await mkdir(join(parent, 'plain'), { recursive: true })
+    await write(join(repo, '.git', 'worktrees', 'wt', 'commondir'), '../..\n')
+    await write(join(worktree, '.git'), `gitdir: ${join(repo, '.git', 'worktrees', 'wt')}\n`)
+    const server = (command: string) => JSON.stringify({ mcpServers: { [command]: { command } } })
+    await write(join(parent, '.mcp.json'), server('above'))
+    await write(join(repo, '.mcp.json'), server('inside'))
+    const stop = (command: string) => ({ Stop: [{ hooks: [{ type: 'command', command }] }] })
+    await write(
+      join(configDir, 'settings.json'),
+      JSON.stringify({ enableAllProjectMcpServers: true, hooks: stop('user-hook') }),
+    )
+    await write(
+      join(repo, '.claude', 'settings.json'),
+      JSON.stringify({ permissions: { allow: ['Bash(make:*)'] }, hooks: stop('repo-hook') }),
+    )
+    const trust = (folder: string) =>
+      write(
+        join(configDir, '.claude.json'),
+        JSON.stringify({ projects: { [folder]: { hasTrustDialogAccepted: true } } }),
+      )
+    const read = (cwd: string) =>
+      withEnv(
+        { ...clean, CODEX_HOME: join(root, 'codex-home'), CLAUDE_CODEX_CLAUDE_HOOKS: 'project' },
+        async () => ({
+          trusted: claudeTrustsProject(cwd, configDir),
+          servers: Object.keys(byName(claudeMcpServers(cwd, configDir))),
+          allow: claudePermissionRules(cwd, configDir).allow,
+          hooks: claudeHookSpecs(cwd, configDir).map((hook) => hook.command),
+        }),
+      )
+
+    // Trust accepted for a folder above reaches neither a repository in it
+    // nor a plain folder.
+    await trust(parent)
+    assert.equal((await read(parent)).trusted, true)
+    assert.deepEqual(await read(repo), {
+      trusted: false,
+      servers: [],
+      allow: [],
+      hooks: ['user-hook'],
+    })
+    assert.equal((await read(join(parent, 'plain'))).trusted, false)
+
+    await trust(repo)
+    // A .mcp.json above the repository root is not the project's.
+    assert.deepEqual(await read(repo), {
+      trusted: true,
+      servers: ['inside'],
+      allow: ['Bash(make:*)'],
+      hooks: ['user-hook', 'repo-hook'],
+    })
+    // A folder in the repository and a worktree of it share its trust; a
+    // repository nested in it has its own.
+    assert.equal((await read(join(repo, 'src'))).trusted, true)
+    assert.equal((await read(worktree)).trusted, true)
+    assert.equal((await read(nested)).trusted, false)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a settings.local.json the repository supplies approves and allows nothing', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'inherited-claude-local-'))
+  const configDir = join(root, 'claude-config')
+  const repo = join(root, 'repo')
+  const git = (...args: string[]) =>
+    assert.equal(spawnSync('git', args, { cwd: repo, stdio: 'ignore' }).status, 0)
+  try {
+    await mkdir(repo, { recursive: true })
+    git('init', '-q')
+    await write(
+      join(repo, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          tool: { command: 'tool' },
+          other: { command: 'other' },
+          extra: { command: 'x' },
+        },
+      }),
+    )
+    await write(
+      join(configDir, 'settings.json'),
+      JSON.stringify({ enabledMcpjsonServers: ['tool', 'other'] }),
+    )
+    await write(
+      join(configDir, '.claude.json'),
+      JSON.stringify({ projects: { [repo]: { hasTrustDialogAccepted: true } } }),
+    )
+    await write(
+      join(repo, '.claude', 'settings.local.json'),
+      JSON.stringify({
+        enableAllProjectMcpServers: true,
+        disabledMcpjsonServers: ['other'],
+        permissions: { allow: ['Bash(curl:*)'], deny: ['WebFetch'] },
+      }),
+    )
+    const read = () =>
+      withEnv({ ...clean, CODEX_HOME: join(root, 'codex-home') }, async () => {
+        const { allow, deny } = claudePermissionRules(repo, configDir)
+        return { servers: Object.keys(byName(claudeMcpServers(repo, configDir))), allow, deny }
+      })
+    const supplied = { servers: ['tool'], allow: [], deny: ['WebFetch'] }
+
+    // The user's own file.
+    assert.deepEqual(await read(), {
+      servers: ['tool', 'extra'],
+      allow: ['Bash(curl:*)'],
+      deny: ['WebFetch'],
+    })
+    // Checked in, it is the repository's: only what it takes away counts.
+    git('add', '.claude/settings.local.json')
+    assert.deepEqual(await read(), supplied)
+    git('rm', '-q', '--cached', '.claude/settings.local.json')
+    assert.deepEqual((await read()).allow, ['Bash(curl:*)'])
+    // So is one reached through a symlinked .claude folder.
+    await rename(join(repo, '.claude'), join(root, 'elsewhere'))
+    await symlink(join(root, 'elsewhere'), join(repo, '.claude'))
+    assert.deepEqual(await read(), supplied)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a headersHelper runs for a user-scope server, for a local-scope one only when trusted', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'inherited-claude-helper-'))
+  const configDir = join(root, 'claude-config')
+  const repo = join(root, 'repo')
+  const remote = { type: 'http', url: 'https://mcp.example.com/', headersHelper: './token.sh' }
+  const global = (entry: Record<string, unknown>) =>
+    write(
+      join(configDir, '.claude.json'),
+      JSON.stringify({
+        mcpServers: { user: remote },
+        projects: { [repo]: { mcpServers: { local: remote }, ...entry } },
+      }),
+    )
+  const helpers = () =>
+    withEnv({ ...clean, CODEX_HOME: join(root, 'codex-home') }, async () =>
+      Object.fromEntries(
+        claudeMcpServers(repo, configDir).map((server) => [
+          server.name,
+          server.config.headersHelper ?? null,
+        ]),
+      ),
+    )
+  try {
+    await mkdir(join(repo, '.git'), { recursive: true })
+    await global({})
+    assert.deepEqual(await helpers(), { user: './token.sh', local: null })
+    await global({ hasTrustDialogAccepted: true })
+    assert.deepEqual(await helpers(), { user: './token.sh', local: './token.sh' })
   } finally {
     await rm(root, { recursive: true, force: true })
   }
@@ -517,11 +720,13 @@ command = "codex-shared"
 [mcp_servers.overridden]
 command = "codex-overridden"
 disabled_tools = ["drop"]
+env_vars = ["OVERRIDDEN_TOKEN"]
 
 [mcp_servers.narrow]
 command = "codex-narrow"
 enabled_tools = ["only"]
 disabled_tools = ["never"]
+env_vars = ["NARROW_TOKEN"]
 `,
     )
     await write(
@@ -538,15 +743,21 @@ disabled_tools = ["never"]
       CLAUDE_CODEX_CODEX_MCP_SERVERS: '1',
       CLAUDE_CODEX_CLAUDE_CONFIG_DIR: configDir,
       CLAUDE_CODEX_MCP_SERVERS: explicitFile,
+      NARROW_TOKEN: 'narrow-secret',
+      OVERRIDDEN_TOKEN: 'overridden-secret',
     }
     const snapshot = await withEnv(env, async () => readMcpConfig({ cwd: root }))
+    // The CLI's environment gets the values of the servers still in use.
+    const [alias, ...others] = Object.keys(snapshot.env)
+    assert.deepEqual(others, [])
+    assert.deepEqual(snapshot.env, { [alias as string]: 'narrow-secret' })
     assert.deepEqual(snapshot.sdkValue, {
       shared: { type: 'stdio', command: 'claude-shared', args: [] },
       narrow: {
         type: 'stdio',
         command: 'codex-narrow',
         args: [],
-        env: { PATH: process.env.PATH },
+        env: { PATH: process.env.PATH, NARROW_TOKEN: `\${${alias}}` },
       },
       overridden: { type: 'stdio', command: 'explicit' },
     })
@@ -563,6 +774,7 @@ disabled_tools = ["never"]
     const own = await withEnv(env, async () => readMcpConfig({ inherit: false }))
     assert.deepEqual(own.sdkValue, { overridden: { type: 'stdio', command: 'explicit' } })
     assert.deepEqual(own.toolRules, { disallowedTools: [], enabledTools: {} })
+    assert.deepEqual(own.env, {})
 
     const missing = await withEnv(
       { ...env, CLAUDE_CODEX_MCP_SERVERS: join(root, 'missing.json') },
@@ -656,6 +868,7 @@ command = ${q(process.execPath)}
 args = ["server.mjs"]
 cwd = "../tools"
 enabled_tools = ["echo"]
+env_vars = ["FIXTURE_TOKEN"]
 `,
   )
   // Off by default: the Codex App keeps its own desktop servers in that file.
@@ -667,11 +880,18 @@ enabled_tools = ["echo"]
     const listed = await request('mcpServerStatus/list', { threadId: started.thread.id })
     assert.deepEqual(listed.data, [])
   })
-  const optIn = { CODEX_HOME: codexHome, CLAUDE_CODEX_CODEX_MCP_SERVERS: '1' }
+  const optIn = {
+    CODEX_HOME: codexHome,
+    CLAUDE_CODEX_CODEX_MCP_SERVERS: '1',
+    FIXTURE_TOKEN: 'fixture-secret',
+  }
   await withServer(root, optIn, async ({ request, turn }) => {
     const started = await request('thread/start', { cwd: repo, model: 'sonnet' })
     const normal = await turn(started.thread.id)
     assert.deepEqual(Object.keys(normal.mcpServers as object), ['everywhere', 'fixture'])
+    // The secret reaches the CLI's environment, not its command line.
+    assert.ok(!JSON.stringify(normal.mcpServers).includes('fixture-secret'))
+    assert.deepEqual(Object.values(normal.mcpEnv ?? {}), ['fixture-secret'])
     assert.deepEqual(normal.disallowedTools, ['mcp__everywhere__drop'])
     assert.deepEqual(normal.mcpEnabledTools, { mcp__fixture__: ['mcp__fixture__echo'] })
     // Summaries and other internal turns get none of them.
@@ -701,6 +921,16 @@ enabled_tools = ["echo"]
       arguments: { value: 'hi' },
     })
     assert.deepEqual(called.content, [{ type: 'text', text: 'tool:echo:hi' }])
+    // A server the adapter starts itself gets the value filled in.
+    const env = await request('mcpServer/tool/call', {
+      threadId: started.thread.id,
+      server: 'fixture',
+      tool: 'env',
+      arguments: { value: 'FIXTURE_TOKEN' },
+    })
+    assert.deepEqual(env.content, [{ type: 'text', text: 'env:fixture-secret' }])
+    // A turn without the inherited servers gets none of their values.
+    assert.deepEqual(summary.mcpEnv, {})
   })
   await rm(root, { recursive: true, force: true })
 })
@@ -933,13 +1163,19 @@ test('the native runtime passes inherited servers, tool rules and agents to the 
   assert.equal(plain.hooks, undefined)
 
   const agents = { helper: { description: 'Helps', prompt: 'Help.' } }
+  const docs = { type: 'stdio', command: 'docs-mcp', env: { TOKEN: '${DOCS_ALIAS}' } }
   const options = await sessionOptions({
-    mcpServers: { docs: { type: 'stdio', command: 'docs-mcp' } },
+    mcpServers: { docs },
+    mcpEnv: { DOCS_ALIAS: 'docs-secret' },
     disallowedTools: ['mcp__docs__drop'],
     mcpEnabledTools: { mcp__docs__: ['mcp__docs__read'] },
     agents,
   })
-  assert.deepEqual(options.mcpServers, { docs: { type: 'stdio', command: 'docs-mcp' } })
+  // The value reaches the CLI in its environment; the configs the SDK puts
+  // on its command line only name it.
+  assert.deepEqual(options.mcpServers, { docs })
+  assert.equal(options.env.DOCS_ALIAS, 'docs-secret')
+  assert.ok(!JSON.stringify(options.mcpServers).includes('docs-secret'))
   assert.deepEqual(options.disallowedTools, ['mcp__docs__drop'])
   assert.deepEqual(options.agents, agents)
   assert.equal(options.hooks.PreToolUse.length, 1)
@@ -950,7 +1186,10 @@ test('Claude Code permission rules: the user rules apply, project deny rules alw
   const configDir = join(root, 'claude-config')
   const repo = join(root, 'repo')
   try {
-    await mkdir(join(repo, '.git'), { recursive: true })
+    await mkdir(repo, { recursive: true })
+    // A real repository: its settings.local.json counts as the user's only
+    // when git can tell it is not checked in.
+    assert.equal(spawnSync('git', ['init', '-q'], { cwd: repo, stdio: 'ignore' }).status, 0)
     await write(
       join(configDir, 'settings.json'),
       JSON.stringify({
