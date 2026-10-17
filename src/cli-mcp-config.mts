@@ -17,6 +17,8 @@ import { adapterHome, debugLog } from './util.mjs'
 
 // The files this process wrote and has not removed yet.
 const written = new Set<string>()
+// Whether the exit handler that removes them is in place.
+let removedOnExit = false
 
 export function cliMcpConfigDir(): string {
   return join(adapterHome(), 'mcp-config')
@@ -32,8 +34,12 @@ export function writeCliMcpConfig(servers: unknown, dir = cliMcpConfigDir()): st
   chmodSync(dir, 0o700)
   const file = join(dir, `${process.pid}-${randomUUID()}.json`)
   writeFileSync(file, `${JSON.stringify({ mcpServers: servers })}\n`, { mode: 0o600, flag: 'wx' })
-  // The adapter exits right after it stops its sessions, before they end.
-  if (written.size === 0) process.once('exit', removeAll)
+  // The adapter may exit before its sessions end. One handler for the
+  // process's lifetime, however often the set empties and fills again.
+  if (!removedOnExit) {
+    removedOnExit = true
+    process.on('exit', removeAll)
+  }
   written.add(file)
   return file
 }

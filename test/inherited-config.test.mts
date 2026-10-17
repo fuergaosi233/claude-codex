@@ -1577,6 +1577,14 @@ test('the MCP config files of adapters that are gone are swept', async () => {
     removeCliMcpConfig(mine)
     removeCliMcpConfig(mine)
     assert.equal(sweepCliMcpConfigs(join(dir, 'missing')), 0)
+    // However many sessions come and go, one exit handler removes their files.
+    const listeners = process.listenerCount('exit')
+    for (let i = 0; i < 20; i++) {
+      const file = writeCliMcpConfig({ docs: { type: 'stdio', command: 'docs-mcp' } }, dir)
+      assert.ok(file)
+      removeCliMcpConfig(file)
+    }
+    assert.equal(process.listenerCount('exit'), listeners)
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
