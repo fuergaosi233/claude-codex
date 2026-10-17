@@ -225,6 +225,14 @@ interface SessionTask {
   outputFile: string | null
 }
 
+// What is left to do once a CLI session is over.
+interface SessionEnd {
+  // The seconds its SessionEnd hooks get together.
+  readonly budgetSec: () => number
+  // Runs within `budget` when given, else the session's own.
+  readonly run: (budget?: AbortSignal) => Promise<void>
+}
+
 const WORKFLOW_TERMINAL_FLUSH_TIMEOUT_MS = 500
 const WORKFLOW_JOURNAL_SETTLE_TIMEOUT_MS = 3_000
 // How long an idle session waits for Claude to answer a task that just ended
@@ -236,6 +244,9 @@ const SESSION_CONTROL_TIMEOUT_MS = 5_000
 // How long a new turn waits for an interrupted session to drain before it
 // gives up on the sink and goes ahead.
 const SINK_DRAIN_TIMEOUT_MS = 30_000
+// How long past their budget stopping waits for SessionEnd hooks: a killed
+// hook settles once its output has drained.
+const SESSION_END_MARGIN_MS = 1_000
 const TERMINAL_TASK_STATUSES = new Set(['completed', 'failed', 'killed', 'stopped'])
 // A parked agent keeps its progress but does no work until sent a message.
 const IDLE_TASK_STATUSES = new Set([...TERMINAL_TASK_STATUSES, 'paused'])
@@ -252,8 +263,11 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   // What is left to do when a CLI session is over, by session (its abort
   // controller): remove its MCP config file and run the user's SessionEnd
   // hooks, which the CLI runs as it exits, after the SDK has dropped its
-  // callbacks.
-  private sessionEnds = new WeakMap<AbortController, () => void>()
+  // callbacks. An entry goes once it is done, so what is here at stop() is
+  // what the live sessions still have to do.
+  private sessionEnds = new Map<AbortController, SessionEnd>()
+  // The SessionEnd hooks still running, with their budget in seconds.
+  private ending = new Map<Promise<void>, number>()
 
   setBackgroundListener(listener: RuntimeBackgroundListener): void {
     this.listener = listener
@@ -462,6 +476,17 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     this.sessions.clear()
     this.turns.clear()
     this.permissions.clear()
+    // The CLI runs its SessionEnd hooks as it exits, within one budget. The
+    // sessions still open end with the adapter, so their hooks run now and
+    // share one, as they would in a single CLI; a session that winds down
+    // meanwhile finds its hooks already started.
+    const open = [...this.sessionEnds]
+    const budgetSec = Math.max(0, ...open.map(([, end]) => end.budgetSec()))
+    const budget = AbortSignal.timeout(budgetSec * 1000)
+    for (const [abort] of open) this.finishSession(abort, budget)
+    // Those of a session that ended just before are waited for too.
+    const waitSec = Math.max(0, ...this.ending.values())
+    await settlesWithin(Promise.all(this.ending.keys()), waitSec * 1000 + SESSION_END_MARGIN_MS)
   }
 
   // ── private ──
@@ -545,11 +570,14 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (context.agents && Object.keys(context.agents).length > 0) opts.agents = context.agents
     // The source the CLI would give this session's SessionStart hooks.
     const origin = !resume ? 'startup' : opts.forkSession ? 'fork' : 'resume'
-    const { hooks, end } = sdkHooks(context, inheritedApprovals(context), origin)
+    const { hooks, end, endBudgetSec } = sdkHooks(context, inheritedApprovals(context), origin)
     if (hooks) opts.hooks = hooks
-    this.sessionEnds.set(abort, () => {
-      if (mcpConfig) removeCliMcpConfig(mcpConfig)
-      void end?.('other')
+    this.sessionEnds.set(abort, {
+      budgetSec: endBudgetSec,
+      run: async (budget) => {
+        if (mcpConfig) removeCliMcpConfig(mcpConfig)
+        await end?.('other', budget)
+      },
     })
     let goalServer = false
     if (context.goalTools && this.zod && typeof sdk.createSdkMcpServer === 'function') {
@@ -1305,8 +1333,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (registered === session) this.sessions.delete(session.threadId)
     // Release the CLI's stdin (see TurnInput).
     session.input.close()
-    this.sessionEnds.get(session.abort)?.()
-    this.sessionEnds.delete(session.abort)
+    this.finishSession(session.abort)
     const pending = session.current
     session.current = null
     if (pending && !pending.resolved) await this.finishTurnAtSessionEnd(pending, failure)
@@ -1316,6 +1343,18 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (session.reusable && !superseded) {
       this.listener?.onSessionReleased(session.threadId, liveTasks)
     }
+  }
+
+  // Does what is left once the CLI session of `abort` is over, at most once.
+  private finishSession(abort: AbortController, budget?: AbortSignal): void {
+    const end = this.sessionEnds.get(abort)
+    if (!end) return
+    this.sessionEnds.delete(abort)
+    const done: Promise<void> = end
+      .run(budget)
+      .catch(() => {})
+      .finally(() => this.ending.delete(done))
+    this.ending.set(done, end.budgetSec())
   }
 
   private async finishTurnAtSessionEnd(pending: PendingTurn, failure: Error | null): Promise<void> {

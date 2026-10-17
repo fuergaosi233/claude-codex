@@ -995,10 +995,10 @@ test('enabled_tools are enforced by a PreToolUse hook and disabled_tools are dis
     },
   })
   assert.equal((await call('mcp__c__anything')).hookSpecificOutput !== undefined, true)
-  assert.deepEqual(sdkHooks({ mcpEnabledTools: {} } as unknown as RuntimeTurnContext), {
-    hooks: null,
-    end: null,
-  })
+  const none = sdkHooks({ mcpEnabledTools: {} } as unknown as RuntimeTurnContext)
+  assert.equal(none.hooks, null)
+  assert.equal(none.end, null)
+  assert.equal(none.endBudgetSec(), 0)
 })
 
 test('Claude threads run with the inherited servers and the App lists them', async () => {

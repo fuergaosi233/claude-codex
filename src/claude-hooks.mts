@@ -252,8 +252,11 @@ export interface ClaudeHookSession {
   readonly hooks: SdkHooks
   // Runs the SessionEnd hooks once the CLI session is over (null when there
   // are none); only the first call counts, and only for a session that took
-  // a prompt. Resolves when the hooks that are not async are done.
-  readonly end: ((reason: string) => Promise<void>) | null
+  // a prompt. They share the session's budget, or `budget` when sessions
+  // end together. Resolves when the hooks that are not async are done.
+  readonly end: ((reason: string, budget?: AbortSignal) => Promise<void>) | null
+  // The seconds the session's SessionEnd hooks get together; 0 for none.
+  readonly endBudgetSec: () => number
 }
 
 // The hooks of one CLI session.
@@ -323,18 +326,19 @@ export function claudeHookSession(
     add(spec.event, matcher)
   }
 
+  const endBudgetSec = () => (ends.length > 0 ? sessionEndBudgetSec(ends) : 0)
   let ended = false
-  const end = async (reason: string): Promise<void> => {
+  const end = async (reason: string, budget?: AbortSignal): Promise<void> => {
     if (ended || !session) return
     ended = true
     const input = { ...session, hook_event_name: 'SessionEnd', reason }
     const due = ends.filter((spec) => matches(spec.matcher, reason))
     // One budget for them all: what is still running when it is spent is
     // stopped.
-    const budget = AbortSignal.timeout(sessionEndBudgetSec(ends) * 1000)
-    await Promise.all(due.map((spec) => run(spec, input, budget)))
+    const signal = budget ?? AbortSignal.timeout(endBudgetSec() * 1000)
+    await Promise.all(due.map((spec) => run(spec, input, signal)))
   }
-  return { hooks, end: ends.length > 0 ? end : null }
+  return { hooks, end: ends.length > 0 ? end : null, endBudgetSec }
 }
 
 // Whether a tool call meets a hook's `if`: the call an ask rule written the

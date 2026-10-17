@@ -25,6 +25,8 @@ export interface SessionHooks {
   readonly hooks: SdkHooks | null
   // Runs the user's SessionEnd hooks once the CLI session is over.
   readonly end: ClaudeHookSession['end']
+  // The seconds those hooks get together; 0 for none.
+  readonly endBudgetSec: ClaudeHookSession['endBudgetSec']
 }
 
 // `approvals` says whether the user's hooks may approve a tool call, and
@@ -45,6 +47,7 @@ export function sdkHooks(
   const ask = context.inheritedAskRules
   if (ask && ask.length > 0) add('PreToolUse', askRulesGuard(ask, context.cwd))
   let end: SessionHooks['end'] = null
+  let endBudgetSec: SessionHooks['endBudgetSec'] = () => 0
   if (context.claudeHooks && context.claudeHooks.length > 0) {
     const claude = claudeHookSession(context.claudeHooks, {
       projectDir: context.cwd,
@@ -55,8 +58,9 @@ export function sdkHooks(
     for (const [event, matchers] of Object.entries(claude.hooks))
       for (const matcher of matchers) add(event, matcher)
     end = claude.end
+    endBudgetSec = claude.endBudgetSec
   }
-  return { hooks: Object.keys(hooks).length > 0 ? hooks : null, end }
+  return { hooks: Object.keys(hooks).length > 0 ? hooks : null, end, endBudgetSec }
 }
 
 // The SDK cannot hide some of a server's tools, so a call to a tool outside

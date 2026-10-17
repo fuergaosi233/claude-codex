@@ -216,8 +216,10 @@ after the SDK has let go of them, so the adapter runs those two itself:
 `startup`, `resume` or `fork` matched as the CLI matches it, its context and
 `systemMessage` reaching Claude and the user along with that prompt;
 `SessionEnd`, with the reason `other`, when the CLI session is over, for a
-session that took a prompt. The CLI itself still runs `SessionStart` for
-`compact` and `clear`. Prompt, agent and HTTP hooks, PowerShell hooks,
+session that took a prompt. A session still open when the adapter stops ends
+with it: the hooks of all such sessions run before the adapter exits and share
+one budget, as those of a single CLI would. The CLI itself still runs
+`SessionStart` for `compact` and `clear`. Prompt, agent and HTTP hooks, PowerShell hooks,
 `asyncRewake`'s wake-up, `CLAUDE_ENV_FILE`, and other events (such as
 `PreCompact`, whose output a callback cannot pass back, or `PermissionRequest`,
 which the Codex approval flow owns) are not carried over. Point

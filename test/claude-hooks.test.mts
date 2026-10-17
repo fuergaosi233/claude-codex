@@ -812,3 +812,122 @@ test('the runtime runs SessionStart for how the CLI session begins and SessionEn
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('SessionEnd hooks of the sessions still open run once as the runtime stops, within one budget', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'claude-hooks-stop-')))
+  const project = join(root, 'project')
+  const log = join(root, 'log')
+  const pids = join(root, 'pids')
+  try {
+    await mkdir(project, { recursive: true })
+    const runtime = new NativeClaudeRuntime()
+    const sessions: FakeSession[] = []
+    Reflect.set(runtime, 'sdk', {
+      query: (args: { prompt: AsyncIterable<unknown>; options: Record<string, unknown> }) => {
+        const session = new FakeSession(args.options, args.prompt)
+        // The CLI exits once the SDK aborts it, and the session winds down.
+        const abort = args.options.abortController as AbortController
+        abort.signal.addEventListener('abort', () => session.close())
+        sessions.push(session)
+        return session
+      },
+    })
+    // With a listener, a session outlives its turn while it has work.
+    runtime.setBackgroundListener({
+      onTaskEvent: () => {},
+      onAutonomousTurn: () => {},
+      onSessionReleased: () => {},
+    })
+    const handlers: RuntimeHandlers = {
+      onEvent: async (_event: RuntimeEvent) => {},
+      onPermissionRequest: async () => ({ decision: 'accept' }),
+      onUserInputRequest: async () => ({ answers: {} }),
+    }
+    const context: RuntimeTurnContext = {
+      threadId: 'thread',
+      turnId: 'turn',
+      prompt: 'Hi.',
+      cwd: project,
+      runtimeType: null,
+      model: null,
+      effort: null,
+      claudeSessionId: null,
+      forkSession: false,
+      mcpServers: null,
+      allowedTools: null,
+      addDirs: [],
+      enableFileCheckpointing: false,
+      outputFormat: null,
+      approvalPolicy: 'never',
+      sandboxMode: 'danger-full-access',
+      systemPromptAddendum: null,
+      planMode: false,
+      imageInputs: [],
+      // Records the session it ends, then outstays the 1.5 seconds a
+      // SessionEnd hook gets by default.
+      claudeHooks: [
+        spec({
+          event: 'SessionEnd',
+          timeoutSec: 1.5,
+          command: `printf '%s\\n' "$(cat)" >> '${log}'; echo $$ >> '${pids}'; sleep 20`,
+        }),
+      ],
+    }
+    const turn = async (index: number, threadId: string, frames: Record<string, unknown>[]) => {
+      const done = runtime.runTurn({ ...context, threadId, turnId: `turn-${index}` }, handlers)
+      for (let i = 0; i < 400 && !sessions[index]; i++)
+        await new Promise((resolve) => setTimeout(resolve, 5))
+      const session = sessions[index]
+      assert.ok(session, 'no session opened')
+      await call(session.options.hooks as SdkHooks, 'UserPromptSubmit', {
+        ...prompt(project),
+        session_id: threadId,
+      })
+      for (const frame of frames) session.push(frame)
+      session.push({ type: 'result', subtype: 'success', result: 'Hello.' })
+      await done
+      return session
+    }
+    const lines = async () =>
+      (await readFile(log, 'utf8').catch(() => ''))
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => JSON.parse(line))
+        .map((input) => [input.session_id, input.hook_event_name, input.reason])
+        .sort()
+    await withEnv({ CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS: undefined }, async () => {
+      // A background task keeps this session open after its turn.
+      const live = await turn(0, 'live', [
+        { type: 'system', subtype: 'background_tasks_changed', tasks: [{ task_id: 'task-1' }] },
+      ])
+      assert.equal(live.closed, false)
+      // This one has nothing left to do: it closes, and its hook starts.
+      const ended = await turn(1, 'ended', [])
+      for (let i = 0; i < 400 && (await lines()).length < 1; i++)
+        await new Promise((resolve) => setTimeout(resolve, 5))
+      assert.equal(ended.closed, true)
+      assert.deepEqual(await lines(), [['ended', 'SessionEnd', 'other']])
+
+      const started = Date.now()
+      await runtime.stop()
+      const took = Date.now() - started
+      // The open session's hook ran, and stopping waited for both hooks, but
+      // not past their budget.
+      assert.deepEqual(await lines(), [
+        ['ended', 'SessionEnd', 'other'],
+        ['live', 'SessionEnd', 'other'],
+      ])
+      assert.ok(took >= 1000, `stopping did not wait for the hooks (${took} ms)`)
+      assert.ok(took < 4000, `stopping outlasted the SessionEnd budget (${took} ms)`)
+      for (const pid of (await readFile(pids, 'utf8')).trim().split('\n').map(Number))
+        assert.throws(() => process.kill(pid, 0), 'a SessionEnd hook outlived the budget')
+      // The open session wound down as the runtime stopped; its hook does not
+      // run again.
+      await new Promise((resolve) => setTimeout(resolve, 300))
+      assert.equal(live.closed, true)
+      assert.equal((await lines()).length, 2)
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
