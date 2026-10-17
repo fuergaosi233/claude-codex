@@ -91,7 +91,9 @@ When the Claude CLI runs with its setting sources turned off, set
 `CLAUDE_CODEX_CLAUDE_CONFIG_DIR` (usually `~/.claude`) to bring that Claude Code
 configuration along: the user and project `CLAUDE.md` files with their
 `@imports`, `CLAUDE.local.md`, `.claude/rules/` (rules scoped by `paths:` are
-listed for Claude to read when they apply), and the user and project skills.
+listed for Claude to read when they apply), and the user and project skills. The
+folder's MCP servers, subagents, permission rules and hooks come along only with
+their own switches (see below), as the Codex config's servers do.
 
 ### Inherited configuration
 
@@ -119,7 +121,8 @@ server's tool-call timeout. Codex OAuth logins, `startup_timeout_sec`,
 `required`, per-tool approval settings and the servers plugins bring are not
 carried over.
 
-With `CLAUDE_CODEX_CLAUDE_CONFIG_DIR` set, Claude threads start the Claude Code
+With `CLAUDE_CODEX_CLAUDE_CONFIG_DIR` set and
+`CLAUDE_CODEX_CLAUDE_MCP_SERVERS=1`, Claude threads start the Claude Code
 servers: user-scope servers and the project's local-scope servers from the
 global config file (`~/.claude.json` for `~/.claude`), and the servers of the
 project's `.mcp.json` files (from the repository root down to the thread's
@@ -134,79 +137,82 @@ worktree's folder in that repository's `.git/worktrees` points back at it. The
 checked-in `.claude/settings.json` cannot approve servers, and neither can a
 `.claude/settings.local.json` that is checked in, reached through a symlinked
 `.claude` folder or in a checkout whose `.git` file git does not vouch for,
-since that file then comes from the repository rather than the user. A server's `${VAR}` references are left for the
-CLI to fill in from its environment, as it does for its own config files, and a
-local-scope server's `headersHelper` runs only in a trusted project. A Claude
-Code server wins a name over a Codex one, and `CLAUDE_CODEX_MCP_SERVERS` wins
-over both. Only the thread's own turns get these servers, not summaries or other
-internal turns; the App's MCP panel lists those of the thread it asks about.
+since that file then comes from the repository rather than the user. A server's
+`${VAR}` references are left for the CLI to fill in from its environment, as it
+does for its own config files, and a local-scope server's `headersHelper` runs
+only in a trusted project. A Claude Code server wins a name over a Codex one,
+and `CLAUDE_CODEX_MCP_SERVERS` wins over both. Only the thread's own turns get
+these servers, not summaries or other internal turns; the App's MCP panel lists
+those of the thread it asks about.
 
-The bridged Claude Code folder also brings its subagents: `agents/*.md` in it,
-then `.claude/agents/*.md` from the git root down to the thread's folder, a
-project agent winning a name over a user agent. Their `name`, `description`,
-`tools`, `disallowedTools`, `model`, `skills`, `maxTurns`, `effort`, `memory`,
-`background`, `initialPrompt` and named `mcpServers` carry over;
-`permissionMode`, `hooks` and inline server definitions do not, since the Codex
-approval policy decides what runs.
+With `CLAUDE_CODEX_CLAUDE_AGENTS=1`, the bridged Claude Code folder also brings
+its subagents: `agents/*.md` in it, then `.claude/agents/*.md` from the git root
+down to the thread's folder, a project agent winning a name over a user agent.
+Their `name`, `description`, `tools`, `disallowedTools`, `model`, `skills`,
+`maxTurns`, `effort`, `memory`, `background`, `initialPrompt` and named
+`mcpServers` carry over; `permissionMode`, `hooks` and inline server definitions
+do not, since the Codex approval policy decides what runs.
 
-Its permission rules apply as well. `permissions.deny` from the user's
-`settings.json` and the project's `.claude/settings.json` and
-`.claude/settings.local.json` always applies: a denied tool stays refused
-whatever the approval policy. So does `permissions.ask`: the CLI takes no ask
-rules outside a settings file, so the adapter registers a `PreToolUse` callback
-that sends the calls they cover to the Codex approval prompt, even when an allow
-rule or a hook would approve them. It matches them as Claude Code does and errs
-towards asking: a Bash rule covers each command of a compound command line and
-what wrappers such as `timeout`, `xargs` or `sh -c` run, a command line with
-command substitution or a heredoc is asked about whenever it mentions the rule's
-command, and an `Edit` rule covers every tool that edits files, a `Read` rule
-`Glob` and `Grep` by the folder they search. Under Full Access the prompt is
-approved without asking, as every other one is; in plan mode an asked-for call
-is refused. `permissions.allow` lets matching tool calls run without a Codex
-approval prompt; the user's rules always count, a project's only once the
-project is trusted (those of a `settings.local.json` the repository supplies
-never), and none in plan mode or a read-only sandbox, where Codex would not let
-those tools run unasked. A user rule's `/path` stays relative to the config
-folder, as in Claude Code. `defaultMode` and `additionalDirectories` are not
-carried over: the Codex approval policy and sandbox decide the mode and the
-folders.
+With `CLAUDE_CODEX_CLAUDE_PERMISSIONS=1`, its permission rules apply as well.
+`permissions.deny` from the user's `settings.json` and the project's
+`.claude/settings.json` and `.claude/settings.local.json` always applies: a
+denied tool stays refused whatever the approval policy. So does
+`permissions.ask`: the CLI takes no ask rules outside a settings file, so the
+adapter registers a `PreToolUse` callback that sends the calls they cover to the
+Codex approval prompt, even when an allow rule or a hook would approve them. It
+matches them as Claude Code does and errs towards asking: a Bash rule covers
+each command of a compound command line and what wrappers such as `timeout`,
+`xargs` or `sh -c` run, a command line with command substitution or a heredoc is
+asked about whenever it mentions the rule's command, and an `Edit` rule covers
+every tool that edits files, a `Read` rule `Glob` and `Grep` by the folder they
+search. Under Full Access the prompt is approved without asking, as every other
+one is; in plan mode an asked-for call is refused. `permissions.allow` lets
+matching tool calls run without a Codex approval prompt; the user's rules always
+count, a project's only once the project is trusted (those of a
+`settings.local.json` the repository supplies never), and none in plan mode or a
+read-only sandbox, where Codex would not let those tools run unasked. A user
+rule's `/path` stays relative to the config folder, as in Claude Code.
+`defaultMode` and `additionalDirectories` are not carried over: the Codex
+approval policy and sandbox decide the mode and the folders.
 
-Its command hooks run only when asked for: they are often status or notification
-integrations for terminal sessions, and running them for every App chat would
-silently change what they do (a hook that waits for input would even hold up the
-turn). `CLAUDE_CODEX_CLAUDE_HOOKS=user` runs the hooks in the bridged folder's
-`settings.json`; `CLAUDE_CODEX_CLAUDE_HOOKS=project` also runs those of a
-trusted project's `.claude/settings.json` and `.claude/settings.local.json`, so
-a repository never runs a command on its own say; unset, `0` or any other value
-runs none. They run for `PreToolUse`, `PostToolUse`, `PostToolUseFailure`,
-`UserPromptSubmit`, `Stop`, `SubagentStart`, `SubagentStop`, `SessionStart`,
-`SessionEnd` and `Notification`. The adapter registers each command with the
-Claude Agent SDK; the CLI matches it as it would a settings hook and the adapter
-runs it the way Claude Code does: with `sh -c` (`bash -c` for `shell: "bash"`,
-no shell in exec form with `args`), the hook input as JSON on stdin,
-`CLAUDE_PROJECT_DIR` set, its `timeout` (by default 10 minutes, 30 seconds for
-`UserPromptSubmit`, 1.5 seconds for `SessionEnd`, where an explicit one goes up
-to a minute), `async` and `once` honored. A hook is done when its own process
-exits; a background process it started keeps running, while a hook that times
-out is killed with everything it started. Exit 0 passes JSON output on (plain
-output becomes context for `UserPromptSubmit` and `SessionStart`), exit 2 blocks
-with stderr as the reason (for `SubagentStart`, `SessionStart` and `SessionEnd`
-it only shows stderr, for `Notification` it does nothing), other exits are
-non-blocking errors, and `disableAllHooks` turns them all off. In plan mode or a
-read-only sandbox a hook can still deny or ask but its approval is dropped,
-leaving the call to Codex. The CLI runs `SessionStart` hooks for a new, resumed
-or forked session before the SDK has registered its callbacks, and `SessionEnd`
-hooks after the SDK has let go of them, so the adapter runs those two itself:
+Its command hooks run only when asked for too: they are often status or
+notification integrations for terminal sessions, and running them for every App
+chat would silently change what they do (a hook that waits for input would even
+hold up the turn). `CLAUDE_CODEX_CLAUDE_HOOKS=user` runs the hooks in the
+bridged folder's `settings.json`; `CLAUDE_CODEX_CLAUDE_HOOKS=project` also runs
+those of a trusted project's `.claude/settings.json` and
+`.claude/settings.local.json`, so a repository never runs a command on its own
+say; unset, `0` or any other value runs none. They run for `PreToolUse`,
+`PostToolUse`, `PostToolUseFailure`, `UserPromptSubmit`, `Stop`,
+`SubagentStart`, `SubagentStop`, `SessionStart`, `SessionEnd` and
+`Notification`. The adapter registers each command with the Claude Agent SDK;
+the CLI matches it as it would a settings hook and the adapter runs it the way
+Claude Code does: with `sh -c` (`bash -c` for `shell: "bash"`, no shell in exec
+form with `args`), the hook input as JSON on stdin, `CLAUDE_PROJECT_DIR` set,
+its `timeout` (by default 10 minutes, 30 seconds for `UserPromptSubmit`, 1.5
+seconds for `SessionEnd`, where an explicit one goes up to a minute), `async`
+and `once` honored. A hook is done when its own process exits; a background
+process it started keeps running, while a hook that times out is killed with
+everything it started. Exit 0 passes JSON output on (plain output becomes
+context for `UserPromptSubmit` and `SessionStart`), exit 2 blocks with stderr as
+the reason (for `SubagentStart`, `SessionStart` and `SessionEnd` it only shows
+stderr, for `Notification` it does nothing), other exits are non-blocking
+errors, and `disableAllHooks` turns them all off. In plan mode or a read-only
+sandbox a hook can still deny or ask but its approval is dropped, leaving the
+call to Codex. The CLI runs `SessionStart` hooks for a new, resumed or forked
+session before the SDK has registered its callbacks, and `SessionEnd` hooks
+after the SDK has let go of them, so the adapter runs those two itself:
 `SessionStart` once the session takes its first prompt, with the source
 `startup`, `resume` or `fork` matched as the CLI matches it, its context and
 `systemMessage` reaching Claude and the user along with that prompt;
 `SessionEnd`, with the reason `other`, when the CLI session is over, for a
 session that took a prompt. The CLI itself still runs `SessionStart` for
-`compact` and `clear`. Prompt, agent and HTTP hooks, `if` filters, PowerShell hooks, `asyncRewake`'s
-wake-up, `CLAUDE_ENV_FILE`, and other events (such as `PreCompact`, whose output
-a callback cannot pass back, or `PermissionRequest`, which the Codex approval
-flow owns) are not carried over. Point `CLAUDE_CODEX_CLAUDE_CONFIG_DIR` only at
-a folder the CLI does not read itself, or its hooks run twice.
+`compact` and `clear`. Prompt, agent and HTTP hooks, `if` filters, PowerShell
+hooks, `asyncRewake`'s wake-up, `CLAUDE_ENV_FILE`, and other events (such as
+`PreCompact`, whose output a callback cannot pass back, or `PermissionRequest`,
+which the Codex approval flow owns) are not carried over. Point
+`CLAUDE_CODEX_CLAUDE_CONFIG_DIR` only at a folder the CLI does not read itself,
+or its hooks run twice.
 
 With `CLAUDE_CODEX_CODEX_NOTIFY=1`, the `notify` program of
 `CODEX_HOME/config.toml` runs when a Claude thread's turn completes, as Codex

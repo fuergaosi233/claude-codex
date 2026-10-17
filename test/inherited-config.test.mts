@@ -94,7 +94,20 @@ const clean = {
   CLAUDE_CODEX_MCP_SERVERS: undefined,
   CLAUDE_CODEX_CODEX_MCP_SERVERS: undefined,
   CLAUDE_CODEX_CLAUDE_CONFIG_DIR: undefined,
+  CLAUDE_CODEX_CLAUDE_MCP_SERVERS: undefined,
+  CLAUDE_CODEX_CLAUDE_AGENTS: undefined,
+  CLAUDE_CODEX_CLAUDE_PERMISSIONS: undefined,
+  CLAUDE_CODEX_CLAUDE_HOOKS: undefined,
 }
+
+// A bridged Claude Code config folder (or none) with a switch value: only
+// a bridged folder with the switch at exactly 1 brings that part along.
+const switches: Array<[boolean, string | undefined]> = [
+  [false, '1'],
+  [true, undefined],
+  [true, 'true'],
+  [true, '1'],
+]
 
 interface TestApp {
   request: (method: string, params: Record<string, unknown>) => Promise<any>
@@ -855,6 +868,7 @@ env_vars = ["NARROW_TOKEN"]
       CODEX_HOME: codexHome,
       CLAUDE_CODEX_CODEX_MCP_SERVERS: '1',
       CLAUDE_CODEX_CLAUDE_CONFIG_DIR: configDir,
+      CLAUDE_CODEX_CLAUDE_MCP_SERVERS: '1',
       CLAUDE_CODEX_MCP_SERVERS: explicitFile,
       NARROW_TOKEN: 'narrow-secret',
       OVERRIDDEN_TOKEN: 'overridden-secret',
@@ -1192,7 +1206,7 @@ Write docs.
   }
 })
 
-test('Claude threads get the Claude Code agents only with the config folder bridged', async () => {
+test('Claude threads get the Claude Code agents only when asked for', async () => {
   const root = await mkdtemp(join(tmpdir(), 'inherited-agents-server-'))
   const configDir = join(root, 'claude-config')
   const repo = join(root, 'repo')
@@ -1201,19 +1215,20 @@ test('Claude threads get the Claude Code agents only with the config folder brid
     join(configDir, 'agents', 'helper.md'),
     '---\nname: helper\ndescription: Helps\n---\nHelp.\n',
   )
-  for (const bridged of [false, true])
+  for (const [bridged, asked] of switches)
     await withServer(
       root,
       {
         CODEX_HOME: join(root, 'codex-home'),
         CLAUDE_CODEX_CLAUDE_CONFIG_DIR: bridged ? configDir : undefined,
+        CLAUDE_CODEX_CLAUDE_AGENTS: asked,
       },
       async ({ request, turn }) => {
         const started = await request('thread/start', { cwd: repo, model: 'sonnet' })
         const normal = await turn(started.thread.id)
         assert.deepEqual(
           normal.agents,
-          bridged ? { helper: { description: 'Helps', prompt: 'Help.' } } : null,
+          bridged && asked === '1' ? { helper: { description: 'Helps', prompt: 'Help.' } } : null,
         )
         const summary = await turn(started.thread.id, {
           outputSchema: { type: 'object', properties: { summary: { type: 'string' } } },
@@ -1221,6 +1236,68 @@ test('Claude threads get the Claude Code agents only with the config folder brid
         assert.equal(summary.agents, null)
       },
     )
+  await rm(root, { recursive: true, force: true })
+})
+
+test('a bridged Claude Code config folder brings only its instructions unless asked for more', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'inherited-bridge-only-'))
+  const configDir = join(root, 'claude-config')
+  const repo = join(root, 'repo')
+  await mkdir(join(repo, '.git'), { recursive: true })
+  await write(join(configDir, 'CLAUDE.md'), 'Bridged instructions.\n')
+  await write(
+    join(configDir, '.claude.json'),
+    JSON.stringify({ mcpServers: { shared: { command: '/nonexistent/claude-shared' } } }),
+  )
+  await write(
+    join(configDir, 'agents', 'helper.md'),
+    '---\nname: helper\ndescription: Helps\n---\nHelp.\n',
+  )
+  await write(
+    join(configDir, 'settings.json'),
+    JSON.stringify({
+      permissions: { allow: ['Bash(npm test:*)'], deny: ['WebFetch'], ask: ['Bash(git push:*)'] },
+      hooks: { Stop: [{ hooks: [{ type: 'command', command: 'notify-done' }] }] },
+    }),
+  )
+  const base = { CODEX_HOME: join(root, 'codex-home'), CLAUDE_CODEX_CLAUDE_CONFIG_DIR: configDir }
+  await withServer(root, base, async ({ request, turn }) => {
+    const started = await request('thread/start', { cwd: repo, model: 'sonnet' })
+    const normal = await turn(started.thread.id)
+    assert.match(normal.systemPromptAddendum ?? '', /Bridged instructions\./)
+    assert.equal(normal.mcpServers, null)
+    assert.equal(normal.agents, null)
+    assert.equal(normal.inheritedAllowedTools, null)
+    assert.equal(normal.inheritedAskRules, null)
+    assert.deepEqual(normal.disallowedTools, [])
+    assert.equal(normal.claudeHooks, null)
+    // Nor does the App's MCP panel list its servers.
+    for (const params of [{}, { threadId: started.thread.id }])
+      assert.deepEqual((await request('mcpServerStatus/list', params)).data, [])
+  })
+  const asked = {
+    ...base,
+    CLAUDE_CODEX_CLAUDE_MCP_SERVERS: '1',
+    CLAUDE_CODEX_CLAUDE_AGENTS: '1',
+    CLAUDE_CODEX_CLAUDE_PERMISSIONS: '1',
+  }
+  await withServer(root, asked, async ({ request, turn }) => {
+    const started = await request('thread/start', { cwd: repo, model: 'sonnet' })
+    const normal = await turn(started.thread.id)
+    assert.deepEqual(Object.keys(normal.mcpServers as object), ['shared'])
+    assert.deepEqual(Object.keys(normal.agents ?? {}), ['helper'])
+    assert.deepEqual(normal.inheritedAllowedTools, ['Bash(npm test:*)'])
+    assert.deepEqual(normal.disallowedTools, ['WebFetch'])
+    // Hooks keep their own switch.
+    assert.equal(normal.claudeHooks, null)
+    for (const params of [{}, { threadId: started.thread.id }]) {
+      const listed = await request('mcpServerStatus/list', params)
+      assert.deepEqual(
+        listed.data.map((entry: { name: string }) => entry.name),
+        ['shared'],
+      )
+    }
+  })
   await rm(root, { recursive: true, force: true })
 })
 
@@ -1550,7 +1627,7 @@ test('Claude Code permission rules: the user rules apply, project deny rules alw
   }
 })
 
-test('Claude threads get the permission rules only with the config folder bridged', async () => {
+test('Claude threads get the permission rules only when asked for', async () => {
   const root = await mkdtemp(join(tmpdir(), 'inherited-permissions-server-'))
   const configDir = join(root, 'claude-config')
   const repo = join(root, 'repo')
@@ -1561,19 +1638,21 @@ test('Claude threads get the permission rules only with the config folder bridge
       permissions: { allow: ['Bash(npm test:*)'], deny: ['WebFetch'], ask: ['Bash(git push:*)'] },
     }),
   )
-  for (const bridged of [false, true])
+  for (const [bridged, asked] of switches) {
+    const on = bridged && asked === '1'
     await withServer(
       root,
       {
         CODEX_HOME: join(root, 'codex-home'),
         CLAUDE_CODEX_CLAUDE_CONFIG_DIR: bridged ? configDir : undefined,
+        CLAUDE_CODEX_CLAUDE_PERMISSIONS: asked,
       },
       async ({ request, turn }) => {
         const started = await request('thread/start', { cwd: repo, model: 'sonnet' })
         const normal = await turn(started.thread.id)
-        assert.deepEqual(normal.inheritedAllowedTools, bridged ? ['Bash(npm test:*)'] : null)
-        assert.deepEqual(normal.inheritedAskRules, bridged ? ['Bash(git push:*)'] : null)
-        assert.deepEqual(normal.disallowedTools, bridged ? ['WebFetch'] : [])
+        assert.deepEqual(normal.inheritedAllowedTools, on ? ['Bash(npm test:*)'] : null)
+        assert.deepEqual(normal.inheritedAskRules, on ? ['Bash(git push:*)'] : null)
+        assert.deepEqual(normal.disallowedTools, on ? ['WebFetch'] : [])
         const summary = await turn(started.thread.id, {
           outputSchema: { type: 'object', properties: { summary: { type: 'string' } } },
         })
@@ -1581,6 +1660,7 @@ test('Claude threads get the permission rules only with the config folder bridge
         assert.equal(summary.inheritedAskRules, null)
       },
     )
+  }
   await rm(root, { recursive: true, force: true })
 })
 

@@ -10,30 +10,42 @@ import { bridgedClaudeConfigDir } from './project-instructions.mjs'
 import { debugLog } from './util.mjs'
 
 // What a Claude thread takes over from the user's Codex and Claude Code
-// configs beyond instructions (project-instructions.mts covers those).
+// configs beyond instructions (project-instructions.mts covers those). Each
+// part comes along only when asked for, so a bridged Claude Code config
+// folder (CLAUDE_CODEX_CLAUDE_CONFIG_DIR) brings its instructions alone
+// unless a switch below adds more.
 //
 // MCP servers: the Codex config's with CLAUDE_CODEX_CODEX_MCP_SERVERS=1,
-// and, when CLAUDE_CODEX_CLAUDE_CONFIG_DIR is set, the Claude Code config's.
+// and the bridged Claude Code config's with CLAUDE_CODEX_CLAUDE_MCP_SERVERS=1.
 // Claude Code's win a name over Codex's, being meant for Claude; the
-// explicit CLAUDE_CODEX_MCP_SERVERS wins over both (see mcp.mts).
+// explicit CLAUDE_CODEX_MCP_SERVERS wins over both (see mcp.mts). The App's
+// MCP panel lists the same servers.
 //
-// Subagents: with CLAUDE_CODEX_CLAUDE_CONFIG_DIR set, the user's and the
+// Subagents: with CLAUDE_CODEX_CLAUDE_AGENTS=1, the user's and the
 // project's Claude Code agents (see claude-agents.mts).
 //
-// Permission rules: with CLAUDE_CODEX_CLAUDE_CONFIG_DIR set, the allow, ask
+// Permission rules: with CLAUDE_CODEX_CLAUDE_PERMISSIONS=1, the allow, ask
 // and deny rules of the user's and the project's Claude Code settings. Deny
 // rules always apply. Allow rules let a tool skip the Codex approval, so
 // the runtime drops them in plan mode and in a read-only sandbox. Ask rules
 // have no command-line form; a PreToolUse callback sends the calls they
 // cover to the Codex approval (see ask-rules.mts).
 //
-// Hooks: with CLAUDE_CODEX_CLAUDE_CONFIG_DIR set, on request only: the
-// command hooks of the user's Claude Code settings with
+// Hooks: the command hooks of the user's Claude Code settings with
 // CLAUDE_CODEX_CLAUDE_HOOKS=user, and also a trusted project's with
 // CLAUDE_CODEX_CLAUDE_HOOKS=project (see claude-hooks.mts).
+//
+// The Claude Code switches need the bridged folder; without it they do
+// nothing.
+
+// The bridged Claude Code config folder when `variable` asks for a part of
+// it with exactly 1, as the Codex switches do; null otherwise.
+function bridgedFor(variable: string): string | null {
+  return process.env[variable] === '1' ? bridgedClaudeConfigDir() : null
+}
 
 export function inheritedMcpServers(cwd: string | null): InheritedMcpServer[] {
-  const bridged = bridgedClaudeConfigDir()
+  const bridged = bridgedFor('CLAUDE_CODEX_CLAUDE_MCP_SERVERS')
   const servers = new Map<string, InheritedMcpServer>()
   for (const server of [
     ...codexMcpServers(cwd),
@@ -58,7 +70,7 @@ export function inheritedMcpServers(cwd: string | null): InheritedMcpServer[] {
 // The Claude Code agents for a thread's folder, as the SDK's agents option,
 // or null when there are none to bring.
 export function inheritedAgents(cwd: string): Record<string, Record<string, unknown>> | null {
-  const bridged = bridgedClaudeConfigDir()
+  const bridged = bridgedFor('CLAUDE_CODEX_CLAUDE_AGENTS')
   if (!bridged) return null
   const agents = claudeAgents(cwd, bridged)
   logOnChange(`agents:${cwd}`, 'inherited_agents', {
@@ -69,10 +81,10 @@ export function inheritedAgents(cwd: string): Record<string, Record<string, unkn
   return Object.fromEntries(agents.map((agent) => [agent.name, agent.definition]))
 }
 
-// The Claude Code permission rules for a thread's folder, or null when the
-// Claude Code config is not bridged.
+// The Claude Code permission rules for a thread's folder, or null when they
+// are not asked for.
 export function inheritedPermissionRules(cwd: string): ClaudePermissionRules | null {
-  const bridged = bridgedClaudeConfigDir()
+  const bridged = bridgedFor('CLAUDE_CODEX_CLAUDE_PERMISSIONS')
   if (!bridged) return null
   const rules = claudePermissionRules(cwd, bridged)
   // Counts only: a rule can quote a command line, credentials included.

@@ -14,8 +14,9 @@ import { debugLog } from './util.mjs'
 
 // Claude Code settings the adapter applies on the CLI's behalf when
 // CLAUDE_CODEX_CLAUDE_CONFIG_DIR names the user's Claude Code folder, for a
-// CLI that reads none of its own (see project-instructions.mts). They are
-// read from the files and with the precedence the CLI uses.
+// CLI that reads none of its own (see project-instructions.mts), and the
+// user's switch asks for them (see inherited-config.mts). They are read from
+// the files and with the precedence the CLI uses.
 //
 // MCP servers: user-scope servers in the global config file, then the
 // project's .mcp.json servers, then local-scope servers recorded for the
