@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
 import { inheritedMcpServers, type McpToolRules, mcpToolRules } from './inherited-config.mjs'
+import { ownVariable, remoteCredential } from './mcp-credentials.mjs'
 
 export interface McpConfigSnapshot {
   sdkValue: unknown | null
@@ -324,31 +325,35 @@ function getServerConfig(serverName: string, scope: McpConfigScope): Record<stri
 // ${NAME} and ${NAME:-default} in the places the CLI expands them: a stdio
 // server's command, arguments and env, a remote server's url and headers,
 // the headers twice, as the CLI fills them in when it reads the config and
-// again when it connects. A missing variable without a default stays as
-// written. Like the CLI with its own credentials, this never fills in
-// Claude's own variables (ANTHROPIC_*, CLAUDE_CODE_*), credentials among them.
+// again when it connects. A variable set, even to nothing, wins over the
+// default, and a missing one without a default stays as written. Like the
+// CLI, this never fills in Claude's own variables (ANTHROPIC_*, CLAUDE_CODE_*
+// and the like) that are set, and toward a remote server not the credentials
+// on the CLI's list either: there those read as empty, set or not.
 export function expandServerConfig(
   config: Record<string, unknown>,
   env: Record<string, string | undefined>,
 ): Record<string, unknown> {
-  const expand = (text: string): string =>
+  const fill = (text: string, remote: boolean): string =>
     text.replace(
       /\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}/g,
       (whole, name: string, fallback: string | undefined) => {
-        if (/^(ANTHROPIC_|CLAUDE_CODE_)/i.test(name)) return ''
         const found = env[name]
+        if (remote ? remoteCredential(name) : found !== undefined && ownVariable(name)) return ''
         if (found !== undefined) return found
         return fallback ?? whole
       },
     )
-  const record = (value: unknown, fill: (text: string) => string) =>
-    Object.fromEntries(Object.entries(stringRecord(value)).map(([key, raw]) => [key, fill(raw)]))
+  const local = (text: string) => fill(text, false)
+  const remote = (text: string) => fill(text, true)
+  const record = (value: unknown, expand: (text: string) => string) =>
+    Object.fromEntries(Object.entries(stringRecord(value)).map(([key, raw]) => [key, expand(raw)]))
   const out = { ...config }
-  if (typeof out.command === 'string') out.command = expand(out.command)
-  if (Array.isArray(out.args)) out.args = out.args.map((arg) => expand(String(arg)))
-  if (typeof out.url === 'string') out.url = expand(out.url)
-  if (out.env) out.env = record(out.env, expand)
-  if (out.headers) out.headers = record(out.headers, (text) => expand(expand(text)))
+  if (typeof out.command === 'string') out.command = local(out.command)
+  if (Array.isArray(out.args)) out.args = out.args.map((arg) => local(String(arg)))
+  if (typeof out.url === 'string') out.url = remote(out.url)
+  if (out.env) out.env = record(out.env, local)
+  if (out.headers) out.headers = record(out.headers, (text) => remote(remote(text)))
   return out
 }
 

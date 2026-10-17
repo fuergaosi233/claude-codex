@@ -1557,6 +1557,93 @@ http_headers = { "X-Raw" = "\${RAW_SECRET}", "X-Two" = "\${\${RAW_SECRET}}" }
   }
 })
 
+test("the App's direct MCP calls keep credentials out of a server config as the CLI does", () => {
+  const env = {
+    HOME: '/home/user',
+    EMPTY: '',
+    ANTHROPIC_API_KEY: 'anthropic-secret',
+    CLAUDE_BRIDGE_OAUTH_TOKEN: 'bridge-secret',
+    OTEL_EXPORTER_OTLP_HEADERS: 'otel-secret',
+    NPM_TOKEN: 'npm-secret',
+    VAULT_TOKEN: 'vault-secret',
+    ORG_GRADLE_PROJECT_REPO_PASSWORD: 'gradle-secret',
+    HF_TOKEN: 'hf-token',
+    GITHUB_TOKEN: 'github-token',
+    DOCS_TOKEN: 'docs-token',
+  }
+  // A stdio server gets anything but Claude's own variables that are set.
+  const stdio = expandServerConfig(
+    {
+      command: '${HOME}/bin/server',
+      args: ['${ANTHROPIC_API_KEY}', '${ANTHROPIC_UNSET:-fallback}', '${EMPTY:-fallback}'],
+      env: {
+        BRIDGE: '${CLAUDE_BRIDGE_OAUTH_TOKEN}',
+        OTEL: '${OTEL_EXPORTER_OTLP_HEADERS:-fallback}',
+        NPM: '${NPM_TOKEN}',
+        VAULT: '${VAULT_TOKEN:-fallback}',
+        MISSING: '${MISSING}',
+      },
+    },
+    env,
+  )
+  assert.equal(stdio.command, '/home/user/bin/server')
+  assert.deepEqual(stdio.args, ['', 'fallback', ''])
+  assert.deepEqual(stdio.env, {
+    BRIDGE: '',
+    OTEL: '',
+    NPM: 'npm-secret',
+    VAULT: 'vault-secret',
+    MISSING: '${MISSING}',
+  })
+  // A remote server gets no credential on the CLI's list, set or not, and no
+  // default in its place.
+  const remote = expandServerConfig(
+    {
+      url: 'https://mcp.example.com${HOME}?npm=${NPM_TOKEN}&hf=${HF_TOKEN}',
+      headers: {
+        Authorization: 'Bearer ${GITHUB_TOKEN}',
+        'X-Docs': '${DOCS_TOKEN}',
+        'X-Vault': '${VAULT_TOKEN:-default}',
+        'X-Pypi': '${PYPI_TOKEN:-default}',
+        'X-Input': '${INPUT_NPM_TOKEN:-default}',
+        'X-Proxy': '${https_proxy:-default}',
+        'X-Anthropic': '${ANTHROPIC_UNSET:-default}',
+        'X-Otel': '${OTEL_UNSET:-default}',
+        'X-Cargo': '${CARGO_REGISTRIES_MINE_TOKEN:-default}',
+        'X-Poetry': '${POETRY_HTTP_BASIC_MINE_URL:-default}',
+        'X-Gradle-Password': '${ORG_GRADLE_PROJECT_REPO_PASSWORD}',
+        'X-Gradle-User': '${ORG_GRADLE_PROJECT_REPO_USER:-default}',
+        'X-Gradle-Version': '${ORG_GRADLE_PROJECT_VERSION:-1.0}',
+        'X-Bundle': '${BUNDLE_GEMS__EXAMPLE__COM:-default}',
+        'X-Bundle-Path': '${BUNDLE_PATH:-vendor}',
+        'X-Git': '${GIT_CONFIG_VALUE_0:-default}',
+        'X-Empty': '${EMPTY:-default}',
+      },
+    },
+    env,
+  )
+  assert.equal(remote.url, 'https://mcp.example.com/home/user?npm=&hf=hf-token')
+  assert.deepEqual(remote.headers, {
+    Authorization: 'Bearer github-token',
+    'X-Docs': 'docs-token',
+    'X-Vault': '',
+    'X-Pypi': '',
+    'X-Input': '',
+    'X-Proxy': '',
+    'X-Anthropic': '',
+    'X-Otel': '',
+    'X-Cargo': '',
+    'X-Poetry': '',
+    'X-Gradle-Password': '',
+    'X-Gradle-User': '',
+    'X-Gradle-Version': '1.0',
+    'X-Bundle': '',
+    'X-Bundle-Path': 'vendor',
+    'X-Git': '',
+    'X-Empty': '',
+  })
+})
+
 test('the variable the ${ escape relies on stays unset even when exported', () => {
   const dist = (name: string) => JSON.stringify(new URL(`../src/${name}`, import.meta.url).href)
   // A CLI session gets the runtime's environment as it is when the session
