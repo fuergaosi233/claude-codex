@@ -170,6 +170,48 @@ function projectServerApproval(
   return (name) => !disabled.has(name) && (all || enabled.has(name))
 }
 
+export interface ClaudePermissionRules {
+  // Rules that let a tool run without asking, as --allowedTools entries.
+  readonly allow: string[]
+  // Rules that refuse a tool, as --disallowedTools entries.
+  readonly deny: string[]
+  // How many ask rules were found; they are not applied.
+  readonly ask: number
+}
+
+// permissions.allow and permissions.deny from the user's settings and the
+// project's (the checked-in .claude/settings.json and the uncommitted
+// settings.local.json files). Deny rules only take tools away, so the
+// project's always apply; its allow rules only in a project the user
+// trusts.
+export function claudePermissionRules(cwd: string, configDir: string): ClaudePermissionRules {
+  const allow = new Set<string>()
+  const deny = new Set<string>()
+  let ask = 0
+  const add = (settings: Table | null, withAllow: boolean, root: string | null): void => {
+    const permissions = asTable(settings?.permissions)
+    if (!permissions) return
+    const anchor = (rule: string) => (root ? anchoredRule(rule, root) : rule)
+    if (withAllow) for (const rule of stringList(permissions.allow)) allow.add(anchor(rule))
+    for (const rule of stringList(permissions.deny)) deny.add(anchor(rule))
+    ask += stringList(permissions.ask).length
+  }
+  add(readJsonFile(claudeUserSettingsPath(configDir)), true, configDir)
+  const { shared, local } = claudeProjectSettingsPaths(cwd)
+  const trusted = claudeTrustsProject(cwd, configDir)
+  for (const path of [shared, ...local]) add(readJsonFile(path), trusted, null)
+  return { allow: [...allow], deny: [...deny], ask }
+}
+
+// A file rule's /path is relative to the folder of the settings file it is
+// in; given on the command line it would be relative to the thread's
+// folder, so a user-settings rule is made absolute (//path).
+function anchoredRule(rule: string, root: string): string {
+  const match = /^(Read|Edit|Write|MultiEdit|NotebookEdit)\(\/(?!\/)(.*)\)$/.exec(rule)
+  if (!match) return rule
+  return `${match[1]}(/${resolve(root)}/${match[2]})`
+}
+
 // A Claude Code server entry, with ${VAR} and ${VAR:-default} expanded from
 // the adapter's environment as the CLI would from its own. Transports the
 // SDK cannot pass on are skipped.

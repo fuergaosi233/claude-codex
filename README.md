@@ -127,6 +127,18 @@ project agent winning a name over a user agent. Their `name`, `description`,
 `hooks` and inline server definitions do not, since the Codex approval policy
 decides what runs.
 
+Its permission rules apply as well. `permissions.deny` from the user's
+`settings.json` and the project's `.claude/settings.json` and
+`.claude/settings.local.json` always applies: a denied tool stays refused
+whatever the approval policy. `permissions.allow` lets matching tool calls run
+without a Codex approval prompt; the user's rules always count, a project's only
+once the project is trusted, and none in plan mode or a read-only sandbox,
+where Codex would not let those tools run unasked. A user rule's `/path` stays
+relative to the config folder, as in Claude Code. `permissions.ask`,
+`defaultMode` and `additionalDirectories` are not carried over: the CLI takes no
+ask rules outside a settings file, and the Codex approval policy and sandbox
+decide the mode and the folders.
+
 ### `/workflows` compatibility
 
 With the native Claude Agent SDK backend, `/workflows <task>` is translated to Claude's

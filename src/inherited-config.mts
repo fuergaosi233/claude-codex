@@ -1,5 +1,9 @@
 import { claudeAgents } from './claude-agents.mjs'
-import { claudeMcpServers } from './claude-config.mjs'
+import {
+  type ClaudePermissionRules,
+  claudeMcpServers,
+  claudePermissionRules,
+} from './claude-config.mjs'
 import { codexMcpServers, type InheritedMcpServer } from './codex-config.mjs'
 import { bridgedClaudeConfigDir } from './project-instructions.mjs'
 import { debugLog } from './util.mjs'
@@ -14,6 +18,12 @@ import { debugLog } from './util.mjs'
 //
 // Subagents: with CLAUDE_CODEX_CLAUDE_CONFIG_DIR set, the user's and the
 // project's Claude Code agents (see claude-agents.mts).
+//
+// Permission rules: with CLAUDE_CODEX_CLAUDE_CONFIG_DIR set, the allow and
+// deny rules of the user's and the project's Claude Code settings. Deny
+// rules always apply. Allow rules let a tool skip the Codex approval, so
+// the runtime drops them in plan mode and in a read-only sandbox. Ask
+// rules have no command-line form and are not applied.
 
 export function inheritedMcpServers(cwd: string | null): InheritedMcpServer[] {
   const bridged = bridgedClaudeConfigDir()
@@ -50,6 +60,22 @@ export function inheritedAgents(cwd: string): Record<string, Record<string, unkn
   })
   if (agents.length === 0) return null
   return Object.fromEntries(agents.map((agent) => [agent.name, agent.definition]))
+}
+
+// The Claude Code permission rules for a thread's folder, or null when the
+// Claude Code config is not bridged.
+export function inheritedPermissionRules(cwd: string): ClaudePermissionRules | null {
+  const bridged = bridgedClaudeConfigDir()
+  if (!bridged) return null
+  const rules = claudePermissionRules(cwd, bridged)
+  // Counts only: a rule can quote a command line, credentials included.
+  logOnChange(`permissions:${cwd}`, 'inherited_permission_rules', {
+    cwd,
+    allow: rules.allow.length,
+    deny: rules.deny.length,
+    askNotApplied: rules.ask,
+  })
+  return rules
 }
 
 export interface McpToolRules {

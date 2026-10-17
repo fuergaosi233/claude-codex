@@ -330,6 +330,7 @@ export class MockRuntime implements ClaudeRuntime {
         delta: JSON.stringify({
           mcpServers: context.mcpServers ?? null,
           allowedTools: context.allowedTools ?? null,
+          inheritedAllowedTools: context.inheritedAllowedTools ?? null,
           disallowedTools: context.disallowedTools ?? null,
           mcpEnabledTools: context.mcpEnabledTools ?? null,
           agents: context.agents ?? null,

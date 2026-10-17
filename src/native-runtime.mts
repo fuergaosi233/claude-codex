@@ -529,8 +529,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     // CLI has finished answering everything queued (see maybeRelease).
     opts.env = { ...process.env, CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1' }
     if (context.addDirs && context.addDirs.length > 0) opts.additionalDirectories = context.addDirs
-    if (context.allowedTools && context.allowedTools.length > 0)
-      opts.allowedTools = context.allowedTools
+    const allowedTools = [...(context.allowedTools ?? []), ...inheritedAllowedTools(context)]
+    if (allowedTools.length > 0) opts.allowedTools = allowedTools
     if (context.disallowedTools && context.disallowedTools.length > 0)
       opts.disallowedTools = context.disallowedTools
     if (context.mcpServers && typeof context.mcpServers === 'object')
@@ -2603,6 +2603,16 @@ function autoAllowsTools(context: RuntimeTurnContext): boolean {
   )
 }
 
+// The allow rules from the user's Claude Code settings that apply to a
+// turn. They let tools run without the Codex approval, so a read-only
+// sandbox and plan mode, which would stop those tools, drop them.
+function inheritedAllowedTools(context: RuntimeTurnContext): string[] {
+  const rules = context.inheritedAllowedTools ?? []
+  if (rules.length === 0 || context.sandboxMode === 'read-only') return []
+  const mode = derivePermissionMode(context.approvalPolicy, context.sandboxMode, context.planMode)
+  return mode === 'plan' ? [] : rules
+}
+
 // Options a live CLI process cannot change in place. A turn whose signature
 // differs needs a fresh process (unless background work pins the old one).
 function sessionSignature(context: RuntimeTurnContext): string {
@@ -2614,6 +2624,7 @@ function sessionSignature(context: RuntimeTurnContext): string {
     context.goalTools ? GOAL_MCP_SERVER : null,
     context.addDirs ?? [],
     context.allowedTools ?? [],
+    inheritedAllowedTools(context),
     context.disallowedTools ?? [],
     context.mcpEnabledTools ?? null,
     context.agents ?? null,

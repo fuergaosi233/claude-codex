@@ -5,7 +5,11 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import test from 'node:test'
 import { claudeAgents, frontmatterData } from '../src/claude-agents.mjs'
-import { claudeGlobalConfigPath, claudeMcpServers } from '../src/claude-config.mjs'
+import {
+  claudeGlobalConfigPath,
+  claudeMcpServers,
+  claudePermissionRules,
+} from '../src/claude-config.mjs'
 import {
   codexMcpServers,
   codexTrustsProject,
@@ -937,4 +941,121 @@ test('the native runtime passes inherited servers, tool rules and agents to the 
   assert.deepEqual(options.disallowedTools, ['mcp__docs__drop'])
   assert.deepEqual(options.agents, agents)
   assert.equal(options.hooks.PreToolUse.length, 1)
+})
+
+test('Claude Code permission rules: the user rules apply, project deny rules always, project allow rules when trusted', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'inherited-permissions-'))
+  const configDir = join(root, 'claude-config')
+  const repo = join(root, 'repo')
+  try {
+    await mkdir(join(repo, '.git'), { recursive: true })
+    await write(
+      join(configDir, 'settings.json'),
+      JSON.stringify({
+        permissions: {
+          allow: ['Bash(npm test:*)', 'Read(/notes/**)', 'Read(//etc/hosts)', 'Bash(/bin/ls)'],
+          deny: ['Read(./.env)', 'WebFetch', 'Edit(/settings.json)'],
+          ask: ['Bash(git push:*)'],
+          defaultMode: 'bypassPermissions',
+        },
+      }),
+    )
+    await write(
+      join(repo, '.claude', 'settings.json'),
+      JSON.stringify({
+        permissions: { allow: ['Bash(make:*)'], deny: ['Bash(rm:*)', 'WebFetch'] },
+      }),
+    )
+    await write(
+      join(repo, '.claude', 'settings.local.json'),
+      JSON.stringify({ permissions: { allow: ['Edit(/src/**)'], deny: ['Write(/dist/**)'] } }),
+    )
+    const read = () =>
+      withEnv({ ...clean, CODEX_HOME: join(root, 'codex-home') }, async () =>
+        claudePermissionRules(repo, configDir),
+      )
+    const userAllow = [
+      'Bash(npm test:*)',
+      // A user-settings file rule is anchored at the config folder.
+      `Read(/${configDir}/notes/**)`,
+      'Read(//etc/hosts)',
+      'Bash(/bin/ls)',
+    ]
+    const deny = [
+      'Read(./.env)',
+      'WebFetch',
+      `Edit(/${configDir}/settings.json)`,
+      'Bash(rm:*)',
+      // A project rule stays relative to the project.
+      'Write(/dist/**)',
+    ]
+    assert.deepEqual(await read(), { allow: userAllow, deny, ask: 1 })
+
+    await write(
+      join(configDir, '.claude.json'),
+      JSON.stringify({ projects: { [repo]: { hasTrustDialogAccepted: true } } }),
+    )
+    assert.deepEqual(await read(), {
+      allow: [...userAllow, 'Bash(make:*)', 'Edit(/src/**)'],
+      deny,
+      ask: 1,
+    })
+    // No settings, no rules.
+    assert.deepEqual(claudePermissionRules(join(root, 'elsewhere'), join(root, 'empty')), {
+      allow: [],
+      deny: [],
+      ask: 0,
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('Claude threads get the permission rules only with the config folder bridged', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'inherited-permissions-server-'))
+  const configDir = join(root, 'claude-config')
+  const repo = join(root, 'repo')
+  await mkdir(join(repo, '.git'), { recursive: true })
+  await write(
+    join(configDir, 'settings.json'),
+    JSON.stringify({ permissions: { allow: ['Bash(npm test:*)'], deny: ['WebFetch'] } }),
+  )
+  for (const bridged of [false, true])
+    await withServer(
+      root,
+      {
+        CODEX_HOME: join(root, 'codex-home'),
+        CLAUDE_CODEX_CLAUDE_CONFIG_DIR: bridged ? configDir : undefined,
+      },
+      async ({ request, turn }) => {
+        const started = await request('thread/start', { cwd: repo, model: 'sonnet' })
+        const normal = await turn(started.thread.id)
+        assert.deepEqual(normal.inheritedAllowedTools, bridged ? ['Bash(npm test:*)'] : null)
+        assert.deepEqual(normal.disallowedTools, bridged ? ['WebFetch'] : [])
+        const summary = await turn(started.thread.id, {
+          outputSchema: { type: 'object', properties: { summary: { type: 'string' } } },
+        })
+        assert.equal(summary.inheritedAllowedTools, null)
+      },
+    )
+  await rm(root, { recursive: true, force: true })
+})
+
+test('inherited allow rules stay out of plan mode and a read-only sandbox', async () => {
+  const rule = 'Bash(npm test:*)'
+  const allowed = async (overrides: Partial<RuntimeTurnContext>) =>
+    (
+      await withEnv({ CLAUDE_CODEX_PERMISSION_MODE: undefined }, () =>
+        sessionOptions({ allowedTools: ['Read'], inheritedAllowedTools: [rule], ...overrides }),
+      )
+    ).allowedTools as string[]
+  assert.deepEqual(await allowed({}), ['Read', rule])
+  assert.deepEqual(
+    await allowed({ approvalPolicy: 'on-request', sandboxMode: 'workspace-write' }),
+    ['Read', rule],
+  )
+  assert.deepEqual(await allowed({ approvalPolicy: 'on-request', sandboxMode: 'read-only' }), [
+    'Read',
+  ])
+  assert.ok(!(await allowed({ planMode: true })).includes(rule))
 })
