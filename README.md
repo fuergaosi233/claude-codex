@@ -93,6 +93,32 @@ configuration along: the user and project `CLAUDE.md` files with their
 `@imports`, `CLAUDE.local.md`, `.claude/rules/` (rules scoped by `paths:` are
 listed for Claude to read when they apply), and the user and project skills.
 
+### Inherited configuration
+
+With `CLAUDE_CODEX_CODEX_MCP_SERVERS=1`, Claude threads start the MCP servers in
+the Codex config: `[mcp_servers.<name>]` in `CODEX_HOME/config.toml`, plus the
+`.codex/config.toml` files of a project Codex trusts. This is off by default
+because the Codex App writes its own desktop servers (such as a computer-use
+client and a Node REPL) into `config.toml` for Codex threads, and those would
+otherwise land in every Claude thread. Stdio servers keep their `args`, `env`,
+`env_vars` and `cwd`; streamable HTTP servers keep their headers and bearer
+token. A server with `enabled = false` stays off, `disabled_tools` are withheld
+from Claude, a call to a tool outside `enabled_tools` is refused, and
+`tool_timeout_sec` becomes the server's tool-call timeout. Codex OAuth logins,
+`startup_timeout_sec`, `required`, per-tool approval settings and the servers
+plugins bring are not carried over.
+
+With `CLAUDE_CODEX_CLAUDE_CONFIG_DIR` set, Claude threads start the Claude Code
+servers: user-scope servers and the project's local-scope servers from the global
+config file (`~/.claude.json` for `~/.claude`), and the project's `.mcp.json`
+servers once the project is trusted (in Codex or through Claude Code's trust
+dialog) and the server is approved in the user's own settings
+(`enabledMcpjsonServers` or `enableAllProjectMcpServers`; the checked-in
+`.claude/settings.json` cannot approve them). A Claude Code server wins a name
+over a Codex one, and `CLAUDE_CODEX_MCP_SERVERS` wins over both. Only the
+thread's own turns get these servers, not summaries or other internal turns;
+the App's MCP panel lists those of the thread it asks about.
+
 ### `/workflows` compatibility
 
 With the native Claude Agent SDK backend, `/workflows <task>` is translated to Claude's

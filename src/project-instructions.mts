@@ -125,7 +125,7 @@ function cliClaudeConfigDir(): string {
 }
 
 // The nearest folder at or above `cwd` holding .git.
-function gitRoot(cwd: string): string | null {
+export function gitRoot(cwd: string): string | null {
   for (let dir = cwd; ; dir = dirname(dir)) {
     if (existsSync(join(dir, '.git'))) return dir
     if (dirname(dir) === dir) return null
@@ -371,20 +371,20 @@ function frontmatterFields(text: string): { name?: string; description?: string 
   return out
 }
 
-function frontmatterBody(text: string): string | null {
+export function frontmatterBody(text: string): string | null {
   if (!/^---\r?\n/.test(text)) return null
   const end = text.indexOf('\n---', 3)
   return end < 0 ? null : text.slice(text.indexOf('\n') + 1, end)
 }
 
-function withoutFrontmatter(text: string): string {
+export function withoutFrontmatter(text: string): string {
   if (frontmatterBody(text) == null) return text
   const end = text.indexOf('\n---', 3)
   const next = text.indexOf('\n', end + 4)
   return next < 0 ? '' : text.slice(next + 1)
 }
 
-function markdownFiles(dir: string): string[] {
+export function markdownFiles(dir: string): string[] {
   const files: string[] = []
   for (const entry of listDir(dir)) {
     const path = join(dir, entry)
@@ -403,7 +403,7 @@ function firstFile(dir: string, names: readonly string[]): InstructionFile | nul
   return null
 }
 
-function readText(path: string): string | null {
+export function readText(path: string): string | null {
   try {
     return statSync(path).isFile() ? readFileSync(path, 'utf8') : null
   } catch {
@@ -435,7 +435,7 @@ function isDirectory(path: string): boolean {
   }
 }
 
-function realPath(path: string): string {
+export function realPath(path: string): string {
   try {
     return realpathSync(path)
   } catch {

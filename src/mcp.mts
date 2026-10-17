@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
+import { inheritedMcpServers, type McpToolRules, mcpToolRules } from './inherited-config.mjs'
 
 export interface McpConfigSnapshot {
   sdkValue: unknown | null
@@ -7,31 +8,55 @@ export interface McpConfigSnapshot {
   listStatuses: Array<Record<string, unknown>>
   // mcpServer/startupStatus/updated -> { name, status: McpServerStartupState, error }
   startupStatuses: Array<{ name: string; status: string; error: string | null }>
+  // The Codex config's tool lists for the inherited servers still in use.
+  toolRules: McpToolRules
 }
 
-export function readMcpConfig(): McpConfigSnapshot {
-  const raw = process.env.CLAUDE_CODEX_MCP_SERVERS
-  if (!raw) return { sdkValue: null, listStatuses: [], startupStatuses: [] }
+export interface McpConfigScope {
+  // The thread's folder, for the servers its project adds; null for the
+  // servers that apply in every folder.
+  readonly cwd?: string | null
+  // false leaves out the servers the Codex and Claude Code configs bring.
+  readonly inherit?: boolean
+}
 
-  try {
-    const sdkValue = parseMcpValue(raw)
-    const names = serverNames(sdkValue)
-    return {
-      sdkValue,
-      listStatuses: names.map((name) => listStatusEntry(name)),
-      // The adapter passes MCP servers straight to the Claude Agent SDK; it
-      // does not run a separate startup handshake, so the optimistic terminal
-      // state is "ready" rather than the invalid "pending".
-      startupStatuses: names.map((name) => ({ name, status: 'ready', error: null })),
-    }
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    return {
-      sdkValue: null,
-      listStatuses: [listStatusEntry('CLAUDE_CODEX_MCP_SERVERS')],
-      startupStatuses: [{ name: 'CLAUDE_CODEX_MCP_SERVERS', status: 'failed', error: message }],
+// CLAUDE_CODEX_MCP_SERVERS, over the servers the Codex and Claude Code
+// configs bring (see inherited-config.mts); it wins a name.
+export function readMcpConfig(scope: McpConfigScope = {}): McpConfigSnapshot {
+  const inherited = scope.inherit === false ? [] : inheritedMcpServers(scope.cwd ?? null)
+  const servers: Record<string, unknown> = {}
+  for (const server of inherited) servers[server.name] = server.config
+  const raw = process.env.CLAUDE_CODEX_MCP_SERVERS
+  let failure: string | null = null
+  if (raw) {
+    try {
+      for (const [name, config] of Object.entries(explicitServers(parseMcpValue(raw)))) {
+        delete servers[name]
+        servers[name] = config
+      }
+    } catch (error) {
+      failure = error instanceof Error ? error.message : String(error)
     }
   }
+  const names = Object.keys(servers)
+  const snapshot: McpConfigSnapshot = {
+    sdkValue: names.length > 0 ? servers : null,
+    toolRules: mcpToolRules(inherited.filter((server) => servers[server.name] === server.config)),
+    listStatuses: names.map((name) => listStatusEntry(name)),
+    // The adapter passes MCP servers straight to the Claude Agent SDK; it
+    // does not run a separate startup handshake, so the optimistic terminal
+    // state is "ready" rather than the invalid "pending".
+    startupStatuses: names.map((name) => ({ name, status: 'ready', error: null })),
+  }
+  if (failure) {
+    snapshot.listStatuses.push(listStatusEntry('CLAUDE_CODEX_MCP_SERVERS'))
+    snapshot.startupStatuses.push({
+      name: 'CLAUDE_CODEX_MCP_SERVERS',
+      status: 'failed',
+      error: failure,
+    })
+  }
+  return snapshot
 }
 
 // Cache enumerated server statuses briefly: the App's MCP panel can poll
@@ -42,24 +67,29 @@ const STATUS_CACHE_MS = 10_000
 // mcpServerStatus/list with real tools/resources enumerated from each server.
 // Falls back to the conformant empty shape per server on any error/timeout so a
 // single unreachable server never fails the whole list.
-export async function listMcpServerStatuses(): Promise<Array<Record<string, unknown>>> {
-  const snapshot = readMcpConfig()
+export async function listMcpServerStatuses(
+  scope: McpConfigScope = {},
+): Promise<Array<Record<string, unknown>>> {
+  const snapshot = readMcpConfig(scope)
   const names = serverNames(snapshot.sdkValue)
   const key = JSON.stringify(snapshot.sdkValue ?? null)
   if (statusCache && statusCache.key === key && Date.now() - statusCache.at < STATUS_CACHE_MS) {
     return statusCache.data
   }
-  const data = await Promise.all(names.map((name) => enumerateServerStatus(name)))
+  const data = await Promise.all(names.map((name) => enumerateServerStatus(name, scope)))
   statusCache = { key, at: Date.now(), data }
   return data
 }
 
-async function enumerateServerStatus(name: string): Promise<Record<string, unknown>> {
+async function enumerateServerStatus(
+  name: string,
+  scope: McpConfigScope,
+): Promise<Record<string, unknown>> {
   const base = listStatusEntry(name)
   const [tools, resources, resourceTemplates] = await Promise.all([
-    safeMcpList(name, 'tools/list', 'tools'),
-    safeMcpList(name, 'resources/list', 'resources'),
-    safeMcpList(name, 'resources/templates/list', 'resourceTemplates'),
+    safeMcpList(name, 'tools/list', 'tools', scope),
+    safeMcpList(name, 'resources/list', 'resources', scope),
+    safeMcpList(name, 'resources/templates/list', 'resourceTemplates', scope),
   ])
   if (Array.isArray(tools)) base.tools = toolMap(tools)
   if (Array.isArray(resources)) {
@@ -92,8 +122,13 @@ function toolMap(tools: unknown[]): Record<string, Record<string, unknown>> {
   return Object.fromEntries(entries)
 }
 
-async function safeMcpList(name: string, method: string, key: string): Promise<unknown[] | null> {
-  const result = await runMcpRequest(name, method, {}).then(
+async function safeMcpList(
+  name: string,
+  method: string,
+  key: string,
+  scope: McpConfigScope,
+): Promise<unknown[] | null> {
+  const result = await runMcpRequest(name, method, {}, scope).then(
     (value) => asRecord(value),
     () => null,
   )
@@ -106,11 +141,14 @@ export async function callMcpTool(
   serverName: string,
   toolName: string,
   args: unknown,
+  scope: McpConfigScope = {},
 ): Promise<Record<string, unknown>> {
-  const result = await runMcpRequest(serverName, 'tools/call', {
-    name: toolName,
-    arguments: args ?? {},
-  })
+  const result = await runMcpRequest(
+    serverName,
+    'tools/call',
+    { name: toolName, arguments: args ?? {} },
+    scope,
+  )
   const record = asRecord(result)
   return {
     content: Array.isArray(record.content) ? record.content : [],
@@ -123,8 +161,9 @@ export async function callMcpTool(
 export async function readMcpResource(
   serverName: string,
   uri: string,
+  scope: McpConfigScope = {},
 ): Promise<Record<string, unknown>> {
-  const result = await runMcpRequest(serverName, 'resources/read', { uri })
+  const result = await runMcpRequest(serverName, 'resources/read', { uri }, scope)
   const record = asRecord(result)
   return { contents: Array.isArray(record.contents) ? record.contents : [] }
 }
@@ -133,8 +172,9 @@ async function runMcpRequest(
   serverName: string,
   method: string,
   params: unknown,
+  scope: McpConfigScope,
 ): Promise<unknown> {
-  const config = getServerConfig(serverName)
+  const config = getServerConfig(serverName, scope)
   if (config.type === 'http') {
     return runHttpMcpRequest(config, method, params)
   }
@@ -267,11 +307,11 @@ async function fetchJsonRpc(
   return JSON.parse(trimmed)
 }
 
-function getServerConfig(serverName: string): Record<string, unknown> {
-  const snapshot = readMcpConfig()
+function getServerConfig(serverName: string, scope: McpConfigScope): Record<string, unknown> {
+  const snapshot = readMcpConfig(scope)
   const value = snapshot.sdkValue
   if (!value || typeof value !== 'object' || Array.isArray(value))
-    throw new Error('CLAUDE_CODEX_MCP_SERVERS is not an object config')
+    throw new Error(`unknown MCP server: ${serverName}`)
   const config = (value as Record<string, unknown>)[serverName]
   if (!config || typeof config !== 'object' || Array.isArray(config))
     throw new Error(`unknown MCP server: ${serverName}`)
@@ -283,10 +323,16 @@ function parseMcpValue(raw: string): unknown {
   if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
     return JSON.parse(trimmed)
   }
-  if (existsSync(trimmed)) {
-    return trimmed
-  }
+  if (!existsSync(trimmed)) throw new Error(`MCP config file not found: ${trimmed}`)
   return JSON.parse(readFileSync(trimmed, 'utf8'))
+}
+
+// The servers by name; a file may wrap them in "mcpServers" as Claude Code's
+// .mcp.json does.
+function explicitServers(value: unknown): Record<string, unknown> {
+  const record = asRecord(value)
+  const wrapped = asRecord(record.mcpServers)
+  return Object.keys(record).length === 1 && Object.keys(wrapped).length > 0 ? wrapped : record
 }
 
 function serverNames(value: unknown): string[] {

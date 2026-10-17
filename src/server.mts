@@ -22,7 +22,13 @@ import {
   MODEL_GOAL_STATUSES,
 } from './goal-prompts.mjs'
 import { accountUsage, hostMethod, RpcError } from './host-methods.mjs'
-import { callMcpTool, listMcpServerStatuses, readMcpConfig, readMcpResource } from './mcp.mjs'
+import {
+  callMcpTool,
+  listMcpServerStatuses,
+  type McpConfigScope,
+  readMcpConfig,
+  readMcpResource,
+} from './mcp.mjs'
 import { projectInstructions } from './project-instructions.mjs'
 import { projectProviderLoopConfig } from './provider-loop-config.mjs'
 import {
@@ -827,7 +833,7 @@ export class CodexClaudeAppServer {
       case 'mcpServerStatus/list': {
         // serverName limits discovery to one server.
         const serverName = nullIfEmpty(stringOr(asRecord(params).serverName, ''))
-        return listMcpServerStatuses().then((data) => ({
+        return listMcpServerStatuses(this.mcpScope(params)).then((data) => ({
           data: serverName == null ? data : data.filter((server) => server.name === serverName),
           nextCursor: null,
         }))
@@ -838,12 +844,14 @@ export class CodexClaudeAppServer {
         return readMcpResource(
           stringOr(asRecord(params).server, ''),
           stringOr(asRecord(params).uri, ''),
+          this.mcpScope(params),
         ).then((result) => ({ ...result, originCallId: null }))
       case 'mcpServer/tool/call':
         return callMcpTool(
           stringOr(asRecord(params).server, ''),
           stringOr(asRecord(params).tool, ''),
           asRecord(params).arguments ?? {},
+          this.mcpScope(params),
         )
       case 'windowsSandbox/setupStart':
         return { started: false }
@@ -3527,21 +3535,27 @@ export class CodexClaudeAppServer {
     // checkpoint. It stays pending until Claude starts the forked session.
     const resumeSessionAt = isCodexThread ? null : this.store.claudeResumeAt(thread.id)
     let resumedAtCheckpoint = false
+    const turnCwd = stringOr(params.cwd, thread.cwd)
+    // A Claude thread's own turns also get the MCP servers the Codex and
+    // Claude Code configs bring.
+    const mcp = readMcpConfig({ cwd: turnCwd, inherit: desktopPresentation && !isCodexThread })
     const runtimeTurn = this.runtime.runTurn(
       {
         threadId: thread.id,
         turnId: turn.id,
         purpose: turnPurpose,
         prompt: effectivePrompt,
-        cwd: stringOr(params.cwd, thread.cwd),
+        cwd: turnCwd,
         runtimeType: isCodexThread ? 'codex-proxy' : null,
         model: resolvedModel,
         effort: resolvedEffort,
         claudeSessionId: isCodexThread ? thread.codexSessionId : thread.claudeSessionId,
         forkSession,
         resumeSessionAt,
-        mcpServers: readMcpConfig().sdkValue,
+        mcpServers: mcp.sdkValue,
         allowedTools: defaultAllowedTools(),
+        disallowedTools: mcp.toolRules.disallowedTools,
+        mcpEnabledTools: mcp.toolRules.enabledTools,
         addDirs: stringListFromEnv('CLAUDE_CODEX_ADD_DIRS', []),
         enableFileCheckpointing: process.env.CLAUDE_CODEX_ENABLE_FILE_CHECKPOINTING === '1',
         outputFormat: claudeOutputFormat(params.outputSchema),
@@ -7050,6 +7064,14 @@ export class CodexClaudeAppServer {
           this.idleCheckHandler?.()
       })
     }
+  }
+
+  // The MCP servers an App request sees: a named thread's, its project's
+  // included; otherwise those that apply in every folder.
+  private mcpScope(params: unknown): McpConfigScope {
+    const threadId = stringOr(asRecord(params).threadId, '')
+    const thread = threadId ? this.store.getThread(threadId) : null
+    return { cwd: thread && thread.runtimeBackend !== 'codex' ? thread.cwd : null }
   }
 
   // Ends a turn whose runtime run failed. The client leaves its running state

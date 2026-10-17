@@ -392,6 +392,11 @@ export interface RuntimeTurnContext {
   resumeSessionAt?: string | null
   mcpServers: unknown | null
   allowedTools: string[] | null
+  // Tools Claude must not use, as permission rules (the CLI's --disallowedTools).
+  disallowedTools?: string[] | null
+  // MCP servers limited to some of their tools: the server's tool-name prefix
+  // (mcp__<server>__) to the full names of the tools Claude may call.
+  mcpEnabledTools?: Record<string, string[]> | null
   addDirs: string[]
   enableFileCheckpointing: boolean
   outputFormat: unknown | null

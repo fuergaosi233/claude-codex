@@ -43,6 +43,7 @@ import {
   UPDATE_GOAL_DESCRIPTION,
 } from './goal-prompts.mjs'
 import { echoedUuids, TurnInput, type TurnInputMessage } from './native-turn-input.mjs'
+import { sdkHooks } from './sdk-hooks.mjs'
 import { readTaskResult } from './task-output.mjs'
 import type {
   ClaudeRuntime,
@@ -530,8 +531,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (context.addDirs && context.addDirs.length > 0) opts.additionalDirectories = context.addDirs
     if (context.allowedTools && context.allowedTools.length > 0)
       opts.allowedTools = context.allowedTools
+    if (context.disallowedTools && context.disallowedTools.length > 0)
+      opts.disallowedTools = context.disallowedTools
     if (context.mcpServers && typeof context.mcpServers === 'object')
       opts.mcpServers = context.mcpServers
+    const hooks = sdkHooks(context)
+    if (hooks) opts.hooks = hooks
     let goalServer = false
     if (context.goalTools && this.zod && typeof sdk.createSdkMcpServer === 'function') {
       goalServer = true
@@ -2608,6 +2613,8 @@ function sessionSignature(context: RuntimeTurnContext): string {
     context.goalTools ? GOAL_MCP_SERVER : null,
     context.addDirs ?? [],
     context.allowedTools ?? [],
+    context.disallowedTools ?? [],
+    context.mcpEnabledTools ?? null,
     parseWorkflowCommand(context.prompt)?.type === 'run',
     context.planMode === true,
     configuredPermissionMode(),
