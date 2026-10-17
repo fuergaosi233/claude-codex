@@ -672,6 +672,38 @@ test('a settings.local.json the repository supplies approves and allows nothing'
     await rename(join(repo, '.claude'), join(root, 'elsewhere'))
     await symlink(join(root, 'elsewhere'), join(repo, '.claude'))
     assert.deepEqual(await read(), supplied)
+    await rm(join(repo, '.claude'))
+    await rename(join(root, 'elsewhere'), join(repo, '.claude'))
+    assert.deepEqual((await read()).allow, ['Bash(curl:*)'])
+
+    // And one checked in under another spelling, which a case-insensitive
+    // file system opens by this one (elsewhere it stands for this one).
+    const local = join(repo, '.claude', 'settings.local.json')
+    const contents = await readFile(local, 'utf8')
+    await rename(join(repo, '.claude'), join(repo, '.claude-moving'))
+    await rename(join(repo, '.claude-moving'), join(repo, '.Claude'))
+    await rename(
+      join(repo, '.Claude', 'settings.local.json'),
+      join(repo, '.Claude', 'Settings.Local.json'),
+    )
+    git('add', '.Claude/Settings.Local.json')
+    if (!existsSync(local)) await write(local, contents)
+    assert.equal(repositorySupplied(local), true)
+    assert.deepEqual(await read(), supplied)
+    git('rm', '-q', '--cached', '.Claude/Settings.Local.json')
+    assert.equal(repositorySupplied(local), false)
+
+    // And one in a folder reached through a symlink anywhere below the
+    // repository root, though git sees no settings.local.json there.
+    const pkg = join(repo, 'vendor', 'pkg')
+    await write(join(pkg, '.claude', 'settings.local.json'), contents)
+    await symlink(join('vendor', 'pkg'), join(repo, 'pkg'))
+    git('add', 'pkg')
+    assert.equal(repositorySupplied(join(pkg, '.claude', 'settings.local.json')), false)
+    assert.equal(repositorySupplied(join(repo, 'pkg', '.claude', 'settings.local.json')), true)
+    // A symlink to the repository itself is the user's own way there.
+    await symlink(repo, join(root, 'alias'))
+    assert.equal(repositorySupplied(join(root, 'alias', '.claude', 'settings.local.json')), false)
   } finally {
     await rm(root, { recursive: true, force: true })
   }

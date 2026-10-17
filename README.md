@@ -135,9 +135,11 @@ does not count. A checkout's `.git` file is the checkout's to write, so it only
 leads to a main checkout when git's own records vouch for the link: the
 worktree's folder in that repository's `.git/worktrees` points back at it. The
 checked-in `.claude/settings.json` cannot approve servers, and neither can a
-`.claude/settings.local.json` that is checked in, reached through a symlinked
-`.claude` folder or in a checkout whose `.git` file git does not vouch for,
-since that file then comes from the repository rather than the user. A server's
+`.claude/settings.local.json` that is checked in (under any spelling of its
+path, since the file system may ignore case where git does not), reached
+through a symlink anywhere below the repository root or in a checkout whose
+`.git` file git does not vouch for, since that file then comes from the
+repository rather than the user. A server's
 `${VAR}` references are left for the CLI to fill in from its environment, as it
 does for its own config files, and a local-scope server's `headersHelper` runs
 only in a trusted project. A Claude Code server wins a name over a Codex one,

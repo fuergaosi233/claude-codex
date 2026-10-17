@@ -118,20 +118,28 @@ export function claudeTrustsProject(cwd: string, configDir: string): boolean {
 }
 
 // Whether a project's settings.local.json is the repository's rather than
-// the user's: checked into git, or reached through a symlinked .claude
-// folder. Claude Code keeps that file out of git for the user's own choices,
-// so approvals in a copy the repository supplies are not the user's. A git
-// that cannot tell counts as yes, and so does a checkout whose .git file git
-// does not vouch for, since git would then read an index the folder made up.
+// the user's: checked into git under any spelling of its path (git matches
+// paths by case, a case-insensitive file system does not), or reached
+// through a symlink anywhere below the repository root, which can lead to a
+// file the repository put elsewhere. Claude Code keeps that file out of git
+// for the user's own choices, so approvals in a copy the repository supplies
+// are not the user's. A git that cannot tell counts as yes, and so does a
+// checkout whose .git file git does not vouch for, since git would then read
+// an index the folder made up.
 export function repositorySupplied(path: string): boolean {
   const folder = dirname(path)
+  let linked: boolean
   try {
-    if (lstatSync(folder).isSymbolicLink()) return true
+    linked = lstatSync(folder).isSymbolicLink()
   } catch {
     return false
   }
   const root = gitRoot(dirname(folder))
-  if (!root) return false
+  if (!root) return linked
+  // gitRoot walks up from the folder by name, so `root` is one of its
+  // ancestors as written; a symlink above it is the user's own layout.
+  for (let at = folder; at !== root && dirname(at) !== at; at = dirname(at))
+    if (symlink(at)) return true
   if (!gitVouchesForCheckout(root)) {
     debugLog('claude_settings_git_pointer_unverified', { path })
     return true
@@ -143,15 +151,24 @@ export function repositorySupplied(path: string): boolean {
   )
   env.GIT_CEILING_DIRECTORIES = dirname(root)
   env.GIT_OPTIONAL_LOCKS = '0'
+  const spec = `:(icase,literal)${relative(root, path)}`
   const result = spawnSync(
     'git',
-    ['-c', 'core.fsmonitor=false', 'ls-files', '--error-unmatch', '--', relative(root, path)],
+    ['-c', 'core.fsmonitor=false', 'ls-files', '--error-unmatch', '--', spec],
     { cwd: root, stdio: 'ignore', timeout: 5000, env },
   )
   if (result.status === 0) return true
   if (result.status === 1) return false
   debugLog('claude_settings_git_check_failed', { path, status: result.status })
   return true
+}
+
+function symlink(path: string): boolean {
+  try {
+    return lstatSync(path).isSymbolicLink()
+  } catch {
+    return false
+  }
 }
 
 // The parts of the project's uncommitted settings files the user can rely
