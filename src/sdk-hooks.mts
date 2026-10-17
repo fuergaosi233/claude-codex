@@ -1,5 +1,5 @@
 import { askRulesGuard } from './ask-rules.mjs'
-import { claudeHookMatchers } from './claude-hooks.mjs'
+import { type ClaudeHookSession, claudeHookSession, type SessionOrigin } from './claude-hooks.mjs'
 import type { RuntimeTurnContext } from './types.mjs'
 
 // The hook callbacks a Claude session registers with the SDK (its `hooks`
@@ -20,8 +20,20 @@ export interface HookMatcher {
 }
 export type SdkHooks = Record<string, HookMatcher[]>
 
-// `approvals` says whether the user's hooks may approve a tool call.
-export function sdkHooks(context: RuntimeTurnContext, approvals = true): SdkHooks | null {
+export interface SessionHooks {
+  // The SDK's `hooks` option, or null for none.
+  readonly hooks: SdkHooks | null
+  // Runs the user's SessionEnd hooks once the CLI session is over.
+  readonly end: ClaudeHookSession['end']
+}
+
+// `approvals` says whether the user's hooks may approve a tool call, and
+// `origin` is how the CLI session begins.
+export function sdkHooks(
+  context: RuntimeTurnContext,
+  approvals = true,
+  origin: SessionOrigin = 'startup',
+): SessionHooks {
   const hooks: SdkHooks = {}
   const add = (event: string, matcher: HookMatcher): void => {
     hooks[event] = [...(hooks[event] ?? []), matcher]
@@ -32,12 +44,19 @@ export function sdkHooks(context: RuntimeTurnContext, approvals = true): SdkHook
   // then allow), so an ask rule holds even against a hook that approves.
   const ask = context.inheritedAskRules
   if (ask && ask.length > 0) add('PreToolUse', askRulesGuard(ask, context.cwd))
+  let end: SessionHooks['end'] = null
   if (context.claudeHooks && context.claudeHooks.length > 0) {
-    const claude = claudeHookMatchers(context.claudeHooks, { projectDir: context.cwd, approvals })
-    for (const [event, matchers] of Object.entries(claude))
+    const claude = claudeHookSession(context.claudeHooks, {
+      projectDir: context.cwd,
+      approvals,
+      origin,
+      model: context.model,
+    })
+    for (const [event, matchers] of Object.entries(claude.hooks))
       for (const matcher of matchers) add(event, matcher)
+    end = claude.end
   }
-  return Object.keys(hooks).length > 0 ? hooks : null
+  return { hooks: Object.keys(hooks).length > 0 ? hooks : null, end }
 }
 
 // The SDK cannot hide some of a server's tools, so a call to a tool outside

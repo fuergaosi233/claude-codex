@@ -248,6 +248,9 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   private permissions = new Map<string, PendingPermission>()
   private sessions = new Map<string, LiveSession>()
   private listener: RuntimeBackgroundListener | null = null
+  // The user's SessionEnd hooks by session (its abort controller): the CLI
+  // runs them as it exits, after the SDK has dropped its callbacks.
+  private hookEnds = new WeakMap<AbortController, (reason: string) => Promise<void>>()
 
   setBackgroundListener(listener: RuntimeBackgroundListener): void {
     this.listener = listener
@@ -536,8 +539,11 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (context.mcpServers && typeof context.mcpServers === 'object')
       opts.mcpServers = context.mcpServers
     if (context.agents && Object.keys(context.agents).length > 0) opts.agents = context.agents
-    const hooks = sdkHooks(context, inheritedApprovals(context))
+    // The source the CLI would give this session's SessionStart hooks.
+    const origin = !resume ? 'startup' : opts.forkSession ? 'fork' : 'resume'
+    const { hooks, end } = sdkHooks(context, inheritedApprovals(context), origin)
     if (hooks) opts.hooks = hooks
+    if (end) this.hookEnds.set(abort, end)
     let goalServer = false
     if (context.goalTools && this.zod && typeof sdk.createSdkMcpServer === 'function') {
       goalServer = true
@@ -1292,6 +1298,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (registered === session) this.sessions.delete(session.threadId)
     // Release the CLI's stdin (see TurnInput).
     session.input.close()
+    void this.hookEnds.get(session.abort)?.('other')
     const pending = session.current
     session.current = null
     if (pending && !pending.resolved) await this.finishTurnAtSessionEnd(pending, failure)

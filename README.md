@@ -182,9 +182,17 @@ out is killed with everything it started. Exit 0 passes JSON output on (plain
 output becomes context for `UserPromptSubmit` and `SessionStart`), exit 2 blocks
 with stderr as the reason (for `SubagentStart`, `SessionStart` and `SessionEnd`
 it only shows stderr, for `Notification` it does nothing), other exits are
-non-blocking errors, and `disableAllHooks` turns them all off. In plan mode or a read-only sandbox a hook
-can still deny or ask but its approval is dropped, leaving the call to Codex.
-Prompt, agent and HTTP hooks, `if` filters, PowerShell hooks, `asyncRewake`'s
+non-blocking errors, and `disableAllHooks` turns them all off. In plan mode or a
+read-only sandbox a hook can still deny or ask but its approval is dropped,
+leaving the call to Codex. The CLI runs `SessionStart` hooks for a new, resumed
+or forked session before the SDK has registered its callbacks, and `SessionEnd`
+hooks after the SDK has let go of them, so the adapter runs those two itself:
+`SessionStart` once the session takes its first prompt, with the source
+`startup`, `resume` or `fork` matched as the CLI matches it, its context and
+`systemMessage` reaching Claude and the user along with that prompt;
+`SessionEnd`, with the reason `other`, when the CLI session is over, for a
+session that took a prompt. The CLI itself still runs `SessionStart` for
+`compact` and `clear`. Prompt, agent and HTTP hooks, `if` filters, PowerShell hooks, `asyncRewake`'s
 wake-up, `CLAUDE_ENV_FILE`, and other events (such as `PreCompact`, whose output
 a callback cannot pass back, or `PermissionRequest`, which the Codex approval
 flow owns) are not carried over. Point `CLAUDE_CODEX_CLAUDE_CONFIG_DIR` only at

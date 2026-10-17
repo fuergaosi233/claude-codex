@@ -5,11 +5,13 @@ import { dirname, join } from 'node:path'
 import test from 'node:test'
 import {
   type ClaudeHookSpec,
-  claudeHookMatchers,
+  claudeHookSession,
   claudeHookSpecs,
   hookOutput,
 } from '../src/claude-hooks.mjs'
+import { NativeClaudeRuntime } from '../src/native-runtime.mjs'
 import type { HookOutput, SdkHooks } from '../src/sdk-hooks.mjs'
+import type { RuntimeEvent, RuntimeHandlers, RuntimeTurnContext } from '../src/types.mjs'
 
 async function write(path: string, text: string): Promise<void> {
   await mkdir(dirname(path), { recursive: true })
@@ -201,7 +203,7 @@ test('a hook command gets the input on stdin and answers as Claude Code reads it
   const seen = join(root, 'seen')
   try {
     await mkdir(work, { recursive: true })
-    const hooks = claudeHookMatchers(
+    const { hooks } = claudeHookSession(
       [
         spec({
           matcher: 'Bash',
@@ -325,7 +327,7 @@ test('hooks time out, run in the background or once, as configured', async () =>
   const count = join(root, 'count')
   const late = join(root, 'late')
   try {
-    const hooks = claudeHookMatchers(
+    const session = claudeHookSession(
       [
         // Only the timeout ends the loop; were it to end otherwise, the hook
         // would block.
@@ -339,11 +341,13 @@ test('hooks time out, run in the background or once, as configured', async () =>
       ],
       { projectDir: root, approvals: true },
     )
+    const { hooks } = session
     const started = Date.now()
     assert.deepEqual(await call(hooks, 'Stop', {}), {})
     assert.ok(Date.now() - started < 10_000, 'the timed-out hook was not stopped')
 
-    assert.deepEqual(await call(hooks, 'SessionEnd', {}), {})
+    await call(hooks, 'UserPromptSubmit', { session_id: 'session' })
+    await session.end?.('other')
     await assert.rejects(readFile(late, 'utf8'))
     for (let i = 0; i < 50; i++) {
       if (
@@ -364,7 +368,7 @@ test('hooks time out, run in the background or once, as configured', async () =>
     assert.deepEqual(await call(hooks, 'SessionStart', {}), {})
     assert.equal(await readFile(count, 'utf8'), 'run\n')
     // A new session runs it again.
-    const next = claudeHookMatchers(
+    const { hooks: next } = claudeHookSession(
       [spec({ event: 'SessionStart', once: true, command: `echo run >> '${count}'` })],
       {
         projectDir: root,
@@ -383,7 +387,7 @@ test('a hook is done when its own process exits, and what it started keeps runni
   const go = join(root, 'go')
   const alive = join(root, 'alive')
   try {
-    const hooks = claudeHookMatchers(
+    const { hooks } = claudeHookSession(
       [
         // The background process holds the hook's output open until told to
         // go on, and then proves it was not killed.
@@ -416,7 +420,7 @@ test('a hook is done when its own process exits, and what it started keeps runni
 test('a hook the CLI gives up on is stopped', async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'claude-hooks-abort-')))
   try {
-    const hooks = claudeHookMatchers([spec({ command: 'sleep 5' })], {
+    const { hooks } = claudeHookSession([spec({ command: 'sleep 5' })], {
       projectDir: root,
       approvals: true,
     })
@@ -428,6 +432,319 @@ test('a hook the CLI gives up on is stopped', async () => {
     setTimeout(() => controller.abort(), 100)
     assert.deepEqual(await pending, {})
     assert.ok(Date.now() - started < 3000)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+// What a UserPromptSubmit hook gets for a session's prompt.
+const prompt = (cwd: string) => ({
+  session_id: 'session-1',
+  transcript_path: '/transcripts/session-1.jsonl',
+  cwd,
+  permission_mode: 'default',
+  hook_event_name: 'UserPromptSubmit',
+  prompt: 'Hi.',
+})
+
+test('SessionStart hooks run with the first prompt and SessionEnd hooks when the session is over', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'claude-hooks-session-')))
+  const at = (name: string) => join(root, name)
+  try {
+    const session = claudeHookSession(
+      [
+        spec({
+          event: 'SessionStart',
+          matcher: 'startup|resume',
+          command: `cat > '${at('start.json')}'; echo 'Branch: main'`,
+        }),
+        spec({
+          event: 'SessionStart',
+          matcher: 'compact',
+          command: `echo compact >> '${at('compact')}'; echo 'Compacted.'`,
+        }),
+        spec({
+          event: 'SessionStart',
+          command: `echo '{"systemMessage":"Welcome back.","hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"Read TODO.md."}}'`,
+        }),
+        spec({
+          event: 'SessionStart',
+          async: true,
+          command: `sleep 0.2; echo late > '${at('late')}'`,
+        }),
+        spec({
+          event: 'SessionStart',
+          matcher: 'startup',
+          command: "echo 'Index stale.' >&2; exit 2",
+        }),
+        spec({ event: 'UserPromptSubmit', command: "echo 'Today is a holiday.'" }),
+        spec({ event: 'SessionEnd', command: `cat > '${at('end.json')}'` }),
+        spec({ event: 'SessionEnd', matcher: 'clear', command: `touch '${at('clear')}'` }),
+      ],
+      { projectDir: root, approvals: true, origin: 'startup', model: 'claude-test' },
+    )
+    const { hooks, end } = session
+    assert.ok(end)
+    // The first prompt's hook comes before the user's own; SessionEnd is no
+    // callback, since the CLI could not reach it.
+    assert.equal(hooks.UserPromptSubmit?.length, 2)
+    assert.equal(hooks.SessionStart?.length, 5)
+    assert.equal(hooks.SessionEnd, undefined)
+    // A session that never took a prompt has nothing to end.
+    await end('other')
+    await assert.rejects(access(at('end.json')))
+    // Should the CLI call them for how the session began, the adapter has
+    // that covered.
+    assert.deepEqual(await call(hooks, 'SessionStart', { source: 'startup' }), {})
+    await assert.rejects(access(at('start.json')))
+
+    const first = await call(hooks, 'UserPromptSubmit', prompt(root))
+    assert.deepEqual(first, {
+      hookSpecificOutput: {
+        hookEventName: 'UserPromptSubmit',
+        additionalContext: 'Branch: main\n\nRead TODO.md.',
+      },
+      systemMessage: 'Welcome back.\nIndex stale.',
+    })
+    assert.deepEqual(JSON.parse(await readFile(at('start.json'), 'utf8')), {
+      session_id: 'session-1',
+      transcript_path: '/transcripts/session-1.jsonl',
+      cwd: root,
+      permission_mode: 'default',
+      hook_event_name: 'SessionStart',
+      source: 'startup',
+      model: 'claude-test',
+    })
+    assert.equal(await appears(at('late')), true, 'the async SessionStart hook did not run')
+    // Once per session.
+    await rm(at('start.json'))
+    assert.deepEqual(await call(hooks, 'UserPromptSubmit', prompt(root)), {})
+    await assert.rejects(access(at('start.json')))
+    // The CLI still calls them for compact, matching them itself.
+    const compact = hooks.SessionStart?.[1]?.hooks[0]
+    assert.equal(hooks.SessionStart?.[1]?.matcher, 'compact')
+    assert.ok(compact)
+    const signal = new AbortController().signal
+    assert.deepEqual(await compact({ source: 'compact' }, undefined, { signal }), {
+      hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: 'Compacted.' },
+    })
+
+    await end('other')
+    assert.deepEqual(JSON.parse(await readFile(at('end.json'), 'utf8')), {
+      session_id: 'session-1',
+      transcript_path: '/transcripts/session-1.jsonl',
+      cwd: root,
+      permission_mode: 'default',
+      hook_event_name: 'SessionEnd',
+      reason: 'other',
+    })
+    await assert.rejects(access(at('clear')))
+    await rm(at('end.json'))
+    await end('other')
+    await assert.rejects(access(at('end.json')))
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('SessionStart hooks match how the session began and keep to their timeout', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'claude-hooks-origin-')))
+  try {
+    const specs = [
+      spec({ event: 'SessionStart', matcher: 'startup', command: 'echo started' }),
+      spec({ event: 'SessionStart', matcher: 'resume', command: 'echo resumed' }),
+      spec({ event: 'SessionStart', matcher: '^(resume|fork)$', command: 'echo continued' }),
+      spec({ event: 'SessionStart', matcher: 'clear|compact', command: 'echo cleared' }),
+    ]
+    const context = async (origin?: 'startup' | 'resume' | 'fork') => {
+      const { hooks } = claudeHookSession(specs, {
+        projectDir: root,
+        approvals: true,
+        ...(origin ? { origin } : {}),
+      })
+      if (!hooks.UserPromptSubmit) return null
+      const output = await call(hooks, 'UserPromptSubmit', prompt(root))
+      return (output.hookSpecificOutput as Record<string, unknown> | undefined)?.additionalContext
+    }
+    assert.equal(await context('startup'), 'started')
+    assert.equal(await context('resume'), 'resumed\n\ncontinued')
+    assert.equal(await context('fork'), 'continued')
+    // Without a beginning, only the CLI calls them.
+    assert.equal(await context(), null)
+
+    const { hooks } = claudeHookSession(
+      [
+        spec({ event: 'SessionStart', timeoutSec: 0.5, command: 'sleep 5; echo never' }),
+        spec({ event: 'SessionStart', timeoutSec: 40, async: true, command: 'true' }),
+      ],
+      { projectDir: root, approvals: true, origin: 'startup' },
+    )
+    // Room for the slowest hook that is waited for.
+    assert.equal(hooks.UserPromptSubmit?.[0]?.timeout, 31)
+    const started = Date.now()
+    assert.deepEqual(await call(hooks, 'UserPromptSubmit', prompt(root)), {})
+    assert.ok(Date.now() - started < 4000, 'the SessionStart hook outlived its timeout')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+// A Claude session the runtime opens: it keeps the SDK options and yields what
+// the test pushes until closed.
+class FakeSession implements AsyncIterable<Record<string, unknown>> {
+  closed = false
+  private queue: Record<string, unknown>[] = []
+  private wake: (() => void) | null = null
+
+  readonly options: Record<string, unknown>
+
+  constructor(options: Record<string, unknown>, prompt: AsyncIterable<unknown>) {
+    this.options = options
+    void (async () => {
+      for await (const _ of prompt);
+    })()
+  }
+
+  push(message: Record<string, unknown>): void {
+    this.queue.push(message)
+    this.notify()
+  }
+
+  async interrupt(): Promise<void> {}
+
+  async setModel(): Promise<void> {}
+
+  async setPermissionMode(): Promise<void> {}
+
+  close(): void {
+    this.closed = true
+    this.notify()
+  }
+
+  async *[Symbol.asyncIterator](): AsyncGenerator<Record<string, unknown>, void> {
+    while (true) {
+      const next = this.queue.shift()
+      if (next) {
+        yield next
+        continue
+      }
+      if (this.closed) return
+      await new Promise<void>((resolve) => {
+        this.wake = resolve
+      })
+    }
+  }
+
+  private notify(): void {
+    const wake = this.wake
+    this.wake = null
+    wake?.()
+  }
+}
+
+test('the runtime runs SessionStart for how the CLI session begins and SessionEnd once it ends', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'claude-hooks-runtime-')))
+  const home = join(root, 'home')
+  const project = join(root, 'project')
+  const log = join(root, 'log')
+  try {
+    await mkdir(project, { recursive: true })
+    // A transcript to resume, in a home of the test's own.
+    const slug = project.replace(/[^a-zA-Z0-9-]/g, '-')
+    await write(join(home, '.claude', 'projects', slug, 'session-1.jsonl'), '{}\n')
+    const runtime = new NativeClaudeRuntime()
+    const sessions: FakeSession[] = []
+    Reflect.set(runtime, 'sdk', {
+      query: (args: { prompt: AsyncIterable<unknown>; options: Record<string, unknown> }) => {
+        const session = new FakeSession(args.options, args.prompt)
+        sessions.push(session)
+        return session
+      },
+    })
+    const handlers: RuntimeHandlers = {
+      onEvent: async (_event: RuntimeEvent) => {},
+      onPermissionRequest: async () => ({ decision: 'accept' }),
+      onUserInputRequest: async () => ({ answers: {} }),
+    }
+    const context: RuntimeTurnContext = {
+      threadId: 'thread',
+      turnId: 'turn-1',
+      prompt: 'Hi.',
+      cwd: project,
+      runtimeType: null,
+      model: null,
+      effort: null,
+      claudeSessionId: null,
+      forkSession: false,
+      mcpServers: null,
+      allowedTools: null,
+      addDirs: [],
+      enableFileCheckpointing: false,
+      outputFormat: null,
+      approvalPolicy: 'never',
+      sandboxMode: 'danger-full-access',
+      systemPromptAddendum: null,
+      planMode: false,
+      imageInputs: [],
+      claudeHooks: [
+        spec({ event: 'SessionStart', command: `printf '%s\\n' "$(cat)" >> '${log}'` }),
+        spec({ event: 'SessionEnd', command: `printf '%s\\n' "$(cat)" >> '${log}'` }),
+      ],
+    }
+    const turn = async (index: number, overrides: Partial<RuntimeTurnContext>) => {
+      const done = runtime.runTurn({ ...context, turnId: `turn-${index}`, ...overrides }, handlers)
+      for (let i = 0; i < 400 && !sessions[index]; i++)
+        await new Promise((resolve) => setTimeout(resolve, 5))
+      const session = sessions[index]
+      assert.ok(session, 'no session opened')
+      const hooks = session.options.hooks as SdkHooks
+      await call(hooks, 'UserPromptSubmit', prompt(project))
+      session.push({ type: 'result', subtype: 'success', result: 'Hello.' })
+      await done
+      return session
+    }
+    const lines = async () =>
+      (await readFile(log, 'utf8'))
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line))
+        .map((input) => [input.hook_event_name, input.source ?? input.reason])
+    const settled = async (count: number) => {
+      for (let i = 0; i < 400 && (await lines().catch(() => [])).length < count; i++)
+        await new Promise((resolve) => setTimeout(resolve, 25))
+      return lines()
+    }
+    await withEnv(
+      {
+        HOME: home,
+        CLAUDE_CONFIG_DIR: undefined,
+        CLAUDE_CONFIG_DIRS: undefined,
+        CLAUDE_ROUTER_DIR: undefined,
+      },
+      async () => {
+        const first = await turn(0, {})
+        // Nothing reuses it, so it closes once its turn is done.
+        for (let i = 0; i < 400 && !first.closed; i++)
+          await new Promise((resolve) => setTimeout(resolve, 5))
+        assert.equal(first.closed, true)
+        assert.deepEqual(await settled(2), [
+          ['SessionStart', 'startup'],
+          ['SessionEnd', 'other'],
+        ])
+        const resumed = await turn(1, { claudeSessionId: 'session-1' })
+        assert.equal(resumed.options.resume, 'session-1')
+        assert.deepEqual((await settled(4)).slice(2), [
+          ['SessionStart', 'resume'],
+          ['SessionEnd', 'other'],
+        ])
+        await turn(2, { claudeSessionId: 'session-1', forkSession: true })
+        assert.deepEqual((await settled(6)).slice(4), [
+          ['SessionStart', 'fork'],
+          ['SessionEnd', 'other'],
+        ])
+      },
+    )
+    await runtime.stop()
   } finally {
     await rm(root, { recursive: true, force: true })
   }

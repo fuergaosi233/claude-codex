@@ -824,7 +824,7 @@ test('enabled_tools are enforced by a PreToolUse hook and disabled_tools are dis
     enabledTools: { mcp__a__: ['mcp__a__read'], mcp__c__: [] },
   })
   const context = { mcpEnabledTools: rules.enabledTools } as unknown as RuntimeTurnContext
-  const hooks = sdkHooks(context)
+  const { hooks } = sdkHooks(context)
   const guard = hooks?.PreToolUse?.[0]?.hooks[0]
   assert.ok(guard)
   const signal = new AbortController().signal
@@ -841,7 +841,10 @@ test('enabled_tools are enforced by a PreToolUse hook and disabled_tools are dis
     },
   })
   assert.equal((await call('mcp__c__anything')).hookSpecificOutput !== undefined, true)
-  assert.equal(sdkHooks({ mcpEnabledTools: {} } as unknown as RuntimeTurnContext), null)
+  assert.deepEqual(sdkHooks({ mcpEnabledTools: {} } as unknown as RuntimeTurnContext), {
+    hooks: null,
+    end: null,
+  })
 })
 
 test('Claude threads run with the inherited servers and the App lists them', async () => {

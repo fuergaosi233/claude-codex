@@ -29,6 +29,15 @@ import { debugLog } from './util.mjs'
 // exit 2 blocks (or, for events that cannot block, shows stderr to the user
 // or nothing), any other exit is a non-blocking error.
 //
+// Two events never reach a callback. The CLI runs SessionStart hooks for a
+// new, resumed or forked session while it loads, before it reads the SDK's
+// initialize request that registers the callbacks, and SessionEnd hooks as
+// it exits, after the SDK has dropped them. The adapter runs those itself:
+// SessionStart when the session takes its first prompt, its context going
+// to Claude with that prompt as a UserPromptSubmit hook's would, and
+// SessionEnd once the CLI session is over. The CLI still calls SessionStart
+// for compact and clear.
+//
 // Not carried over: prompt, agent and http hooks, hooks filtered with
 // `if`, PowerShell hooks, the asyncRewake wake-up (such a hook just runs in
 // the background), CLAUDE_ENV_FILE, and the events whose outcome a callback
@@ -74,6 +83,10 @@ const OUTPUT_KEYS = [
   'systemMessage',
   'hookSpecificOutput',
 ]
+// The SessionStart sources the CLI reports before the callbacks exist.
+const SESSION_ORIGINS = new Set(['startup', 'resume', 'fork'])
+// The fields of a hook input that describe the session, not the event.
+const SESSION_KEYS = ['session_id', 'transcript_path', 'cwd', 'permission_mode', 'agent_type']
 
 export interface ClaudeHookSpec {
   readonly event: string
@@ -184,36 +197,145 @@ export interface ClaudeHookOptions {
   // Whether a hook may approve a tool call; false in plan mode and a
   // read-only sandbox, where only Codex approves.
   readonly approvals: boolean
+  // How the CLI session began: the source its SessionStart hooks run for.
+  // Without one they run only when the CLI calls them (compact, clear).
+  readonly origin?: SessionOrigin
+  // The session's model, for SessionStart's input.
+  readonly model?: string | null
 }
 
-// The SDK hook matchers for a session. `once` hooks run once per session.
-export function claudeHookMatchers(
+export type SessionOrigin = 'startup' | 'resume' | 'fork'
+
+export interface ClaudeHookSession {
+  // The SDK hook matchers.
+  readonly hooks: SdkHooks
+  // Runs the SessionEnd hooks once the CLI session is over (null when there
+  // are none); only the first call counts, and only for a session that took
+  // a prompt. Resolves when the hooks that are not async are done.
+  readonly end: ((reason: string) => Promise<void>) | null
+}
+
+// The hooks of one CLI session. `once` hooks run once per session.
+export function claudeHookSession(
   specs: readonly ClaudeHookSpec[],
   options: ClaudeHookOptions,
-): SdkHooks {
+): ClaudeHookSession {
   const hooks: SdkHooks = {}
+  const add = (event: string, matcher: HookMatcher): void => {
+    hooks[event] = [...(hooks[event] ?? []), matcher]
+  }
   const ran = new Set<ClaudeHookSpec>()
+  // An async hook runs in the background, its outcome only logged.
+  const run = async (
+    spec: ClaudeHookSpec,
+    input: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<HookOutput> => {
+    if (spec.once) {
+      if (ran.has(spec)) return {}
+      ran.add(spec)
+    }
+    if (spec.async) {
+      void runHookCommand(spec, input, options.projectDir).then((result) => logResult(spec, result))
+      return {}
+    }
+    const result = await runHookCommand(spec, input, options.projectDir, signal)
+    logResult(spec, result)
+    return hookOutput(spec.event, result, options.approvals)
+  }
+
+  const { origin } = options
+  const starts = origin
+    ? specs.filter((spec) => spec.event === 'SessionStart' && matches(spec.matcher, origin))
+    : []
+  const ends = specs.filter((spec) => spec.event === 'SessionEnd')
+  // The session as hook inputs describe it, known from its first prompt on.
+  let session: Record<string, unknown> | null = null
+  if (starts.length > 0 || ends.length > 0) {
+    let begun = false
+    const waits = starts.filter((spec) => !spec.async).map((spec) => spec.timeoutSec)
+    const first: HookCallback = async (input, _toolUseId, { signal }) => {
+      const current = sessionFields(input)
+      session = current
+      if (begun || starts.length === 0) return {}
+      begun = true
+      const start: Record<string, unknown> = {
+        ...current,
+        hook_event_name: 'SessionStart',
+        source: origin,
+      }
+      if (options.model) start.model = options.model
+      // Each runs in parallel within its own timeout, as Claude Code runs them.
+      const outputs = await Promise.all(starts.map((spec) => run(spec, start, signal)))
+      return startOutput(outputs)
+    }
+    add('UserPromptSubmit', {
+      hooks: [first],
+      // Room for the slowest, and for its output to drain.
+      timeout: Math.max(EVENT_TIMEOUT_SEC.UserPromptSubmit ?? 30, ...waits) + 1,
+    })
+  }
   for (const spec of specs) {
+    if (spec.event === 'SessionEnd') continue
     const callback: HookCallback = async (input, _toolUseId, { signal }) => {
-      if (spec.once) {
-        if (ran.has(spec)) return {}
-        ran.add(spec)
-      }
-      if (spec.async) {
-        void runHookCommand(spec, input, options.projectDir).then((result) =>
-          logResult(spec, result),
-        )
-        return {}
-      }
-      const result = await runHookCommand(spec, input, options.projectDir, signal)
-      logResult(spec, result)
-      return hookOutput(spec.event, result, options.approvals)
+      if (spec.event === 'SessionStart' && SESSION_ORIGINS.has(String(input.source))) return {}
+      return run(spec, input, signal)
     }
     const matcher: HookMatcher = { hooks: [callback], timeout: spec.timeoutSec }
     if (spec.matcher) matcher.matcher = spec.matcher
-    hooks[spec.event] = [...(hooks[spec.event] ?? []), matcher]
+    add(spec.event, matcher)
   }
-  return hooks
+
+  let ended = false
+  const end = async (reason: string): Promise<void> => {
+    if (ended || !session) return
+    ended = true
+    const input = { ...session, hook_event_name: 'SessionEnd', reason }
+    const due = ends.filter((spec) => matches(spec.matcher, reason))
+    await Promise.all(due.map((spec) => run(spec, input)))
+  }
+  return { hooks, end: ends.length > 0 ? end : null }
+}
+
+// Whether a hook's matcher takes a query, as the CLI decides: every query
+// when it has none (or * or .*), a name in a list split on |, otherwise a
+// regular expression.
+function matches(matcher: string | null, query: string): boolean {
+  if (!matcher || matcher === '*' || matcher === '.*') return true
+  if (/^[a-zA-Z0-9_|]+$/.test(matcher))
+    return matcher.split('|').some((name) => name.trim() === query)
+  try {
+    return new RegExp(matcher).test(query)
+  } catch {
+    return false
+  }
+}
+
+function sessionFields(input: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(
+    SESSION_KEYS.filter((key) => input[key] !== undefined).map((key) => [key, input[key]]),
+  )
+}
+
+// What the first prompt's hook passes on from the SessionStart hooks: their
+// context for Claude and their messages for the user.
+function startOutput(outputs: readonly HookOutput[]): HookOutput {
+  const context: string[] = []
+  const messages: string[] = []
+  for (const output of outputs) {
+    const extra = asTable(output.hookSpecificOutput)?.additionalContext
+    if (typeof extra === 'string' && extra.trim()) context.push(extra.trim())
+    const message = output.systemMessage
+    if (typeof message === 'string' && message.trim()) messages.push(message.trim())
+  }
+  const answer: HookOutput = {}
+  if (context.length > 0)
+    answer.hookSpecificOutput = {
+      hookEventName: 'UserPromptSubmit',
+      additionalContext: context.join('\n\n'),
+    }
+  if (messages.length > 0) answer.systemMessage = messages.join('\n')
+  return answer
 }
 
 export interface HookCommandResult {
