@@ -3,6 +3,7 @@ import { chmodSync, existsSync, readFileSync, unlinkSync, writeFileSync } from '
 import { dirname } from 'node:path'
 import { sweepCliMcpConfigs } from './cli-mcp-config.mjs'
 import { reapOrphanedCliChildren } from './cli-orphans.mjs'
+import { inheritedHooksWarning } from './inherited-config.mjs'
 import { createRuntime } from './runtime-factory.mjs'
 import { CodexClaudeAppServer } from './server.mjs'
 import { SessionStore } from './store.mjs'
@@ -100,6 +101,12 @@ async function main(): Promise<void> {
   }
   // And the MCP config files a killed adapter left for its CLI sessions.
   sweepCliMcpConfigs()
+  // Bridged hooks run twice under a CLI that reads its own settings files.
+  const hooksWarning = inheritedHooksWarning()
+  if (hooksWarning) {
+    debugLog('adapter.inheritedHooksWarning', { cli: Boolean(process.env.CLAUDE_CODEX_CLI) })
+    process.stderr.write(`[claude-codex-adapter] ${hooksWarning}\n`)
+  }
   const runtime = createRuntime()
   const server = new CodexClaudeAppServer(store, runtime)
   let shuttingDown = false

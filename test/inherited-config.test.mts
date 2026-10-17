@@ -43,7 +43,7 @@ import {
   verbatim,
 } from '../src/codex-config.mjs'
 import { notifyPayload } from '../src/codex-notify.mjs'
-import { mcpToolName, mcpToolRules } from '../src/inherited-config.mjs'
+import { inheritedHooksWarning, mcpToolName, mcpToolRules } from '../src/inherited-config.mjs'
 import { expandServerConfig, readMcpConfig } from '../src/mcp.mjs'
 import { NativeClaudeRuntime } from '../src/native-runtime.mjs'
 import { sdkHooks } from '../src/sdk-hooks.mjs'
@@ -1921,6 +1921,34 @@ test('a completed Claude turn runs the Codex config notify program when enabled'
         'last-assistant-message': 'All done.',
       })
     })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('bridged hooks come with a warning about a CLI that would run them as well', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'claude-codex-hooks-warning-'))
+  const warning = (env: Record<string, string | undefined>) =>
+    withEnv({ ...clean, CLAUDE_CODEX_CLI: undefined, ...env }, async () => inheritedHooksWarning())
+  try {
+    const bridged = { CLAUDE_CODEX_CLAUDE_CONFIG_DIR: root }
+    // No hooks bridged, nothing to say.
+    assert.equal(await warning({}), null)
+    assert.equal(await warning(bridged), null)
+    assert.equal(await warning({ ...bridged, CLAUDE_CODEX_CLAUDE_HOOKS: '1' }), null)
+    assert.equal(await warning({ CLAUDE_CODEX_CLAUDE_HOOKS: 'user' }), null)
+    // The SDK's own CLI reads every setting source.
+    const own = await warning({ ...bridged, CLAUDE_CODEX_CLAUDE_HOOKS: 'user' })
+    assert.match(own ?? '', /^CLAUDE_CODEX_CLAUDE_HOOKS=user .*runs twice\. Set CLAUDE_CODEX_CLI/)
+    assert.match(own ?? '', /--setting-sources ""/)
+    // A named CLI may be a launcher that turns them off.
+    const named = await warning({
+      ...bridged,
+      CLAUDE_CODEX_CLAUDE_HOOKS: 'project',
+      CLAUDE_CODEX_CLI: join(root, 'claude'),
+    })
+    assert.match(named ?? '', /^CLAUDE_CODEX_CLAUDE_HOOKS=project .*CLAUDE_CODEX_CLI names has to/)
+    assert.ok(!named?.includes(root))
   } finally {
     await rm(root, { recursive: true, force: true })
   }

@@ -185,7 +185,12 @@ hold up the turn). `CLAUDE_CODEX_CLAUDE_HOOKS=user` runs the hooks in the
 bridged folder's `settings.json`; `CLAUDE_CODEX_CLAUDE_HOOKS=project` also runs
 those of a trusted project's `.claude/settings.json` and
 `.claude/settings.local.json`, so a repository never runs a command on its own
-say; unset, `0` or any other value runs none. They run for `PreToolUse`,
+say; unset, `0` or any other value runs none. The Claude CLI must then start
+without its setting sources, as the bridged folder expects, or it runs the same
+hooks itself and each runs twice; the adapter warns as it starts, plainly when
+`CLAUDE_CODEX_CLI` is unset, since the CLI the SDK starts reads every source. It
+leaves those sources alone, as a CLI started directly still needs them for its
+provider settings. They run for `PreToolUse`,
 `PostToolUse`, `PostToolUseFailure`, `UserPromptSubmit`, `Stop`,
 `SubagentStart`, `SubagentStop`, `SessionStart`, `SessionEnd` and
 `Notification`. The adapter registers each command with the Claude Agent SDK;

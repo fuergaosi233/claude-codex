@@ -4,7 +4,7 @@ import {
   claudeMcpServers,
   claudePermissionRules,
 } from './claude-config.mjs'
-import { type ClaudeHookSpec, claudeHookSpecs } from './claude-hooks.mjs'
+import { type ClaudeHookSpec, claudeHookScope, claudeHookSpecs } from './claude-hooks.mjs'
 import { codexMcpServers, type InheritedMcpServer } from './codex-config.mjs'
 import { bridgedClaudeConfigDir } from './project-instructions.mjs'
 import { debugLog } from './util.mjs'
@@ -109,6 +109,31 @@ export function inheritedHooks(cwd: string): ClaudeHookSpec[] | null {
     hooks: hooks.map((hook) => ({ event: hook.event, matcher: hook.matcher, source: hook.source })),
   })
   return hooks.length > 0 ? hooks : null
+}
+
+// The adapter runs those hooks for a CLI that reads no settings files; a
+// CLI that reads them runs the same hooks itself, so each would run twice.
+// The adapter does not turn the CLI's setting sources off for it: a CLI
+// started directly takes its provider env, apiKeyHelper, model and plugins
+// from those files, and the folder's subagents, MCP servers and permission
+// rules too unless their own switches are on. So it says as it starts what
+// the CLI has to do instead: plainly when it starts the SDK's own CLI, which
+// reads every source, and as a reminder for the one CLAUDE_CODEX_CLI names,
+// which may be a launcher that turns them off. Null with no hooks bridged.
+export function inheritedHooksWarning(): string | null {
+  const scope = claudeHookScope()
+  if (scope === 'off' || !bridgedClaudeConfigDir()) return null
+  const asked = `CLAUDE_CODEX_CLAUDE_HOOKS=${scope}`
+  if (!process.env.CLAUDE_CODEX_CLI)
+    return (
+      `${asked} runs the Claude Code hooks in the adapter, but the Claude CLI the SDK starts ` +
+      'reads its settings files and runs their hooks too, so each runs twice. Set ' +
+      'CLAUDE_CODEX_CLI to a Claude CLI started with --setting-sources "", or turn the hooks off.'
+    )
+  return (
+    `${asked} runs the Claude Code hooks in the adapter: the Claude CLI that CLAUDE_CODEX_CLI ` +
+    'names has to start with --setting-sources "", or it runs the same hooks and each runs twice.'
+  )
 }
 
 export interface McpToolRules {
