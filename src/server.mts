@@ -923,7 +923,10 @@ export class CodexClaudeAppServer {
       case 'gitDiffToRemote':
         return this.gitDiffToRemote(asRecord(params))
       case 'getAuthStatus':
-        return { authMethod: null, authToken: null, requiresOpenaiAuth: false }
+        // Not an AuthMode value, but the auth method the App derives from the
+        // account/read answer above. Its main process needs the two to match.
+        // App rule: bedrock-auth-status
+        return { authMethod: 'amazonBedrock', authToken: null, requiresOpenaiAuth: false }
       case 'fuzzyFileSearch':
         return this.fuzzyFileSearch(asRecord(params))
       case 'fuzzyFileSearch/sessionStart':
