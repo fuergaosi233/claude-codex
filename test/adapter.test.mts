@@ -620,6 +620,16 @@ test('model/list exposes Claude model aliases and Codex-safe reasoning efforts',
     assert.deepEqual(account.result.account, { type: 'amazonBedrock' })
     assert.equal(account.result.requiresOpenaiAuth, false)
 
+    // The App's main process reads its flags only under the auth method it
+    // derives from account/read.
+    proc.stdin.write(json({ id: 8, method: 'getAuthStatus', params: {} }))
+    const authStatus = await reader.nextResponse(8)
+    assert.deepEqual(authStatus.result, {
+      authMethod: 'amazonBedrock',
+      authToken: null,
+      requiresOpenaiAuth: false,
+    })
+
     proc.stdin.write(json({ id: 2, method: 'model/list', params: {} }))
     const models = await reader.nextResponse(2)
     const ids = models.result.data.map((model: any) => model.id)
