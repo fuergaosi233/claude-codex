@@ -581,9 +581,13 @@ export function buildSystemPromptAddendum(input: {
   developerInstructions: string | null
   personality: string | null
   desktopPresentation?: boolean
+  // AGENTS.md and the Claude Code files the CLI does not read itself.
+  projectInstructions?: string | null
 }): string | null {
   const sections: string[] = []
   if (input.desktopPresentation) sections.push(desktopPresentationPrompt)
+  const project = (input.projectInstructions ?? '').trim()
+  if (project) sections.push(project)
   const base = (input.baseInstructions ?? '').trim()
   if (base) sections.push(`# Project instructions\n${base}`)
   const dev = (input.developerInstructions ?? '').trim()
