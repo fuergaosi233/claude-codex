@@ -53,6 +53,14 @@ export const APP_RULES: readonly AppRule[] = [
     verify: 'The model picker still lists the Claude models.',
   },
   {
+    id: 'bedrock-auth-status',
+    app: 'Publishes its feature flags under the auth method it derives from account/read (amazonBedrock for a Bedrock account), and its main process only reads flags published under the authMethod getAuthStatus returns. Without a match it keeps retrying a thread it resumes on its own, so a message queued while a turn ran is never sent and new chats get no title.',
+    adapter:
+      'Answers getAuthStatus with authMethod amazonBedrock, which matches the account/read answer.',
+    verify:
+      'Queue a message while a turn runs: it is sent when the turn ends, and a new chat gets a title.',
+  },
+  {
     id: 'skills-popup',
     app: 'Fills the Skills group of the "/" popup from skills/list, refetches it on skills/changed, and sends a picked skill as a [$name](path) link inside the prompt text.',
     adapter:
