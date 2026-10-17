@@ -11,8 +11,8 @@ import type { HookMatcher } from './sdk-hooks.mjs'
 // matches them, erring towards asking: a Bash rule covers each command of
 // a compound command line and what a wrapper such as `timeout` or `sh -c`
 // runs, and a command line whose commands cannot be told apart (command
-// substitution, a heredoc) is asked about when it mentions the rule's
-// command at all.
+// substitution, a heredoc, a command named by a variable) is asked about
+// under any Bash rule, since it could run anything.
 
 const EDIT_TOOLS = ['Edit', 'Write', 'MultiEdit', 'NotebookEdit']
 const READ_TOOLS = ['Read', 'Glob', 'Grep', 'LS', 'NotebookRead']
@@ -130,11 +130,8 @@ export function bashRuleCovers(specifier: string, line: string): boolean {
   const words = parsed?.length === 1 ? parsed[0] : null
   const pattern = words ? words.join(' ') : specifier.trim()
   const commands = commandCandidates(line)
-  if (commands === null) {
-    // Cannot tell the commands apart: ask when the rule's command shows up.
-    const head = /^[^\s*:]*/.exec(pattern)?.[0] ?? ''
-    return head === '' || line.includes(head)
-  }
+  // Cannot tell the commands apart: ask.
+  if (commands === null) return true
   return commands.some(commandMatcher(pattern))
 }
 

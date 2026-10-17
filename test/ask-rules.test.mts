@@ -36,13 +36,21 @@ test('a Bash ask rule covers every command of a command line and what wrappers r
   ])
     assert.equal(covered('git push:*', line), false, line)
 
-  // A command line whose commands only the shell can work out is asked about
-  // when it mentions the rule's command.
-  assert.equal(covered('git push:*', 'echo $(git push)'), true)
-  assert.equal(covered('git push:*', 'echo `git push`'), true)
-  assert.equal(covered('git push:*', 'cat <<EOF\ngit push\nEOF'), true)
-  assert.equal(covered('git push:*', '$GIT push'), false)
-  assert.equal(covered('git push:*', 'echo $(date)'), false)
+  // A command line whose commands only the shell can work out could run
+  // anything, so any Bash rule asks about it.
+  for (const line of [
+    'echo $(git push)',
+    'echo `git push`',
+    'cat <<EOF\ngit push\nEOF',
+    '$GIT push',
+    'echo $(date)',
+    'diff <(ls a) <(ls b)',
+    "echo 'unterminated",
+    'sh -c "echo $(id)"',
+  ]) {
+    assert.equal(covered('git push:*', line), true, line)
+    assert.equal(covered('rm *', line), true, line)
+  }
 
   // Wildcards: `cmd *` covers cmd and its arguments, not a longer name.
   assert.equal(covered('ls *', 'ls'), true)
@@ -144,5 +152,13 @@ test('the ask guard answers ask with the rule, and nothing for other calls', asy
     },
   })
   assert.deepEqual(await run('Bash', { command: 'git status' }), {})
+  // Whatever runs inside $(...) is not known: the Bash rule asks.
+  assert.deepEqual(await run('Bash', { command: 'echo $(date)' }), {
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'ask',
+      permissionDecisionReason: 'Your Claude Code settings ask before Bash(git push:*).',
+    },
+  })
   assert.deepEqual(await run('Read', { file_path: '/a' }), {})
 })
