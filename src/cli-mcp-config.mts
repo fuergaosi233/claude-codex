@@ -9,11 +9,18 @@ import { adapterHome, debugLog } from './util.mjs'
 // header, an env value. The file is the user's alone (a 0600 file in a 0700
 // folder under the adapter's home), named by the adapter's pid, and removed
 // when its CLI session ends or the adapter exits; the next adapter removes
-// those a killed one left behind. Values a config takes from the environment stay ${NAME} references
-// in it, for the CLI to fill in, so they never reach the disk.
+// those a killed one left behind. Values a config takes from the environment
+// stay ${NAME} references in it, for the CLI to fill in, so they never reach
+// the disk.
 //
-// The SDK's in-process servers still go through mcpServers: they have no
-// settings to write, and the SDK keeps them off the command line.
+// The SDK's in-process servers still go through mcpServers: the SDK passes
+// them in a --mcp-config of its own, by name only, with nothing in them to
+// hide. The CLI reads every --mcp-config it gets and merges their servers.
+//
+// The file stays for the whole session, not only until the CLI has read it:
+// the CLI keeps its --mcp-config arguments and passes them on to the CLI
+// processes it starts later, as for a conversation it forks to the
+// background, which read the file again.
 
 // The files this process wrote and has not removed yet.
 const written = new Set<string>()
