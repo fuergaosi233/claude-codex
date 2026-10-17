@@ -8,6 +8,7 @@ import {
   claudeHookSession,
   claudeHookSpecs,
   hookOutput,
+  runHookCommand,
   sessionEndBudgetSec,
 } from '../src/claude-hooks.mjs'
 import { NativeClaudeRuntime } from '../src/native-runtime.mjs'
@@ -426,6 +427,55 @@ test('a hook the CLI gives up on is stopped', async () => {
     assert.deepEqual(await pending, {})
     assert.ok(Date.now() - started < 3000)
   } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("a killed hook's process group is killed once more after its shell is gone", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'claude-hooks-group-')))
+  // A child the shell forks as the kill comes in cannot be made to miss it
+  // on purpose, so this records the group kills: whether the shell was
+  // still there (running, or not yet reaped) at each.
+  const kill = process.kill
+  const groupKills: boolean[] = []
+  process.kill = ((pid: number, signal?: string | number) => {
+    if (pid < 0 && signal === 'SIGKILL') {
+      let shellGone = false
+      try {
+        kill.call(process, -pid, 0)
+      } catch {
+        shellGone = true
+      }
+      groupKills.push(shellGone)
+    }
+    return kill.call(process, pid, signal)
+  }) as typeof process.kill
+  try {
+    for (const how of ['timeout', 'abort', 'exit']) {
+      groupKills.length = 0
+      const controller = new AbortController()
+      const pending = runHookCommand(
+        spec({
+          command: how === 'exit' ? 'true' : 'sleep 20',
+          timeoutSec: how === 'timeout' ? 0.2 : 30,
+        }),
+        {},
+        root,
+        controller.signal,
+      )
+      if (how === 'abort') setTimeout(() => controller.abort(), 100)
+      const result = await pending
+      assert.equal(result.timedOut, how === 'timeout', how)
+      if (how === 'exit') {
+        // A hook that ends by itself leaves what it started alone.
+        assert.deepEqual(groupKills, [], how)
+        continue
+      }
+      assert.equal(groupKills[0], false, `${how}: the first kill finds the shell`)
+      assert.equal(groupKills.at(-1), true, `${how}: the group goes again once the shell is gone`)
+    }
+  } finally {
+    process.kill = kill
     await rm(root, { recursive: true, force: true })
   }
 })

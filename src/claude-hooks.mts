@@ -451,15 +451,21 @@ export function runHookCommand(
       finish(null)
       return
     }
-    // The whole group, again until the shell is gone: macOS can miss a shell
-    // that is just forking, which then carries on after its killed command.
-    const kill = () => {
+    // Whether the hook timed out or the CLI gave up on it.
+    let killed = false
+    const killGroup = () => {
       try {
         if (child.pid && process.platform !== 'win32') process.kill(-child.pid, 'SIGKILL')
         else child.kill('SIGKILL')
       } catch {
         child.kill('SIGKILL')
       }
+    }
+    // The whole group, again until the shell is gone: macOS can miss a shell
+    // that is just forking, which then carries on after its killed command.
+    const kill = () => {
+      killed = true
+      killGroup()
       clearTimeout(retry)
       retry = setTimeout(kill, KILL_RETRY_MS)
       retry.unref()
@@ -481,9 +487,12 @@ export function runHookCommand(
       finish(null)
     })
     child.on('exit', (code) => {
-      // Done: what it started is its own business now.
+      // Done: what it started is its own business now, unless it was killed.
+      // Then the group goes once more: a child it forked as the last kill
+      // came in can have missed it, and nothing kills it later.
       clearTimeout(timer)
       clearTimeout(retry)
+      if (killed) killGroup()
       signal?.removeEventListener('abort', abort)
       drain = setTimeout(() => {
         // The pipes stay open for a background process that still writes
