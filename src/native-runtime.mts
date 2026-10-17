@@ -535,6 +535,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       opts.disallowedTools = context.disallowedTools
     if (context.mcpServers && typeof context.mcpServers === 'object')
       opts.mcpServers = context.mcpServers
+    if (context.agents && Object.keys(context.agents).length > 0) opts.agents = context.agents
     const hooks = sdkHooks(context)
     if (hooks) opts.hooks = hooks
     let goalServer = false
@@ -2615,6 +2616,7 @@ function sessionSignature(context: RuntimeTurnContext): string {
     context.allowedTools ?? [],
     context.disallowedTools ?? [],
     context.mcpEnabledTools ?? null,
+    context.agents ?? null,
     parseWorkflowCommand(context.prompt)?.type === 'run',
     context.planMode === true,
     configuredPermissionMode(),

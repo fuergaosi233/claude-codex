@@ -332,6 +332,7 @@ export class MockRuntime implements ClaudeRuntime {
           allowedTools: context.allowedTools ?? null,
           disallowedTools: context.disallowedTools ?? null,
           mcpEnabledTools: context.mcpEnabledTools ?? null,
+          agents: context.agents ?? null,
         }),
       })
       await handlers.onEvent({ type: 'completed', success: true, result: 'inherited config check' })

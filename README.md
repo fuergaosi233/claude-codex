@@ -119,6 +119,14 @@ over a Codex one, and `CLAUDE_CODEX_MCP_SERVERS` wins over both. Only the
 thread's own turns get these servers, not summaries or other internal turns;
 the App's MCP panel lists those of the thread it asks about.
 
+The bridged Claude Code folder also brings its subagents: `agents/*.md` in it,
+then `.claude/agents/*.md` from the git root down to the thread's folder, a
+project agent winning a name over a user agent. Their `name`, `description`,
+`tools`, `disallowedTools`, `model`, `skills`, `maxTurns`, `effort`, `memory`,
+`background`, `initialPrompt` and named `mcpServers` carry over; `permissionMode`,
+`hooks` and inline server definitions do not, since the Codex approval policy
+decides what runs.
+
 ### `/workflows` compatibility
 
 With the native Claude Agent SDK backend, `/workflows <task>` is translated to Claude's

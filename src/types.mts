@@ -397,6 +397,8 @@ export interface RuntimeTurnContext {
   // MCP servers limited to some of their tools: the server's tool-name prefix
   // (mcp__<server>__) to the full names of the tools Claude may call.
   mcpEnabledTools?: Record<string, string[]> | null
+  // Subagents by name, as the SDK's agents option takes them.
+  agents?: Record<string, Record<string, unknown>> | null
   addDirs: string[]
   enableFileCheckpointing: boolean
   outputFormat: unknown | null

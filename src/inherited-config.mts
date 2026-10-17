@@ -1,3 +1,4 @@
+import { claudeAgents } from './claude-agents.mjs'
 import { claudeMcpServers } from './claude-config.mjs'
 import { codexMcpServers, type InheritedMcpServer } from './codex-config.mjs'
 import { bridgedClaudeConfigDir } from './project-instructions.mjs'
@@ -10,6 +11,9 @@ import { debugLog } from './util.mjs'
 // and, when CLAUDE_CODEX_CLAUDE_CONFIG_DIR is set, the Claude Code config's.
 // Claude Code's win a name over Codex's, being meant for Claude; the
 // explicit CLAUDE_CODEX_MCP_SERVERS wins over both (see mcp.mts).
+//
+// Subagents: with CLAUDE_CODEX_CLAUDE_CONFIG_DIR set, the user's and the
+// project's Claude Code agents (see claude-agents.mts).
 
 export function inheritedMcpServers(cwd: string | null): InheritedMcpServer[] {
   const bridged = bridgedClaudeConfigDir()
@@ -32,6 +36,20 @@ export function inheritedMcpServers(cwd: string | null): InheritedMcpServer[] {
     })),
   })
   return list
+}
+
+// The Claude Code agents for a thread's folder, as the SDK's agents option,
+// or null when there are none to bring.
+export function inheritedAgents(cwd: string): Record<string, Record<string, unknown>> | null {
+  const bridged = bridgedClaudeConfigDir()
+  if (!bridged) return null
+  const agents = claudeAgents(cwd, bridged)
+  logOnChange(`agents:${cwd}`, 'inherited_agents', {
+    cwd,
+    agents: agents.map((agent) => ({ name: agent.name, source: agent.source })),
+  })
+  if (agents.length === 0) return null
+  return Object.fromEntries(agents.map((agent) => [agent.name, agent.definition]))
 }
 
 export interface McpToolRules {

@@ -4,6 +4,7 @@ import { copyFile, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promi
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import test from 'node:test'
+import { claudeAgents, frontmatterData } from '../src/claude-agents.mjs'
 import { claudeGlobalConfigPath, claudeMcpServers } from '../src/claude-config.mjs'
 import {
   codexMcpServers,
@@ -12,6 +13,7 @@ import {
 } from '../src/codex-config.mjs'
 import { mcpToolName, mcpToolRules } from '../src/inherited-config.mjs'
 import { readMcpConfig } from '../src/mcp.mjs'
+import { NativeClaudeRuntime } from '../src/native-runtime.mjs'
 import { sdkHooks } from '../src/sdk-hooks.mjs'
 import { CodexClaudeAppServer } from '../src/server.mjs'
 import { SessionStore } from '../src/store.mjs'
@@ -59,6 +61,75 @@ const clean = {
   CLAUDE_CODEX_MCP_SERVERS: undefined,
   CLAUDE_CODEX_CODEX_MCP_SERVERS: undefined,
   CLAUDE_CODEX_CLAUDE_CONFIG_DIR: undefined,
+}
+
+interface TestApp {
+  request: (method: string, params: Record<string, unknown>) => Promise<any>
+  // Runs a turn and returns the context the runtime got.
+  turn: (threadId: string, params?: Record<string, unknown>) => Promise<RuntimeTurnContext>
+  // Notifications the server sent, in order.
+  notifications: Array<{ method: string; params: any }>
+}
+
+// An app server over a fake runtime that records each turn's context.
+async function withServer(
+  root: string,
+  env: Record<string, string | undefined>,
+  run: (app: TestApp) => Promise<void>,
+): Promise<void> {
+  await withEnv({ ...clean, CLAUDE_CODEX_HOME: join(root, 'adapter'), ...env }, async () => {
+    const store = new SessionStore(join(root, 'state.sqlite'))
+    const contexts: RuntimeTurnContext[] = []
+    const responses = new Map<unknown, any>()
+    const notifications: TestApp['notifications'] = []
+    let finish: (() => void) | undefined
+    const runtime: ClaudeRuntime = {
+      runTurn: async (context, handlers) => {
+        contexts.push(context)
+        await handlers.onEvent({ type: 'text_delta', delta: 'All done.' })
+        await handlers.onEvent({ type: 'completed', success: true, result: 'All done.' })
+      },
+      steer: async () => {},
+      interrupt: async () => {},
+      stop: async () => {},
+    }
+    const server = new CodexClaudeAppServer(store, runtime)
+    const peer: RpcPeer = {
+      id: 'inherited-config-test',
+      close: () => {},
+      send: (message) => {
+        if ('id' in message) responses.set(message.id, message)
+        if ('method' in message) {
+          notifications.push({ method: message.method, params: message.params })
+          if (message.method === 'turn/completed') finish?.()
+        }
+      },
+    }
+    let nextId = 0
+    const request = async (method: string, params: Record<string, unknown>) => {
+      const id = ++nextId
+      await server.handle(peer, { id, method, params })
+      const response = responses.get(id)
+      assert.ok(response, `Missing ${method} response`)
+      assert.equal(response.error, undefined)
+      return response.result
+    }
+    const turn = async (threadId: string, params: Record<string, unknown> = {}) => {
+      const completed = new Promise<void>((resolve) => {
+        finish = resolve
+      })
+      await request('turn/start', { threadId, input: [{ type: 'text', text: 'Hi.' }], ...params })
+      await completed
+      const context = contexts.at(-1)
+      assert.ok(context)
+      return context
+    }
+    try {
+      await run({ request, turn, notifications })
+    } finally {
+      await server.stop()
+    }
+  })
 }
 
 test('the TOML reader covers the syntax Codex config files use', () => {
@@ -581,92 +652,289 @@ cwd = "../tools"
 enabled_tools = ["echo"]
 `,
   )
-  await withEnv(
-    {
-      ...clean,
-      CLAUDE_CODEX_HOME: join(root, 'adapter'),
-      CODEX_HOME: codexHome,
-      CLAUDE_CODEX_CODEX_MCP_SERVERS: '1',
-    },
-    async () => {
-      const store = new SessionStore(join(root, 'state.sqlite'))
-      const contexts: RuntimeTurnContext[] = []
-      const responses = new Map<unknown, any>()
-      let finish: (() => void) | undefined
-      const runtime: ClaudeRuntime = {
-        runTurn: async (context, handlers) => {
-          contexts.push(context)
-          await handlers.onEvent({ type: 'completed', success: true, result: 'done' })
-        },
-        steer: async () => {},
-        interrupt: async () => {},
-        stop: async () => {},
-      }
-      const server = new CodexClaudeAppServer(store, runtime)
-      const peer: RpcPeer = {
-        id: 'inherited-config-test',
-        close: () => {},
-        send: (message) => {
-          if ('id' in message) responses.set(message.id, message)
-          if ('method' in message && message.method === 'turn/completed') finish?.()
-        },
-      }
-      let nextId = 0
-      const request = async (method: string, params: Record<string, unknown>) => {
-        const id = ++nextId
-        await server.handle(peer, { id, method, params })
-        const response = responses.get(id)
-        assert.ok(response, `Missing ${method} response`)
-        assert.equal(response.error, undefined)
-        return response.result
-      }
-      const turn = async (threadId: string, params: Record<string, unknown> = {}) => {
-        const completed = new Promise<void>((resolve) => {
-          finish = resolve
-        })
-        await request('turn/start', { threadId, input: [{ type: 'text', text: 'Hi.' }], ...params })
-        await completed
-        const context = contexts.at(-1)
-        assert.ok(context)
-        return context
-      }
-      try {
+  // Off by default: the Codex App keeps its own desktop servers in that file.
+  await withServer(root, { CODEX_HOME: codexHome }, async ({ request, turn }) => {
+    const started = await request('thread/start', { cwd: repo, model: 'sonnet' })
+    const normal = await turn(started.thread.id)
+    assert.equal(normal.mcpServers ?? null, null)
+    assert.deepEqual(normal.disallowedTools, [])
+    const listed = await request('mcpServerStatus/list', { threadId: started.thread.id })
+    assert.deepEqual(listed.data, [])
+  })
+  const optIn = { CODEX_HOME: codexHome, CLAUDE_CODEX_CODEX_MCP_SERVERS: '1' }
+  await withServer(root, optIn, async ({ request, turn }) => {
+    const started = await request('thread/start', { cwd: repo, model: 'sonnet' })
+    const normal = await turn(started.thread.id)
+    assert.deepEqual(Object.keys(normal.mcpServers as object), ['everywhere', 'fixture'])
+    assert.deepEqual(normal.disallowedTools, ['mcp__everywhere__drop'])
+    assert.deepEqual(normal.mcpEnabledTools, { mcp__fixture__: ['mcp__fixture__echo'] })
+    // Summaries and other internal turns get none of them.
+    const summary = await turn(started.thread.id, {
+      outputSchema: { type: 'object', properties: { summary: { type: 'string' } } },
+    })
+    assert.equal(summary.mcpServers, null)
+    assert.deepEqual(summary.disallowedTools, [])
+
+    // Without a thread only the servers for every folder are listed.
+    const global = await request('mcpServerStatus/list', {})
+    assert.deepEqual(
+      global.data.map((entry: { name: string }) => entry.name),
+      ['everywhere'],
+    )
+    // With one, its project's servers too, enumerated in their folder.
+    const scoped = await request('mcpServerStatus/list', { threadId: started.thread.id })
+    assert.deepEqual(
+      scoped.data.map((entry: { name: string }) => entry.name),
+      ['everywhere', 'fixture'],
+    )
+    assert.deepEqual(Object.keys(scoped.data[1].tools), ['echo'])
+    const called = await request('mcpServer/tool/call', {
+      threadId: started.thread.id,
+      server: 'fixture',
+      tool: 'echo',
+      arguments: { value: 'hi' },
+    })
+    assert.deepEqual(called.content, [{ type: 'text', text: 'tool:echo:hi' }])
+  })
+  await rm(root, { recursive: true, force: true })
+})
+
+test('agent frontmatter is read as YAML', () => {
+  const data = frontmatterData(`---
+name: reviewer
+# a comment
+description: "Reviews code.\\nUse after edits."
+tools: Read, Grep, Bash(git diff:*)
+disallowedTools:
+  - Write
+  - Edit
+model: sonnet # the alias
+maxTurns: 5
+background: true
+skills: [lint, "deploy"]
+mcpServers:
+  - github
+  - inline:
+      command: x
+hooks:
+  PreToolUse:
+    - matcher: Bash
+initialPrompt: >
+  Start by
+  listing files.
+notes: |-
+  line one
+  line two
+summary: Use when: the diff is large
+  and needs care
+---
+Body.
+`)
+  assert.deepEqual(data, {
+    name: 'reviewer',
+    description: 'Reviews code.\nUse after edits.',
+    tools: 'Read, Grep, Bash(git diff:*)',
+    disallowedTools: ['Write', 'Edit'],
+    model: 'sonnet',
+    maxTurns: 5,
+    background: true,
+    skills: ['lint', 'deploy'],
+    mcpServers: ['github', {}],
+    hooks: {},
+    initialPrompt: 'Start by listing files.\n',
+    notes: 'line one\nline two',
+    summary: 'Use when: the diff is large and needs care',
+  })
+  assert.equal(frontmatterData('No frontmatter.'), null)
+})
+
+test('Claude Code agents come from the config folder and the project, the project winning', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'inherited-agents-'))
+  const configDir = join(root, 'claude-config')
+  const repo = join(root, 'repo')
+  const cwd = join(repo, 'app')
+  try {
+    await mkdir(join(repo, '.git'), { recursive: true })
+    await write(
+      join(configDir, 'agents', 'reviewer.md'),
+      `---
+name: reviewer
+description: User reviewer
+tools: "*"
+model: inherit
+permissionMode: bypassPermissions
+---
+
+Review as the user likes.
+`,
+    )
+    await write(
+      join(configDir, 'agents', 'team', 'writer.md'),
+      `---
+name: writer
+description: Writes docs.\\nKeeps them short.
+tools:
+  - Read
+  - Write
+disallowedTools: Bash
+effort: high
+memory: user
+maxTurns: "3"
+skills: docs
+---
+Write docs.
+`,
+    )
+    await write(join(configDir, 'agents', 'README.md'), 'Notes about agents, not an agent.')
+    await write(
+      join(configDir, 'agents', 'nameless.md'),
+      '---\ndescription: No name\n---\nIgnored.\n',
+    )
+    await write(
+      join(repo, '.claude', 'agents', 'reviewer.md'),
+      '---\nname: reviewer\ndescription: Repo reviewer\ntools: Read, Grep\n---\nRepo rules.\n',
+    )
+    await write(
+      join(cwd, '.claude', 'agents', 'reviewer.md'),
+      '---\nname: reviewer\ndescription: App reviewer\n---\nApp rules.\n',
+    )
+    await write(
+      join(repo, '.claude', 'agents', 'tester.md'),
+      '---\nname: tester\ndescription: Runs tests\nbackground: true\n---\nTest.\n',
+    )
+
+    const atRoot = Object.fromEntries(
+      claudeAgents(repo, configDir).map((agent) => [agent.name, agent]),
+    )
+    assert.deepEqual(Object.keys(atRoot), ['writer', 'reviewer', 'tester'])
+    assert.deepEqual(atRoot.writer?.definition, {
+      description: 'Writes docs.\nKeeps them short.',
+      prompt: 'Write docs.',
+      tools: ['Read', 'Write'],
+      disallowedTools: ['Bash'],
+      skills: ['docs'],
+      maxTurns: 3,
+      memory: 'user',
+      effort: 'high',
+    })
+    assert.deepEqual(atRoot.reviewer, {
+      name: 'reviewer',
+      source: join(repo, '.claude', 'agents', 'reviewer.md'),
+      definition: { description: 'Repo reviewer', prompt: 'Repo rules.', tools: ['Read', 'Grep'] },
+    })
+    assert.deepEqual(atRoot.tester?.definition, {
+      description: 'Runs tests',
+      prompt: 'Test.',
+      background: true,
+    })
+    // The closest folder wins.
+    const inApp = claudeAgents(cwd, configDir).find((agent) => agent.name === 'reviewer')
+    assert.equal(inApp?.definition.description, 'App reviewer')
+    // Alone, the user agent: every tool, the main model, no permission mode.
+    const userOnly = claudeAgents(join(root, 'elsewhere'), configDir)
+    assert.deepEqual(userOnly.find((agent) => agent.name === 'reviewer')?.definition, {
+      description: 'User reviewer',
+      prompt: 'Review as the user likes.',
+      model: 'inherit',
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('Claude threads get the Claude Code agents only with the config folder bridged', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'inherited-agents-server-'))
+  const configDir = join(root, 'claude-config')
+  const repo = join(root, 'repo')
+  await mkdir(join(repo, '.git'), { recursive: true })
+  await write(
+    join(configDir, 'agents', 'helper.md'),
+    '---\nname: helper\ndescription: Helps\n---\nHelp.\n',
+  )
+  for (const bridged of [false, true])
+    await withServer(
+      root,
+      {
+        CODEX_HOME: join(root, 'codex-home'),
+        CLAUDE_CODEX_CLAUDE_CONFIG_DIR: bridged ? configDir : undefined,
+      },
+      async ({ request, turn }) => {
         const started = await request('thread/start', { cwd: repo, model: 'sonnet' })
         const normal = await turn(started.thread.id)
-        assert.deepEqual(Object.keys(normal.mcpServers as object), ['everywhere', 'fixture'])
-        assert.deepEqual(normal.disallowedTools, ['mcp__everywhere__drop'])
-        assert.deepEqual(normal.mcpEnabledTools, { mcp__fixture__: ['mcp__fixture__echo'] })
-        // Summaries and other internal turns get none of them.
+        assert.deepEqual(
+          normal.agents,
+          bridged ? { helper: { description: 'Helps', prompt: 'Help.' } } : null,
+        )
         const summary = await turn(started.thread.id, {
           outputSchema: { type: 'object', properties: { summary: { type: 'string' } } },
         })
-        assert.equal(summary.mcpServers, null)
-        assert.deepEqual(summary.disallowedTools, [])
+        assert.equal(summary.agents, null)
+      },
+    )
+  await rm(root, { recursive: true, force: true })
+})
 
-        // Without a thread only the servers for every folder are listed.
-        const global = await request('mcpServerStatus/list', {})
-        assert.deepEqual(
-          global.data.map((entry: { name: string }) => entry.name),
-          ['everywhere'],
-        )
-        // With one, its project's servers too, enumerated in their folder.
-        const scoped = await request('mcpServerStatus/list', { threadId: started.thread.id })
-        assert.deepEqual(
-          scoped.data.map((entry: { name: string }) => entry.name),
-          ['everywhere', 'fixture'],
-        )
-        assert.deepEqual(Object.keys(scoped.data[1].tools), ['echo'])
-        const called = await request('mcpServer/tool/call', {
-          threadId: started.thread.id,
-          server: 'fixture',
-          tool: 'echo',
-          arguments: { value: 'hi' },
-        })
-        assert.deepEqual(called.content, [{ type: 'text', text: 'tool:echo:hi' }])
-      } finally {
-        await server.stop()
-      }
+// The options a native Claude session starts with for a turn context.
+async function sessionOptions(
+  overrides: Partial<RuntimeTurnContext>,
+): Promise<Record<string, any>> {
+  const runtime = new NativeClaudeRuntime()
+  let captured: Record<string, any> | undefined
+  Reflect.set(runtime, 'sdk', {
+    query: async function* ({ options }: { options: Record<string, any> }) {
+      captured = options
+      yield { type: 'result', subtype: 'success', result: 'done' }
+    },
+  })
+  await runtime.runTurn(
+    {
+      threadId: 'thread',
+      turnId: 'turn',
+      prompt: 'Hi.',
+      cwd: process.cwd(),
+      runtimeType: null,
+      model: null,
+      effort: null,
+      claudeSessionId: null,
+      forkSession: false,
+      mcpServers: null,
+      allowedTools: null,
+      addDirs: [],
+      enableFileCheckpointing: false,
+      outputFormat: null,
+      approvalPolicy: 'never',
+      sandboxMode: 'danger-full-access',
+      systemPromptAddendum: null,
+      planMode: false,
+      imageInputs: [],
+      ...overrides,
+    },
+    {
+      onEvent: async () => {},
+      onPermissionRequest: async () => ({ decision: 'accept' }),
+      onUserInputRequest: async () => ({ answers: {} }),
     },
   )
-  await rm(root, { recursive: true, force: true })
+  await runtime.stop()
+  assert.ok(captured)
+  return captured
+}
+
+test('the native runtime passes inherited servers, tool rules and agents to the SDK', async () => {
+  const plain = await sessionOptions({})
+  assert.equal(plain.disallowedTools, undefined)
+  assert.equal(plain.agents, undefined)
+  assert.equal(plain.hooks, undefined)
+
+  const agents = { helper: { description: 'Helps', prompt: 'Help.' } }
+  const options = await sessionOptions({
+    mcpServers: { docs: { type: 'stdio', command: 'docs-mcp' } },
+    disallowedTools: ['mcp__docs__drop'],
+    mcpEnabledTools: { mcp__docs__: ['mcp__docs__read'] },
+    agents,
+  })
+  assert.deepEqual(options.mcpServers, { docs: { type: 'stdio', command: 'docs-mcp' } })
+  assert.deepEqual(options.disallowedTools, ['mcp__docs__drop'])
+  assert.deepEqual(options.agents, agents)
+  assert.equal(options.hooks.PreToolUse.length, 1)
 })
