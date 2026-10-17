@@ -1557,6 +1557,26 @@ http_headers = { "X-Raw" = "\${RAW_SECRET}", "X-Two" = "\${\${RAW_SECRET}}" }
   }
 })
 
+test('the variable the ${ escape relies on stays unset even when exported', () => {
+  const dist = (name: string) => JSON.stringify(new URL(`../src/${name}`, import.meta.url).href)
+  // A CLI session gets the runtime's environment as it is when the session
+  // starts, so what matters is that loading the runtime clears it.
+  const script = `
+    await import(${dist('native-runtime.mjs')})
+    const cli = '__CLAUDE_CODEX_UNSET' in process.env
+    const { verbatim } = await import(${dist('codex-config.mjs')})
+    const { expandServerConfig } = await import(${dist('mcp.mjs')})
+    const direct = expandServerConfig({ args: [verbatim('\${HOME}')] }, process.env).args[0]
+    process.stdout.write(JSON.stringify({ cli, direct }))
+  `
+  const ran = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+    encoding: 'utf8',
+    env: { ...process.env, __CLAUDE_CODEX_UNSET: 'leaked' },
+  })
+  assert.equal(ran.status, 0, ran.stderr)
+  assert.deepEqual(JSON.parse(ran.stdout), { cli: false, direct: '${HOME}' })
+})
+
 test('the MCP config files of adapters that are gone are swept', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'inherited-mcp-sweep-'))
   try {

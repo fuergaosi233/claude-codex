@@ -281,8 +281,12 @@ function sdkServerConfig(name: string, entry: Table, base: string): Record<strin
 // A variable name the CLI fills in as ${NAME}.
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
 
-// A variable nothing sets.
+// A variable nothing sets. The CLI fills in a set one, even an empty one,
+// in place of the default, so the adapter drops it from its own environment
+// as it loads: the CLI sessions it starts get theirs from that, and the
+// App's direct MCP calls fill a config in from it as well.
 const UNSET = '__CLAUDE_CODEX_UNSET'
+delete process.env[UNSET]
 
 // `text` as the CLI passes it on unchanged. The CLI fills in ${NAME} and
 // ${NAME:-default} in a server's command, arguments, env, url and headers,
