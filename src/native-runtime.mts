@@ -36,6 +36,7 @@ if (!process.env.ANTHROPIC_BETAS) {
 
 import type { Query } from '@anthropic-ai/claude-agent-sdk'
 import { noteClaudeCommands } from './claude-commands.mjs'
+import { removeCliMcpConfig, writeCliMcpConfig } from './cli-mcp-config.mjs'
 import { recordCliChildren } from './cli-orphans.mjs'
 import {
   CREATE_GOAL_DESCRIPTION,
@@ -248,9 +249,11 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   private permissions = new Map<string, PendingPermission>()
   private sessions = new Map<string, LiveSession>()
   private listener: RuntimeBackgroundListener | null = null
-  // The user's SessionEnd hooks by session (its abort controller): the CLI
-  // runs them as it exits, after the SDK has dropped its callbacks.
-  private hookEnds = new WeakMap<AbortController, (reason: string) => Promise<void>>()
+  // What is left to do when a CLI session is over, by session (its abort
+  // controller): remove its MCP config file and run the user's SessionEnd
+  // hooks, which the CLI runs as it exits, after the SDK has dropped its
+  // callbacks.
+  private sessionEnds = new WeakMap<AbortController, () => void>()
 
   setBackgroundListener(listener: RuntimeBackgroundListener): void {
     this.listener = listener
@@ -530,20 +533,24 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }
     // session_state_changed tells a session that outlives its turn when the
     // CLI has finished answering everything queued (see maybeRelease).
-    opts.env = { ...process.env, ...context.mcpEnv, CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1' }
+    opts.env = { ...process.env, CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1' }
     if (context.addDirs && context.addDirs.length > 0) opts.additionalDirectories = context.addDirs
     const allowedTools = [...(context.allowedTools ?? []), ...inheritedAllowedTools(context)]
     if (allowedTools.length > 0) opts.allowedTools = allowedTools
     if (context.disallowedTools && context.disallowedTools.length > 0)
       opts.disallowedTools = context.disallowedTools
-    if (context.mcpServers && typeof context.mcpServers === 'object')
-      opts.mcpServers = context.mcpServers
+    // The servers go to the CLI in a file, off its command line.
+    const mcpConfig = writeCliMcpConfig(context.mcpServers)
+    if (mcpConfig) opts.extraArgs = { 'mcp-config': mcpConfig }
     if (context.agents && Object.keys(context.agents).length > 0) opts.agents = context.agents
     // The source the CLI would give this session's SessionStart hooks.
     const origin = !resume ? 'startup' : opts.forkSession ? 'fork' : 'resume'
     const { hooks, end } = sdkHooks(context, inheritedApprovals(context), origin)
     if (hooks) opts.hooks = hooks
-    if (end) this.hookEnds.set(abort, end)
+    this.sessionEnds.set(abort, () => {
+      if (mcpConfig) removeCliMcpConfig(mcpConfig)
+      void end?.('other')
+    })
     let goalServer = false
     if (context.goalTools && this.zod && typeof sdk.createSdkMcpServer === 'function') {
       goalServer = true
@@ -1298,7 +1305,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (registered === session) this.sessions.delete(session.threadId)
     // Release the CLI's stdin (see TurnInput).
     session.input.close()
-    void this.hookEnds.get(session.abort)?.('other')
+    this.sessionEnds.get(session.abort)?.()
+    this.sessionEnds.delete(session.abort)
     const pending = session.current
     session.current = null
     if (pending && !pending.resolved) await this.finishTurnAtSessionEnd(pending, failure)
@@ -2634,8 +2642,6 @@ function sessionSignature(context: RuntimeTurnContext): string {
     context.effort ?? null,
     context.systemPromptAddendum ?? '',
     context.mcpServers ?? null,
-    // Compared in memory only, never logged.
-    context.mcpEnv ?? null,
     context.goalTools ? GOAL_MCP_SERVER : null,
     context.addDirs ?? [],
     context.allowedTools ?? [],

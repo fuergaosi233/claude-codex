@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto'
 import { statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
@@ -27,10 +26,6 @@ export interface InheritedMcpServer {
   // Tool lists that narrow what Claude may call, when the config has them.
   readonly enabledTools?: readonly string[]
   readonly disabledTools?: readonly string[]
-  // Values the config refers to as ${NAME}, for the CLI's environment. The
-  // SDK passes the server configs on the CLI's command line, where any
-  // local process can read them, so a secret goes in the environment.
-  readonly env?: Readonly<Record<string, string>>
 }
 
 interface ConfigLayer {
@@ -200,94 +195,105 @@ export function codexMcpServers(cwd: string | null): InheritedMcpServer[] {
   }
   const servers: InheritedMcpServer[] = []
   for (const [name, { entry, source, base }] of merged) {
-    const server = sdkServerConfig(name, entry, base)
-    if (!server) continue
+    const config = sdkServerConfig(name, entry, base)
+    if (!config) continue
     const enabledTools = stringList(entry.enabled_tools)
     const disabledTools = stringList(entry.disabled_tools)
     servers.push({
       name,
       source,
-      config: server.config,
+      config,
       ...(Array.isArray(entry.enabled_tools) ? { enabledTools } : {}),
       ...(disabledTools.length > 0 ? { disabledTools } : {}),
-      ...(Object.keys(server.env).length > 0 ? { env: server.env } : {}),
     })
   }
   return servers
 }
 
-// One Codex server entry in the SDK's terms. Codex resolves environment
-// variable names against its own environment; so does this, because the
-// Claude CLI may run with a narrower one. Such a value reaches the CLI in
-// its environment, under a name of its own, and the config refers to it as
-// ${NAME} for the CLI to fill in.
-function sdkServerConfig(
-  name: string,
-  entry: Table,
-  base: string,
-): { config: Record<string, unknown>; env: Record<string, string> } | null {
+// One Codex server entry in the SDK's terms. A value Codex takes from its
+// environment (env_vars, env_http_headers, bearer_token_env_var) becomes a
+// ${NAME} reference the CLI fills in from its own environment, which it gets
+// from the adapter's: the value never reaches the config file. A value
+// written into the Codex config is passed on as written.
+function sdkServerConfig(name: string, entry: Table, base: string): Record<string, unknown> | null {
   if (entry.enabled === false) return null
   // Runs on a remote executor Claude threads do not have.
   if (entry.experimental_environment === 'remote') return null
   const seconds = typeof entry.tool_timeout_sec === 'number' ? entry.tool_timeout_sec : null
   const timeout = seconds && seconds > 0 ? { timeout: Math.round(seconds * 1000) } : {}
-  const secrets: Record<string, string> = {}
-  const reference = (kind: string, key: string, value: string): string => {
-    const alias = secretAlias(name, kind, key)
-    secrets[alias] = value
-    return `\${${alias}}`
+  // Only a name the CLI can fill in; an unset variable is left out, as Codex
+  // leaves it out.
+  const reference = (variable: string): string | null => {
+    if (process.env[variable] === undefined) return null
+    if (ENV_NAME.test(variable)) return `\${${variable}}`
+    debugLog('codex_mcp_server_variable_unusable', { server: name, variable })
+    return null
   }
   if (typeof entry.command === 'string' && entry.command) {
     const env: Record<string, string> = {}
     // Codex hands a server the PATH it runs with.
-    if (process.env.PATH) env.PATH = process.env.PATH
+    if (process.env.PATH) env.PATH = verbatim(process.env.PATH)
     for (const item of Array.isArray(entry.env_vars) ? entry.env_vars : []) {
       const spec = typeof item === 'string' ? { name: item } : asTable(item)
       const key = typeof spec?.name === 'string' ? spec.name : ''
       if (!key || spec?.source === 'remote') continue
-      const value = process.env[key]
-      if (value !== undefined) env[key] = reference('env', key, value)
+      const value = reference(key)
+      if (value) env[key] = value
     }
-    Object.assign(env, stringRecord(entry.env))
-    const args = stringList(entry.args)
+    for (const [key, value] of Object.entries(stringRecord(entry.env))) env[key] = verbatim(value)
+    const args = stringList(entry.args).map((arg) => verbatim(arg))
+    const command = verbatim(entry.command)
     const cwd = typeof entry.cwd === 'string' && entry.cwd ? expandPath(entry.cwd, base) : null
     // The SDK has no cwd for a server, so a shell changes into it first.
     const launch = cwd
       ? {
           command: '/bin/sh',
-          args: ['-c', 'cd "$1" && shift && exec "$@"', 'sh', cwd, entry.command, ...args],
+          args: ['-c', 'cd "$1" && shift && exec "$@"', 'sh', verbatim(cwd), command, ...args],
         }
-      : { command: entry.command, args }
-    return { config: { type: 'stdio', ...launch, env, ...timeout }, env: secrets }
+      : { command, args }
+    return { type: 'stdio', ...launch, env, ...timeout }
   }
   if (typeof entry.url === 'string' && entry.url) {
-    const headers = stringRecord(entry.http_headers)
+    const headers: Record<string, string> = {}
+    for (const [header, value] of Object.entries(stringRecord(entry.http_headers)))
+      headers[header] = verbatim(value, 2)
     for (const [header, variable] of Object.entries(stringRecord(entry.env_http_headers))) {
-      const value = process.env[variable]
-      if (value !== undefined) headers[header] = reference('header', header, value)
+      const value = reference(variable)
+      if (value) headers[header] = value
     }
-    if (typeof entry.bearer_token_env_var === 'string' && entry.bearer_token_env_var) {
-      const token = process.env[entry.bearer_token_env_var]
-      if (token) headers.Authorization = `Bearer ${reference('bearer', 'Authorization', token)}`
+    const variable = entry.bearer_token_env_var
+    if (typeof variable === 'string' && variable) {
+      // Codex takes an empty token for none.
+      const token = process.env[variable] ? reference(variable) : null
+      if (token) headers.Authorization = `Bearer ${token}`
       else debugLog('codex_mcp_server_token_missing', { server: name })
     }
-    const config = {
+    return {
       type: 'http',
-      url: entry.url,
+      url: verbatim(entry.url),
       ...(Object.keys(headers).length > 0 ? { headers } : {}),
       ...timeout,
     }
-    return { config, env: secrets }
   }
   return null
 }
 
-// The CLI's environment name for a value a server's config takes from the
-// adapter's. A name of its own keeps it apart from the CLI's own variables
-// and from the credential names the CLI never fills in toward a server.
-function secretAlias(server: string, kind: string, key: string): string {
-  const digest = createHash('sha256').update(`${server}\0${kind}\0${key}`).digest('hex')
-  return `CLAUDE_CODEX_MCP_${digest.slice(0, 16).toUpperCase()}`
+// A variable name the CLI fills in as ${NAME}.
+const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
+
+// A variable nothing sets.
+const UNSET = '__CLAUDE_CODEX_UNSET'
+
+// `text` as the CLI passes it on unchanged. The CLI fills in ${NAME} and
+// ${NAME:-default} in a server's command, arguments, env, url and headers,
+// and has no escape for them, while Codex passes the values in its config on
+// as written. So each `${` becomes `${UNSET:-$}{`, which the CLI fills in
+// with the `$` it stands for. It fills in headers twice, when it reads the
+// config and again when it connects, so they take `passes` 2.
+export function verbatim(text: string, passes = 1): string {
+  let out = text
+  for (let pass = 0; pass < passes; pass++) out = out.replaceAll('${', `\${${UNSET}:-$}{`)
+  return out
 }
 
 // The program `notify` names, with its arguments, or null.

@@ -1,19 +1,25 @@
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
+import { existsSync } from 'node:fs'
 import {
   copyFile,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   realpath,
   rename,
   rm,
+  stat,
   symlink,
   writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import test from 'node:test'
+import { setTimeout as delay } from 'node:timers/promises'
+import { query, type SpawnOptions } from '@anthropic-ai/claude-agent-sdk'
 import { claudeAgents, frontmatterData } from '../src/claude-agents.mjs'
 import {
   claudeGlobalConfigPath,
@@ -24,15 +30,21 @@ import {
 } from '../src/claude-config.mjs'
 import { claudeHookSpecs } from '../src/claude-hooks.mjs'
 import {
+  removeCliMcpConfig,
+  sweepCliMcpConfigs,
+  writeCliMcpConfig,
+} from '../src/cli-mcp-config.mjs'
+import {
   codexMcpServers,
   codexTrustsProject,
   gitVouchesForCheckout,
   type InheritedMcpServer,
   mainRepositoryRoot,
+  verbatim,
 } from '../src/codex-config.mjs'
 import { notifyPayload } from '../src/codex-notify.mjs'
 import { mcpToolName, mcpToolRules } from '../src/inherited-config.mjs'
-import { readMcpConfig } from '../src/mcp.mjs'
+import { expandServerConfig, readMcpConfig } from '../src/mcp.mjs'
 import { NativeClaudeRuntime } from '../src/native-runtime.mjs'
 import { sdkHooks } from '../src/sdk-hooks.mjs'
 import { CodexClaudeAppServer } from '../src/server.mjs'
@@ -288,18 +300,13 @@ command = "app-tools"
       servers.map((server) => server.name),
       ['docs', 'local', 'remote'],
     )
-    // Values from the environment never land in the configs, which the SDK
-    // passes on the CLI's command line: the configs refer to them by a name
-    // of their own, and the CLI gets them in its environment.
+    // Values from the environment never land in the configs, which go to
+    // the CLI in a file: the configs refer to them as ${NAME}, for the CLI to
+    // fill in from its environment.
     const configs = JSON.stringify(servers.map((server) => server.config))
     for (const secret of ['docs-token-value', 'header-value', 'bearer-value'])
       assert.ok(!configs.includes(secret), `${secret} is in the server configs`)
     const found = byName(servers)
-    const alias = (server: InheritedMcpServer | undefined, value: string): string => {
-      const name = Object.entries(server?.env ?? {}).find(([, found]) => found === value)?.[0]
-      assert.match(name ?? '', /^CLAUDE_CODEX_MCP_[0-9A-F]{16}$/)
-      return `\${${name}}`
-    }
     assert.deepEqual(found.docs, {
       name: 'docs',
       source: join(codexHome, 'config.toml'),
@@ -308,16 +315,14 @@ command = "app-tools"
         command: 'docs-mcp',
         args: ['--stdio'],
         env: {
-          PATH: process.env.PATH,
-          DOCS_TOKEN: alias(found.docs, 'docs-token-value'),
+          PATH: verbatim(process.env.PATH ?? ''),
+          DOCS_TOKEN: '${DOCS_TOKEN}',
           DOCS_MODE: 'fast',
         },
         timeout: 12500,
       },
       disabledTools: ['delete'],
-      env: found.docs?.env,
     })
-    assert.equal(Object.keys(found.docs?.env ?? {}).length, 1)
     assert.deepEqual(found.local?.enabledTools, ['read', 'list'])
     const local = configOf<{ command: string; args: string[] }>(found.local)
     assert.equal(local.command, '/bin/sh')
@@ -330,11 +335,10 @@ command = "app-tools"
       url: 'https://mcp.example.com/mcp',
       headers: {
         'X-Team': 'core',
-        'X-Key': alias(found.remote, 'header-value'),
-        Authorization: `Bearer ${alias(found.remote, 'bearer-value')}`,
+        'X-Key': '${DOCS_HEADER}',
+        Authorization: 'Bearer ${GITHUB_TOKEN}',
       },
     })
-    assert.equal(found.local?.env, undefined)
 
     // Off unless asked for with exactly 1.
     for (const value of [undefined, '0', 'true', 'yes'])
@@ -856,17 +860,13 @@ env_vars = ["NARROW_TOKEN"]
       OVERRIDDEN_TOKEN: 'overridden-secret',
     }
     const snapshot = await withEnv(env, async () => readMcpConfig({ cwd: root }))
-    // The CLI's environment gets the values of the servers still in use.
-    const [alias, ...others] = Object.keys(snapshot.env)
-    assert.deepEqual(others, [])
-    assert.deepEqual(snapshot.env, { [alias as string]: 'narrow-secret' })
     assert.deepEqual(snapshot.sdkValue, {
       shared: { type: 'stdio', command: 'claude-shared', args: [] },
       narrow: {
         type: 'stdio',
         command: 'codex-narrow',
         args: [],
-        env: { PATH: process.env.PATH, NARROW_TOKEN: `\${${alias}}` },
+        env: { PATH: verbatim(process.env.PATH ?? ''), NARROW_TOKEN: '${NARROW_TOKEN}' },
       },
       overridden: { type: 'stdio', command: 'explicit' },
     })
@@ -883,7 +883,6 @@ env_vars = ["NARROW_TOKEN"]
     const own = await withEnv(env, async () => readMcpConfig({ inherit: false }))
     assert.deepEqual(own.sdkValue, { overridden: { type: 'stdio', command: 'explicit' } })
     assert.deepEqual(own.toolRules, { disallowedTools: [], enabledTools: {} })
-    assert.deepEqual(own.env, {})
 
     const missing = await withEnv(
       { ...env, CLAUDE_CODEX_MCP_SERVERS: join(root, 'missing.json') },
@@ -1001,9 +1000,14 @@ env_vars = ["FIXTURE_TOKEN"]
     const started = await request('thread/start', { cwd: repo, model: 'sonnet' })
     const normal = await turn(started.thread.id)
     assert.deepEqual(Object.keys(normal.mcpServers as object), ['everywhere', 'fixture'])
-    // The secret reaches the CLI's environment, not its command line.
+    // The config names the secret for the CLI to fill in from its
+    // environment; the value is not in it.
     assert.ok(!JSON.stringify(normal.mcpServers).includes('fixture-secret'))
-    assert.deepEqual(Object.values(normal.mcpEnv ?? {}), ['fixture-secret'])
+    const fixture = (normal.mcpServers as Record<string, { env?: object }>).fixture
+    assert.deepEqual(fixture?.env, {
+      PATH: verbatim(process.env.PATH ?? ''),
+      FIXTURE_TOKEN: '${FIXTURE_TOKEN}',
+    })
     assert.deepEqual(normal.disallowedTools, ['mcp__everywhere__drop'])
     assert.deepEqual(normal.mcpEnabledTools, { mcp__fixture__: ['mcp__fixture__echo'] })
     // Summaries and other internal turns get none of them.
@@ -1041,8 +1045,6 @@ env_vars = ["FIXTURE_TOKEN"]
       arguments: { value: 'FIXTURE_TOKEN' },
     })
     assert.deepEqual(env.content, [{ type: 'text', text: 'env:fixture-secret' }])
-    // A turn without the inherited servers gets none of their values.
-    assert.deepEqual(summary.mcpEnv, {})
   })
   await rm(root, { recursive: true, force: true })
 })
@@ -1223,14 +1225,17 @@ test('Claude threads get the Claude Code agents only with the config folder brid
 })
 
 // The options a native Claude session starts with for a turn context.
+// `during` sees them while the session is open.
 async function sessionOptions(
   overrides: Partial<RuntimeTurnContext>,
+  during?: (options: Record<string, any>) => Promise<void>,
 ): Promise<Record<string, any>> {
   const runtime = new NativeClaudeRuntime()
   let captured: Record<string, any> | undefined
   Reflect.set(runtime, 'sdk', {
     query: async function* ({ options }: { options: Record<string, any> }) {
       captured = options
+      await during?.(options)
       yield { type: 'result', subtype: 'success', result: 'done' }
     },
   })
@@ -1268,29 +1273,204 @@ async function sessionOptions(
   return captured
 }
 
-test('the native runtime passes inherited servers, tool rules and agents to the SDK', async () => {
-  const plain = await sessionOptions({})
-  assert.equal(plain.disallowedTools, undefined)
-  assert.equal(plain.agents, undefined)
-  assert.equal(plain.hooks, undefined)
-
-  const agents = { helper: { description: 'Helps', prompt: 'Help.' } }
-  const docs = { type: 'stdio', command: 'docs-mcp', env: { TOKEN: '${DOCS_ALIAS}' } }
-  const options = await sessionOptions({
-    mcpServers: { docs },
-    mcpEnv: { DOCS_ALIAS: 'docs-secret' },
-    disallowedTools: ['mcp__docs__drop'],
-    mcpEnabledTools: { mcp__docs__: ['mcp__docs__read'] },
-    agents,
+// What the SDK runs the CLI with for these options. The SDK's own spawn
+// hook catches the command line; the CLI never runs.
+async function cliCommandLine(options: Record<string, any>): Promise<SpawnOptions> {
+  let spawned: (spec: SpawnOptions) => void = () => {}
+  const seen = new Promise<SpawnOptions>((resolve) => {
+    spawned = resolve
   })
-  // The value reaches the CLI in its environment; the configs the SDK puts
-  // on its command line only name it.
-  assert.deepEqual(options.mcpServers, { docs })
-  assert.equal(options.env.DOCS_ALIAS, 'docs-secret')
-  assert.ok(!JSON.stringify(options.mcpServers).includes('docs-secret'))
-  assert.deepEqual(options.disallowedTools, ['mcp__docs__drop'])
-  assert.deepEqual(options.agents, agents)
-  assert.equal(options.hooks.PreToolUse.length, 1)
+  const run = query({
+    prompt: 'Hi.',
+    options: {
+      ...options,
+      abortController: new AbortController(),
+      pathToClaudeCodeExecutable: process.execPath,
+      spawnClaudeCodeProcess: (spec) => {
+        spawned(spec)
+        // Stands in for the CLI: reads its input until the SDK closes it.
+        return spawn(process.execPath, ['-e', 'process.stdin.resume()'], {
+          stdio: ['pipe', 'pipe', 'ignore'],
+        })
+      },
+    },
+  })
+  run.next().catch(() => {})
+  const spec = await seen
+  run.close()
+  return spec
+}
+
+test('the native runtime passes inherited servers, tool rules and agents to the SDK', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'inherited-runtime-'))
+  const home = join(root, 'adapter')
+  try {
+    await withEnv({ CLAUDE_CODEX_HOME: home }, async () => {
+      const plain = await sessionOptions({})
+      assert.equal(plain.disallowedTools, undefined)
+      assert.equal(plain.agents, undefined)
+      assert.equal(plain.hooks, undefined)
+      assert.equal(plain.extraArgs, undefined)
+
+      const agents = { helper: { description: 'Helps', prompt: 'Help.' } }
+      const docs = { type: 'stdio', command: 'docs-mcp', env: { TOKEN: '${DOCS_TOKEN}' } }
+      let file = ''
+      const options = await sessionOptions(
+        {
+          mcpServers: { docs },
+          disallowedTools: ['mcp__docs__drop'],
+          mcpEnabledTools: { mcp__docs__: ['mcp__docs__read'] },
+          agents,
+        },
+        async (options) => {
+          // The servers reach the CLI in a file only the user can read.
+          file = options.extraArgs['mcp-config']
+          assert.equal(dirname(file), join(home, 'mcp-config'))
+          assert.equal((await stat(file)).mode & 0o777, 0o600)
+          assert.equal((await stat(dirname(file))).mode & 0o777, 0o700)
+          assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), { mcpServers: { docs } })
+        },
+      )
+      assert.equal(options.mcpServers, undefined)
+      // It is gone with the session.
+      const deadline = Date.now() + 5000
+      while (existsSync(file) && Date.now() < deadline) await delay(10)
+      assert.equal(existsSync(file), false)
+      assert.deepEqual(options.disallowedTools, ['mcp__docs__drop'])
+      assert.deepEqual(options.agents, agents)
+      assert.equal(options.hooks.PreToolUse.length, 1)
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('no inherited MCP server value reaches the SDK options or the CLI command line', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'inherited-mcp-argv-'))
+  const codexHome = join(root, 'codex-home')
+  try {
+    await write(
+      join(codexHome, 'config.toml'),
+      `[mcp_servers.docs]
+command = "docs-mcp"
+env = { DOCS_MODE = "literal-env-value" }
+env_vars = ["DOCS_TOKEN"]
+
+[mcp_servers.remote]
+url = "https://mcp.example.com/mcp"
+http_headers = { "X-Team" = "literal-header-value" }
+env_http_headers = { "X-Key" = "DOCS_HEADER" }
+bearer_token_env_var = "REMOTE_BEARER"
+`,
+    )
+    const fromEnv = ['docs-token-secret', 'docs-header-secret', 'bearer-secret']
+    const literal = ['literal-env-value', 'literal-header-value']
+    const env = {
+      ...clean,
+      CODEX_HOME: codexHome,
+      CLAUDE_CODEX_HOME: join(root, 'adapter'),
+      CLAUDE_CODEX_CODEX_MCP_SERVERS: '1',
+      DOCS_TOKEN: 'docs-token-secret',
+      DOCS_HEADER: 'docs-header-secret',
+      REMOTE_BEARER: 'bearer-secret',
+    }
+    await withEnv(env, async () => {
+      const mcpServers = readMcpConfig({}).sdkValue
+      let spec: SpawnOptions | undefined
+      let written = ''
+      const options = await sessionOptions({ mcpServers }, async (options) => {
+        written = await readFile(options.extraArgs['mcp-config'], 'utf8')
+        spec = await cliCommandLine(options)
+      })
+      // The file holds the settings, with references for the values from
+      // the environment.
+      for (const value of literal) assert.ok(written.includes(value), `${value} is not in the file`)
+      for (const value of fromEnv) assert.ok(!written.includes(value), `${value} is in the file`)
+      assert.ok(written.includes('Bearer ${REMOTE_BEARER}'))
+      // The options and the command line hold none of them, past the
+      // adapter's environment the CLI runs with, where the values from the
+      // environment are under their own names.
+      const { env: cliEnv, ...rest } = options
+      const added = Object.entries(cliEnv).filter(([name, value]) => process.env[name] !== value)
+      const serialized = JSON.stringify([rest, added])
+      const args = spec?.args ?? []
+      for (const value of [...fromEnv, ...literal]) {
+        assert.ok(!serialized.includes(value), `${value} is in the SDK options`)
+        assert.ok(!args.some((arg) => arg.includes(value)), `${value} is on the command line`)
+      }
+      const at = args.indexOf('--mcp-config')
+      assert.ok(at > 0)
+      assert.equal(args[at + 1], options.extraArgs['mcp-config'])
+      assert.ok(!args.some((arg) => arg.includes('mcpServers')))
+      // The CLI gets the values under their own names, to fill them in.
+      assert.equal(spec?.env.DOCS_TOKEN, 'docs-token-secret')
+      assert.deepEqual(
+        Object.keys(spec?.env ?? {}).filter((name) => name.startsWith('CLAUDE_CODEX_MCP_')),
+        [],
+      )
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a Codex server setting with ${...} in it reaches the server as written', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'inherited-mcp-verbatim-'))
+  const codexHome = join(root, 'codex-home')
+  try {
+    await write(
+      join(codexHome, 'config.toml'),
+      `[mcp_servers.raw]
+command = "raw-\${HOME}"
+args = ["\${HOME}", "$\${HOME}", "\${UNSET_NAME:-fallback}"]
+env = { RAW = "\${RAW_SECRET}" }
+
+[mcp_servers.remote]
+url = "https://mcp.example.com/\${HOME}"
+http_headers = { "X-Raw" = "\${RAW_SECRET}", "X-Two" = "\${\${RAW_SECRET}}" }
+`,
+    )
+    const env = { ...clean, CODEX_HOME: codexHome, CLAUDE_CODEX_CODEX_MCP_SERVERS: '1' }
+    const servers = byName(await withEnv(env, async () => codexMcpServers(null)))
+    // What the server ends up with once the CLI has filled in what it fills in.
+    const filled = (server: InheritedMcpServer | undefined) =>
+      expandServerConfig(configOf(server), { HOME: '/home/user', RAW_SECRET: 'secret' })
+    const raw = filled(servers.raw)
+    assert.equal(raw.command, 'raw-${HOME}')
+    assert.deepEqual(raw.args, ['${HOME}', '$${HOME}', '${UNSET_NAME:-fallback}'])
+    assert.equal((raw.env as Record<string, string>).RAW, '${RAW_SECRET}')
+    const remote = filled(servers.remote)
+    assert.equal(remote.url, 'https://mcp.example.com/${HOME}')
+    assert.deepEqual(remote.headers, { 'X-Raw': '${RAW_SECRET}', 'X-Two': '${${RAW_SECRET}}' })
+    assert.equal(verbatim('no references'), 'no references')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('the MCP config files of adapters that are gone are swept', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'inherited-mcp-sweep-'))
+  try {
+    assert.equal(writeCliMcpConfig({}, dir), null)
+    assert.equal(writeCliMcpConfig(null, dir), null)
+    const mine = writeCliMcpConfig({ docs: { type: 'stdio', command: 'docs-mcp' } }, dir)
+    assert.ok(mine)
+    // A process that has exited.
+    const gone = spawnSync(process.execPath, ['-e', '']).pid
+    const stale = join(dir, `${gone}-${randomUUID()}.json`)
+    const alive = join(dir, `${process.ppid}-${randomUUID()}.json`)
+    for (const file of [stale, alive, join(dir, 'notes.json')]) await write(file, '{}')
+    assert.equal(sweepCliMcpConfigs(dir), 1)
+    assert.deepEqual(
+      (await readdir(dir)).sort(),
+      [basename(mine), basename(alive), 'notes.json'].sort(),
+    )
+    removeCliMcpConfig(mine)
+    removeCliMcpConfig(mine)
+    assert.equal(sweepCliMcpConfigs(join(dir, 'missing')), 0)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
 })
 
 test('Claude Code permission rules: the user rules apply, project deny rules always, project allow rules when trusted', async () => {

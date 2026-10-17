@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { chmodSync, existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
+import { sweepCliMcpConfigs } from './cli-mcp-config.mjs'
 import { reapOrphanedCliChildren } from './cli-orphans.mjs'
 import { createRuntime } from './runtime-factory.mjs'
 import { CodexClaudeAppServer } from './server.mjs'
@@ -97,6 +98,8 @@ async function main(): Promise<void> {
       `[claude-codex-adapter] stopped ${reaped.length} orphaned Claude CLI process(es)\n`,
     )
   }
+  // And the MCP config files a killed adapter left for its CLI sessions.
+  sweepCliMcpConfigs()
   const runtime = createRuntime()
   const server = new CodexClaudeAppServer(store, runtime)
   let shuttingDown = false

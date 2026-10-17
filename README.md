@@ -102,15 +102,22 @@ because the Codex App writes its own desktop servers (such as a computer-use
 client and a Node REPL) into `config.toml` for Codex threads, and those would
 otherwise land in every Claude thread. Stdio servers keep their `args`, `env`,
 `env_vars` and `cwd`; streamable HTTP servers keep their headers and bearer
-token. The values `env_vars`, `env_http_headers` and `bearer_token_env_var` name
-reach the CLI in its environment, never on its command line, where the server
-configs go and any local process can read them (values written into the file
-itself are passed on as written); a launcher that rebuilds the CLI's environment
-from an allowlist drops them. A server with `enabled = false` stays off,
-`disabled_tools` are withheld from Claude, a call to a tool outside
-`enabled_tools` is refused, and `tool_timeout_sec` becomes the server's
-tool-call timeout. Codex OAuth logins, `startup_timeout_sec`, `required`,
-per-tool approval settings and the servers plugins bring are not carried over.
+token. The server configs reach the CLI in a file only the user can read, in the
+adapter's home, removed when the CLI session ends, rather than on the CLI's
+command line, where any local process can read them. The values `env_vars`,
+`env_http_headers` and `bearer_token_env_var` name stay out of that file too: it
+refers to them as `${NAME}`, and the CLI fills them in from the environment it
+gets from the adapter. So a launcher that rebuilds the CLI's environment from an
+allowlist drops them, and like any server config's references they never take
+the CLI's own credentials nor, toward a remote server, a credential name on the
+CLI's list (such as `VAULT_TOKEN` or `NPM_TOKEN`), which arrives empty: give
+such a value another name. Values written into the Codex config are passed on as
+written, `${...}` included, as Codex passes them. A server with
+`enabled = false` stays off, `disabled_tools` are withheld from Claude, a call
+to a tool outside `enabled_tools` is refused, and `tool_timeout_sec` becomes the
+server's tool-call timeout. Codex OAuth logins, `startup_timeout_sec`,
+`required`, per-tool approval settings and the servers plugins bring are not
+carried over.
 
 With `CLAUDE_CODEX_CLAUDE_CONFIG_DIR` set, Claude threads start the Claude Code
 servers: user-scope servers and the project's local-scope servers from the
