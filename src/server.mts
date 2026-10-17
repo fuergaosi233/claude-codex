@@ -12,6 +12,7 @@ import {
   listClaudeSkills,
 } from './claude-capabilities.mjs'
 import { onClaudeCommandsChanged, skillLinksToCommand } from './claude-commands.mjs'
+import { runCodexNotify } from './codex-notify.mjs'
 import {
   goalBudgetExhausted,
   goalBudgetLimitPrompt,
@@ -338,6 +339,8 @@ interface PeerFeatures {
   // explicitly during initialize; keep the legacy wire shape otherwise.
   // App rule: subagent-completed-kind
   supportsCompletedSubagentActivity: boolean
+  // clientInfo.name from initialize, which Codex's notify event reports.
+  clientName: string | null
 }
 
 function turnItemsView(value: unknown): TurnItemsView {
@@ -555,6 +558,8 @@ export class CodexClaudeAppServer {
             declaredActivityKinds.includes('completed') ||
             rendersCompletedSubagentActivity(stringOr(clientInfo.version, '')) ||
             process.env.CLAUDE_CODEX_SUBAGENT_COMPLETED === '1',
+          clientName:
+            typeof clientInfo.name === 'string' && clientInfo.name ? clientInfo.name : null,
         })
         // The App lists config warnings in its settings, which is where an App
         // build nobody checked the App rules against gets reported.
@@ -4587,6 +4592,9 @@ export class CodexClaudeAppServer {
     }
     this.clearActiveTurn(thread.id)
     this.setThreadStatus(peer, thread.id, { type: 'idle' })
+    // Codex runs the config's notify program for its own threads' turns.
+    if (params.outputSchema == null && thread.runtimeBackend !== 'codex' && !thread.ephemeral)
+      this.notifyTurnComplete(peer, thread, completed, turnCwd)
     // Plan-mode text streams through the `plan` ThreadItem + item/plan/delta
     // events; turn/plan/updated is reserved for the update_plan/TodoWrite
     // checklist tool (see the tool_use handler), matching the real app-server
@@ -4594,6 +4602,27 @@ export class CodexClaudeAppServer {
     this.notify(peer, {
       method: 'turn/completed',
       params: { threadId: thread.id, turn: this.toLifecycleTurn(completed) },
+    })
+  }
+
+  // Runs the Codex config's notify program for a completed turn.
+  private notifyTurnComplete(
+    peer: RpcPeer,
+    thread: ThreadRecord,
+    turn: TurnRecord,
+    cwd: string,
+  ): void {
+    const inputMessages = turn.items
+      .map((item) => (item.type === 'userMessage' ? textFromInput(item.content) : ''))
+      .filter(Boolean)
+    const answer = turn.items.findLast((item) => item.type === 'agentMessage' && item.text !== '')
+    runCodexNotify({
+      threadId: thread.id,
+      turnId: turn.id,
+      cwd,
+      client: this.peerFeatures.get(peer)?.clientName ?? null,
+      inputMessages,
+      lastAssistantMessage: answer?.type === 'agentMessage' ? answer.text : null,
     })
   }
 

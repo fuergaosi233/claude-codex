@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { copyFile, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import test from 'node:test'
@@ -15,6 +15,7 @@ import {
   codexTrustsProject,
   type InheritedMcpServer,
 } from '../src/codex-config.mjs'
+import { notifyPayload } from '../src/codex-notify.mjs'
 import { mcpToolName, mcpToolRules } from '../src/inherited-config.mjs'
 import { readMcpConfig } from '../src/mcp.mjs'
 import { NativeClaudeRuntime } from '../src/native-runtime.mjs'
@@ -62,6 +63,7 @@ function configOf<T>(server: InheritedMcpServer | undefined): T {
 
 // Settings that would leak in from the test runner's own environment.
 const clean = {
+  CLAUDE_CODEX_CODEX_NOTIFY: undefined,
   CLAUDE_CODEX_MCP_SERVERS: undefined,
   CLAUDE_CODEX_CODEX_MCP_SERVERS: undefined,
   CLAUDE_CODEX_CLAUDE_CONFIG_DIR: undefined,
@@ -1129,4 +1131,93 @@ test('the native runtime registers the Claude Code hooks with the SDK', async ()
   }
   assert.equal(await decision({}), 'allow')
   assert.equal(await decision({ approvalPolicy: 'on-request', sandboxMode: 'read-only' }), null)
+})
+
+test('the notify event carries the fields Codex sends, in its order', () => {
+  const event = {
+    threadId: 'thread-1',
+    turnId: 'turn-1',
+    cwd: '/work',
+    client: 'codex-tui',
+    inputMessages: ['Rename foo.'],
+    lastAssistantMessage: 'Renamed.',
+  }
+  assert.equal(
+    notifyPayload(event),
+    '{"type":"agent-turn-complete","thread-id":"thread-1","turn-id":"turn-1","cwd":"/work","client":"codex-tui","input-messages":["Rename foo."],"last-assistant-message":"Renamed."}',
+  )
+  assert.deepEqual(
+    Object.keys(JSON.parse(notifyPayload({ ...event, client: null, lastAssistantMessage: null }))),
+    ['type', 'thread-id', 'turn-id', 'cwd', 'input-messages', 'last-assistant-message'],
+  )
+})
+
+test('a completed Claude turn runs the Codex config notify program when enabled', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'inherited-notify-'))
+  const codexHome = join(root, 'codex-home')
+  const repo = join(root, 'repo')
+  const script = join(root, 'notify.mjs')
+  const calls = join(root, 'calls.jsonl')
+  await mkdir(repo, { recursive: true })
+  await write(
+    script,
+    "import { appendFileSync } from 'node:fs'\nappendFileSync(process.argv[2], `${JSON.stringify(process.argv.slice(3))}\\n`)\n",
+  )
+  await write(
+    join(codexHome, 'config.toml'),
+    `notify = [${q(process.execPath)}, ${q(script)}, ${q(calls)}]\n`,
+  )
+  const readCalls = async (count: number): Promise<string[][]> => {
+    for (let i = 0; i < 100; i++) {
+      const lines = await readFile(calls, 'utf8').then(
+        (text) => text.split('\n').filter(Boolean),
+        () => [],
+      )
+      if (lines.length >= count) return lines.map((line) => JSON.parse(line))
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+    assert.fail(`the notify program ran fewer than ${count} times`)
+  }
+  try {
+    // Off unless asked for with exactly 1: the Codex App sets notify to its
+    // own program.
+    for (const value of [undefined, '0', 'true'])
+      await withServer(
+        root,
+        { CODEX_HOME: codexHome, CLAUDE_CODEX_CODEX_NOTIFY: value },
+        async ({ request, turn }) => {
+          const started = await request('thread/start', { cwd: repo, model: 'sonnet' })
+          await turn(started.thread.id)
+        },
+      )
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    await assert.rejects(readFile(calls, 'utf8'))
+
+    const optIn = { CODEX_HOME: codexHome, CLAUDE_CODEX_CODEX_NOTIFY: '1' }
+    await withServer(root, optIn, async ({ request, turn }) => {
+      await request('initialize', { clientInfo: { name: 'notify-test-client', version: '1' } })
+      const started = await request('thread/start', { cwd: repo, model: 'sonnet' })
+      // Summaries and other internal turns notify nobody.
+      await turn(started.thread.id, {
+        outputSchema: { type: 'object', properties: { summary: { type: 'string' } } },
+      })
+      await turn(started.thread.id)
+      const [call, ...rest] = await readCalls(1)
+      assert.equal(rest.length, 0)
+      assert.equal(call?.length, 1)
+      const event = JSON.parse(call?.[0] ?? '{}')
+      assert.equal(typeof event['turn-id'], 'string')
+      assert.deepEqual(event, {
+        type: 'agent-turn-complete',
+        'thread-id': started.thread.id,
+        'turn-id': event['turn-id'],
+        cwd: repo,
+        client: 'notify-test-client',
+        'input-messages': ['Hi.'],
+        'last-assistant-message': 'All done.',
+      })
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
 })

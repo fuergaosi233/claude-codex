@@ -164,6 +164,18 @@ callback cannot pass back, or `PermissionRequest`, which the Codex approval flow
 owns) are not carried over. Point `CLAUDE_CODEX_CLAUDE_CONFIG_DIR` only at a
 folder the CLI does not read itself, or its hooks run twice.
 
+With `CLAUDE_CODEX_CODEX_NOTIFY=1`, the `notify` program of
+`CODEX_HOME/config.toml` runs when a Claude thread's turn completes, as Codex
+runs it for its own turns: the configured argv plus one JSON argument,
+`{"type":"agent-turn-complete", "thread-id", "turn-id", "cwd", "client",
+"input-messages", "last-assistant-message"}`. This is off by default because
+the Codex App sets `notify` to its own turn-ended program for Codex threads,
+which would otherwise be called after every Claude turn. The adapter does not
+wait for the program, ends it after 30 seconds and writes its stderr to the
+debug log. Summaries and other internal turns, and Codex model threads (whose
+own Codex runs it), do not notify; a project's `.codex/config.toml` cannot set
+it.
+
 ### `/workflows` compatibility
 
 With the native Claude Agent SDK backend, `/workflows <task>` is translated to Claude's
