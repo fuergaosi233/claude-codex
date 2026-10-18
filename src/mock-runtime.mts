@@ -35,6 +35,8 @@ export class MockRuntime implements ClaudeRuntime {
   private resets = new Map<string, number>()
   // Background Bash shells by task id.
   private shells = new Map<string, { threadId: string; toolUseId: string }>()
+  // Background workflows: task id to thread id.
+  private workflows = new Map<string, string>()
 
   async runTurn(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void> {
     // A session slow to come up (the CLI's, while an interrupted turn is
@@ -82,10 +84,31 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    if (/fork check/i.test(context.prompt)) {
+      const text =
+        context.forkedAt != null
+          ? `forked at ${new Date(context.forkedAt).toISOString()}`
+          : 'not a fork'
+      await handlers.onEvent({ type: 'text_delta', delta: text })
+      await handlers.onEvent({ type: 'completed', success: true, result: text })
+      return
+    }
+
     if (context.continuation) {
       const text = this.continuations.get(context.threadId) ?? null
       this.continuations.delete(context.threadId)
       if (text) await handlers.onEvent({ type: 'text_delta', delta: text })
+      await handlers.onEvent({ type: 'completed', success: true, result: text })
+      return
+    }
+
+    // Codex App's Continue button: say what Claude was asked to pick up.
+    if (context.prompt.includes('pressed Continue')) {
+      const message = /<interrupted_user_message>\n([\s\S]*?)\n<\/interrupted_user_message>/.exec(
+        context.prompt,
+      )?.[1]
+      const text = message ? `answering: ${message}` : 'picking up where I left off'
+      await handlers.onEvent({ type: 'text_delta', delta: text })
       await handlers.onEvent({ type: 'completed', success: true, result: text })
       return
     }
@@ -672,6 +695,45 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    if (/background workflow check/i.test(context.prompt)) {
+      // A Workflow Claude runs in the background: the call returns at once
+      // and the run stays a live task of the thread until "workflow stop
+      // check". Only the live task is played, not the workflow's agents. With
+      // "text first" Claude's only text comes before the call; "silent"
+      // sends none.
+      const textFirst = /text first/i.test(context.prompt)
+      const silent = /silent/i.test(context.prompt)
+      const toolUseId = `workflow-${Date.now()}`
+      const taskId = `workflow-${this.workflows.size + 1}`
+      if (textFirst)
+        await handlers.onEvent({ type: 'text_delta', delta: 'starting the review workflow' })
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId,
+        toolName: 'Workflow',
+        input: { workflow: 'review', run_in_background: true },
+      })
+      this.workflows.set(taskId, context.threadId)
+      await handlers.onEvent({
+        type: 'tool_result',
+        toolUseId,
+        content: `Workflow running in background with ID: ${taskId}`,
+      })
+      if (!textFirst && !silent)
+        await handlers.onEvent({ type: 'text_delta', delta: 'review workflow started' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'started' })
+      return
+    }
+
+    if (/workflow stop check/i.test(context.prompt)) {
+      // Claude stops the thread's background workflows.
+      for (const [taskId, threadId] of this.workflows)
+        if (threadId === context.threadId) this.workflows.delete(taskId)
+      await handlers.onEvent({ type: 'text_delta', delta: 'workflows stopped' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'stopped' })
+      return
+    }
+
     if (/background close check/i.test(context.prompt)) {
       // Claude stops its own background agent; no notification follows.
       const toolUseId = `stop-${Date.now()}`
@@ -954,6 +1016,7 @@ export class MockRuntime implements ClaudeRuntime {
     for (const { timer } of this.backgroundTasks.values()) clearTimeout(timer)
     this.backgroundTasks.clear()
     this.shells.clear()
+    this.workflows.clear()
   }
 
   setBackgroundListener(listener: RuntimeBackgroundListener): void {
@@ -998,7 +1061,10 @@ export class MockRuntime implements ClaudeRuntime {
     const shells = [...this.shells]
       .filter(([, shell]) => shell.threadId === threadId)
       .map(([taskId, shell]) => ({ taskId, taskType: 'local_bash', toolUseId: shell.toolUseId }))
-    return [...agents, ...shells]
+    const workflows = [...this.workflows]
+      .filter(([, owner]) => owner === threadId)
+      .map(([taskId]) => ({ taskId, taskType: 'local_workflow', toolUseId: null }))
+    return [...agents, ...shells, ...workflows]
   }
 
   hasBackgroundWork(): boolean {

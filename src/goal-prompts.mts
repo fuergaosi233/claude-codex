@@ -46,6 +46,24 @@ export function wrapInternalContext(text: string): string {
   return `<codex_internal_context>\n${text}\n</codex_internal_context>`
 }
 
+// Codex App's Continue button starts a turn with no input. Claude needs a
+// prompt all the same; when the previous turn was cut short (the adapter
+// restarted, say) the message the user sent in it may never have reached
+// Claude, so it comes along.
+export function continuePrompt(interruptedMessage: string | null): string {
+  if (!interruptedMessage)
+    return wrapInternalContext(
+      'The user pressed Continue without a new message. Pick up where you left off.',
+    )
+  return wrapInternalContext(`The previous turn was interrupted before it finished, and the user pressed Continue without a new message. The message they sent in that turn is below; it may never have reached you.
+
+<interrupted_user_message>
+${escapeObjective(interruptedMessage)}
+</interrupted_user_message>
+
+If you have not answered it yet, answer it now. Otherwise, pick up where you left off.`)
+}
+
 export function goalContinuationPrompt(goal: ThreadGoal): string {
   return wrapInternalContext(`Continue working toward the active thread goal.
 

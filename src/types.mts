@@ -339,6 +339,10 @@ export type ThreadItem =
           message: string | null
         }
       >
+      // Stored only: marks a closeAgent kept for Apps without the completed
+      // subagent activity kind. historyForPeer hides it from every other
+      // client and strips the mark.
+      legacyOnly?: true
     }
   // Canonical MultiAgent V2 display/liveness item. Codex App discovers the
   // child from `started` and clears its working state from `completed` or
@@ -390,6 +394,10 @@ export interface RuntimeTurnContext {
   // Resume claudeSessionId only up to this transcript entry, in a forked
   // session (thread rewind or fork). Backends that cannot truncate ignore it.
   resumeSessionAt?: string | null
+  // Set on a thread forked from another (ms since the epoch, after the fork).
+  // Its Claude session opens with the parent's history, all older than this,
+  // and what Claude left scheduled or running there stays the parent's.
+  forkedAt?: number | null
   mcpServers: unknown | null
   allowedTools: string[] | null
   addDirs: string[]

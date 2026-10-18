@@ -8,12 +8,13 @@ import { SessionStore } from './store.mjs'
 import {
   normalizeListenUrl,
   parseProxySockArg,
+  type RunningTransport,
   runProxy,
   startStdioTransport,
   startWebSocketTransport,
 } from './transports.mjs'
 import type { RpcPeer } from './types.mjs'
-import { debugLog, defaultSocketPath, ensureParent } from './util.mjs'
+import { debugLog, defaultSocketPath, ensureParent, sleep } from './util.mjs'
 
 // Install global crash guards FIRST, before anything else can fail. Without
 // these, a single uncaught rejection or a synchronous EPIPE from a write to a
@@ -99,6 +100,7 @@ async function main(): Promise<void> {
   }
   const runtime = createRuntime()
   const server = new CodexClaudeAppServer(store, runtime)
+  let transport: RunningTransport | null = null
   let shuttingDown = false
   const shutdown = async (reason: string) => {
     if (shuttingDown) return
@@ -117,9 +119,16 @@ async function main(): Promise<void> {
       debugLog('adapter.shutdown.failed', { reason, pid: process.pid, message })
       process.stderr.write(`[claude-codex-adapter] shutdown failed: ${message}\n`)
     }
+    try {
+      // Closing the listener removes its unix socket if no other process has
+      // bound the path since. Bounded, so a close that hangs cannot keep the
+      // process from exiting.
+      await Promise.race([transport?.close(), sleep(2000)])
+    } catch {}
     if (pidFile) {
       try {
-        unlinkSync(pidFile)
+        // Ours only, like the socket.
+        if (Number(readFileSync(pidFile, 'utf8')) === process.pid) unlinkSync(pidFile)
       } catch {}
     }
     process.exit(code)
@@ -192,7 +201,7 @@ async function main(): Promise<void> {
     startStdioTransport(onMessage, onClose)
     return
   }
-  await startWebSocketTransport(normalized, onMessage, onClose, onConnect)
+  transport = await startWebSocketTransport(normalized, onMessage, onClose, onConnect)
 }
 
 function getArg(args: string[], name: string): string | null {

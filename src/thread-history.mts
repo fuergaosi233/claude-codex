@@ -2,6 +2,7 @@
 // thread/items/list, thread/timeline/list and the two searches. A thread's
 // turns come from the store whole, so cursors are positions in them.
 
+import { stripQuietTurnHeartbeat } from './quiet-turns.mjs'
 import type { ThreadItem, TurnRecord } from './types.mjs'
 import { toolOutputInput } from './util.mjs'
 
@@ -166,8 +167,9 @@ export function pageTimeline(
 }
 
 // The text of a message as the App shows it: what the user wrote, or one of
-// Claude's answers. Commentary between tool calls, tool output and reasoning
-// are not searched.
+// Claude's answers, without the heartbeat a quiet turn's answer carries.
+// Commentary between tool calls, tool output and reasoning are not searched.
+// App rule: quiet-turn-heartbeat
 export function visibleMessageText(item: ThreadItem): string | null {
   const input =
     item.type === 'userMessage'
@@ -177,7 +179,8 @@ export function visibleMessageText(item: ThreadItem): string | null {
         : null
   if (input)
     return input.flatMap((part) => (part.type === 'text' ? [part.text] : [])).join('\n') || null
-  if (item.type === 'agentMessage' && item.phase !== 'commentary') return item.text || null
+  if (item.type === 'agentMessage' && item.phase !== 'commentary')
+    return stripQuietTurnHeartbeat(item.text) || null
   return null
 }
 

@@ -559,9 +559,22 @@ export function claudeOutputFormat(outputSchema: unknown): unknown | null {
   if (outputSchema == null) return null
   if (outputSchema && typeof outputSchema === 'object' && !Array.isArray(outputSchema)) {
     const record = outputSchema as Record<string, unknown>
-    if (record.type === 'json_schema' && record.schema != null) return outputSchema
+    if (record.type === 'json_schema' && record.schema != null)
+      return { ...record, schema: withoutSchemaDialect(record.schema) }
   }
-  return { type: 'json_schema', schema: outputSchema }
+  return { type: 'json_schema', schema: withoutSchemaDialect(outputSchema) }
+}
+
+// The Claude CLI checks a structured output schema against the JSON Schema
+// draft it ships and refuses one that declares another, such as the draft
+// 2020-12 the Codex App's zod schemas declare. Those use nothing
+// draft-specific, so the declaration is dropped.
+// App rule: helper-thread-model
+function withoutSchemaDialect(schema: unknown): unknown {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema) || !('$schema' in schema))
+    return schema
+  const { $schema: _dialect, ...rest } = schema as Record<string, unknown>
+  return rest
 }
 
 export function normalizeCodexReasoningEffort(

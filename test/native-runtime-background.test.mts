@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -955,4 +955,241 @@ test('the result reports the context window of the model behind the main loop', 
   await turn
   const usage = events.find((event) => event.type === 'usage')
   assert.equal(usage?.type === 'usage' ? usage.contextWindow : undefined, 1_000_000)
+})
+
+function createCron(toolUseId: string, jobId: string): Record<string, unknown>[] {
+  return [
+    assistant(`create-${toolUseId}`, [
+      {
+        type: 'tool_use',
+        id: toolUseId,
+        name: 'CronCreate',
+        input: { cron: '23 */2 * * *', prompt: 'run the check', recurring: true },
+      },
+    ]),
+    {
+      type: 'user',
+      message: {
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: toolUseId,
+            content: `Scheduled recurring job ${jobId} (Every 2 hours at :23).`,
+          },
+        ],
+      },
+      tool_use_result: {
+        id: jobId,
+        humanSchedule: 'Every 2 hours at :23',
+        recurring: true,
+        durable: false,
+      },
+    },
+    assistant(`ack-${toolUseId}`, [text('Scheduled.')]),
+    { type: 'result', subtype: 'success', result: 'Scheduled.' },
+  ]
+}
+
+test('native session stays open for a session cron job and hands each fire to a turn of its own', async () => {
+  await withSettleMs(40, async () => {
+    const { runtime, queries } = fakeRuntime()
+    const listener = recordingListener()
+    runtime.setBackgroundListener(listener)
+
+    const first = runtime.runTurn(context, handlers([]))
+    const query = await waitFor(() => queries[0], 'session')
+    query.push(init, ...createCron('cron-use', 'job-1'))
+    await first
+    await sleep(80)
+    assert.equal(query.closed, false, 'the job lives in this process')
+    // A schedule alone does not keep the adapter up once the App is gone.
+    assert.equal(runtime.hasBackgroundWork(), false)
+
+    // The job fires: Claude starts a turn on its own.
+    query.push(init, assistant('fire', [text('Checked.')]), {
+      type: 'result',
+      subtype: 'success',
+      result: 'Checked.',
+    })
+    await waitFor(() => listener.autonomous.length === 1, 'autonomous turn request')
+    const wakeEvents: RuntimeEvent[] = []
+    await runtime.runTurn(
+      { ...context, turnId: 'turn-2', prompt: '', continuation: true },
+      handlers(wakeEvents),
+    )
+    assert.deepEqual(textDeltas(wakeEvents), ['Checked.'])
+
+    // Deleting the job lets the session go.
+    const third = runtime.runTurn(
+      { ...context, turnId: 'turn-3', prompt: 'stop the check' },
+      handlers([]),
+    )
+    await waitFor(() => query.prompts.length === 2, 'third prompt')
+    assert.equal(queries.length, 1, 'the next turn reuses the session')
+    query.push(
+      init,
+      assistant('delete', [
+        { type: 'tool_use', id: 'delete-use', name: 'CronDelete', input: { id: 'job-1' } },
+      ]),
+      {
+        type: 'user',
+        message: {
+          content: [{ type: 'tool_result', tool_use_id: 'delete-use', content: 'Cancelled.' }],
+        },
+      },
+      assistant('done', [text('Stopped.')]),
+      { type: 'result', subtype: 'success', result: 'Stopped.' },
+    )
+    await third
+    await waitFor(() => query.closed, 'session close')
+    await runtime.stop()
+  })
+})
+
+test('native interrupt keeps a session that has a cron job scheduled', async () => {
+  const { runtime, queries } = fakeRuntime()
+  runtime.setBackgroundListener(recordingListener())
+
+  const first = runtime.runTurn(context, handlers([]))
+  const query = await waitFor(() => queries[0], 'session')
+  query.push(init, ...createCron('cron-use', 'job-1'))
+  await first
+
+  const secondEvents: RuntimeEvent[] = []
+  const second = runtime.runTurn(
+    { ...context, turnId: 'turn-2', prompt: 'long task' },
+    handlers(secondEvents),
+  )
+  await waitFor(() => query.prompts.length === 2, 'second prompt')
+  query.push(init, assistant('partial', [text('Working on it')]))
+  await waitFor(() => textDeltas(secondEvents).length === 1, 'partial output')
+  await runtime.interrupt('thread')
+  await second
+  assert.equal(query.interrupts, 1)
+  assert.equal(query.closed, false, 'interrupting must not drop the scheduled job')
+  await runtime.stop()
+})
+
+test('native session resumed from a transcript stays open for the cron jobs the CLI schedules again', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'claude-codex-cron-'))
+  const projects = join(home, '.claude', 'projects', process.cwd().replace(/[^a-zA-Z0-9-]/g, '-'))
+  mkdirSync(projects, { recursive: true })
+  const transcript = (createdAt: number) =>
+    createCron('cron-use', 'job-1')
+      .slice(0, 2)
+      .map((message, index) =>
+        JSON.stringify({
+          ...message,
+          uuid: `line-${index}`,
+          timestamp: new Date(createdAt).toISOString(),
+          toolUseResult: message.tool_use_result,
+        }),
+      )
+      .join('\n')
+  writeFileSync(join(projects, 'scheduled.jsonl'), transcript(Date.now() - 60 * 60 * 1000))
+  // The CLI retires a recurring job after seven days.
+  writeFileSync(join(projects, 'expired.jsonl'), transcript(Date.now() - 8 * 24 * 60 * 60 * 1000))
+  const saved = { ...process.env }
+  process.env.HOME = home
+  delete process.env.CLAUDE_CONFIG_DIR
+  delete process.env.CLAUDE_CONFIG_DIRS
+  delete process.env.CLAUDE_ROUTER_DIR
+  try {
+    await withSettleMs(40, async () => {
+      for (const [claudeSessionId, kept] of [
+        ['scheduled', true],
+        ['expired', false],
+      ] as const) {
+        const { runtime, queries } = fakeRuntime()
+        runtime.setBackgroundListener(recordingListener())
+        const turn = runtime.runTurn({ ...context, claudeSessionId }, handlers([]))
+        const query = await waitFor(() => queries[0], 'session')
+        query.push(init, assistant('reply', [text('Hello.')]), {
+          type: 'result',
+          subtype: 'success',
+          result: 'Hello.',
+        })
+        await turn
+        await sleep(80)
+        assert.equal(query.closed, !kept, claudeSessionId)
+        await runtime.stop()
+      }
+    })
+  } finally {
+    for (const name of ['HOME', 'CLAUDE_CONFIG_DIR', 'CLAUDE_CONFIG_DIRS', 'CLAUDE_ROUTER_DIR']) {
+      if (saved[name] === undefined) delete process.env[name]
+      else process.env[name] = saved[name]
+    }
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('native forked session leaves its parent the cron jobs scheduled before the fork', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'claude-codex-cron-'))
+  const projects = join(home, '.claude', 'projects', process.cwd().replace(/[^a-zA-Z0-9-]/g, '-'))
+  mkdirSync(projects, { recursive: true })
+  const scheduledAt = Date.now() - 60 * 60 * 1000
+  writeFileSync(
+    join(projects, 'parent.jsonl'),
+    createCron('cron-use', 'job-1')
+      .slice(0, 2)
+      .map((message, index) =>
+        JSON.stringify({
+          ...message,
+          uuid: `line-${index}`,
+          timestamp: new Date(scheduledAt).toISOString(),
+          toolUseResult: message.tool_use_result,
+        }),
+      )
+      .join('\n'),
+  )
+  const saved = { ...process.env }
+  process.env.HOME = home
+  delete process.env.CLAUDE_CONFIG_DIR
+  delete process.env.CLAUDE_CONFIG_DIRS
+  delete process.env.CLAUDE_ROUTER_DIR
+  try {
+    await withSettleMs(40, async () => {
+      for (const [label, forkedAt, kept] of [
+        ['forked after the job', scheduledAt + 60_000, false],
+        ['forked before the job', scheduledAt - 60_000, true],
+      ] as const) {
+        const { runtime, queries } = fakeRuntime()
+        const sdk = Reflect.get(runtime, 'sdk') as { query: (args: unknown) => FakeQuery }
+        const options: Record<string, unknown>[] = []
+        Reflect.set(runtime, 'sdk', {
+          query: (args: { options: Record<string, unknown> }) => {
+            options.push(args.options)
+            return sdk.query(args)
+          },
+        })
+        runtime.setBackgroundListener(recordingListener())
+        const turn = runtime.runTurn(
+          { ...context, claudeSessionId: 'parent', forkSession: true, forkedAt },
+          handlers([]),
+        )
+        const query = await waitFor(() => queries[0], 'session')
+        assert.equal(
+          (options[0]?.env as NodeJS.ProcessEnv | undefined)?.CLAUDE_CODE_RESUME_SOURCE_ALIVE,
+          new Date(forkedAt).toISOString(),
+          label,
+        )
+        query.push(init, assistant('reply', [text('Hello.')]), {
+          type: 'result',
+          subtype: 'success',
+          result: 'Hello.',
+        })
+        await turn
+        await sleep(80)
+        assert.equal(query.closed, !kept, label)
+        await runtime.stop()
+      }
+    })
+  } finally {
+    for (const name of ['HOME', 'CLAUDE_CONFIG_DIR', 'CLAUDE_CONFIG_DIRS', 'CLAUDE_ROUTER_DIR']) {
+      if (saved[name] === undefined) delete process.env[name]
+      else process.env[name] = saved[name]
+    }
+    rmSync(home, { recursive: true, force: true })
+  }
 })
