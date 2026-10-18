@@ -358,6 +358,13 @@ function turnItemsView(value: unknown): TurnItemsView {
   return 'summary'
 }
 
+// The Claude model a helper thread runs on in place of a Codex model: the
+// summary model.
+// App rule: helper-thread-model
+function claudeHelperModel(model: string): string {
+  return resolveClaudeModel(model, 'summary') ?? model
+}
+
 export class CodexClaudeAppServer {
   private pendingServerRequests = new Map<
     string,
@@ -971,7 +978,7 @@ export class CodexClaudeAppServer {
     if (projectId) this.requireProject(projectId)
     const requestedCwd = stringOr(params.cwd, process.cwd())
     const cwd = maybeCreateThreadWorktree(id, requestedCwd).cwd
-    const model = modelFromParams(params, this.configModel)
+    const requestedModel = modelFromParams(params, this.configModel)
     const reasoningEffort = reasoningEffortFromParams(params, this.configReasoningEffort)
     const permissionProfileId = permissionProfileIdFromParams(params)
     const permissionProfile = permissionProfilePolicy(permissionProfileId)
@@ -980,6 +987,13 @@ export class CodexClaudeAppServer {
       params.ephemeral === true ||
       params.threadSource === 'title_generation' ||
       params.threadSource === 'memory_consolidation'
+    // The App names its own OpenAI model for titles and other helper threads,
+    // and accepts another one; with Codex routing off they run on Claude.
+    // App rule: helper-thread-model
+    const model =
+      isTitleOrHelper && this.codexRoutingDisabled() && isCodexOpenAiModel(requestedModel)
+        ? claudeHelperModel(requestedModel)
+        : requestedModel
     const thread: ThreadRecord = {
       id,
       sessionId: id,
@@ -1121,11 +1135,21 @@ export class CodexClaudeAppServer {
     if (!parent) throw new Error(`unknown thread: ${parentId}`)
     const now = nowSeconds()
     const id = newId()
+    const requestedModel = modelFromParams(params, parent.model)
+    // The App describes a thread in an ephemeral fork named for its own
+    // summary model. With Codex routing off, the fork of a Claude thread stays
+    // on its model.
+    // App rule: helper-thread-model
+    const forkModel =
+      params.ephemeral === true &&
+      parent.runtimeBackend === 'claude' &&
+      isCodexOpenAiModel(requestedModel) &&
+      this.codexRoutingDisabled()
+        ? parent.model
+        : requestedModel
     // Fork: model may flip backend (forking from claude-thread with a
     // gpt-* model = new codex-backed thread); otherwise inherit parent.
-    const runtimeBackend: ThreadRecord['runtimeBackend'] = isCodexOpenAiModel(
-      modelFromParams(params, parent.model),
-    )
+    const runtimeBackend: ThreadRecord['runtimeBackend'] = isCodexOpenAiModel(forkModel)
       ? 'codex'
       : 'claude'
     const requestedCwd = stringOr(params.cwd, parent.cwd)
@@ -1142,7 +1166,7 @@ export class CodexClaudeAppServer {
       sectionPosition: null,
       archived: false,
       cwd,
-      model: modelFromParams(params, parent.model),
+      model: forkModel,
       reasoningEffort: reasoningEffortFromParams(params, parent.reasoningEffort),
       claudeSessionId: forkPoint?.sessionId ?? parent.claudeSessionId,
       createdAt: now,
@@ -2982,7 +3006,19 @@ export class CodexClaudeAppServer {
       if (joined) return { turn: this.toLifecycleTurn(joined) }
     }
     if (typeof params.cwd === 'string' && params.cwd.length > 0) thread.cwd = params.cwd
-    const model = modelFromParams(params, thread.model)
+    const requestedModel = modelFromParams(params, thread.model)
+    // A helper thread on Claude maps a Codex model like thread/start does.
+    // Structured summary/title turns map theirs to the summary model anyway.
+    // App rule: helper-thread-model
+    const helperModel =
+      params.outputSchema == null &&
+      thread.ephemeral &&
+      thread.runtimeBackend === 'claude' &&
+      isCodexOpenAiModel(requestedModel) &&
+      this.codexRoutingDisabled()
+        ? claudeHelperModel(requestedModel)
+        : null
+    const model = helperModel ?? requestedModel
     const reasoningEffort = reasoningEffortFromParams(params, thread.reasoningEffort)
     const permissionProfileId = permissionProfileIdFromParams(params)
     const permissionProfile = permissionProfilePolicy(permissionProfileId)
@@ -3083,7 +3119,11 @@ export class CodexClaudeAppServer {
       }
       // Carry parsed images through the params bag so runRuntimeTurn can hand
       // them to the runtime context without re-parsing user input.
-      this.launchRuntimeTurn(peer, thread, turn, prompt, { ...params, _imageInputs: images })
+      this.launchRuntimeTurn(peer, thread, turn, prompt, {
+        ...params,
+        ...(helperModel ? { model: helperModel } : {}),
+        _imageInputs: images,
+      })
     })
     return { turn: publicTurn }
   }
@@ -5854,6 +5894,15 @@ export class CodexClaudeAppServer {
       },
       layers: null,
     }
+  }
+
+  // Codex models have nowhere to run: CLAUDE_CODEX_DISABLE_CODEX_PROXY turned
+  // Codex routing off, and no Codex proxy carries every thread.
+  private codexRoutingDisabled(): boolean {
+    return (
+      process.env.CLAUDE_CODEX_DISABLE_CODEX_PROXY === '1' &&
+      resolveProviderLoopSelection(this.providerLoopSelectionInput()).runtimeType !== 'codex-proxy'
+    )
   }
 
   private providerLoopSelectionInput(): ProviderLoopSelectionInput {

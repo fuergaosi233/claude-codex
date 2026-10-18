@@ -1230,6 +1230,156 @@ test('Codex app model ids and outputSchema map into Claude runtime context', asy
   }
 })
 
+// The thread/start the App sends to title a chat, on its own OpenAI model.
+function titleThreadStart(id: number): string {
+  return json({
+    id,
+    method: 'thread/start',
+    params: {
+      model: 'gpt-5.6-luna',
+      modelProvider: null,
+      allowProviderModelFallback: true,
+      cwd: process.cwd(),
+      approvalPolicy: 'never',
+      permissions: ':read-only',
+      config: { web_search: 'disabled', model_reasoning_effort: 'low' },
+      personality: null,
+      ephemeral: true,
+      threadSource: 'thread_title',
+      experimentalRawEvents: false,
+      dynamicTools: null,
+      serviceTier: null,
+    },
+  })
+}
+
+// No Codex proxy; summary turns run on haiku.
+const titleAdapterEnv = {
+  CLAUDE_CODEX_PROVIDER: '',
+  CLAUDE_CODEX_AGENT_LOOP: '',
+  CLAUDE_CODEX_RUNTIME_TYPE: '',
+  CLAUDE_CODEX_RUNTIME: '',
+  CLAUDE_CODEX_BACKEND: '',
+  CLAUDE_CODEX_MODELS: '',
+  CLAUDE_CODEX_MODEL_ALIASES: '',
+  CLAUDE_CODEX_SUMMARY_MODEL: 'haiku',
+}
+
+test('with Codex routing off, the App titles a chat on the Claude summary model', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home, {
+    ...titleAdapterEnv,
+    CLAUDE_CODEX_DISABLE_CODEX_PROXY: '1',
+  })
+  const reader = new JsonLineReader(proc)
+  const runTurn = async (id: number, params: Record<string, unknown>) => {
+    proc.stdin.write(json({ id, method: 'turn/start', params }))
+    assert.equal((await reader.nextResponse(id)).error, undefined)
+    let text = ''
+    for (;;) {
+      const message = await reader.next()
+      if (message.method === 'item/agentMessage/delta') text += message.params.delta
+      if (message.method === 'turn/completed') return { text, turn: message.params.turn }
+    }
+  }
+  try {
+    proc.stdin.write(titleThreadStart(1))
+    const start = await reader.nextResponse(1)
+    assert.equal(start.error, undefined)
+    assert.equal(start.result.model, 'haiku')
+    assert.equal(start.result.thread.ephemeral, true)
+    const threadId = start.result.thread.id
+
+    // The App's title turn: no model, an outputSchema, JSON back.
+    const outputSchema = {
+      type: 'object',
+      properties: { title: { type: 'string' }, description: { type: 'string' } },
+      required: ['title', 'description'],
+      additionalProperties: false,
+    }
+    const title = await runTurn(2, {
+      threadId,
+      turnTrigger: 'thread_title',
+      input: [{ type: 'text', text: 'output schema check', text_elements: [] }],
+      cwd: null,
+      approvalPolicy: null,
+      permissions: ':read-only',
+      model: null,
+      effort: null,
+      summary: 'none',
+      personality: null,
+      collaborationMode: null,
+      outputSchema,
+    })
+    assert.equal(title.turn.status, 'completed')
+    assert.deepEqual(JSON.parse(title.text), {
+      model: 'haiku',
+      outputFormat: { type: 'json_schema', schema: outputSchema },
+    })
+
+    // A Codex model on a later turn maps the same way.
+    const plain = await runTurn(3, {
+      threadId,
+      model: 'gpt-5.6-luna',
+      input: [{ type: 'text', text: 'output schema check', text_elements: [] }],
+    })
+    assert.equal(plain.turn.status, 'completed')
+    assert.equal(JSON.parse(plain.text).model, 'haiku')
+
+    // The App describes a Claude chat in an ephemeral fork, which stays on its model.
+    proc.stdin.write(
+      json({ id: 4, method: 'thread/start', params: { cwd: process.cwd(), model: 'sonnet' } }),
+    )
+    const chat = await reader.nextResponse(4)
+    proc.stdin.write(
+      json({
+        id: 5,
+        method: 'thread/fork',
+        params: {
+          threadId: chat.result.thread.id,
+          model: 'gpt-5.6-luna',
+          ephemeral: true,
+          excludeTurns: true,
+          threadSource: 'thread_description',
+        },
+      }),
+    )
+    const fork = await reader.nextResponse(5)
+    assert.equal(fork.error, undefined)
+    assert.equal(fork.result.model, 'sonnet')
+
+    // A chat of the user's own on a Codex model keeps it.
+    proc.stdin.write(
+      json({
+        id: 6,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), model: 'gpt-5.6-luna' },
+      }),
+    )
+    const own = await reader.nextResponse(6)
+    assert.equal(own.error, undefined)
+    assert.equal(own.result.model, 'gpt-5.6-luna')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('with Codex routing on, the App title thread keeps its Codex model', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home, { ...titleAdapterEnv, CLAUDE_CODEX_DISABLE_CODEX_PROXY: '' })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(titleThreadStart(1))
+    const start = await reader.nextResponse(1)
+    assert.equal(start.error, undefined)
+    assert.equal(start.result.model, 'gpt-5.6-luna')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('Codex title-generation turn runs through the runtime instead of a hardcoded local title', async () => {
   // We used to short-circuit Codex App's title-gen turn with a regex-derived
   // "处理X" string. That was forcing a hardcoded title regardless of what the
