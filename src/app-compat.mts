@@ -168,9 +168,9 @@ export const APP_RULES: readonly AppRule[] = [
   },
   {
     id: 'helper-thread-model',
-    app: 'Generates chat titles, descriptions and turn summaries in ephemeral helper threads (threadSource thread_title, thread_description, thread_summary) on its own OpenAI model, the ephemeralGenerationModel of its statsig config, and allows the server to fall back to another model. A title starts a thread and a description forks the chat; its turn/start carries model null and an outputSchema, and the JSON in the last agentMessage counts once turn/completed reports completed. When title generation fails, the chat keeps its first words as its title.',
+    app: 'Generates chat titles, descriptions and turn summaries in ephemeral helper threads (threadSource thread_title, thread_description, thread_summary) on its own OpenAI model, the ephemeralGenerationModel of its statsig config, and allows the server to fall back to another model. A title starts a thread and a description forks the chat; its turn/start carries model null and an outputSchema its zod schemas declare as JSON Schema draft 2020-12, and the JSON in the last agentMessage counts once turn/completed reports completed within 30 seconds. When title generation fails, the chat keeps its first words as its title.',
     adapter:
-      'With CLAUDE_CODEX_DISABLE_CODEX_PROXY=1 and no Codex proxy selected, starts a helper thread that names a Codex model on the Claude summary model instead of the Codex backend, maps a Codex model on its turns the same way, and keeps an ephemeral fork of a Claude chat on the chat model. Other threads that name a Codex model are left on Codex.',
+      'With CLAUDE_CODEX_DISABLE_CODEX_PROXY=1 and no Codex proxy selected, starts a helper thread that names a Codex model on the Claude summary model instead of the Codex backend, maps a Codex model on its turns the same way, and keeps an ephemeral fork of a Claude chat on the chat model. Other threads that name a Codex model are left on Codex. Drops the draft declaration of an outputSchema, which the Claude CLI refuses.',
     verify:
       'With Codex routing off, send the first message of a new chat: the chat gets a generated title, not its first words.',
   },

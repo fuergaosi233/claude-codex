@@ -1290,10 +1290,14 @@ test('with Codex routing off, the App titles a chat on the Claude summary model'
     assert.equal(start.result.thread.ephemeral, true)
     const threadId = start.result.thread.id
 
-    // The App's title turn: no model, an outputSchema, JSON back.
+    // The App's title turn: no model, an outputSchema, JSON back. The App's
+    // zod schema declares draft 2020-12, which the Claude CLI refuses.
     const outputSchema = {
       type: 'object',
-      properties: { title: { type: 'string' }, description: { type: 'string' } },
+      properties: {
+        title: { type: 'string', minLength: 1, maxLength: 36 },
+        description: { type: 'string', minLength: 1 },
+      },
       required: ['title', 'description'],
       additionalProperties: false,
     }
@@ -1309,7 +1313,7 @@ test('with Codex routing off, the App titles a chat on the Claude summary model'
       summary: 'none',
       personality: null,
       collaborationMode: null,
-      outputSchema,
+      outputSchema: { $schema: 'https://json-schema.org/draft/2020-12/schema', ...outputSchema },
     })
     assert.equal(title.turn.status, 'completed')
     assert.deepEqual(JSON.parse(title.text), {
