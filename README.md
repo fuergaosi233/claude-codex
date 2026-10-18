@@ -11,6 +11,15 @@ Codex App still runs its normal SSH version probe, bootstrap, and `app-server
 proxy` flow — but `codex app-server` is handled by this adapter instead of the
 real Codex runtime, so agent turns run on Claude Code.
 
+<p align="center">
+  <img src="docs/public/images/inline-visualization.png" width="720"
+    alt="A Claude reply in the Codex App with an inline visualization: tiles for total signups, the peak month and quarter-over-quarter growth, a bar chart of six months of signups with the peak month highlighted and a dashed monthly average, a chart of month-over-month change, and a short summary of the trend">
+</p>
+
+<p align="center"><sub>Claude, asked in a Codex App chat to chart six months of signups,
+answers with an <a href="#inline-visualizations">inline visualization</a> that the
+App renders inside the reply. The request was in Chinese, so are the labels.</sub></p>
+
 📖 **Documentation: <https://fuergaosi233.github.io/claude-codex/>**
 
 ## Quick start
