@@ -76,7 +76,25 @@ this presentation guidance.
 Rendering is provided by the Codex app version you use. The adapter preserves the
 Markdown in streaming and history; it does not bundle a diagram renderer or a
 Claude Desktop Artifacts runtime. Arbitrary HTML/React code fences do not become
-interactive apps. Older clients may show Mermaid source instead of a diagram.
+interactive apps (inline visualizations, below, go through the App's own
+sandbox). Older clients may show Mermaid source instead of a diagram.
+
+### Inline visualizations
+
+Claude threads can show charts, diagrams and small interactive explainers inside
+the conversation, rendered by the Codex App's own visualization sandbox, as Codex
+threads do. The adapter remembers the `visualize` plugin the App installs at
+startup and lists its skill in the system prompt, with the
+`::codex-inline-vis{path="…"}` line the App renders and the thread's
+visualization folder. Claude reads the skill when a request calls for it, writes
+an HTML fragment there and names it in its reply.
+
+The App reads visualizations only for UUIDv7 thread ids, as Codex issues them.
+New threads, forks and subagents get one; chats created before keep working but
+cannot render inline visualizations. The file rules (a lowercase hyphenated
+`.html` name, an absolute path inside the thread's folders or `/tmp`, at most
+5 MB) are in
+**[Using the Codex App](https://fuergaosi233.github.io/claude-codex/guide/gui#inline-visualizations)**.
 
 ### Project instructions
 

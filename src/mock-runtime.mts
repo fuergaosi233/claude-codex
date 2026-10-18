@@ -975,6 +975,15 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    // A reply naming a visualization the way the visualize skill shows it,
+    // without the invisible marks around `visualize`.
+    if (/visualize line check/i.test(context.prompt)) {
+      const deltas = ['Here is the chart.\n\nvisual', 'ize{"path":"/tmp/chart.html","mode":"wide"}']
+      for (const delta of deltas) await handlers.onEvent({ type: 'text_delta', delta })
+      await handlers.onEvent({ type: 'completed', success: true, result: deltas.join('') })
+      return
+    }
+
     const text = `Claude Code adapter mock response for: ${context.prompt || '(empty prompt)'}`
     for (const ch of text) {
       if (this.interrupted.has(context.threadId)) {

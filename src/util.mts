@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import {
   appendFileSync,
   existsSync,
@@ -10,7 +10,7 @@ import {
   unlinkSync,
 } from 'node:fs'
 import { homedir, platform, tmpdir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import type { ImageInput, TurnToolOutput, UserInput } from './types.mjs'
 
 export function nowSeconds(): number {
@@ -23,6 +23,36 @@ export function nowMillis(): number {
 
 export function newId(): string {
   return randomUUID()
+}
+
+// Thread ids are UUIDv7, as Codex app-server makes them: the App reads a
+// thread's creation date from its id to find the thread's files, such as its
+// inline visualizations, and refuses to read them for any other id.
+// App rule: inline-visualizations
+export function newThreadId(): string {
+  const bytes = randomBytes(16)
+  bytes.writeUIntBE(Date.now(), 0, 6)
+  bytes.writeUInt8((bytes.readUInt8(6) & 0x0f) | 0x70, 6)
+  bytes.writeUInt8((bytes.readUInt8(8) & 0x3f) | 0x80, 8)
+  const hex = bytes.toString('hex')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+}
+
+const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+
+// Where the App looks for a thread's inline visualizations:
+// <CODEX_HOME>/visualizations/<UTC YYYY/MM/DD from the id>/<thread id>. Only
+// UUIDv7 thread ids have one.
+// App rule: inline-visualizations
+export function threadVisualizationDir(threadId: string): string | null {
+  if (!UUID_V7.test(threadId)) return null
+  const created = new Date(Number.parseInt(threadId.replace(/-/g, '').slice(0, 12), 16))
+  const day = [
+    String(created.getUTCFullYear()),
+    String(created.getUTCMonth() + 1).padStart(2, '0'),
+    String(created.getUTCDate()).padStart(2, '0'),
+  ]
+  return join(codexHome(), 'visualizations', ...day, threadId)
 }
 
 export function codexHome(): string {
@@ -45,6 +75,12 @@ export function defaultSocketPath(): string {
   const preferred = join(codexHome(), 'app-server-control', 'app-server-control.sock')
   if (preferred.length <= socketPathLimit()) return preferred
   return join(tmpdir(), `ccx-${stableHash(preferred).slice(0, 16)}.sock`)
+}
+
+// `path` lies strictly below `root`; both are compared lexically.
+export function isPathInside(root: string, path: string): boolean {
+  const child = relative(root, path)
+  return child !== '' && child !== '..' && !child.startsWith(`..${sep}`) && !isAbsolute(child)
 }
 
 export function ensureParent(path: string): void {

@@ -1,12 +1,16 @@
 import { type ChildProcess, execFile, spawn } from 'node:child_process'
 import { existsSync, type FSWatcher, readFileSync, watch, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { rendersCompletedSubagentActivity, unverifiedAppWarning } from './app-compat.mjs'
 import {
+  type AppPlugin,
+  type AppSkill,
+  appPluginSkills,
   claudeHookSource,
+  claudeRunnableAppPlugin,
   codexHookEventName,
   listClaudeHooks,
   listClaudeSkills,
@@ -103,6 +107,7 @@ import {
   tokenBreakdownFromClaudeUsage,
   toolResultText,
   userInputAnswersAsContent,
+  visualizationDirNote,
   wrapMcpToolError,
   wrapMcpToolResult,
 } from './server-helpers.mjs'
@@ -166,6 +171,7 @@ import {
   extractImageInputs,
   isCodexOpenAiModel,
   newId,
+  newThreadId,
   normalizeCodexReasoningEffort,
   nowMillis,
   nowSeconds,
@@ -175,9 +181,11 @@ import {
   resolveClaudeModel,
   sleep,
   textFromInput,
+  threadVisualizationDir,
   toolOutputInput,
   turnToolOutputFromParams,
 } from './util.mjs'
+import { markVisualizeLines } from './visualize-lines.mjs'
 import { parseWorkflowCommand } from './workflow-command.mjs'
 import { maybeCreateThreadWorktree } from './worktree.mjs'
 
@@ -433,6 +441,8 @@ export class CodexClaudeAppServer {
   // so the user's settings survive a daemon restart instead of resetting on
   // every reconnect.
   private configOverrides: Record<string, unknown> = {}
+  // Codex App plugins whose skills Claude can run, as the App installed them.
+  private appPlugins: AppPlugin[] = []
   private readonly configPath = join(adapterHome(), 'config.json')
   private idleCheckHandler: (() => void) | null = null
   private stopped = false
@@ -816,10 +826,11 @@ export class CodexClaudeAppServer {
       case 'plugin/share/updateTargets':
         return this.pluginShareUpdateTargets(asRecord(params))
       case 'plugin/share/delete':
-      case 'plugin/uninstall':
         return {}
+      case 'plugin/uninstall':
+        return this.pluginUninstall(asRecord(params))
       case 'plugin/install':
-        return { authPolicy: 'ON_USE', appsNeedingAuth: [] }
+        return this.pluginInstall(asRecord(params))
       case 'skills/config/write':
         return { effectiveEnabled: asRecord(params).enabled === true }
       case 'plugin/share/list':
@@ -972,7 +983,7 @@ export class CodexClaudeAppServer {
   }
 
   private threadStart(peer: RpcPeer, params: Record<string, unknown>): unknown {
-    const id = newId()
+    const id = newThreadId()
     const now = nowSeconds()
     const projectId = stringOr(params.projectId, '') || null
     if (projectId) this.requireProject(projectId)
@@ -1134,7 +1145,7 @@ export class CodexClaudeAppServer {
     const parent = this.store.getThread(parentId)
     if (!parent) throw new Error(`unknown thread: ${parentId}`)
     const now = nowSeconds()
-    const id = newId()
+    const id = newThreadId()
     const requestedModel = modelFromParams(params, parent.model)
     // The App describes a thread in an ephemeral fork named for its own
     // summary model. With Codex routing off, the fork of a Claude thread stays
@@ -3241,7 +3252,7 @@ export class CodexClaudeAppServer {
         const agents = children.map(({ childId, child }) => {
           const latestTurn = this.store.listTurns(childId).at(-1)
           return {
-            nickname: child?.agentNickname ?? childId.slice(0, 12),
+            nickname: child?.agentNickname ?? childId.slice(-12),
             role: child?.agentRole ?? 'subagent',
             status: latestTurn?.status ?? child?.status.type ?? 'unknown',
           }
@@ -3401,8 +3412,13 @@ export class CodexClaudeAppServer {
     }
     const completeAgentItem = (phase: 'commentary' | 'final_answer'): void => {
       if (!agentItemId) return
+      // Visualize lines get their marks here and not in the deltas: the App
+      // shows the completed text in place of what streamed.
+      // App rule: visualize-line
       const updated = this.store.updateItem(turn.id, agentItemId, (item) =>
-        item.type === 'agentMessage' ? { ...item, phase } : item,
+        item.type === 'agentMessage'
+          ? { ...item, phase, text: markVisualizeLines(item.text) }
+          : item,
       )
       const item = updated?.items.find((item) => item.id === agentItemId)
       if (item)
@@ -3481,6 +3497,7 @@ export class CodexClaudeAppServer {
       this.lastTurnParamsByThread.set(thread.id, rest)
     }
     const desktopPresentation = turnPurpose === 'normal' && thread.runtimeBackend !== 'codex'
+    const appSkills = this.appSkillsFor(desktopPresentation ? thread.id : null)
     // Codex reads AGENTS.md itself; Claude gets it, and the Claude Code files
     // its CLI skips, in the prompt.
     const instructions = desktopPresentation ? projectInstructions(thread.cwd).prompt : null
@@ -3496,14 +3513,20 @@ export class CodexClaudeAppServer {
       const parentThread = this.store.getThread(thread.forkedFromId)
       const parentDev = parentThread?.developerInstructions ?? null
       if (developerInstructions !== parentDev) {
+        const parentSkills = this.appSkillsFor(desktopPresentation ? thread.forkedFromId : null)
         systemPromptAddendum = buildSystemPromptAddendum({
           baseInstructions: parentThread?.baseInstructions ?? baseInstructions,
           developerInstructions: parentDev,
           personality: parentThread?.personality ?? personality,
           desktopPresentation,
           projectInstructions: instructions,
+          ...parentSkills,
         })
-        effectivePrompt = `<side-conversation-instructions>\n${developerInstructions}\n</side-conversation-instructions>\n\n${prompt}`
+        // The parent's prompt names the parent's visualization directory.
+        const sideInstructions = [developerInstructions]
+        if (parentSkills.visualizationDir && appSkills.visualizationDir)
+          sideInstructions.push(visualizationDirNote(appSkills.visualizationDir))
+        effectivePrompt = `<side-conversation-instructions>\n${sideInstructions.join('\n\n')}\n</side-conversation-instructions>\n\n${prompt}`
       } else {
         systemPromptAddendum = buildSystemPromptAddendum({
           baseInstructions,
@@ -3511,6 +3534,7 @@ export class CodexClaudeAppServer {
           personality,
           desktopPresentation,
           projectInstructions: instructions,
+          ...appSkills,
         })
       }
     } else {
@@ -3520,6 +3544,7 @@ export class CodexClaudeAppServer {
         personality,
         desktopPresentation,
         projectInstructions: instructions,
+        ...appSkills,
       })
     }
 
@@ -3633,6 +3658,10 @@ export class CodexClaudeAppServer {
         approvalPolicy,
         sandboxMode,
         systemPromptAddendum,
+        readableRoots: [
+          ...appSkills.appSkills.map((skill) => dirname(skill.path)),
+          ...(appSkills.visualizationDir ? [appSkills.visualizationDir] : []),
+        ],
         planMode: params.planMode === true,
         imageInputs: Array.isArray(params._imageInputs)
           ? (params._imageInputs as ImageInput[])
@@ -3720,8 +3749,10 @@ export class CodexClaudeAppServer {
               typeof event.input.subagent_type === 'string' ? event.input.subagent_type : null
             const subagentModel =
               typeof event.input.model === 'string' ? event.input.model : thread.model
-            const childThreadId = newId()
-            const agentNickname = `agent-${childThreadId.replace(/-/g, '').slice(0, 12)}`
+            const childThreadId = newThreadId()
+            // The id's random tail: its head is a timestamp, shared by agents
+            // spawned in the same millisecond.
+            const agentNickname = `agent-${childThreadId.replace(/-/g, '').slice(-12)}`
             const agentPath = `/root/${agentNickname}`
             const agentRole = subType ?? 'general-purpose'
             const childStartedAt = nowSeconds()
@@ -4716,7 +4747,8 @@ export class CodexClaudeAppServer {
       },
     })
 
-    const completedItem: ThreadItem = { ...startedItem, text: resultText }
+    // App rule: visualize-line
+    const completedItem: ThreadItem = { ...startedItem, text: markVisualizeLines(resultText) }
     this.store.updateItem(childTurn.id, agentItemId, () => completedItem)
     if (resultText) {
       this.notify(peer, {
@@ -4782,6 +4814,7 @@ export class CodexClaudeAppServer {
   // Reads replay history, and each client gets only the items it would have
   // been sent live. One that predates the started/completed activity kinds
   // gets neither kind, and only such a client gets the closeAgent kept for it.
+  // Every client gets agent messages with their visualize lines marked.
   private historyForPeer(peer: RpcPeer, result: unknown): unknown {
     const current = this.supportsCompletedSubagentActivity(peer)
     const sentLive = (item: unknown): boolean => {
@@ -4794,16 +4827,26 @@ export class CodexClaudeAppServer {
       const { legacyOnly: _mark, ...rest } = asRecord(item)
       return rest
     }
+    // Replies stored before the adapter marked their visualize lines render
+    // as well.
+    // App rule: visualize-line
+    const withVisualizeMarks = (item: unknown): unknown => {
+      const record = asRecord(item)
+      if (record.type !== 'agentMessage' || typeof record.text !== 'string') return item
+      const text = markVisualizeLines(record.text)
+      return text === record.text ? item : { ...record, text }
+    }
+    const itemForPeer = (item: unknown): unknown => withVisualizeMarks(unmarked(item))
     const turnForPeer = (turn: unknown): unknown => {
       const record = asRecord(turn)
       return Array.isArray(record.items)
-        ? { ...record, items: record.items.filter(sentLive).map(unmarked) }
+        ? { ...record, items: record.items.filter(sentLive).map(itemForPeer) }
         : turn
     }
     const entryForPeer = (entry: unknown): unknown => {
       const fields = asRecord(entry)
       if ('items' in fields) return turnForPeer(entry)
-      return 'item' in fields ? { ...fields, item: unmarked(fields.item) } : unmarked(entry)
+      return 'item' in fields ? { ...fields, item: itemForPeer(fields.item) } : itemForPeer(entry)
     }
     const record = asRecord(result)
     const thread = asRecord(record.thread)
@@ -6616,6 +6659,48 @@ export class CodexClaudeAppServer {
     }
   }
 
+  // The Codex App skills Claude can run in a thread, and where the thread's
+  // inline visualizations go. The App shows a thread's visualizations only
+  // when its id is a UUIDv7, which threads from older adapters lack, so they
+  // go without the visualize skill.
+  private appSkillsFor(threadId: string | null): {
+    appSkills: AppSkill[]
+    visualizationDir: string | null
+  } {
+    if (threadId == null) return { appSkills: [], visualizationDir: null }
+    const dir = threadVisualizationDir(threadId)
+    const appSkills = appPluginSkills(this.appPlugins).filter(
+      (skill) => dir != null || skill.plugin !== 'visualize',
+    )
+    const visualize = appSkills.some((skill) => skill.plugin === 'visualize')
+    return { appSkills, visualizationDir: visualize ? dir : null }
+  }
+
+  // The App installs its bundled plugins each time it starts. Remember the
+  // ones whose skills Claude can run, across restarts too, so that turns
+  // started before the App gets to it list the same skills.
+  // App rule: inline-visualizations
+  private pluginInstall(params: Record<string, unknown>): unknown {
+    const plugin = claudeRunnableAppPlugin(params.marketplacePath, params.pluginName)
+    const known = this.appPlugins.find((candidate) => candidate.name === plugin?.name)
+    if (plugin && known?.root !== plugin.root) {
+      this.appPlugins = [...this.appPlugins.filter((candidate) => candidate !== known), plugin]
+      this.persistConfig()
+    }
+    return { authPolicy: 'ON_USE', appsNeedingAuth: [] }
+  }
+
+  private pluginUninstall(params: Record<string, unknown>): unknown {
+    // Plugin ids read `<name>@<marketplace>`.
+    const name = stringOr(params.pluginId, '').split('@')[0]
+    const kept = this.appPlugins.filter((plugin) => plugin.name !== name)
+    if (kept.length !== this.appPlugins.length) {
+      this.appPlugins = kept
+      this.persistConfig()
+    }
+    return {}
+  }
+
   private pluginRead(params: Record<string, unknown>): unknown {
     const name = stringOr(params.pluginName, 'unknown')
     return {
@@ -7350,6 +7435,14 @@ export class CodexClaudeAppServer {
       ) {
         this.configOverrides = parsed.overrides as Record<string, unknown>
       }
+      if (Array.isArray(parsed.appPlugins)) {
+        this.appPlugins = parsed.appPlugins.flatMap((entry) => {
+          const plugin = asRecord(entry)
+          return typeof plugin.name === 'string' && typeof plugin.root === 'string'
+            ? [{ name: plugin.name, root: plugin.root }]
+            : []
+        })
+      }
       if (shouldRepair) this.persistConfig()
     } catch {}
   }
@@ -7364,6 +7457,7 @@ export class CodexClaudeAppServer {
             model: this.configModel,
             model_reasoning_effort: this.configReasoningEffort,
             overrides: this.configOverrides,
+            appPlugins: this.appPlugins,
           },
           null,
           2,

@@ -159,6 +159,22 @@ export const APP_RULES: readonly AppRule[] = [
     verify: 'Delete all archived chats in Settings: the list empties without an error.',
   },
   {
+    id: 'inline-visualizations',
+    app: 'Renders an HTML fragment inside a reply from a `::codex-inline-vis{path="…"}` line of its own. It takes the date in the thread\'s visualization folder, <CODEX_HOME>/visualizations/<YYYY/MM/DD>/<thread id>, from the thread id and refuses the read for an id that is not a UUIDv7. It reads only a file named like `^[a-z0-9]+(-[a-z0-9]+)*\\.html$`, at an absolute path inside that folder, the thread\'s workspace or writable roots, or /tmp where the sandbox allows it, of at most 5e6 bytes. It installs its bundled plugins, visualize among them, with plugin/install each time it starts.',
+    adapter:
+      "Issues UUIDv7 ids for new threads, forks and subagents. Remembers the visualize plugin from plugin/install, and lists its skill, the directive and the thread's folder in the desktop prompt of a thread with a UUIDv7 id. Lets Claude read inside the skill's folder and the thread's folder without asking.",
+    verify:
+      'In a new chat, ask for a small chart: Claude reads the visualize skill without an approval prompt, and the chart renders inside the reply.',
+  },
+  {
+    id: 'visualize-line',
+    app: 'Renders an inline visualization from a line holding `visualize` and its JSON wrapped in the private-use marks its visualize skill documents, and shows the same line without the marks as text.',
+    adapter:
+      "Adds the marks to such an unmarked line outside code fences when an agent message completes and the line's JSON names a path: in its item/completed and the stored item, never in a delta, and in history reads of replies stored before. The App checks the rest of the JSON itself.",
+    verify:
+      'Have a reply name a visualization as a plain visualize{…} line: it shows rendered once the message completes, and again after the chat is reopened.',
+  },
+  {
     id: 'quiet-turn-heartbeat',
     app: "On turn/completed reads the turn's last agentMessage, and when it ends with a <heartbeat> block deciding DONT_NOTIFY neither marks the thread unread nor sends a desktop notification. Shows a completed message without the block, and a streaming one raw.",
     adapter:
