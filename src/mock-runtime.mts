@@ -90,6 +90,17 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    // Codex App's Continue button: say what Claude was asked to pick up.
+    if (context.prompt.includes('pressed Continue')) {
+      const message = /<interrupted_user_message>\n([\s\S]*?)\n<\/interrupted_user_message>/.exec(
+        context.prompt,
+      )?.[1]
+      const text = message ? `answering: ${message}` : 'picking up where I left off'
+      await handlers.onEvent({ type: 'text_delta', delta: text })
+      await handlers.onEvent({ type: 'completed', success: true, result: text })
+      return
+    }
+
     // Goal continuation (hidden internal-context prompt). Its template text
     // would trip the keyword branches below, so answer it first: report usage,
     // and finish the goal when the objective asks for it.

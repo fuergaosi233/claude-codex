@@ -13,6 +13,7 @@ import {
 } from './claude-capabilities.mjs'
 import { onClaudeCommandsChanged, skillLinksToCommand } from './claude-commands.mjs'
 import {
+  continuePrompt,
   goalBudgetExhausted,
   goalBudgetLimitPrompt,
   goalContinuationPrompt,
@@ -300,10 +301,23 @@ function isUsageLimitError(error: unknown): boolean {
 
 function queuedInput(value: unknown): UserInput[] {
   const input = Array.isArray(value) ? (value as UserInput[]) : []
-  const { textPrompt, images } = extractImageInputs(input)
-  if (!textPrompt.trim() && images.length === 0 && !textFromInput(input).trim())
-    throw new Error('queued message input must not be empty')
+  if (isEmptyInput(input)) throw new Error('queued message input must not be empty')
   return input
+}
+
+function isEmptyInput(input: UserInput[]): boolean {
+  const { textPrompt, images } = extractImageInputs(input)
+  return !textPrompt.trim() && images.length === 0 && !textFromInput(input).trim()
+}
+
+// What the user sent in a turn that did not finish.
+function interruptedUserText(turn: TurnRecord | null): string | null {
+  if (turn?.status !== 'interrupted' && turn?.status !== 'failed') return null
+  const text = turn.items
+    .flatMap((item) => (item.type === 'userMessage' ? [textFromInput(item.content).trim()] : []))
+    .filter(Boolean)
+    .join('\n\n')
+  return text || null
 }
 
 // With the turnToolOutput gate on, a thread handoff or a message another
@@ -2921,6 +2935,12 @@ export class CodexClaudeAppServer {
     // Goal continuations prompt the model with hidden internal context and
     // carry no user message.
     const hiddenPrompt = typeof params._hiddenPrompt === 'string' ? params._hiddenPrompt : null
+    // Codex App's Continue button sends no input at all.
+    // App rule: continue-turns
+    const resumed =
+      hiddenPrompt == null && params.outputSchema == null && isEmptyInput(input)
+        ? continuePrompt(interruptedUserText(this.store.lastTurn(threadId)))
+        : null
     // extractImageInputs splits user input into the text prompt and any image
     // attachments (localImage / image URL / data:). Sidecar repacks the
     // images into a Claude SDK multimodal user message; here we also append
@@ -2929,13 +2949,19 @@ export class CodexClaudeAppServer {
     const { textPrompt, images } = extractImageInputs(input)
     // A skill picked in the composer arrives as a markdown link; Claude Code
     // runs it as a slash command. The user message keeps the original input.
-    const prompt = hiddenPrompt ?? skillLinksToCommand(textPrompt || textFromInput(input))
-    const workflowCommand = hiddenPrompt ? null : parseWorkflowCommand(prompt)
+    const prompt =
+      hiddenPrompt ?? resumed ?? skillLinksToCommand(textPrompt || textFromInput(input))
+    const workflowCommand = hiddenPrompt || resumed ? null : parseWorkflowCommand(prompt)
     // Like Codex, input that arrives while a turn is running joins that turn.
     // A turn/start can race a turn the adapter has just opened itself (for a
     // background agent's or workflow's report); a second turn would orphan
     // it, and it would never complete.
-    if (!hiddenPrompt && params.outputSchema == null) {
+    if (resumed) {
+      // Pressed while a turn runs: that turn is already carrying on.
+      const runningTurnId = this.activeTurnByThread.get(threadId)
+      const running = runningTurnId ? this.store.getTurn(runningTurnId) : null
+      if (running?.status === 'inProgress') return { turn: this.toLifecycleTurn(running) }
+    } else if (!hiddenPrompt && params.outputSchema == null) {
       const joined = await this.joinRunningTurn(
         peer,
         threadId,
@@ -2964,7 +2990,7 @@ export class CodexClaudeAppServer {
       if (requestedSandbox) thread.sandboxMode = requestedSandbox
     }
     this.store.upsertThread(thread)
-    if (!hiddenPrompt && !thread.preview && prompt) {
+    if (!hiddenPrompt && !resumed && !thread.preview && prompt) {
       thread.preview = prompt.slice(0, 200)
       thread.updatedAt = nowSeconds()
       this.store.upsertThread(thread)

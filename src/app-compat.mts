@@ -81,6 +81,14 @@ export const APP_RULES: readonly AppRule[] = [
     verify: 'Hand a chat off to a new thread: the handoff text shows and Claude answers it.',
   },
   {
+    id: 'continue-turns',
+    app: 'Offers Continue on a chat whose last turn did not finish, and sends it as turn/start with empty input.',
+    adapter:
+      "Prompts Claude to pick up where it left off, with the unfinished turn's user message when it has one.",
+    verify:
+      'Restart the adapter during a turn, press Continue: Claude answers the message sent in it.',
+  },
+  {
     id: 'steer-errors',
     app: 'Matches turn/steer error texts: "no active turn to steer" makes it send the message as a new turn, and "expected active turn id `X` but found `Y`" makes it retry against Y.',
     adapter: 'Fails turn/steer with exactly these texts.',

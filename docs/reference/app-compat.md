@@ -26,6 +26,7 @@ line a rule touches.
 | `skills-popup` | fills the "/" popup from `skills/list` and sends a picked skill as a `[$name](path)` link | `/simplify` is listed and runs |
 | `optimistic-user-message` | draws its own user message for every `turn/start` it sends | a message shows once; a queued one when it starts |
 | `tool-output-turns` | with `turnToolOutput` on, sends a thread handoff or a message from another thread as a `turn/start` with empty input and the text in `toolOutput`, and shows a `functionCallOutput` item as that turn's user message | a chat handed off to a new thread shows the text, and Claude answers it |
+| `continue-turns` | offers Continue on a chat whose last turn did not finish, and sends it as a `turn/start` with empty input | after a restart mid-turn, Continue gets the message sent in that turn answered |
 | `steer-errors` | matches `turn/steer` error texts to fall back to a new turn or retry another turn id | a message sent as a turn ends still arrives |
 | `steer-bubble` | settles the steering bubble when a `userMessage` item carries its `clientUserMessageId` | a steer shows once, in the transcript |
 | `subagent-completed-kind` | renders the completed `subAgentActivity` kind from 26.930 without declaring it | a finished subagent shows as done |

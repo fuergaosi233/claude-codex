@@ -514,6 +514,34 @@ test('a turn/start carrying toolOutput prompts Claude with it and records a func
   })
 })
 
+test('Continue with no input re-sends the message of a turn that did not finish', async () => {
+  await withServer(async (server) => {
+    const threadId = await server.startThread()
+    const from = server.mark()
+    const { turn } = await server.startTurn(threadId, 'slow turn that the user stops')
+    await server.waitFor('item/agentMessage/delta', (params) => params.turnId === turn.id, from)
+    await server.request('turn/interrupt', { threadId, turnId: turn.id })
+    await server.waitFor('turn/completed', (params) => params.turn.id === turn.id, from)
+
+    // The message may never have reached Claude, so it goes along.
+    const second = server.mark()
+    const { turn: resumed } = await server.request('turn/start', { threadId, input: [] })
+    await server.waitFor('turn/completed', (params) => params.turn.id === resumed.id, second)
+    assert.equal(
+      await server.reply(threadId, resumed.id),
+      'answering: slow turn that the user stops',
+    )
+
+    // After a turn that finished there is nothing to re-send.
+    const third = server.mark()
+    const { turn: next } = await server.request('turn/start', { threadId, input: [] })
+    await server.waitFor('turn/completed', (params) => params.turn.id === next.id, third)
+    assert.equal(await server.reply(threadId, next.id), 'picking up where I left off')
+    const { thread } = await server.request('thread/read', { threadId, includeTurns: false })
+    assert.equal(thread.preview, 'slow turn that the user stops')
+  })
+})
+
 test('toolOutput sent while a turn runs joins that turn as its input', async () => {
   await withServer(async (server) => {
     const threadId = await server.startThread()

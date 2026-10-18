@@ -1055,6 +1055,15 @@ export class SessionStore {
     return typeof row?.status === 'string' ? (row.status as TurnRecord['status']) : null
   }
 
+  lastTurn(threadId: string): TurnRecord | null {
+    const row = this.db
+      .prepare(
+        'SELECT * FROM turns WHERE thread_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1',
+      )
+      .get(threadId)
+    return row ? this.rowToTurn(row) : null
+  }
+
   // Used by thread/rollback to drop the N most recent turns from a thread's
   // history. Codex App's rewind UI calls this when the user wants to redo a
   // turn — without it our handler used to no-op and the App's "Rewind" button
