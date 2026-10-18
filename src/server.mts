@@ -178,6 +178,7 @@ import {
   toolOutputInput,
   turnToolOutputFromParams,
 } from './util.mjs'
+import { markVisualizeLines } from './visualize-lines.mjs'
 import { parseWorkflowCommand } from './workflow-command.mjs'
 import { maybeCreateThreadWorktree } from './worktree.mjs'
 
@@ -3333,8 +3334,13 @@ export class CodexClaudeAppServer {
     }
     const completeAgentItem = (phase: 'commentary' | 'final_answer'): void => {
       if (!agentItemId) return
+      // Visualize lines get their marks here and not in the deltas: the App
+      // shows the completed text in place of what streamed.
+      // App rule: visualize-line
       const updated = this.store.updateItem(turn.id, agentItemId, (item) =>
-        item.type === 'agentMessage' ? { ...item, phase } : item,
+        item.type === 'agentMessage'
+          ? { ...item, phase, text: markVisualizeLines(item.text) }
+          : item,
       )
       const item = updated?.items.find((item) => item.id === agentItemId)
       if (item)
@@ -4654,7 +4660,8 @@ export class CodexClaudeAppServer {
       },
     })
 
-    const completedItem: ThreadItem = { ...startedItem, text: resultText }
+    // App rule: visualize-line
+    const completedItem: ThreadItem = { ...startedItem, text: markVisualizeLines(resultText) }
     this.store.updateItem(childTurn.id, agentItemId, () => completedItem)
     if (resultText) {
       this.notify(peer, {
@@ -4718,18 +4725,35 @@ export class CodexClaudeAppServer {
   }
 
   // Reads replay history. A client that predates the started/completed
-  // activity kinds gets only the items it would have been sent live.
+  // activity kinds gets only the items it would have been sent live, and every
+  // client gets agent messages with their visualize lines marked.
   private historyForPeer(peer: RpcPeer, result: unknown): unknown {
-    if (this.supportsCompletedSubagentActivity(peer)) return result
+    const current = this.supportsCompletedSubagentActivity(peer)
     const sentLive = (item: unknown): boolean => {
       const record = asRecord(item)
-      return record.type !== 'subAgentActivity' || record.kind === 'interrupted'
+      return current || record.type !== 'subAgentActivity' || record.kind === 'interrupted'
+    }
+    // Replies stored before the adapter marked their visualize lines render
+    // as well.
+    // App rule: visualize-line
+    const withVisualizeMarks = (item: unknown): unknown => {
+      const record = asRecord(item)
+      if (record.type !== 'agentMessage' || typeof record.text !== 'string') return item
+      const text = markVisualizeLines(record.text)
+      return text === record.text ? item : { ...record, text }
     }
     const turnForPeer = (turn: unknown): unknown => {
       const record = asRecord(turn)
       return Array.isArray(record.items)
-        ? { ...record, items: record.items.filter(sentLive) }
+        ? { ...record, items: record.items.filter(sentLive).map(withVisualizeMarks) }
         : turn
+    }
+    const entryForPeer = (entry: unknown): unknown => {
+      const fields = asRecord(entry)
+      if ('items' in fields) return turnForPeer(entry)
+      return 'item' in fields
+        ? { ...fields, item: withVisualizeMarks(fields.item) }
+        : withVisualizeMarks(entry)
     }
     const record = asRecord(result)
     const thread = asRecord(record.thread)
@@ -4744,7 +4768,7 @@ export class CodexClaudeAppServer {
             // Turns, items/list entries, timeline entries.
             return 'items' in fields || sentLive('item' in fields ? fields.item : entry)
           })
-          .map(turnForPeer),
+          .map(entryForPeer),
       }
     return result
   }

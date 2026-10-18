@@ -4307,6 +4307,160 @@ test('background Agent outlives the parent turn, wakes the parent, and resumes o
   }
 })
 
+// The agent messages a thread's turn published, as their item/completed carried them.
+function completedAgentMessages(messages: any[], threadId: string): any[] {
+  return messages
+    .filter(
+      (m) =>
+        m.method === 'item/completed' &&
+        m.params.threadId === threadId &&
+        m.params.item.type === 'agentMessage',
+    )
+    .map((m) => m.params.item)
+}
+
+const PLAIN_VISUALIZE_REPLY =
+  'Here is the chart.\n\nvisualize{"path":"/tmp/chart.html","mode":"wide"}'
+const MARKED_VISUALIZE_REPLY =
+  'Here is the chart.\n\n\uE200visualize\uE202{"path":"/tmp/chart.html","mode":"wide"}\uE201'
+
+test('a visualize line Claude writes without the marks completes with them', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json(codex930Initialize(0)))
+    await reader.nextResponse(0)
+    const threadId = await startMockThread(reader, proc)
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: textInput('visualize line check') },
+      }),
+    )
+    const seen = await readUntil(
+      reader,
+      (m) => m.method === 'turn/completed' && m.params.threadId === threadId,
+    )
+    // The deltas stream the line as written; the App shows the completed
+    // item in their place.
+    const deltas = seen.filter((m) => m.method === 'item/agentMessage/delta')
+    assert.equal(deltas.map((m) => m.params.delta).join(''), PLAIN_VISUALIZE_REPLY)
+    assert.deepEqual(
+      completedAgentMessages(seen, threadId).map((item) => item.text),
+      [MARKED_VISUALIZE_REPLY],
+    )
+
+    proc.stdin.write(json({ id: 3, method: 'thread/read', params: { threadId } }))
+    const [turn] = (await reader.nextResponse(3)).result.thread.turns
+    assert.equal(
+      turn.items.findLast((item: any) => item.type === 'agentMessage')?.text,
+      MARKED_VISUALIZE_REPLY,
+    )
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('history reads add the marks to a visualize line stored without them', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  await mkdir(join(home, 'claude-codex-adapter'), { recursive: true })
+  const store = new SessionStore(join(home, 'claude-codex-adapter', 'state.sqlite'))
+  const threadId = randomUUID()
+  const turnId = randomUUID()
+  const agentItemId = randomUUID()
+  const now = Math.floor(Date.now() / 1000)
+  // A fenced copy is an example, not a visualization.
+  const fenced = '```\nvisualize{"path":"/tmp/chart.html"}\n```'
+  store.upsertThread({
+    id: threadId,
+    sessionId: threadId,
+    forkedFromId: null,
+    preview: 'chart',
+    name: null,
+    archived: false,
+    cwd: process.cwd(),
+    model: 'sonnet',
+    reasoningEffort: null,
+    modelProvider: 'claude-code',
+    claudeSessionId: null,
+    source: 'appServer',
+    createdAt: now - 2,
+    updatedAt: now - 1,
+    status: { type: 'idle' },
+    approvalPolicy: 'on-request',
+    sandboxMode: 'workspace-write',
+    ephemeral: false,
+    threadSource: 'user',
+    agentRole: null,
+    agentNickname: null,
+    baseInstructions: null,
+    developerInstructions: null,
+    personality: null,
+    runtimeBackend: 'claude',
+    codexSessionId: null,
+  })
+  store.upsertTurn({
+    id: turnId,
+    threadId,
+    status: 'completed',
+    startedAt: now - 2,
+    completedAt: now - 1,
+    durationMs: 1000,
+    items: [
+      {
+        type: 'userMessage',
+        id: randomUUID(),
+        content: [{ type: 'text', text: 'chart', text_elements: [] }],
+      },
+      {
+        type: 'agentMessage',
+        id: agentItemId,
+        text: `${PLAIN_VISUALIZE_REPLY}\n\n${fenced}`,
+        phase: 'final_answer',
+        memoryCitation: null,
+      },
+    ],
+    diff: '',
+    error: null,
+  })
+  store.close()
+
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  const expected = `${MARKED_VISUALIZE_REPLY}\n\n${fenced}`
+  const agentText = (items: any[]) => items.find((item) => item.id === agentItemId)?.text
+  const entryItems = (entries: any[]) => entries.flatMap((entry) => entry.item ?? [])
+  try {
+    proc.stdin.write(json(codex930Initialize(0)))
+    await reader.nextResponse(0)
+
+    proc.stdin.write(json({ id: 1, method: 'thread/read', params: { threadId } }))
+    const [read] = (await reader.nextResponse(1)).result.thread.turns
+    assert.equal(agentText(read.items), expected)
+
+    proc.stdin.write(json({ id: 2, method: 'thread/turns/list', params: { threadId } }))
+    const [listed] = (await reader.nextResponse(2)).result.data
+    assert.equal(agentText(listed.items), expected)
+
+    proc.stdin.write(
+      json({ id: 3, method: 'thread/turns/items/list', params: { threadId, turnId } }),
+    )
+    assert.equal(agentText((await reader.nextResponse(3)).result.data), expected)
+
+    proc.stdin.write(json({ id: 4, method: 'thread/items/list', params: { threadId } }))
+    assert.equal(agentText(entryItems((await reader.nextResponse(4)).result.data)), expected)
+
+    proc.stdin.write(json({ id: 5, method: 'thread/timeline/list', params: { threadId } }))
+    assert.equal(agentText(entryItems((await reader.nextResponse(5)).result.data)), expected)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('SendMessage to a finished foreground agent reopens it like a background one', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawnMockAdapter(home)

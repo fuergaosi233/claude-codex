@@ -158,6 +158,14 @@ export const APP_RULES: readonly AppRule[] = [
     verify:
       'In a new chat, ask for a small chart: Claude reads the visualize skill without an approval prompt, and the chart renders inside the reply.',
   },
+  {
+    id: 'visualize-line',
+    app: 'Renders an inline visualization from a line holding `visualize` and its JSON wrapped in the private-use marks its visualize skill documents, and shows the same line without the marks as text.',
+    adapter:
+      "Adds the marks to such an unmarked line outside code fences when an agent message completes and the line's JSON names a path: in its item/completed and the stored item, never in a delta, and in history reads of replies stored before. The App checks the rest of the JSON itself.",
+    verify:
+      'Have a reply name a visualization as a plain visualize{…} line: it shows rendered once the message completes, and again after the chat is reopened.',
+  },
 ]
 
 // The methods the App starts calling, or sends new parameters to, once the

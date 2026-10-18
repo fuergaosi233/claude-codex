@@ -60,6 +60,13 @@ The App loads the fragment into its visualization sandbox, styled with its
 theme. Claude adds `mode="wide"` to the line where the skill asks for a wide
 layout.
 
+The skill also shows a second form of the line, `visualize{"path":"…"}` between
+invisible marks. When Claude writes that line without the marks, the App would
+show it as text, so the adapter adds them once the message completes and when
+history is read: the line renders at the end of the reply and after the chat is
+reopened. While the reply streams it shows as written, and a line inside a
+code fence is left alone.
+
 **New chats only.** The App finds a thread's visualizations through the
 creation date in its id, and reads them only for UUIDv7 ids, which is what
 Codex issues. The adapter issues UUIDv7 ids for new threads, forks and
