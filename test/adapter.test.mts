@@ -2753,9 +2753,17 @@ test('Claude hook runs are reported as Codex hook/started and hook/completed', a
     settings,
     JSON.stringify({ hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ command: 'true' }] }] } }),
   )
+  // HOME too: hooks in the runner's own ~/.claude/settings.json would claim
+  // the run before the project's file.
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+    env: {
+      ...process.env,
+      HOME: home,
+      CODEX_HOME: home,
+      CLAUDE_CODEX_MOCK: '1',
+      NODE_NO_WARNINGS: '1',
+    },
   })
   const reader = new JsonLineReader(proc)
   try {

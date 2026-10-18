@@ -664,7 +664,8 @@ test('a settings.local.json the repository supplies approves and allows nothing'
       deny: ['WebFetch'],
     })
     // Checked in, it is the repository's: only what it takes away counts.
-    git('add', '.claude/settings.local.json')
+    // (-f: the runner's own global git ignore rules often list this file.)
+    git('add', '-f', '.claude/settings.local.json')
     assert.deepEqual(await read(), supplied)
     git('rm', '-q', '--cached', '.claude/settings.local.json')
     assert.deepEqual((await read()).allow, ['Bash(curl:*)'])
@@ -686,7 +687,7 @@ test('a settings.local.json the repository supplies approves and allows nothing'
       join(repo, '.Claude', 'settings.local.json'),
       join(repo, '.Claude', 'Settings.Local.json'),
     )
-    git('add', '.Claude/Settings.Local.json')
+    git('add', '-f', '.Claude/Settings.Local.json')
     if (!existsSync(local)) await write(local, contents)
     assert.equal(repositorySupplied(local), true)
     assert.deepEqual(await read(), supplied)
@@ -698,7 +699,7 @@ test('a settings.local.json the repository supplies approves and allows nothing'
     const pkg = join(repo, 'vendor', 'pkg')
     await write(join(pkg, '.claude', 'settings.local.json'), contents)
     await symlink(join('vendor', 'pkg'), join(repo, 'pkg'))
-    git('add', 'pkg')
+    git('add', '-f', 'pkg')
     assert.equal(repositorySupplied(join(pkg, '.claude', 'settings.local.json')), false)
     assert.equal(repositorySupplied(join(repo, 'pkg', '.claude', 'settings.local.json')), true)
     // A symlink to the repository itself is the user's own way there.
@@ -1893,6 +1894,7 @@ test('Claude threads run the Claude Code hooks only with the config folder bridg
     await withServer(
       root,
       {
+        HOME: join(root, 'home'),
         CODEX_HOME: join(root, 'codex-home'),
         CLAUDE_CODEX_CLAUDE_CONFIG_DIR: bridged ? configDir : undefined,
         CLAUDE_CODEX_CLAUDE_HOOKS: scope,
@@ -1906,7 +1908,8 @@ test('Claude threads run the Claude Code hooks only with the config folder bridg
         )
         const listed = await request('hooks/list', { cwds: [repo] })
         const commands = listed.data[0].hooks.map((hook: { command: string }) => hook.command)
-        // hooks/list shows what the adapter runs.
+        // hooks/list shows what the adapter runs. Without the opt-in it shows
+        // what the CLI would read itself under HOME, which has none here.
         if (bridged) assert.deepEqual(commands, runs ? ['guard'] : [])
       },
     )
