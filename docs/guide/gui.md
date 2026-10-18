@@ -39,6 +39,12 @@ chart, a diagram or a small interactive explainer that the Codex App renders
 inside the conversation, the same way it does for Codex. Ask for one ("show
 this as a chart", "draw the flow") or let Claude offer one where it helps.
 
+![A Claude reply in the Codex App with an inline visualization: tiles for total signups, the peak month and quarter-over-quarter growth, a bar chart of six months of signups with the peak month highlighted and a dashed monthly average, a chart of month-over-month change, and a short summary of the trend](/images/inline-visualization.png)
+
+*Asked for six months of signups as a bar chart, with the highest month
+highlighted and the trend summed up below. The request was in Chinese, so are
+the labels.*
+
 **How Claude finds the skill.** Each time it starts, the App installs its
 bundled plugins with `plugin/install`. The adapter remembers the `visualize`
 plugin (in `config.json` under its state folder, so it survives restarts) and

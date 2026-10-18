@@ -34,6 +34,19 @@ features:
     details: Ships compiled ESM .mjs, so a remote host needs only Node 24. Dev runs straight from TypeScript with tsx.
 ---
 
+## See it in the Codex App
+
+<div style="max-width: 720px; margin: 0 auto">
+
+![A Claude reply in the Codex App with an inline visualization: tiles for total signups, the peak month and quarter-over-quarter growth, a bar chart of six months of signups with the peak month highlighted and a dashed monthly average, a chart of month-over-month change, and a short summary of the trend](/images/inline-visualization.png)
+
+</div>
+
+Claude, asked in a Codex App chat to chart six months of signups, answers with
+an inline visualization that the App renders inside the reply, as it does for
+Codex. The request was in Chinese, so are the labels. See
+**[Inline visualizations](/guide/gui#inline-visualizations)**.
+
 ## What it does
 
 The adapter implements the Codex `app-server` v2 protocol (stdio, WebSocket,
