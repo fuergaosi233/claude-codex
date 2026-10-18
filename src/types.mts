@@ -1,3 +1,4 @@
+import type { ClaudeHookSpec } from './claude-hooks.mjs'
 import type { RuntimeBackendType } from './runtime-config.mjs'
 
 export type JsonRpcId = string | number | null
@@ -400,6 +401,23 @@ export interface RuntimeTurnContext {
   forkedAt?: number | null
   mcpServers: unknown | null
   allowedTools: string[] | null
+  // Tools Claude must not use, as permission rules (the CLI's --disallowedTools).
+  disallowedTools?: string[] | null
+  // MCP servers limited to some of their tools: the server's tool-name prefix
+  // (mcp__<server>__) to the full names of the tools Claude may call.
+  mcpEnabledTools?: Record<string, string[]> | null
+  // Allow rules from the user's Claude Code settings. Unlike allowedTools
+  // they do not apply in plan mode or a read-only sandbox, where Codex would
+  // not let the tools run unasked.
+  inheritedAllowedTools?: string[] | null
+  // Ask rules from the user's Claude Code settings: the calls they cover go
+  // to the permission prompt even when an allow rule covers them too.
+  inheritedAskRules?: string[] | null
+  // Subagents by name, as the SDK's agents option takes them.
+  agents?: Record<string, Record<string, unknown>> | null
+  // Command hooks from the user's Claude Code settings, run as SDK hook
+  // callbacks.
+  claudeHooks?: ClaudeHookSpec[] | null
   addDirs: string[]
   enableFileCheckpointing: boolean
   outputFormat: unknown | null

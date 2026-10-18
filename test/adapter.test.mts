@@ -1924,6 +1924,51 @@ test('stdio app-server recovers stale in-progress turns after process restart', 
   }
 })
 
+test('the adapter warns once as it starts that bridged hooks need a CLI without settings', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    CODEX_HOME: home,
+    CLAUDE_CODEX_MOCK: '1',
+    NODE_NO_WARNINGS: '1',
+    CLAUDE_CODEX_CLAUDE_CONFIG_DIR: join(home, 'claude'),
+    CLAUDE_CODEX_CLAUDE_HOOKS: 'user',
+  }
+  delete env.CLAUDE_CODEX_CLI
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env,
+  })
+  let stderr = ''
+  proc.stderr.setEncoding('utf8')
+  proc.stderr.on('data', (chunk: string) => {
+    stderr += chunk
+  })
+  try {
+    const reader = new JsonLineReader(proc)
+    for (const id of [1, 2]) {
+      proc.stdin.write(
+        json({
+          id,
+          method: 'initialize',
+          params: { clientInfo: { name: 'test', title: 'Test', version: '0' }, capabilities: null },
+        }),
+      )
+      await reader.nextResponse(id)
+    }
+    // stderr is a pipe of its own, read apart from the responses.
+    for (const until = Date.now() + 5000; !stderr.includes('runs twice') && Date.now() < until; )
+      await delay(25)
+    await delay(200)
+    const lines = stderr.split('\n').filter((line) => line.includes('CLAUDE_CODEX_CLAUDE_HOOKS'))
+    assert.equal(lines.length, 1)
+    assert.match(lines[0] ?? '', /^\[claude-codex-adapter\] .*runs twice/)
+  } finally {
+    await stopProcess(proc)
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('a turn waits out a reader briefly holding the state database', {
   timeout: 20_000,
 }, async (t) => {
@@ -2922,9 +2967,17 @@ test('Claude hook runs are reported as Codex hook/started and hook/completed', a
     settings,
     JSON.stringify({ hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ command: 'true' }] }] } }),
   )
+  // HOME too: hooks in the runner's own ~/.claude/settings.json would claim
+  // the run before the project's file.
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+    env: {
+      ...process.env,
+      HOME: home,
+      CODEX_HOME: home,
+      CLAUDE_CODEX_MOCK: '1',
+      NODE_NO_WARNINGS: '1',
+    },
   })
   const reader = new JsonLineReader(proc)
   try {

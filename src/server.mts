@@ -16,6 +16,7 @@ import {
   listClaudeSkills,
 } from './claude-capabilities.mjs'
 import { onClaudeCommandsChanged, skillLinksToCommand } from './claude-commands.mjs'
+import { runCodexNotify } from './codex-notify.mjs'
 import {
   continuePrompt,
   goalBudgetExhausted,
@@ -27,7 +28,14 @@ import {
   MODEL_GOAL_STATUSES,
 } from './goal-prompts.mjs'
 import { accountUsage, hostMethod, RpcError } from './host-methods.mjs'
-import { callMcpTool, listMcpServerStatuses, readMcpConfig, readMcpResource } from './mcp.mjs'
+import { inheritedAgents, inheritedHooks, inheritedPermissionRules } from './inherited-config.mjs'
+import {
+  callMcpTool,
+  listMcpServerStatuses,
+  type McpConfigScope,
+  readMcpConfig,
+  readMcpResource,
+} from './mcp.mjs'
 import { projectInstructions } from './project-instructions.mjs'
 import { projectProviderLoopConfig } from './provider-loop-config.mjs'
 import {
@@ -359,6 +367,8 @@ interface PeerFeatures {
   // explicitly during initialize; keep the legacy wire shape otherwise.
   // App rule: subagent-completed-kind
   supportsCompletedSubagentActivity: boolean
+  // clientInfo.name from initialize, which Codex's notify event reports.
+  clientName: string | null
 }
 
 function turnItemsView(value: unknown): TurnItemsView {
@@ -585,6 +595,8 @@ export class CodexClaudeAppServer {
             declaredActivityKinds.includes('completed') ||
             rendersCompletedSubagentActivity(stringOr(clientInfo.version, '')) ||
             process.env.CLAUDE_CODEX_SUBAGENT_COMPLETED === '1',
+          clientName:
+            typeof clientInfo.name === 'string' && clientInfo.name ? clientInfo.name : null,
         })
         // The App lists config warnings in its settings, which is where an App
         // build nobody checked the App rules against gets reported.
@@ -865,7 +877,7 @@ export class CodexClaudeAppServer {
       case 'mcpServerStatus/list': {
         // serverName limits discovery to one server.
         const serverName = nullIfEmpty(stringOr(asRecord(params).serverName, ''))
-        return listMcpServerStatuses().then((data) => ({
+        return listMcpServerStatuses(this.mcpScope(params)).then((data) => ({
           data: serverName == null ? data : data.filter((server) => server.name === serverName),
           nextCursor: null,
         }))
@@ -876,12 +888,14 @@ export class CodexClaudeAppServer {
         return readMcpResource(
           stringOr(asRecord(params).server, ''),
           stringOr(asRecord(params).uri, ''),
+          this.mcpScope(params),
         ).then((result) => ({ ...result, originCallId: null }))
       case 'mcpServer/tool/call':
         return callMcpTool(
           stringOr(asRecord(params).server, ''),
           stringOr(asRecord(params).tool, ''),
           asRecord(params).arguments ?? {},
+          this.mcpScope(params),
         )
       case 'windowsSandbox/setupStart':
         return { started: false }
@@ -3633,13 +3647,19 @@ export class CodexClaudeAppServer {
     // checkpoint. It stays pending until Claude starts the forked session.
     const resumeSessionAt = isCodexThread ? null : this.store.claudeResumeAt(thread.id)
     let resumedAtCheckpoint = false
+    const turnCwd = stringOr(params.cwd, thread.cwd)
+    // A Claude thread's own turns also get the MCP servers, subagents,
+    // permission rules and hooks the Codex and Claude Code configs bring.
+    const inheritConfig = desktopPresentation && !isCodexThread
+    const mcp = readMcpConfig({ cwd: turnCwd, inherit: inheritConfig })
+    const permissionRules = inheritConfig ? inheritedPermissionRules(turnCwd) : null
     const runtimeTurn = this.runtime.runTurn(
       {
         threadId: thread.id,
         turnId: turn.id,
         purpose: turnPurpose,
         prompt: effectivePrompt,
-        cwd: stringOr(params.cwd, thread.cwd),
+        cwd: turnCwd,
         runtimeType: isCodexThread ? 'codex-proxy' : null,
         model: resolvedModel,
         effort: resolvedEffort,
@@ -3650,8 +3670,14 @@ export class CodexClaudeAppServer {
         // parent is older than the second after it.
         forkedAt:
           !isCodexThread && thread.forkedFromId != null ? (thread.createdAt + 1) * 1000 : null,
-        mcpServers: readMcpConfig().sdkValue,
+        mcpServers: mcp.sdkValue,
         allowedTools: defaultAllowedTools(),
+        inheritedAllowedTools: permissionRules?.allow ?? null,
+        inheritedAskRules: permissionRules?.ask ?? null,
+        disallowedTools: [...mcp.toolRules.disallowedTools, ...(permissionRules?.deny ?? [])],
+        mcpEnabledTools: mcp.toolRules.enabledTools,
+        agents: inheritConfig ? inheritedAgents(turnCwd) : null,
+        claudeHooks: inheritConfig ? inheritedHooks(turnCwd) : null,
         addDirs: stringListFromEnv('CLAUDE_CODEX_ADD_DIRS', []),
         enableFileCheckpointing: process.env.CLAUDE_CODEX_ENABLE_FILE_CHECKPOINTING === '1',
         outputFormat: claudeOutputFormat(params.outputSchema),
@@ -4688,6 +4714,9 @@ export class CodexClaudeAppServer {
     }
     this.clearActiveTurn(thread.id)
     this.setThreadStatus(peer, thread.id, { type: 'idle' })
+    // Codex runs the config's notify program for its own threads' turns.
+    if (params.outputSchema == null && thread.runtimeBackend !== 'codex' && !thread.ephemeral)
+      this.notifyTurnComplete(peer, thread, completed, turnCwd)
     // Plan-mode text streams through the `plan` ThreadItem + item/plan/delta
     // events; turn/plan/updated is reserved for the update_plan/TodoWrite
     // checklist tool (see the tool_use handler), matching the real app-server
@@ -4695,6 +4724,27 @@ export class CodexClaudeAppServer {
     this.notify(peer, {
       method: 'turn/completed',
       params: { threadId: thread.id, turn: this.toLifecycleTurn(completed) },
+    })
+  }
+
+  // Runs the Codex config's notify program for a completed turn.
+  private notifyTurnComplete(
+    peer: RpcPeer,
+    thread: ThreadRecord,
+    turn: TurnRecord,
+    cwd: string,
+  ): void {
+    const inputMessages = turn.items
+      .map((item) => (item.type === 'userMessage' ? textFromInput(item.content) : ''))
+      .filter(Boolean)
+    const answer = turn.items.findLast((item) => item.type === 'agentMessage' && item.text !== '')
+    runCodexNotify({
+      threadId: thread.id,
+      turnId: turn.id,
+      cwd,
+      client: this.peerFeatures.get(peer)?.clientName ?? null,
+      inputMessages,
+      lastAssistantMessage: answer?.type === 'agentMessage' ? answer.text : null,
     })
   }
 
@@ -7291,6 +7341,14 @@ export class CodexClaudeAppServer {
           this.idleCheckHandler?.()
       })
     }
+  }
+
+  // The MCP servers an App request sees: a named thread's, its project's
+  // included; otherwise those that apply in every folder.
+  private mcpScope(params: unknown): McpConfigScope {
+    const threadId = stringOr(asRecord(params).threadId, '')
+    const thread = threadId ? this.store.getThread(threadId) : null
+    return { cwd: thread && thread.runtimeBackend !== 'codex' ? thread.cwd : null }
   }
 
   // Ends a turn whose runtime run failed. The client leaves its running state

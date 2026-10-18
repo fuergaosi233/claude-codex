@@ -347,6 +347,24 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    if (/inherited config check/i.test(context.prompt)) {
+      await handlers.onEvent({
+        type: 'text_delta',
+        delta: JSON.stringify({
+          mcpServers: context.mcpServers ?? null,
+          allowedTools: context.allowedTools ?? null,
+          inheritedAllowedTools: context.inheritedAllowedTools ?? null,
+          inheritedAskRules: context.inheritedAskRules ?? null,
+          claudeHooks: context.claudeHooks ?? null,
+          disallowedTools: context.disallowedTools ?? null,
+          mcpEnabledTools: context.mcpEnabledTools ?? null,
+          agents: context.agents ?? null,
+        }),
+      })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'inherited config check' })
+      return
+    }
+
     if (/notice event/i.test(context.prompt)) {
       await handlers.onEvent({
         type: 'notice',

@@ -3,6 +3,7 @@ import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { claudeCommandManifest, firstSentence, listClaudeCommands } from './claude-commands.mjs'
+import { claudeHookFiles, claudeHookScope } from './claude-hooks.mjs'
 import { bridgedClaudeConfigDir, claudeSkillFolders } from './project-instructions.mjs'
 import { isPathInside } from './util.mjs'
 
@@ -207,6 +208,14 @@ export function codexHookEventName(claudeEvent: string): string | null {
 }
 
 function hookSettingsFiles(cwd: string): Array<{ path: string; source: 'user' | 'project' }> {
+  // With the Claude Code config bridged and its hooks asked for, the hooks
+  // the adapter runs itself.
+  const bridged = bridgedClaudeConfigDir()
+  if (bridged && claudeHookScope() !== 'off')
+    return claudeHookFiles(cwd, bridged).map((path, index) => ({
+      path,
+      source: index === 0 ? 'user' : 'project',
+    }))
   return [
     { path: join(homedir(), '.claude', 'settings.json'), source: 'user' },
     { path: join(cwd, '.claude', 'settings.json'), source: 'project' },

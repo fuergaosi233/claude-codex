@@ -32,6 +32,12 @@ rl.on('line', (line) => {
     })
     return
   }
+  if (request.method === 'tools/call' && request.params.name === 'env') {
+    // The value of the environment variable named by `value`.
+    const value = process.env[request.params.arguments?.value ?? ''] ?? ''
+    respond(request.id, { content: [{ type: 'text', text: `env:${value}` }], isError: false })
+    return
+  }
   if (request.method === 'tools/call') {
     respond(request.id, {
       content: [
