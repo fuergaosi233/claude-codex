@@ -1123,3 +1123,73 @@ test('native session resumed from a transcript stays open for the cron jobs the 
     rmSync(home, { recursive: true, force: true })
   }
 })
+
+test('native forked session leaves its parent the cron jobs scheduled before the fork', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'claude-codex-cron-'))
+  const projects = join(home, '.claude', 'projects', process.cwd().replace(/[^a-zA-Z0-9-]/g, '-'))
+  mkdirSync(projects, { recursive: true })
+  const scheduledAt = Date.now() - 60 * 60 * 1000
+  writeFileSync(
+    join(projects, 'parent.jsonl'),
+    createCron('cron-use', 'job-1')
+      .slice(0, 2)
+      .map((message, index) =>
+        JSON.stringify({
+          ...message,
+          uuid: `line-${index}`,
+          timestamp: new Date(scheduledAt).toISOString(),
+          toolUseResult: message.tool_use_result,
+        }),
+      )
+      .join('\n'),
+  )
+  const saved = { ...process.env }
+  process.env.HOME = home
+  delete process.env.CLAUDE_CONFIG_DIR
+  delete process.env.CLAUDE_CONFIG_DIRS
+  delete process.env.CLAUDE_ROUTER_DIR
+  try {
+    await withSettleMs(40, async () => {
+      for (const [label, forkedAt, kept] of [
+        ['forked after the job', scheduledAt + 60_000, false],
+        ['forked before the job', scheduledAt - 60_000, true],
+      ] as const) {
+        const { runtime, queries } = fakeRuntime()
+        const sdk = Reflect.get(runtime, 'sdk') as { query: (args: unknown) => FakeQuery }
+        const options: Record<string, unknown>[] = []
+        Reflect.set(runtime, 'sdk', {
+          query: (args: { options: Record<string, unknown> }) => {
+            options.push(args.options)
+            return sdk.query(args)
+          },
+        })
+        runtime.setBackgroundListener(recordingListener())
+        const turn = runtime.runTurn(
+          { ...context, claudeSessionId: 'parent', forkSession: true, forkedAt },
+          handlers([]),
+        )
+        const query = await waitFor(() => queries[0], 'session')
+        assert.equal(
+          (options[0]?.env as NodeJS.ProcessEnv | undefined)?.CLAUDE_CODE_RESUME_SOURCE_ALIVE,
+          new Date(forkedAt).toISOString(),
+          label,
+        )
+        query.push(init, assistant('reply', [text('Hello.')]), {
+          type: 'result',
+          subtype: 'success',
+          result: 'Hello.',
+        })
+        await turn
+        await sleep(80)
+        assert.equal(query.closed, !kept, label)
+        await runtime.stop()
+      }
+    })
+  } finally {
+    for (const name of ['HOME', 'CLAUDE_CONFIG_DIR', 'CLAUDE_CONFIG_DIRS', 'CLAUDE_ROUTER_DIR']) {
+      if (saved[name] === undefined) delete process.env[name]
+      else process.env[name] = saved[name]
+    }
+    rmSync(home, { recursive: true, force: true })
+  }
+})

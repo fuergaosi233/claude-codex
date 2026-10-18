@@ -808,6 +808,22 @@ test('a fork resumes at its fork point, and a full rollback returns there', asyn
   })
 })
 
+test("a fork's Claude session leaves the parent what it scheduled before the fork", async () => {
+  await withServer(async (server) => {
+    const parent = await server.startThread()
+    await server.runTurn(parent, 'parent one')
+    const { thread: fork } = await server.request('thread/fork', { threadId: parent })
+
+    const first = await server.runTurn(fork.id, 'fork check')
+    const forkedAt = new Date((fork.createdAt + 1) * 1000).toISOString()
+    assert.equal(await server.reply(fork.id, first), `forked at ${forkedAt}`)
+    const later = await server.runTurn(fork.id, 'fork check')
+    assert.equal(await server.reply(fork.id, later), `forked at ${forkedAt}`)
+    const own = await server.runTurn(parent, 'fork check')
+    assert.equal(await server.reply(parent, own), 'not a fork')
+  })
+})
+
 test('the ephemeral fork the App describes a thread with stays out of the thread list', async () => {
   await withServer(async (server) => {
     const parent = await server.startThread()

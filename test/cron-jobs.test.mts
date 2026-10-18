@@ -134,3 +134,24 @@ test('CronJobs replays a transcript up to the message a resume stops at', () => 
   none.scanTranscript(transcript.replaceAll('CronCreate', 'Bash'))
   assert.equal(none.until(now), null)
 })
+
+test("CronJobs leaves a forked session's parent its jobs", () => {
+  const now = Date.now()
+  const forkedAt = now - HOUR_MS
+  const line = (message: Record<string, unknown>) => JSON.stringify(message)
+  const created = (toolUseId: string, timestamp: number) =>
+    createCron(
+      toolUseId,
+      { cron: '23 */2 * * *', recurring: true },
+      { id: toolUseId, humanSchedule: 'Every 2 hours at :23', recurring: true, durable: false },
+      { timestamp: new Date(timestamp).toISOString() },
+    ).map(line)
+  const parentOnly = created('parent-job', forkedAt - HOUR_MS).join('\n')
+
+  const fork = new CronJobs()
+  fork.scanTranscript(parentOnly, null, forkedAt)
+  assert.equal(fork.until(now), null)
+
+  fork.scanTranscript([parentOnly, ...created('fork-job', now)].join('\n'), null, forkedAt)
+  assert.equal(fork.until(now), now + RECURRING_MAX_AGE_MS + HOUR_MS)
+})

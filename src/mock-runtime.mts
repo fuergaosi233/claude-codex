@@ -82,6 +82,16 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    if (/fork check/i.test(context.prompt)) {
+      const text =
+        context.forkedAt != null
+          ? `forked at ${new Date(context.forkedAt).toISOString()}`
+          : 'not a fork'
+      await handlers.onEvent({ type: 'text_delta', delta: text })
+      await handlers.onEvent({ type: 'completed', success: true, result: text })
+      return
+    }
+
     if (context.continuation) {
       const text = this.continuations.get(context.threadId) ?? null
       this.continuations.delete(context.threadId)

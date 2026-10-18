@@ -548,6 +548,16 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     // session_state_changed tells a session that outlives its turn when the
     // CLI has finished answering everything queued (see maybeRelease).
     opts.env = { ...process.env, CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1' }
+    // A forked thread resumes a transcript that opens with its parent's
+    // history. Left alone, the CLI would schedule the parent's session cron
+    // jobs a second time and report the parent's background tasks as its own
+    // orphans. With the source marked alive it adopts only what came after.
+    if (resume && context.forkedAt != null) {
+      opts.env = {
+        ...(opts.env as NodeJS.ProcessEnv),
+        CLAUDE_CODE_RESUME_SOURCE_ALIVE: new Date(context.forkedAt).toISOString(),
+      }
+    }
     if (context.addDirs && context.addDirs.length > 0) opts.additionalDirectories = context.addDirs
     if (context.allowedTools && context.allowedTools.length > 0)
       opts.allowedTools = context.allowedTools
@@ -1325,7 +1335,11 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     const file = resume ? sessionTranscriptFile(resume, context.cwd) : null
     if (file) {
       try {
-        jobs.scanTranscript(readFileSync(file, 'utf8'), stringOrNull(options.resumeSessionAt))
+        jobs.scanTranscript(
+          readFileSync(file, 'utf8'),
+          stringOrNull(options.resumeSessionAt),
+          context.forkedAt ?? null,
+        )
       } catch (error) {
         debugLog('native.cron.scan_failed', {
           threadId: context.threadId,

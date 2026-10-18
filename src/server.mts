@@ -3569,6 +3569,10 @@ export class CodexClaudeAppServer {
         claudeSessionId: isCodexThread ? thread.codexSessionId : thread.claudeSessionId,
         forkSession,
         resumeSessionAt,
+        // createdAt is in whole seconds: the history a fork copies from its
+        // parent is older than the second after it.
+        forkedAt:
+          !isCodexThread && thread.forkedFromId != null ? (thread.createdAt + 1) * 1000 : null,
         mcpServers: readMcpConfig().sdkValue,
         allowedTools: defaultAllowedTools(),
         addDirs: stringListFromEnv('CLAUDE_CODEX_ADD_DIRS', []),

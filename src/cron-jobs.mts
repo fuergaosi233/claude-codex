@@ -72,8 +72,10 @@ export class CronJobs {
   }
 
   // Replays a session transcript up to (and including) the message a resume
-  // stops at.
-  scanTranscript(text: string, stopAt: string | null = null): void {
+  // stops at. A forked session's transcript opens with its parent's history;
+  // with `after` set, only messages written after it count, as the CLI sees
+  // them when CLAUDE_CODE_RESUME_SOURCE_ALIVE marks the parent alive.
+  scanTranscript(text: string, stopAt: string | null = null, after: number | null = null): void {
     if (!text.includes('CronCreate')) return
     for (const line of text.split('\n')) {
       const stop = stopAt != null && line.includes(stopAt)
@@ -83,7 +85,10 @@ export class CronJobs {
         line.includes('humanSchedule')
       ) {
         try {
-          this.observe(JSON.parse(line) as Record<string, unknown>)
+          const message = JSON.parse(line) as Record<string, unknown>
+          if (after == null || Date.parse(String(message.timestamp ?? '')) > after) {
+            this.observe(message)
+          }
         } catch {}
       }
       if (stop && lineUuid(line) === stopAt) return
