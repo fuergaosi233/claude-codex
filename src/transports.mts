@@ -1,4 +1,4 @@
-import { existsSync, rmSync } from 'node:fs'
+import { existsSync, lstatSync, rmSync } from 'node:fs'
 import http from 'node:http'
 import net from 'node:net'
 import readline from 'node:readline'
@@ -127,6 +127,10 @@ export async function startWebSocketTransport(
     }
   })
 
+  // The socket this listener bound, by inode: another process may bind the
+  // same path later, and that socket is not ours to remove.
+  const socketPath = parsed.kind === 'unix' ? parsed.path : null
+  const ownSocket = socketPath ? fileId(socketPath) : null
   if (parsed.kind === 'unix') {
     process.stderr.write(`[claude-codex-adapter] listening on ${parsed.path}\n`)
   } else {
@@ -135,15 +139,36 @@ export async function startWebSocketTransport(
 
   return {
     async close() {
+      // Both servers wait for their connections to end before they close.
+      for (const client of wss.clients) client.terminate()
+      const current = socketPath ? fileId(socketPath) : null
+      if (current && current !== ownSocket) {
+        // Closing a unix listener unlinks its path, whatever is there now. The
+        // path holds another socket, so this one stays open, unreachable, until
+        // the process exits.
+        wss.close()
+        server.unref()
+        return
+      }
       await new Promise<void>((resolve) => {
         wss.close(() => {
           server.close(() => resolve())
+          server.closeAllConnections()
         })
       })
-      if (parsed.kind === 'unix' && existsSync(parsed.path)) {
-        rmSync(parsed.path, { force: true })
-      }
+      // Closing unlinked our socket; in case it did not.
+      if (socketPath && fileId(socketPath) === ownSocket) rmSync(socketPath, { force: true })
     },
+  }
+}
+
+// A file's device and inode, or null when nothing is at the path.
+function fileId(path: string): string | null {
+  try {
+    const stat = lstatSync(path)
+    return `${stat.dev}:${stat.ino}`
+  } catch {
+    return null
   }
 }
 

@@ -7,6 +7,7 @@ import {
 } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
+import { existsSync } from 'node:fs'
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import http from 'node:http'
 import net from 'node:net'
@@ -1640,6 +1641,64 @@ test('unix websocket app-server accepts initialize', { timeout: 15_000 }, async 
     terminateWebSocket(ws)
     await stopProcess(proc)
     await rm(sock, { force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('unix daemon removes its socket when it stops, unless another has taken the path', {
+  timeout: 30_000,
+}, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const sock = join(tmpdir(), `ccx-test-${randomUUID().slice(0, 8)}.sock`)
+  const env = {
+    ...process.env,
+    CODEX_HOME: home,
+    CLAUDE_CODEX_MOCK: '1',
+    NODE_NO_WARNINGS: '1',
+  }
+  const start = async (): Promise<ChildProcess> => {
+    const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', `unix://${sock}`], {
+      stdio: ['ignore', 'ignore', 'pipe'],
+      env,
+    })
+    await waitForStderr(proc, /listening on/)
+    return proc
+  }
+  const daemons: ChildProcess[] = []
+  let ws: WebSocket | null = null
+  const other = net.createServer()
+  try {
+    // A connected client does not keep the socket around.
+    const first = await start()
+    daemons.push(first)
+    ws = new WebSocket('ws://localhost/', {
+      createConnection: (() => net.createConnection(sock)) as typeof net.createConnection,
+    })
+    ws.on('error', () => {})
+    await once(ws, 'open')
+    first.kill('SIGTERM')
+    assert.equal(await waitForExit(first, 10_000), 0)
+    assert.equal(existsSync(sock), false, 'the socket goes with the daemon')
+    assert.equal(existsSync(`${sock}.pid`), false)
+
+    // Another process has bound the path since: its socket stays.
+    const second = await start()
+    daemons.push(second)
+    await rm(sock)
+    await new Promise<void>((resolve) => other.listen(sock, resolve))
+    second.kill('SIGINT')
+    assert.equal(await waitForExit(second, 10_000), 0)
+    assert.equal(existsSync(sock), true, 'a socket the daemon did not bind stays')
+    const probe = net.createConnection(sock)
+    await once(probe, 'connect')
+    probe.destroy()
+    assert.equal(existsSync(`${sock}.pid`), false)
+  } finally {
+    terminateWebSocket(ws)
+    await Promise.all(daemons.map((proc) => stopProcess(proc)))
+    if (other.listening) await new Promise<void>((resolve) => other.close(() => resolve()))
+    await rm(sock, { force: true })
+    await rm(`${sock}.pid`, { force: true })
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
