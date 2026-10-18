@@ -34,6 +34,12 @@ import {
   providerLoopSelectionInputFromEnv,
   resolveProviderLoopSelection,
 } from './provider-loop-selection.mjs'
+import {
+  quietBackgroundTurnsEnabled,
+  quietTurnReasons,
+  stripQuietTurnHeartbeat,
+  withQuietTurnHeartbeat,
+} from './quiet-turns.mjs'
 import { recordRunEvent } from './run-registry.mjs'
 import { normalizeRuntimeType } from './runtime-config.mjs'
 import {
@@ -2949,8 +2955,13 @@ export class CodexClaudeAppServer {
     const { textPrompt, images } = extractImageInputs(input)
     // A skill picked in the composer arrives as a markdown link; Claude Code
     // runs it as a slash command. The user message keeps the original input.
+    // Text copied or handed over from a quiet turn's message drops the
+    // heartbeat the adapter appended to it.
+    // App rule: quiet-turn-heartbeat
     const prompt =
-      hiddenPrompt ?? resumed ?? skillLinksToCommand(textPrompt || textFromInput(input))
+      hiddenPrompt ??
+      resumed ??
+      stripQuietTurnHeartbeat(skillLinksToCommand(textPrompt || textFromInput(input)))
     const workflowCommand = hiddenPrompt || resumed ? null : parseWorkflowCommand(prompt)
     // Like Codex, input that arrives while a turn is running joins that turn.
     // A turn/start can race a turn the adapter has just opened itself (for a
@@ -4581,6 +4592,8 @@ export class CodexClaudeAppServer {
         params: { threadId: thread.id, turnId: turn.id, itemId, delta: text },
       })
     }
+    // App rule: quiet-turn-heartbeat
+    this.quietTurnIfWorkRuns(peer, thread, turn.id, params, agentItemId)
     completeMessage('final_answer')
     completePlanItem()
     const completed: TurnRecord = this.store.completeTurn(turn.id, 'completed') ?? turn
@@ -5403,6 +5416,48 @@ export class CodexClaudeAppServer {
     return false
   }
 
+  // A turn that leaves background agents or workflows running ends with the
+  // App's DONT_NOTIFY heartbeat on its last agent message, so the unread dot
+  // waits for the turn the work reports back in (background shells do not
+  // count; see quietTurnReasons). The store keeps the block too:
+  // thread/read then matches what the App was sent, and the App hides the
+  // block in both. An open message gets it before its item/completed; one
+  // that already completed (a tool call came after it) is completed again,
+  // which the App takes as a replacement. No delta carries the block, as the
+  // App shows a streaming message raw.
+  // App rule: quiet-turn-heartbeat
+  private quietTurnIfWorkRuns(
+    peer: RpcPeer,
+    thread: ThreadRecord,
+    turnId: string,
+    params: Record<string, unknown>,
+    openItemId: string | null,
+  ): void {
+    const running = quietTurnReasons({
+      enabled: quietBackgroundTurnsEnabled(),
+      structured: params.outputSchema != null,
+      subagentThread: thread.threadSource === 'subagent',
+      backgroundAgentRunning: this.hasRunningBackgroundSubagent(thread.id),
+      liveTasks: this.runtime.liveTasks?.(thread.id) ?? [],
+    })
+    if (running.length === 0) return
+    // The App reads the turn's last agent message, whatever its phase.
+    const last = this.store.getTurn(turnId)?.items.findLast((item) => item.type === 'agentMessage')
+    const text = last?.type === 'agentMessage' ? withQuietTurnHeartbeat(last.text) : null
+    debugLog('turn.quiet', { threadId: thread.id, turnId, running, marked: text != null })
+    if (!last || text == null) return
+    const updated = this.store.updateItem(turnId, last.id, (item) =>
+      item.type === 'agentMessage' ? { ...item, text } : item,
+    )
+    if (last.id === openItemId) return
+    const item = updated?.items.find((candidate) => candidate.id === last.id)
+    if (item)
+      this.notify(peer, {
+        method: 'item/completed',
+        params: { threadId: thread.id, turnId, item, completedAtMs: nowMillis() },
+      })
+  }
+
   private finalizeBackgroundSubagents(threadId: string | null, message: string): void {
     for (const entry of this.backgroundSubagents.values()) {
       if (threadId != null && entry.parentThreadId !== threadId) continue
@@ -5672,7 +5727,8 @@ export class CodexClaudeAppServer {
       throw new Error('cannot steer a review or compaction turn')
     const input = turnInput(params)
     const { textPrompt, images } = extractImageInputs(input)
-    const prompt = skillLinksToCommand(textPrompt || textFromInput(input))
+    // App rule: quiet-turn-heartbeat
+    const prompt = stripQuietTurnHeartbeat(skillLinksToCommand(textPrompt || textFromInput(input)))
     if (!prompt.trim() && images.length === 0) throw new Error('steer input must not be empty')
     if (peer !== DETACHED_PEER) this.activePeerByThread.set(threadId, peer)
     const item = turnInputItem(params, input)

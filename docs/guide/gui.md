@@ -32,6 +32,23 @@ Selecting it does not itself enable plan mode, so an ordinary conversation may
 correctly run on Sonnet. Choose **Claude Opus** to use Opus throughout. See the
 [Claude Code model configuration](https://code.claude.com/docs/en/model-config#opusplan-model-setting).
 
+## Background work and the unread dot
+
+Claude can leave background subagents (`run_in_background` Agent calls) and
+workflows running after a turn ends. A turn that ends while any of these still
+run does not mark the chat unread or send a desktop notification, because its
+answer is usually only "started, I'll report back". When the work finishes,
+Claude answers in a new turn, and that turn lights the unread dot as usual
+(unless other work is still running then). Backgrounded Bash commands do not
+count: a dev server or a watcher can run for the rest of the chat and would
+otherwise keep every later turn quiet.
+
+To do this the adapter ends the quiet turn's last message with the Codex App's
+own `<heartbeat>` block deciding `DONT_NOTIFY`. The App hides the block; Claude
+never sees it. Other clients, such as the Codex CLI, show it as text. A turn
+with no message from Claude still lights the dot. Set
+`CLAUDE_CODEX_QUIET_BACKGROUND_TURNS=0` to mark every finished turn unread.
+
 ## Localhost GUI testing on macOS
 
 For localhost GUI testing, the adapter is launched by SSH and the in-process TS

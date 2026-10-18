@@ -38,6 +38,7 @@ line a rule touches.
 | `rate-limit-banner` | shows a banner for every `account/rateLimits/updated` | no banner after an ordinary reply |
 | `projects` | holds project writes until `project/list` answers, and matches the `project not found` and deleted-key error texts | a project and a chat moved into it survive an App restart |
 | `delete-missing-rollout` | retries `thread/delete` with `missingRolloutRecovery` after `no rollout found for thread id <id>` | deleting all archived chats empties the list |
+| `quiet-turn-heartbeat` | leaves a thread read and sends no notification when the turn's last agent message ends with a `<heartbeat>` block deciding `DONT_NOTIFY`, and hides the block once the message completes | a turn that leaves a background agent running ends without an unread dot or visible block; the agent's report lights the dot |
 
 The full text of each rule, including the adapter side, is in
 `src/app-compat.mts`.

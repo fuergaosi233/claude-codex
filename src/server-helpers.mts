@@ -3,6 +3,7 @@ import { type FSWatcher, readFileSync, watch, writeFileSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import { promisify } from 'node:util'
 import { callMcpTool, readMcpConfig, readMcpResource } from './mcp.mjs'
+import { stripQuietTurnHeartbeat } from './quiet-turns.mjs'
 import type { SessionStore } from './store.mjs'
 import type {
   ClaudeRuntime,
@@ -280,7 +281,11 @@ export function compactSummary(thread: ThreadRecord, turns: TurnRecord[]): strin
       if (item.type === 'userMessage') return 'User: ' + textFromInput(item.content).slice(0, 500)
       if (item.type === 'functionCallOutput')
         return 'User: ' + textFromInput(toolOutputInput(item.output)).slice(0, 500)
-      if (item.type === 'agentMessage') return 'Assistant: ' + item.text.slice(0, 500)
+      // The summary becomes a prompt, and Claude never sees the quiet-turn
+      // heartbeat.
+      // App rule: quiet-turn-heartbeat
+      if (item.type === 'agentMessage')
+        return 'Assistant: ' + stripQuietTurnHeartbeat(item.text).slice(0, 500)
       return ''
     })
     .filter(Boolean)

@@ -135,6 +135,12 @@ versioning or publishing metadata.
   turn completes as interrupted; stopping a turn no longer wakes the thread to
   acknowledge the background agents Claude Code stopped with it; and
   `/workflows` lists the workflows Claude ran on its own.
+- A turn that ends while its background agents or workflows still run no
+  longer marks the chat unread in the Codex App or sends a desktop
+  notification; the turn the work reports back in does. Background Bash shells
+  do not count, since a dev server or watcher can run for the rest of the chat.
+  `CLAUDE_CODEX_QUIET_BACKGROUND_TURNS=0` marks every finished turn unread
+  again.
 
 ### Rust-first protocol groundwork
 

@@ -158,6 +158,14 @@ export const APP_RULES: readonly AppRule[] = [
       'Fails thread/delete of a thread it does not know with that text and takes the retry as done.',
     verify: 'Delete all archived chats in Settings: the list empties without an error.',
   },
+  {
+    id: 'quiet-turn-heartbeat',
+    app: "On turn/completed reads the turn's last agentMessage, and when it ends with a <heartbeat> block deciding DONT_NOTIFY neither marks the thread unread nor sends a desktop notification. Shows a completed message without the block, and a streaming one raw.",
+    adapter:
+      'Appends that block to the last agentMessage of a turn that ends while background agents or workflows of the thread still run, in its item/completed and never in a delta, and strips it from anything that becomes a prompt. Background Bash shells do not count: one can run for the rest of the chat. CLAUDE_CODEX_QUIET_BACKGROUND_TURNS=0 turns it off.',
+    verify:
+      'Ask for a background agent, then switch to another chat: the launching turn ends without an unread dot or heartbeat text, and the turn the agent reports back in lights the dot.',
+  },
 ]
 
 // The methods the App starts calling, or sends new parameters to, once the

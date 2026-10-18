@@ -17,6 +17,7 @@ import { Duplex } from 'node:stream'
 import test from 'node:test'
 import WebSocket from 'ws'
 import type { ProviderLoopConfigProjectionResult } from '../src/provider-loop-config.mjs'
+import { QUIET_TURN_HEARTBEAT } from '../src/quiet-turns.mjs'
 import { SessionStore } from '../src/store.mjs'
 
 const adapter = resolve('dist/src/adapter.mjs')
@@ -4300,6 +4301,202 @@ test('background Agent outlives the parent turn, wakes the parent, and resumes o
   }
 })
 
+// The agent messages a thread's turn published, as their item/completed carried them.
+function completedAgentMessages(messages: any[], threadId: string): any[] {
+  return messages
+    .filter(
+      (m) =>
+        m.method === 'item/completed' &&
+        m.params.threadId === threadId &&
+        m.params.item.type === 'agentMessage',
+    )
+    .map((m) => m.params.item)
+}
+
+function heartbeatDeltas(messages: any[]): any[] {
+  return messages.filter(
+    (m) => m.method === 'item/agentMessage/delta' && /heartbeat/.test(m.params.delta),
+  )
+}
+
+test('a turn that leaves a background agent running ends quiet, and the report does not', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home, { CLAUDE_CODEX_QUIET_BACKGROUND_TURNS: '' })
+  const reader = new JsonLineReader(proc)
+  const turnCompleted = (threadId: string) => (message: any) =>
+    message.method === 'turn/completed' && message.params.threadId === threadId
+  try {
+    proc.stdin.write(json(codex930Initialize(0)))
+    await reader.nextResponse(0)
+    const threadId = await startMockThread(reader, proc)
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: textInput('background subagent check delay=600') },
+      }),
+    )
+    await reader.nextResponse(2)
+
+    // The launching turn's answer ends with the App's DONT_NOTIFY heartbeat,
+    // sent only in the completed item: the App shows a streaming message raw.
+    const launch = await readUntil(reader, turnCompleted(threadId))
+    const launched = completedAgentMessages(launch, threadId)
+    assert.equal(launched.length, 1)
+    assert.equal(launched[0].text, `agent launched in background\n\n${QUIET_TURN_HEARTBEAT}`)
+    assert.equal(launched[0].phase, 'final_answer')
+    assert.deepEqual(heartbeatDeltas(launch), [])
+
+    // Nothing runs once the agent reported, so its turn lights the dot; the
+    // child's own message never carries the block either.
+    const report = await readUntil(reader, turnCompleted(threadId))
+    const reported = completedAgentMessages(report, threadId)
+    assert.ok(reported.some((item) => /Background agent reported/.test(item.text)))
+    assert.equal(
+      report.some(
+        (m) =>
+          m.method === 'item/completed' &&
+          m.params.item.type === 'agentMessage' &&
+          /heartbeat/.test(m.params.item.text),
+      ),
+      false,
+    )
+    assert.deepEqual(heartbeatDeltas(report), [])
+
+    // History keeps what the App was sent.
+    proc.stdin.write(json({ id: 3, method: 'thread/read', params: { threadId } }))
+    const turns = (await reader.nextResponse(3)).result.thread.turns
+    assert.equal(turns.length, 2)
+    const lastText = (turn: any) =>
+      turn.items.findLast((item: any) => item.type === 'agentMessage')?.text
+    assert.equal(lastText(turns[0]), launched[0].text)
+    assert.doesNotMatch(lastText(turns[1]), /heartbeat/)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+// Starts a turn and returns its id with the agent messages it completed.
+async function runQuietCheckTurn(
+  reader: JsonLineReader,
+  proc: ChildProcessWithoutNullStreams,
+  threadId: string,
+  id: number,
+  text: string,
+): Promise<{ turnId: string; messages: any[] }> {
+  proc.stdin.write(json({ id, method: 'turn/start', params: { threadId, input: textInput(text) } }))
+  const turnId = (await reader.nextResponse(id)).result.turn.id
+  const seen = await readUntil(
+    reader,
+    (m) => m.method === 'turn/completed' && m.params.turn.id === turnId,
+  )
+  assert.equal(seen.at(-1).params.turn.status, 'completed')
+  assert.deepEqual(heartbeatDeltas(seen), [])
+  return { turnId, messages: completedAgentMessages(seen, threadId) }
+}
+
+test('quiet turns follow the background workflows of the thread', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home, { CLAUDE_CODEX_QUIET_BACKGROUND_TURNS: '' })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json(codex930Initialize(0)))
+    await reader.nextResponse(0)
+    const threadId = await startMockThread(reader, proc)
+    let nextId = 10
+    const runTurn = (text: string) => runQuietCheckTurn(reader, proc, threadId, nextId++, text)
+
+    // Nothing runs: the turn lights the dot.
+    const plain = await runTurn('hello')
+    assert.equal(plain.messages.length, 1)
+    assert.doesNotMatch(plain.messages[0].text, /heartbeat/)
+
+    // Claude's only text came before the Workflow call and completed as
+    // commentary; it is completed again, same item, with the heartbeat.
+    const textFirst = await runTurn('background workflow check text first')
+    assert.deepEqual(
+      textFirst.messages.map((item) => [item.id, item.phase, item.text]),
+      [
+        [textFirst.messages[0].id, 'commentary', 'starting the review workflow'],
+        [
+          textFirst.messages[0].id,
+          'commentary',
+          `starting the review workflow\n\n${QUIET_TURN_HEARTBEAT}`,
+        ],
+      ],
+    )
+
+    // The workflow still runs, so the next turn is quiet as well.
+    const meanwhile = await runTurn('hello again')
+    assert.equal(meanwhile.messages.length, 1)
+    assert.ok(meanwhile.messages[0].text.endsWith(`\n\n${QUIET_TURN_HEARTBEAT}`))
+
+    // A turn without a message has nothing to carry the block, and a
+    // message of the heartbeat alone would show as a bubble of its own.
+    const silent = await runTurn('background workflow check silent')
+    assert.deepEqual(silent.messages, [])
+
+    // Once the workflows stop, the turn lights the dot again.
+    const stopped = await runTurn('workflow stop check')
+    assert.deepEqual(
+      stopped.messages.map((item) => item.text),
+      ['workflows stopped'],
+    )
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('a background shell alone never keeps a turn quiet', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home, { CLAUDE_CODEX_QUIET_BACKGROUND_TURNS: '' })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json(codex930Initialize(0)))
+    await reader.nextResponse(0)
+    const threadId = await startMockThread(reader, proc)
+
+    // A dev server can run for the rest of the chat: the turn that starts it,
+    // and every turn while it runs, light the dot.
+    const started = await runQuietCheckTurn(reader, proc, threadId, 10, 'background shell check')
+    assert.deepEqual(
+      started.messages.map((item) => item.text),
+      ['dev server started'],
+    )
+    const meanwhile = await runQuietCheckTurn(reader, proc, threadId, 11, 'hello')
+    assert.equal(meanwhile.messages.length, 1)
+    assert.doesNotMatch(meanwhile.messages[0].text, /heartbeat/)
+    proc.stdin.write(
+      json({ id: 12, method: 'thread/backgroundTerminals/list', params: { threadId } }),
+    )
+    assert.equal((await reader.nextResponse(12)).result.data.length, 1)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('CLAUDE_CODEX_QUIET_BACKGROUND_TURNS=0 lets every turn light the dot', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home, { CLAUDE_CODEX_QUIET_BACKGROUND_TURNS: '0' })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json(codex930Initialize(0)))
+    await reader.nextResponse(0)
+    const threadId = await startMockThread(reader, proc)
+    const started = await runQuietCheckTurn(reader, proc, threadId, 2, 'background workflow check')
+    assert.deepEqual(
+      started.messages.map((item) => item.text),
+      ['review workflow started'],
+    )
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('SendMessage to a finished foreground agent reopens it like a background one', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawnMockAdapter(home)
@@ -5476,10 +5673,19 @@ test('generic Claude tools complete as Codex mcpToolCall items', async () => {
   }
 })
 
-function spawnMockAdapter(home: string): ChildProcessWithoutNullStreams {
+function spawnMockAdapter(
+  home: string,
+  env: NodeJS.ProcessEnv = {},
+): ChildProcessWithoutNullStreams {
   return spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+    env: {
+      ...process.env,
+      CODEX_HOME: home,
+      CLAUDE_CODEX_MOCK: '1',
+      NODE_NO_WARNINGS: '1',
+      ...env,
+    },
   })
 }
 
