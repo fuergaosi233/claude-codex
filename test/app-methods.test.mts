@@ -219,6 +219,7 @@ test('thread/search matches what the user sees and pages past the store prefilte
     const keyOnly = await server.startThread()
     await server.runTurn(keyOnly, 'nothing to see')
     const named = await server.startThread()
+    await server.runTurn(named, 'plain notes')
     await server.request('thread/name/set', { threadId: named, name: 'agentMessage notes' })
 
     // updated_at is in whole seconds, so threads touched in the same second
@@ -271,16 +272,59 @@ test('thread/search matches what the user sees and pages past the store prefilte
 
 test('thread/list pages through threads created in the same second', async () => {
   await withServer(async (server) => {
+    // Every other thread is a chat nothing was sent to, which the list skips.
     const threads: string[] = []
-    for (let index = 0; index < 5; index += 1) threads.push(await server.startThread())
-    const seen: string[] = []
+    for (let index = 0; index < 10; index += 1) {
+      const threadId = await server.startThread()
+      if (index % 2 === 0) continue
+      await server.runTurn(threadId, `chat ${index}`)
+      threads.push(threadId)
+    }
+    const pages: string[][] = []
     let cursor: string | null = null
     do {
       const page: any = await server.request('thread/list', { limit: 2, cursor })
-      seen.push(...ids(page))
+      pages.push(ids(page))
       cursor = page.nextCursor
-    } while (cursor !== null && seen.length < 10)
-    assert.deepEqual(seen.toSorted(), threads.toSorted())
+    } while (cursor !== null && pages.length < 10)
+    assert.deepEqual(
+      pages.map((page) => page.length),
+      [2, 2, 1],
+    )
+    assert.deepEqual(pages.flat().toSorted(), threads.toSorted())
+  })
+})
+
+test('a chat nothing was sent to stays out of the thread list and search', async () => {
+  await withServer(async (server) => {
+    const used = await server.startThread()
+    await server.runTurn(used, 'find the needle')
+    const empty = await server.startThread()
+    await server.request('thread/name/set', { threadId: empty, name: 'needle notes' })
+    assert.deepEqual(ids(await server.request('thread/list')), [used])
+    const search = async () =>
+      (await server.request('thread/search', { searchTerm: 'needle' })).data
+        .map((entry: any) => entry.thread.id)
+        .toSorted()
+    assert.deepEqual(await search(), [used])
+
+    // It still reads and resumes, and the App still finds it loaded.
+    const { thread } = await server.request('thread/read', { threadId: empty, includeTurns: true })
+    assert.equal(thread.id, empty)
+    assert.deepEqual(thread.turns, [])
+    const resumed = await server.request('thread/resume', { threadId: empty })
+    assert.equal(resumed.thread.id, empty)
+    assert.ok((await server.request('thread/loaded/list')).data.includes(empty))
+
+    // Its first turn lists it.
+    await server.runTurn(empty, 'now it starts')
+    assert.deepEqual(ids(await server.request('thread/list')).toSorted(), [used, empty].toSorted())
+    assert.deepEqual(await search(), [used, empty].toSorted())
+
+    // The archive lists every thread, as Codex does.
+    const archived = await server.startThread()
+    await server.request('thread/archive', { threadId: archived })
+    assert.deepEqual(ids(await server.request('thread/list', { archived: true })), [archived])
   })
 })
 
@@ -514,6 +558,34 @@ test('a turn/start carrying toolOutput prompts Claude with it and records a func
   })
 })
 
+test('Continue with no input re-sends the message of a turn that did not finish', async () => {
+  await withServer(async (server) => {
+    const threadId = await server.startThread()
+    const from = server.mark()
+    const { turn } = await server.startTurn(threadId, 'slow turn that the user stops')
+    await server.waitFor('item/agentMessage/delta', (params) => params.turnId === turn.id, from)
+    await server.request('turn/interrupt', { threadId, turnId: turn.id })
+    await server.waitFor('turn/completed', (params) => params.turn.id === turn.id, from)
+
+    // The message may never have reached Claude, so it goes along.
+    const second = server.mark()
+    const { turn: resumed } = await server.request('turn/start', { threadId, input: [] })
+    await server.waitFor('turn/completed', (params) => params.turn.id === resumed.id, second)
+    assert.equal(
+      await server.reply(threadId, resumed.id),
+      'answering: slow turn that the user stops',
+    )
+
+    // After a turn that finished there is nothing to re-send.
+    const third = server.mark()
+    const { turn: next } = await server.request('turn/start', { threadId, input: [] })
+    await server.waitFor('turn/completed', (params) => params.turn.id === next.id, third)
+    assert.equal(await server.reply(threadId, next.id), 'picking up where I left off')
+    const { thread } = await server.request('thread/read', { threadId, includeTurns: false })
+    assert.equal(thread.preview, 'slow turn that the user stops')
+  })
+})
+
 test('toolOutput sent while a turn runs joins that turn as its input', async () => {
   await withServer(async (server) => {
     const threadId = await server.startThread()
@@ -663,10 +735,12 @@ test('projects persist, order, and carry their threads', async () => {
     const inAlpha = started.thread.id
     assert.equal(started.thread.projectId, alpha.id)
     await assert.rejects(server.startThread({ projectId: 'nope' }), /project not found: nope/)
+    await server.runTurn(inAlpha, 'in alpha')
     const { thread: fork } = await server.request('thread/fork', { threadId: inAlpha })
     assert.equal(fork.projectId, alpha.id)
 
     const loose = await server.startThread()
+    await server.runTurn(loose, 'loose')
     from = server.mark()
     await server.request('thread/metadata/update', { threadId: loose, projectId: beta.id })
     assert.deepEqual(server.notified('thread/project/updated', from), [
@@ -777,6 +851,22 @@ test('a fork resumes at its fork point, and a full rollback returns there', asyn
       await server.reply(fork.id, again),
       `resumed mock-${parent} at ${forkPoint}-entry after 1 resets`,
     )
+  })
+})
+
+test("a fork's Claude session leaves the parent what it scheduled before the fork", async () => {
+  await withServer(async (server) => {
+    const parent = await server.startThread()
+    await server.runTurn(parent, 'parent one')
+    const { thread: fork } = await server.request('thread/fork', { threadId: parent })
+
+    const first = await server.runTurn(fork.id, 'fork check')
+    const forkedAt = new Date((fork.createdAt + 1) * 1000).toISOString()
+    assert.equal(await server.reply(fork.id, first), `forked at ${forkedAt}`)
+    const later = await server.runTurn(fork.id, 'fork check')
+    assert.equal(await server.reply(fork.id, later), `forked at ${forkedAt}`)
+    const own = await server.runTurn(parent, 'fork check')
+    assert.equal(await server.reply(parent, own), 'not a fork')
   })
 })
 

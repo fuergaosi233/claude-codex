@@ -1,10 +1,11 @@
 import { createHash } from 'node:crypto'
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { claudeCommandManifest, firstSentence, listClaudeCommands } from './claude-commands.mjs'
 import { claudeHookFiles, claudeHookScope } from './claude-hooks.mjs'
 import { bridgedClaudeConfigDir, claudeSkillFolders } from './project-instructions.mjs'
+import { isPathInside } from './util.mjs'
 
 interface SkillMetadata {
   readonly name: string
@@ -74,9 +75,84 @@ export function listClaudeSkills(params: Record<string, unknown>): SkillsListEnt
   })
 }
 
+// App plugins whose skills Claude can carry out with its own tools: they only
+// read and write files and shape the reply. The App's other plugins drive
+// Codex-only tools, or MCP servers and hooks the App runs for Codex.
+const CLAUDE_RUNNABLE_APP_PLUGINS = new Set(['visualize'])
+
+const MARKETPLACE_MANIFEST = join('.agents', 'plugins', 'marketplace.json')
+
+export interface AppPlugin {
+  readonly name: string
+  readonly root: string
+}
+
+export interface AppSkill {
+  readonly name: string
+  readonly description: string
+  // The skill's SKILL.md; the rest of the skill sits beside it.
+  readonly path: string
+  readonly plugin: string
+}
+
+// The folder of an App plugin Claude can run, found the way plugin/install
+// names it: a local plugin in a marketplace whose manifest lives at
+// <root>/.agents/plugins/marketplace.json, with paths relative to <root>.
+export function claudeRunnableAppPlugin(
+  marketplacePath: unknown,
+  pluginName: unknown,
+): AppPlugin | null {
+  if (typeof pluginName !== 'string' || !CLAUDE_RUNNABLE_APP_PLUGINS.has(pluginName)) return null
+  if (typeof marketplacePath !== 'string' || !isAbsolute(marketplacePath)) return null
+  try {
+    const marketplace = asRecord(JSON.parse(readFileSync(marketplacePath, 'utf8')))
+    const plugins = Array.isArray(marketplace.plugins) ? marketplace.plugins.map(asRecord) : []
+    const source = plugins.find((plugin) => plugin.name === pluginName)?.source
+    const path =
+      typeof source === 'string'
+        ? source
+        : asRecord(source).source === 'local'
+          ? asRecord(source).path
+          : undefined
+    if (typeof path !== 'string') return null
+    const base = marketplacePath.endsWith(MARKETPLACE_MANIFEST)
+      ? marketplacePath.slice(0, -MARKETPLACE_MANIFEST.length)
+      : dirname(marketplacePath)
+    const root = resolve(base, path)
+    return isPathInside(base, root) ? { name: pluginName, root } : null
+  } catch {
+    return null
+  }
+}
+
+// The skills an installed App plugin ships, read from its current files so a
+// plugin the App removed or updated is reflected on the next turn.
+export function appPluginSkills(plugins: readonly AppPlugin[]): AppSkill[] {
+  const skills: AppSkill[] = []
+  for (const plugin of plugins) {
+    if (!CLAUDE_RUNNABLE_APP_PLUGINS.has(plugin.name)) continue
+    try {
+      const manifest = asRecord(
+        JSON.parse(readFileSync(join(plugin.root, '.codex-plugin', 'plugin.json'), 'utf8')),
+      )
+      if (typeof manifest.skills !== 'string') continue
+      const dir = resolve(plugin.root, manifest.skills)
+      if (!isPathInside(plugin.root, dir)) continue
+      for (const skill of readSkillDir(dir, 'system').skills)
+        skills.push({
+          name: skill.name,
+          description: skill.description,
+          path: skill.path,
+          plugin: plugin.name,
+        })
+    } catch {}
+  }
+  return skills.sort((left, right) => left.name.localeCompare(right.name))
+}
+
 function readSkillDir(
   dir: string,
-  scope: 'user' | 'repo',
+  scope: 'user' | 'repo' | 'system',
 ): { skills: SkillMetadata[]; errors: Array<{ path: string; message: string }> } {
   const skills: SkillMetadata[] = []
   const errors: Array<{ path: string; message: string }> = []

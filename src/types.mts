@@ -340,6 +340,10 @@ export type ThreadItem =
           message: string | null
         }
       >
+      // Stored only: marks a closeAgent kept for Apps without the completed
+      // subagent activity kind. historyForPeer hides it from every other
+      // client and strips the mark.
+      legacyOnly?: true
     }
   // Canonical MultiAgent V2 display/liveness item. Codex App discovers the
   // child from `started` and clears its working state from `completed` or
@@ -391,6 +395,10 @@ export interface RuntimeTurnContext {
   // Resume claudeSessionId only up to this transcript entry, in a forked
   // session (thread rewind or fork). Backends that cannot truncate ignore it.
   resumeSessionAt?: string | null
+  // Set on a thread forked from another (ms since the epoch, after the fork).
+  // Its Claude session opens with the parent's history, all older than this,
+  // and what Claude left scheduled or running there stays the parent's.
+  forkedAt?: number | null
   mcpServers: unknown | null
   allowedTools: string[] | null
   // Tools Claude must not use, as permission rules (the CLI's --disallowedTools).
@@ -422,6 +430,9 @@ export interface RuntimeTurnContext {
   // Pre-assembled system prompt addendum (baseInstructions + developerInstructions
   // + personality cue). Sidecar appends it to Claude's default system prompt.
   systemPromptAddendum: string | null
+  // Folders outside the workspace Claude may read without asking, such as
+  // the Codex App skills the prompt lists. Writes still follow the policy.
+  readableRoots?: string[]
   // Drive Claude SDK permission_mode='plan' for this turn — Claude generates
   // a plan but does not execute tools. Set when the App requests `planMode`
   // on turn/start (or when CLAUDE_CODEX_PERMISSION_MODE=plan globally).

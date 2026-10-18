@@ -1,6 +1,13 @@
-import { copyFileSync, existsSync, mkdirSync, readdirSync, realpathSync } from 'node:fs'
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+} from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { basename, dirname, isAbsolute, join } from 'node:path'
 
 // Extended cache TTL for 1-hour prompt caching
 if (!process.env.ANTHROPIC_BETAS) {
@@ -38,6 +45,7 @@ import type { Query } from '@anthropic-ai/claude-agent-sdk'
 import { noteClaudeCommands } from './claude-commands.mjs'
 import { removeCliMcpConfig, writeCliMcpConfig } from './cli-mcp-config.mjs'
 import { recordCliChildren } from './cli-orphans.mjs'
+import { CronJobs } from './cron-jobs.mjs'
 import {
   CREATE_GOAL_DESCRIPTION,
   GET_GOAL_DESCRIPTION,
@@ -64,7 +72,7 @@ import type {
   UserInputAnswers,
   UserInputQuestion,
 } from './types.mjs'
-import { debugLog, newId } from './util.mjs'
+import { debugLog, isPathInside, newId } from './util.mjs'
 import { parseWorkflowCommand, workflowRuntimePrompt } from './workflow-command.mjs'
 import {
   defaultWorkflowTranscriptRoots,
@@ -153,6 +161,7 @@ interface PendingPermission {
 // stays open between turns. A user turn attaches to it instead of starting a
 // new process, and a turn Claude starts on its own (answering a task
 // notification) is buffered until the server attaches a continuation turn.
+// Session cron jobs live in the process the same way (see cron-jobs.mts).
 interface LiveSession {
   threadId: string
   query: Query
@@ -244,6 +253,8 @@ const SESSION_CONTROL_TIMEOUT_MS = 5_000
 // How long a new turn waits for an interrupted session to drain before it
 // gives up on the sink and goes ahead.
 const SINK_DRAIN_TIMEOUT_MS = 30_000
+// setTimeout's ceiling (about 24.8 days).
+const MAX_TIMER_MS = 2 ** 31 - 1
 // How long past their budget stopping waits for SessionEnd hooks: a killed
 // hook settles once its output has drained.
 const SESSION_END_MARGIN_MS = 1_000
@@ -259,6 +270,9 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   private turns = new Map<string, PendingTurn>()
   private permissions = new Map<string, PendingPermission>()
   private sessions = new Map<string, LiveSession>()
+  // Session cron jobs per thread. They outlive a closed process: the next
+  // resume of the same Claude session schedules them again.
+  private cronJobs = new Map<string, CronJobs>()
   private listener: RuntimeBackgroundListener | null = null
   // What is left to do when a CLI session is over, by session (its abort
   // controller): remove its MCP config file and run the user's SessionEnd
@@ -280,7 +294,11 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (draining && !draining.closed && draining.sink) await this.drainSink(draining)
     const live = this.sessions.get(context.threadId)
     if (live && !live.closed && this.isReusable(context)) {
-      if (live.signature === sessionSignature(context) || this.hasLiveWork(live)) {
+      if (
+        live.signature === sessionSignature(context) ||
+        this.hasLiveWork(live) ||
+        this.holdsCronJobs(live)
+      ) {
         return this.attachTurn(live, context, handlers, false)
       }
       this.closeSession(live)
@@ -347,10 +365,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
 
   async interrupt(threadId: string): Promise<void> {
     const live = this.sessions.get(threadId)
-    const soft = live != null && !live.closed && live.liveTasks.size > 0
+    const soft =
+      live != null && !live.closed && (live.liveTasks.size > 0 || this.holdsCronJobs(live))
     if (soft && live) {
-      // Aborting would kill the process and every background task with it.
-      // Stop only the running turn; the tasks keep going and report back.
+      // Aborting would kill the process and every background task (and
+      // scheduled job) with it. Stop only the running turn; the tasks keep
+      // going and report back.
       await this.serialize(live, async () => {
         const current = live.current
         const cancelled = current ? this.cancelSends(live) : []
@@ -460,6 +480,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   resetSession(threadId: string): void {
     const live = this.sessions.get(threadId)
     if (live) this.closeSession(live)
+    this.cronJobs.delete(threadId)
   }
 
   async stop(): Promise<void> {
@@ -559,6 +580,16 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     // session_state_changed tells a session that outlives its turn when the
     // CLI has finished answering everything queued (see maybeRelease).
     opts.env = { ...process.env, CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1' }
+    // A forked thread resumes a transcript that opens with its parent's
+    // history. Left alone, the CLI would schedule the parent's session cron
+    // jobs a second time and report the parent's background tasks as its own
+    // orphans. With the source marked alive it adopts only what came after.
+    if (resume && context.forkedAt != null) {
+      opts.env = {
+        ...(opts.env as NodeJS.ProcessEnv),
+        CLAUDE_CODE_RESUME_SOURCE_ALIVE: new Date(context.forkedAt).toISOString(),
+      }
+    }
     if (context.addDirs && context.addDirs.length > 0) opts.additionalDirectories = context.addDirs
     const allowedTools = [...(context.allowedTools ?? []), ...inheritedAllowedTools(context)]
     if (allowedTools.length > 0) opts.allowedTools = allowedTools
@@ -704,6 +735,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       // matches the previous behaviour of skipping the canUseTool round-trip
       // entirely for those modes.
       if (autoAllow) return { behavior: 'allow' }
+      if (readsWithin(toolName, input, context.readableRoots)) return { behavior: 'allow' }
 
       const requestId = `${context.threadId}:${context.turnId}:${toolName}:${toolUseId}`
       // Subagent-aware approval suppression: when Claude is mid-subagent we
@@ -782,6 +814,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       // canUseTool reaches the session only once Claude asks for a tool.
       let session: LiveSession | null = null
       const options = this.buildOptions(sdk, context, abort, () => session)
+      if (reusable) this.trackCronJobs(context, options)
       const opened: LiveSession = {
         threadId: context.threadId,
         query: sdk.query({ prompt: input, options }),
@@ -1014,6 +1047,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (session.closed) return
     this.clearSessionTimers(session)
     const type = String(message.type ?? '')
+    const cronJobs = session.reusable ? this.cronJobs.get(session.threadId) : undefined
+    cronJobs?.observe(message)
     if (type === 'command_lifecycle') {
       this.trackCommand(session, message)
       this.maybeRelease(session)
@@ -1024,6 +1059,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     const result = type === 'result'
     let endedWhileIdle: string[] = []
     if (init) {
+      if (cronJobs && typeof message.session_id === 'string')
+        cronJobs.sessionId = message.session_id
       // Claude started a turn: whatever just ended is being answered now.
       endedWhileIdle = session.endedWhileIdle
       session.endedWhileIdle = []
@@ -1235,14 +1272,14 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
 
   // The server failed a turn the CLI is still running. Left alone, the CLI
   // would carry on with it unseen, tools and all, and its output would come
-  // back as a turn of its own. Background tasks keep the session; a session
-  // without any has nothing worth keeping.
+  // back as a turn of its own. Background tasks and scheduled jobs keep the
+  // session; a session without any has nothing worth keeping.
   private abandonCliTurn(session: LiveSession): void {
     session.current = null
     session.steers.clear()
     session.backlog.length = 0
     session.autonomousRequested = false
-    if (session.liveTasks.size === 0) {
+    if (session.liveTasks.size === 0 && !this.holdsCronJobs(session)) {
       this.closeSession(session)
       session.abort.abort()
       return
@@ -1288,7 +1325,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
           liveTasks: [...session.liveTasks],
           cliRunning: session.cliRunning,
         })
-        if (!session.current && session.backlog.length === 0) this.closeSession(session)
+        if (session.current || session.backlog.length > 0) return
+        if (!this.holdForCronJobs(session)) this.closeSession(session)
       }, backgroundIdleMs())
       session.idleTimer.unref?.()
       return
@@ -1297,13 +1335,67 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (session.unsettled) {
       session.settleTimer = setTimeout(() => {
         session.settleTimer = null
-        if (!session.current && session.backlog.length === 0 && session.liveTasks.size === 0)
-          this.closeSession(session)
+        if (session.current || session.backlog.length > 0 || session.liveTasks.size > 0) return
+        if (!this.holdForCronJobs(session)) this.closeSession(session)
       }, sessionSettleMs())
       session.settleTimer.unref?.()
       return
     }
+    if (this.holdForCronJobs(session)) return
     this.closeSession(session)
+  }
+
+  // Keeps an idle session open until its last scheduled job is done; a cron
+  // fire then arrives as a turn Claude starts on its own.
+  private holdForCronJobs(session: LiveSession): boolean {
+    const until = this.cronJobsUntil(session)
+    if (until == null) return false
+    if (session.idleTimer) clearTimeout(session.idleTimer)
+    session.idleTimer = setTimeout(
+      () => {
+        session.idleTimer = null
+        this.maybeRelease(session)
+      },
+      Math.min(Math.max(until - Date.now(), 0), MAX_TIMER_MS),
+    )
+    session.idleTimer.unref?.()
+    return true
+  }
+
+  private holdsCronJobs(session: LiveSession): boolean {
+    return this.cronJobsUntil(session) != null
+  }
+
+  private cronJobsUntil(session: LiveSession): number | null {
+    if (!session.reusable || session.closed) return null
+    if (truthyEnv(process.env.CLAUDE_CODE_DISABLE_CRON)) return null
+    return this.cronJobs.get(session.threadId)?.until() ?? null
+  }
+
+  // What a new session starts with: nothing for a fresh Claude session, the
+  // jobs tracked so far when it resumes the session this thread last ran,
+  // and otherwise what the transcript it resumes still holds.
+  private trackCronJobs(context: RuntimeTurnContext, options: Record<string, unknown>): void {
+    const resume = stringOrNull(options.resume)
+    const known = this.cronJobs.get(context.threadId)
+    if (resume && known && known.sessionId === resume && options.forkSession !== true) return
+    const jobs = new CronJobs()
+    const file = resume ? sessionTranscriptFile(resume, context.cwd) : null
+    if (file) {
+      try {
+        jobs.scanTranscript(
+          readFileSync(file, 'utf8'),
+          stringOrNull(options.resumeSessionAt),
+          context.forkedAt ?? null,
+        )
+      } catch (error) {
+        debugLog('native.cron.scan_failed', {
+          threadId: context.threadId,
+          error: error instanceof Error ? error.message : String(error),
+        })
+      }
+    }
+    this.cronJobs.set(context.threadId, jobs)
   }
 
   private closeSession(session: LiveSession): void {
@@ -2657,6 +2749,29 @@ function autoAllowsTools(context: RuntimeTurnContext): boolean {
   )
 }
 
+// A Read of a file inside one of `roots`, after resolving symlinks.
+export function readsWithin(
+  toolName: string,
+  input: Record<string, unknown>,
+  roots: readonly string[] | undefined,
+): boolean {
+  const target = input.file_path
+  if (toolName !== 'Read' || !roots?.length) return false
+  if (typeof target !== 'string' || !isAbsolute(target)) return false
+  const path = realPath(target)
+  return roots.some((root) => isPathInside(realPath(root), path))
+}
+
+// `path` with symlinks resolved as far as it exists.
+function realPath(path: string): string {
+  try {
+    return realpathSync(path)
+  } catch {
+    const parent = dirname(path)
+    return parent === path ? path : join(realPath(parent), basename(path))
+  }
+}
+
 // Whether the user's Claude Code config (allow rules, hooks) may let a tool
 // run without the Codex approval: not in a read-only sandbox or plan mode,
 // which would stop those tools.
@@ -2703,6 +2818,26 @@ function sessionSettleMs(): number {
 
 function backgroundIdleMs(): number {
   return positiveEnvMs('CLAUDE_CODEX_BACKGROUND_IDLE_MS') ?? BACKGROUND_IDLE_MS
+}
+
+function truthyEnv(value: string | undefined): boolean {
+  return value != null && value !== '' && value !== '0' && value.toLowerCase() !== 'false'
+}
+
+// The transcript the CLI resumes: its config directory, under the project
+// directory named after the session's cwd.
+function sessionTranscriptFile(sessionId: string, cwd: string): string | null {
+  const root = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')
+  const dirs = [cwd]
+  try {
+    const real = realpathSync(cwd)
+    if (real !== cwd) dirs.push(real)
+  } catch {}
+  for (const dir of dirs) {
+    const file = join(root, 'projects', dir.replace(/[^a-zA-Z0-9-]/g, '-'), `${sessionId}.jsonl`)
+    if (existsSync(file)) return file
+  }
+  return null
 }
 
 function positiveEnvMs(name: string): number | null {

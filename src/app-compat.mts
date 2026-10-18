@@ -81,6 +81,14 @@ export const APP_RULES: readonly AppRule[] = [
     verify: 'Hand a chat off to a new thread: the handoff text shows and Claude answers it.',
   },
   {
+    id: 'continue-turns',
+    app: 'Offers Continue on a chat whose last turn did not finish, and sends it as turn/start with empty input.',
+    adapter:
+      "Prompts Claude to pick up where it left off, with the unfinished turn's user message when it has one.",
+    verify:
+      'Restart the adapter during a turn, press Continue: Claude answers the message sent in it.',
+  },
+  {
     id: 'steer-errors',
     app: 'Matches turn/steer error texts: "no active turn to steer" makes it send the message as a new turn, and "expected active turn id `X` but found `Y`" makes it retry against Y.',
     adapter: 'Fails turn/steer with exactly these texts.',
@@ -149,6 +157,46 @@ export const APP_RULES: readonly AppRule[] = [
     adapter:
       'Fails thread/delete of a thread it does not know with that text and takes the retry as done.',
     verify: 'Delete all archived chats in Settings: the list empties without an error.',
+  },
+  {
+    id: 'inline-visualizations',
+    app: 'Renders an HTML fragment inside a reply from a `::codex-inline-vis{path="…"}` line of its own. It takes the date in the thread\'s visualization folder, <CODEX_HOME>/visualizations/<YYYY/MM/DD>/<thread id>, from the thread id and refuses the read for an id that is not a UUIDv7. It reads only a file named like `^[a-z0-9]+(-[a-z0-9]+)*\\.html$`, at an absolute path inside that folder, the thread\'s workspace or writable roots, or /tmp where the sandbox allows it, of at most 5e6 bytes. It installs its bundled plugins, visualize among them, with plugin/install each time it starts.',
+    adapter:
+      "Issues UUIDv7 ids for new threads, forks and subagents. Remembers the visualize plugin from plugin/install, and lists its skill, the directive and the thread's folder in the desktop prompt of a thread with a UUIDv7 id. Lets Claude read inside the skill's folder and the thread's folder without asking.",
+    verify:
+      'In a new chat, ask for a small chart: Claude reads the visualize skill without an approval prompt, and the chart renders inside the reply.',
+  },
+  {
+    id: 'visualize-line',
+    app: 'Renders an inline visualization from a line holding `visualize` and its JSON wrapped in the private-use marks its visualize skill documents, and shows the same line without the marks as text.',
+    adapter:
+      "Adds the marks to such an unmarked line outside code fences when an agent message completes and the line's JSON names a path: in its item/completed and the stored item, never in a delta, and in history reads of replies stored before. The App checks the rest of the JSON itself.",
+    verify:
+      'Have a reply name a visualization as a plain visualize{…} line: it shows rendered once the message completes, and again after the chat is reopened.',
+  },
+  {
+    id: 'quiet-turn-heartbeat',
+    app: "On turn/completed reads the turn's last agentMessage, and when it ends with a <heartbeat> block deciding DONT_NOTIFY neither marks the thread unread nor sends a desktop notification. Shows a completed message without the block, and a streaming one raw.",
+    adapter:
+      'Appends that block to the last agentMessage of a turn that ends while background agents or workflows of the thread still run, in its item/completed and never in a delta, and strips it from anything that becomes a prompt. Background Bash shells do not count: one can run for the rest of the chat. CLAUDE_CODEX_QUIET_BACKGROUND_TURNS=0 turns it off.',
+    verify:
+      'Ask for a background agent, then switch to another chat: the launching turn ends without an unread dot or heartbeat text, and the turn the agent reports back in lights the dot.',
+  },
+  {
+    id: 'helper-thread-model',
+    app: 'Generates chat titles, descriptions and turn summaries in ephemeral helper threads (threadSource thread_title, thread_description, thread_summary) on its own OpenAI model, the ephemeralGenerationModel of its statsig config, and allows the server to fall back to another model. A title starts a thread and a description forks the chat; its turn/start carries model null and an outputSchema its zod schemas declare as JSON Schema draft 2020-12, and the JSON in the last agentMessage counts once turn/completed reports completed within 30 seconds. When title generation fails, the chat keeps its first words as its title.',
+    adapter:
+      'With CLAUDE_CODEX_DISABLE_CODEX_PROXY=1 and no Codex proxy selected, starts a helper thread that names a Codex model on the Claude summary model instead of the Codex backend, maps a Codex model on its turns the same way, and keeps an ephemeral fork of a Claude chat on the chat model. Other threads that name a Codex model are left on Codex. Drops the draft declaration of an outputSchema, which the Claude CLI refuses.',
+    verify:
+      'With Codex routing off, send the first message of a new chat: the chat gets a generated title, not its first words.',
+  },
+  {
+    id: 'prewarmed-threads',
+    app: 'Starts the thread of a new chat with thread/start before the user sends anything, keeps it out of thread/list and holds back its thread/started until it sends turn/start there, and deletes it with thread/delete once the chat goes unused for 10 minutes. It forgets such threads when the app-server connection drops or the App quits.',
+    adapter:
+      'Lists and searches a thread only once it has a turn or a preview, as Codex lists a thread only once it has a user message, so a prewarmed chat the App forgot does not show up empty in the sidebar. The archive, a chosen section and subagent queries still list every thread.',
+    verify:
+      'Open a new chat without sending anything, restart the adapter and reload the App: no empty chat shows in the sidebar.',
   },
 ]
 

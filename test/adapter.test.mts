@@ -7,6 +7,7 @@ import {
 } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
+import { existsSync } from 'node:fs'
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import http from 'node:http'
 import net from 'node:net'
@@ -17,6 +18,7 @@ import { Duplex } from 'node:stream'
 import test from 'node:test'
 import WebSocket from 'ws'
 import type { ProviderLoopConfigProjectionResult } from '../src/provider-loop-config.mjs'
+import { QUIET_TURN_HEARTBEAT } from '../src/quiet-turns.mjs'
 import { SessionStore } from '../src/store.mjs'
 
 const adapter = resolve('dist/src/adapter.mjs')
@@ -1229,6 +1231,160 @@ test('Codex app model ids and outputSchema map into Claude runtime context', asy
   }
 })
 
+// The thread/start the App sends to title a chat, on its own OpenAI model.
+function titleThreadStart(id: number): string {
+  return json({
+    id,
+    method: 'thread/start',
+    params: {
+      model: 'gpt-5.6-luna',
+      modelProvider: null,
+      allowProviderModelFallback: true,
+      cwd: process.cwd(),
+      approvalPolicy: 'never',
+      permissions: ':read-only',
+      config: { web_search: 'disabled', model_reasoning_effort: 'low' },
+      personality: null,
+      ephemeral: true,
+      threadSource: 'thread_title',
+      experimentalRawEvents: false,
+      dynamicTools: null,
+      serviceTier: null,
+    },
+  })
+}
+
+// No Codex proxy; summary turns run on haiku.
+const titleAdapterEnv = {
+  CLAUDE_CODEX_PROVIDER: '',
+  CLAUDE_CODEX_AGENT_LOOP: '',
+  CLAUDE_CODEX_RUNTIME_TYPE: '',
+  CLAUDE_CODEX_RUNTIME: '',
+  CLAUDE_CODEX_BACKEND: '',
+  CLAUDE_CODEX_MODELS: '',
+  CLAUDE_CODEX_MODEL_ALIASES: '',
+  CLAUDE_CODEX_SUMMARY_MODEL: 'haiku',
+}
+
+test('with Codex routing off, the App titles a chat on the Claude summary model', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home, {
+    ...titleAdapterEnv,
+    CLAUDE_CODEX_DISABLE_CODEX_PROXY: '1',
+  })
+  const reader = new JsonLineReader(proc)
+  const runTurn = async (id: number, params: Record<string, unknown>) => {
+    proc.stdin.write(json({ id, method: 'turn/start', params }))
+    assert.equal((await reader.nextResponse(id)).error, undefined)
+    let text = ''
+    for (;;) {
+      const message = await reader.next()
+      if (message.method === 'item/agentMessage/delta') text += message.params.delta
+      if (message.method === 'turn/completed') return { text, turn: message.params.turn }
+    }
+  }
+  try {
+    proc.stdin.write(titleThreadStart(1))
+    const start = await reader.nextResponse(1)
+    assert.equal(start.error, undefined)
+    assert.equal(start.result.model, 'haiku')
+    assert.equal(start.result.thread.ephemeral, true)
+    const threadId = start.result.thread.id
+
+    // The App's title turn: no model, an outputSchema, JSON back. The App's
+    // zod schema declares draft 2020-12, which the Claude CLI refuses.
+    const outputSchema = {
+      type: 'object',
+      properties: {
+        title: { type: 'string', minLength: 1, maxLength: 36 },
+        description: { type: 'string', minLength: 1 },
+      },
+      required: ['title', 'description'],
+      additionalProperties: false,
+    }
+    const title = await runTurn(2, {
+      threadId,
+      turnTrigger: 'thread_title',
+      input: [{ type: 'text', text: 'output schema check', text_elements: [] }],
+      cwd: null,
+      approvalPolicy: null,
+      permissions: ':read-only',
+      model: null,
+      effort: null,
+      summary: 'none',
+      personality: null,
+      collaborationMode: null,
+      outputSchema: { $schema: 'https://json-schema.org/draft/2020-12/schema', ...outputSchema },
+    })
+    assert.equal(title.turn.status, 'completed')
+    assert.deepEqual(JSON.parse(title.text), {
+      model: 'haiku',
+      outputFormat: { type: 'json_schema', schema: outputSchema },
+    })
+
+    // A Codex model on a later turn maps the same way.
+    const plain = await runTurn(3, {
+      threadId,
+      model: 'gpt-5.6-luna',
+      input: [{ type: 'text', text: 'output schema check', text_elements: [] }],
+    })
+    assert.equal(plain.turn.status, 'completed')
+    assert.equal(JSON.parse(plain.text).model, 'haiku')
+
+    // The App describes a Claude chat in an ephemeral fork, which stays on its model.
+    proc.stdin.write(
+      json({ id: 4, method: 'thread/start', params: { cwd: process.cwd(), model: 'sonnet' } }),
+    )
+    const chat = await reader.nextResponse(4)
+    proc.stdin.write(
+      json({
+        id: 5,
+        method: 'thread/fork',
+        params: {
+          threadId: chat.result.thread.id,
+          model: 'gpt-5.6-luna',
+          ephemeral: true,
+          excludeTurns: true,
+          threadSource: 'thread_description',
+        },
+      }),
+    )
+    const fork = await reader.nextResponse(5)
+    assert.equal(fork.error, undefined)
+    assert.equal(fork.result.model, 'sonnet')
+
+    // A chat of the user's own on a Codex model keeps it.
+    proc.stdin.write(
+      json({
+        id: 6,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), model: 'gpt-5.6-luna' },
+      }),
+    )
+    const own = await reader.nextResponse(6)
+    assert.equal(own.error, undefined)
+    assert.equal(own.result.model, 'gpt-5.6-luna')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('with Codex routing on, the App title thread keeps its Codex model', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home, { ...titleAdapterEnv, CLAUDE_CODEX_DISABLE_CODEX_PROXY: '' })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(titleThreadStart(1))
+    const start = await reader.nextResponse(1)
+    assert.equal(start.error, undefined)
+    assert.equal(start.result.model, 'gpt-5.6-luna')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('Codex title-generation turn runs through the runtime instead of a hardcoded local title', async () => {
   // We used to short-circuit Codex App's title-gen turn with a regex-derived
   // "处理X" string. That was forcing a hardcoded title regardless of what the
@@ -1485,6 +1641,64 @@ test('unix websocket app-server accepts initialize', { timeout: 15_000 }, async 
     terminateWebSocket(ws)
     await stopProcess(proc)
     await rm(sock, { force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('unix daemon removes its socket when it stops, unless another has taken the path', {
+  timeout: 30_000,
+}, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const sock = join(tmpdir(), `ccx-test-${randomUUID().slice(0, 8)}.sock`)
+  const env = {
+    ...process.env,
+    CODEX_HOME: home,
+    CLAUDE_CODEX_MOCK: '1',
+    NODE_NO_WARNINGS: '1',
+  }
+  const start = async (): Promise<ChildProcess> => {
+    const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', `unix://${sock}`], {
+      stdio: ['ignore', 'ignore', 'pipe'],
+      env,
+    })
+    await waitForStderr(proc, /listening on/)
+    return proc
+  }
+  const daemons: ChildProcess[] = []
+  let ws: WebSocket | null = null
+  const other = net.createServer()
+  try {
+    // A connected client does not keep the socket around.
+    const first = await start()
+    daemons.push(first)
+    ws = new WebSocket('ws://localhost/', {
+      createConnection: (() => net.createConnection(sock)) as typeof net.createConnection,
+    })
+    ws.on('error', () => {})
+    await once(ws, 'open')
+    first.kill('SIGTERM')
+    assert.equal(await waitForExit(first, 10_000), 0)
+    assert.equal(existsSync(sock), false, 'the socket goes with the daemon')
+    assert.equal(existsSync(`${sock}.pid`), false)
+
+    // Another process has bound the path since: its socket stays.
+    const second = await start()
+    daemons.push(second)
+    await rm(sock)
+    await new Promise<void>((resolve) => other.listen(sock, resolve))
+    second.kill('SIGINT')
+    assert.equal(await waitForExit(second, 10_000), 0)
+    assert.equal(existsSync(sock), true, 'a socket the daemon did not bind stays')
+    const probe = net.createConnection(sock)
+    await once(probe, 'connect')
+    probe.destroy()
+    assert.equal(existsSync(`${sock}.pid`), false)
+  } finally {
+    terminateWebSocket(ws)
+    await Promise.all(daemons.map((proc) => stopProcess(proc)))
+    if (other.listening) await new Promise<void>((resolve) => other.close(() => resolve()))
+    await rm(sock, { force: true })
+    await rm(`${sock}.pid`, { force: true })
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
@@ -3589,6 +3803,13 @@ test('Task subagent emits the canonical activity lifecycle and leaves wait as th
     )
     assert.ok(childThreadStarted, 'subagent must emit child thread/started for live navigation')
     assert.equal(childThreadStarted.id, childThreadId)
+    // Child ids are UUIDv7 like every thread id; the nickname takes the
+    // random tail, not the timestamp shared by agents spawned together.
+    assert.match(childThreadId, /^[0-9a-f]{8}-[0-9a-f]{4}-7/)
+    assert.equal(
+      childThreadStarted.agentNickname,
+      `agent-${childThreadId.replace(/-/g, '').slice(-12)}`,
+    )
     assert.equal(
       childThreadStarted.parentThreadId,
       threadId,
@@ -4111,6 +4332,54 @@ test('subagent without a terminal result emits interrupted activity and failed w
     )
     const childTurns = await reader.nextResponse(3)
     assert.equal(childTurns.result.data[0].status, 'failed')
+
+    // Read back, each client gets what it got live: the closeAgent kept for
+    // the legacy App would hide the child from a current one.
+    const isClose = (item: any) => item.type === 'collabAgentToolCall' && item.tool === 'closeAgent'
+    const closesIn = async (
+      client: ChildProcessWithoutNullStreams,
+      clientReader: JsonLineReader,
+      firstId: number,
+    ) => {
+      const request = async (id: number, method: string, params: unknown) => {
+        client.stdin.write(json({ id, method, params }))
+        return (await clientReader.nextResponse(id)).result
+      }
+      const items = (thread: any) => thread.turns.flatMap((turn: any) => turn.items)
+      const read = await request(firstId, 'thread/read', { threadId, includeTurns: true })
+      const listed = await request(firstId + 1, 'thread/items/list', { threadId })
+      const updated = await request(firstId + 2, 'thread/metadata/update', { threadId })
+      return {
+        read: items(read.thread).filter(isClose),
+        listed: listed.data.map((entry: any) => entry.item).filter(isClose),
+        updated: items(updated.thread).filter(isClose),
+      }
+    }
+    const kept = await closesIn(proc, reader, 4)
+    assert.equal(kept.read.length, 1)
+    assert.deepEqual(kept.listed, kept.read)
+    assert.deepEqual(kept.updated, kept.read)
+    assert.equal('legacyOnly' in kept.read[0], false)
+
+    // The same thread read by a current App, after a restart.
+    const exited = once(proc, 'exit')
+    proc.kill()
+    await exited
+    const current = spawnMockAdapter(home)
+    try {
+      const currentReader = new JsonLineReader(current)
+      current.stdin.write(json(codex930Initialize(0)))
+      await currentReader.nextResponse(0)
+      assert.deepEqual(await closesIn(current, currentReader, 1), {
+        read: [],
+        listed: [],
+        updated: [],
+      })
+    } finally {
+      const currentExited = once(current, 'exit')
+      current.kill()
+      await currentExited
+    }
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -4346,6 +4615,344 @@ test('background Agent outlives the parent turn, wakes the parent, and resumes o
           m.params.item.type === 'agentMessage' &&
           /follow-up report/.test(m.params.item.text),
       ),
+    )
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+// The agent messages a thread's turn published, as their item/completed carried them.
+function completedAgentMessages(messages: any[], threadId: string): any[] {
+  return messages
+    .filter(
+      (m) =>
+        m.method === 'item/completed' &&
+        m.params.threadId === threadId &&
+        m.params.item.type === 'agentMessage',
+    )
+    .map((m) => m.params.item)
+}
+
+const PLAIN_VISUALIZE_REPLY =
+  'Here is the chart.\n\nvisualize{"path":"/tmp/chart.html","mode":"wide"}'
+const MARKED_VISUALIZE_REPLY =
+  'Here is the chart.\n\n\uE200visualize\uE202{"path":"/tmp/chart.html","mode":"wide"}\uE201'
+
+test('a visualize line Claude writes without the marks completes with them', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json(codex930Initialize(0)))
+    await reader.nextResponse(0)
+    const threadId = await startMockThread(reader, proc)
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: textInput('visualize line check') },
+      }),
+    )
+    const seen = await readUntil(
+      reader,
+      (m) => m.method === 'turn/completed' && m.params.threadId === threadId,
+    )
+    // The deltas stream the line as written; the App shows the completed
+    // item in their place.
+    const deltas = seen.filter((m) => m.method === 'item/agentMessage/delta')
+    assert.equal(deltas.map((m) => m.params.delta).join(''), PLAIN_VISUALIZE_REPLY)
+    assert.deepEqual(
+      completedAgentMessages(seen, threadId).map((item) => item.text),
+      [MARKED_VISUALIZE_REPLY],
+    )
+
+    proc.stdin.write(json({ id: 3, method: 'thread/read', params: { threadId } }))
+    const [turn] = (await reader.nextResponse(3)).result.thread.turns
+    assert.equal(
+      turn.items.findLast((item: any) => item.type === 'agentMessage')?.text,
+      MARKED_VISUALIZE_REPLY,
+    )
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('history reads add the marks to a visualize line stored without them', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  await mkdir(join(home, 'claude-codex-adapter'), { recursive: true })
+  const store = new SessionStore(join(home, 'claude-codex-adapter', 'state.sqlite'))
+  const threadId = randomUUID()
+  const turnId = randomUUID()
+  const agentItemId = randomUUID()
+  const now = Math.floor(Date.now() / 1000)
+  // A fenced copy is an example, not a visualization.
+  const fenced = '```\nvisualize{"path":"/tmp/chart.html"}\n```'
+  store.upsertThread({
+    id: threadId,
+    sessionId: threadId,
+    forkedFromId: null,
+    preview: 'chart',
+    name: null,
+    archived: false,
+    cwd: process.cwd(),
+    model: 'sonnet',
+    reasoningEffort: null,
+    modelProvider: 'claude-code',
+    claudeSessionId: null,
+    source: 'appServer',
+    createdAt: now - 2,
+    updatedAt: now - 1,
+    status: { type: 'idle' },
+    approvalPolicy: 'on-request',
+    sandboxMode: 'workspace-write',
+    ephemeral: false,
+    threadSource: 'user',
+    agentRole: null,
+    agentNickname: null,
+    baseInstructions: null,
+    developerInstructions: null,
+    personality: null,
+    runtimeBackend: 'claude',
+    codexSessionId: null,
+  })
+  store.upsertTurn({
+    id: turnId,
+    threadId,
+    status: 'completed',
+    startedAt: now - 2,
+    completedAt: now - 1,
+    durationMs: 1000,
+    items: [
+      {
+        type: 'userMessage',
+        id: randomUUID(),
+        content: [{ type: 'text', text: 'chart', text_elements: [] }],
+      },
+      {
+        type: 'agentMessage',
+        id: agentItemId,
+        text: `${PLAIN_VISUALIZE_REPLY}\n\n${fenced}`,
+        phase: 'final_answer',
+        memoryCitation: null,
+      },
+    ],
+    diff: '',
+    error: null,
+  })
+  store.close()
+
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  const expected = `${MARKED_VISUALIZE_REPLY}\n\n${fenced}`
+  const agentText = (items: any[]) => items.find((item) => item.id === agentItemId)?.text
+  const entryItems = (entries: any[]) => entries.flatMap((entry) => entry.item ?? [])
+  try {
+    proc.stdin.write(json(codex930Initialize(0)))
+    await reader.nextResponse(0)
+
+    proc.stdin.write(json({ id: 1, method: 'thread/read', params: { threadId } }))
+    const [read] = (await reader.nextResponse(1)).result.thread.turns
+    assert.equal(agentText(read.items), expected)
+
+    proc.stdin.write(json({ id: 2, method: 'thread/turns/list', params: { threadId } }))
+    const [listed] = (await reader.nextResponse(2)).result.data
+    assert.equal(agentText(listed.items), expected)
+
+    proc.stdin.write(
+      json({ id: 3, method: 'thread/turns/items/list', params: { threadId, turnId } }),
+    )
+    assert.equal(agentText((await reader.nextResponse(3)).result.data), expected)
+
+    proc.stdin.write(json({ id: 4, method: 'thread/items/list', params: { threadId } }))
+    assert.equal(agentText(entryItems((await reader.nextResponse(4)).result.data)), expected)
+
+    proc.stdin.write(json({ id: 5, method: 'thread/timeline/list', params: { threadId } }))
+    assert.equal(agentText(entryItems((await reader.nextResponse(5)).result.data)), expected)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+function heartbeatDeltas(messages: any[]): any[] {
+  return messages.filter(
+    (m) => m.method === 'item/agentMessage/delta' && /heartbeat/.test(m.params.delta),
+  )
+}
+
+test('a turn that leaves a background agent running ends quiet, and the report does not', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home, { CLAUDE_CODEX_QUIET_BACKGROUND_TURNS: '' })
+  const reader = new JsonLineReader(proc)
+  const turnCompleted = (threadId: string) => (message: any) =>
+    message.method === 'turn/completed' && message.params.threadId === threadId
+  try {
+    proc.stdin.write(json(codex930Initialize(0)))
+    await reader.nextResponse(0)
+    const threadId = await startMockThread(reader, proc)
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: textInput('background subagent check delay=600') },
+      }),
+    )
+    await reader.nextResponse(2)
+
+    // The launching turn's answer ends with the App's DONT_NOTIFY heartbeat,
+    // sent only in the completed item: the App shows a streaming message raw.
+    const launch = await readUntil(reader, turnCompleted(threadId))
+    const launched = completedAgentMessages(launch, threadId)
+    assert.equal(launched.length, 1)
+    assert.equal(launched[0].text, `agent launched in background\n\n${QUIET_TURN_HEARTBEAT}`)
+    assert.equal(launched[0].phase, 'final_answer')
+    assert.deepEqual(heartbeatDeltas(launch), [])
+
+    // Nothing runs once the agent reported, so its turn lights the dot; the
+    // child's own message never carries the block either.
+    const report = await readUntil(reader, turnCompleted(threadId))
+    const reported = completedAgentMessages(report, threadId)
+    assert.ok(reported.some((item) => /Background agent reported/.test(item.text)))
+    assert.equal(
+      report.some(
+        (m) =>
+          m.method === 'item/completed' &&
+          m.params.item.type === 'agentMessage' &&
+          /heartbeat/.test(m.params.item.text),
+      ),
+      false,
+    )
+    assert.deepEqual(heartbeatDeltas(report), [])
+
+    // History keeps what the App was sent.
+    proc.stdin.write(json({ id: 3, method: 'thread/read', params: { threadId } }))
+    const turns = (await reader.nextResponse(3)).result.thread.turns
+    assert.equal(turns.length, 2)
+    const lastText = (turn: any) =>
+      turn.items.findLast((item: any) => item.type === 'agentMessage')?.text
+    assert.equal(lastText(turns[0]), launched[0].text)
+    assert.doesNotMatch(lastText(turns[1]), /heartbeat/)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+// Starts a turn and returns its id with the agent messages it completed.
+async function runQuietCheckTurn(
+  reader: JsonLineReader,
+  proc: ChildProcessWithoutNullStreams,
+  threadId: string,
+  id: number,
+  text: string,
+): Promise<{ turnId: string; messages: any[] }> {
+  proc.stdin.write(json({ id, method: 'turn/start', params: { threadId, input: textInput(text) } }))
+  const turnId = (await reader.nextResponse(id)).result.turn.id
+  const seen = await readUntil(
+    reader,
+    (m) => m.method === 'turn/completed' && m.params.turn.id === turnId,
+  )
+  assert.equal(seen.at(-1).params.turn.status, 'completed')
+  assert.deepEqual(heartbeatDeltas(seen), [])
+  return { turnId, messages: completedAgentMessages(seen, threadId) }
+}
+
+test('quiet turns follow the background workflows of the thread', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home, { CLAUDE_CODEX_QUIET_BACKGROUND_TURNS: '' })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json(codex930Initialize(0)))
+    await reader.nextResponse(0)
+    const threadId = await startMockThread(reader, proc)
+    let nextId = 10
+    const runTurn = (text: string) => runQuietCheckTurn(reader, proc, threadId, nextId++, text)
+
+    // Nothing runs: the turn lights the dot.
+    const plain = await runTurn('hello')
+    assert.equal(plain.messages.length, 1)
+    assert.doesNotMatch(plain.messages[0].text, /heartbeat/)
+
+    // Claude's only text came before the Workflow call and completed as
+    // commentary; it is completed again, same item, with the heartbeat.
+    const textFirst = await runTurn('background workflow check text first')
+    assert.deepEqual(
+      textFirst.messages.map((item) => [item.id, item.phase, item.text]),
+      [
+        [textFirst.messages[0].id, 'commentary', 'starting the review workflow'],
+        [
+          textFirst.messages[0].id,
+          'commentary',
+          `starting the review workflow\n\n${QUIET_TURN_HEARTBEAT}`,
+        ],
+      ],
+    )
+
+    // The workflow still runs, so the next turn is quiet as well.
+    const meanwhile = await runTurn('hello again')
+    assert.equal(meanwhile.messages.length, 1)
+    assert.ok(meanwhile.messages[0].text.endsWith(`\n\n${QUIET_TURN_HEARTBEAT}`))
+
+    // A turn without a message has nothing to carry the block, and a
+    // message of the heartbeat alone would show as a bubble of its own.
+    const silent = await runTurn('background workflow check silent')
+    assert.deepEqual(silent.messages, [])
+
+    // Once the workflows stop, the turn lights the dot again.
+    const stopped = await runTurn('workflow stop check')
+    assert.deepEqual(
+      stopped.messages.map((item) => item.text),
+      ['workflows stopped'],
+    )
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('a background shell alone never keeps a turn quiet', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home, { CLAUDE_CODEX_QUIET_BACKGROUND_TURNS: '' })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json(codex930Initialize(0)))
+    await reader.nextResponse(0)
+    const threadId = await startMockThread(reader, proc)
+
+    // A dev server can run for the rest of the chat: the turn that starts it,
+    // and every turn while it runs, light the dot.
+    const started = await runQuietCheckTurn(reader, proc, threadId, 10, 'background shell check')
+    assert.deepEqual(
+      started.messages.map((item) => item.text),
+      ['dev server started'],
+    )
+    const meanwhile = await runQuietCheckTurn(reader, proc, threadId, 11, 'hello')
+    assert.equal(meanwhile.messages.length, 1)
+    assert.doesNotMatch(meanwhile.messages[0].text, /heartbeat/)
+    proc.stdin.write(
+      json({ id: 12, method: 'thread/backgroundTerminals/list', params: { threadId } }),
+    )
+    assert.equal((await reader.nextResponse(12)).result.data.length, 1)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('CLAUDE_CODEX_QUIET_BACKGROUND_TURNS=0 lets every turn light the dot', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home, { CLAUDE_CODEX_QUIET_BACKGROUND_TURNS: '0' })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json(codex930Initialize(0)))
+    await reader.nextResponse(0)
+    const threadId = await startMockThread(reader, proc)
+    const started = await runQuietCheckTurn(reader, proc, threadId, 2, 'background workflow check')
+    assert.deepEqual(
+      started.messages.map((item) => item.text),
+      ['review workflow started'],
     )
   } finally {
     proc.kill()
@@ -5333,6 +5940,10 @@ test('thread/start with ephemeral=true is hidden from thread/list and surfaces t
     )
     const userStart = await reader.nextResponse(2)
     const userId = userStart.result.thread.id
+    proc.stdin.write(
+      json({ id: 10, method: 'turn/start', params: { threadId: userId, input: textInput('hi') } }),
+    )
+    await awaitMessage(reader, (message) => message.method === 'turn/completed')
 
     proc.stdin.write(json({ id: 3, method: 'thread/list', params: {} }))
     const list = await reader.nextResponse(3)
@@ -5529,10 +6140,19 @@ test('generic Claude tools complete as Codex mcpToolCall items', async () => {
   }
 })
 
-function spawnMockAdapter(home: string): ChildProcessWithoutNullStreams {
+function spawnMockAdapter(
+  home: string,
+  env: NodeJS.ProcessEnv = {},
+): ChildProcessWithoutNullStreams {
   return spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+    env: {
+      ...process.env,
+      CODEX_HOME: home,
+      CLAUDE_CODEX_MOCK: '1',
+      NODE_NO_WARNINGS: '1',
+      ...env,
+    },
   })
 }
 
@@ -8265,6 +8885,15 @@ test('thread/list honors isPinned and metadata updates persist the pin state', a
     proc.stdin.write(json({ id: 2, method: 'thread/start', params: { cwd: process.cwd() } }))
     const second = await reader.nextResponse(2)
     const secondId = second.result.thread.id
+    for (const [id, threadId] of [
+      [10, firstId],
+      [11, secondId],
+    ]) {
+      proc.stdin.write(
+        json({ id, method: 'turn/start', params: { threadId, input: textInput('hi') } }),
+      )
+      await awaitMessage(reader, (message) => message.method === 'turn/completed')
+    }
 
     proc.stdin.write(
       json({
