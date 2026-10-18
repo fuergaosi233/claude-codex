@@ -4059,6 +4059,54 @@ test('subagent without a terminal result emits interrupted activity and failed w
     )
     const childTurns = await reader.nextResponse(3)
     assert.equal(childTurns.result.data[0].status, 'failed')
+
+    // Read back, each client gets what it got live: the closeAgent kept for
+    // the legacy App would hide the child from a current one.
+    const isClose = (item: any) => item.type === 'collabAgentToolCall' && item.tool === 'closeAgent'
+    const closesIn = async (
+      client: ChildProcessWithoutNullStreams,
+      clientReader: JsonLineReader,
+      firstId: number,
+    ) => {
+      const request = async (id: number, method: string, params: unknown) => {
+        client.stdin.write(json({ id, method, params }))
+        return (await clientReader.nextResponse(id)).result
+      }
+      const items = (thread: any) => thread.turns.flatMap((turn: any) => turn.items)
+      const read = await request(firstId, 'thread/read', { threadId, includeTurns: true })
+      const listed = await request(firstId + 1, 'thread/items/list', { threadId })
+      const updated = await request(firstId + 2, 'thread/metadata/update', { threadId })
+      return {
+        read: items(read.thread).filter(isClose),
+        listed: listed.data.map((entry: any) => entry.item).filter(isClose),
+        updated: items(updated.thread).filter(isClose),
+      }
+    }
+    const kept = await closesIn(proc, reader, 4)
+    assert.equal(kept.read.length, 1)
+    assert.deepEqual(kept.listed, kept.read)
+    assert.deepEqual(kept.updated, kept.read)
+    assert.equal('legacyOnly' in kept.read[0], false)
+
+    // The same thread read by a current App, after a restart.
+    const exited = once(proc, 'exit')
+    proc.kill()
+    await exited
+    const current = spawnMockAdapter(home)
+    try {
+      const currentReader = new JsonLineReader(current)
+      current.stdin.write(json(codex930Initialize(0)))
+      await currentReader.nextResponse(0)
+      assert.deepEqual(await closesIn(current, currentReader, 1), {
+        read: [],
+        listed: [],
+        updated: [],
+      })
+    } finally {
+      const currentExited = once(current, 'exit')
+      current.kill()
+      await currentExited
+    }
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })

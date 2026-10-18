@@ -662,7 +662,7 @@ export class CodexClaudeAppServer {
       case 'thread/queue/start':
         return this.threadQueueStart(peer, asRecord(params))
       case 'thread/metadata/update':
-        return this.threadMetadataUpdate(asRecord(params))
+        return this.historyForPeer(peer, this.threadMetadataUpdate(asRecord(params)))
       case 'thread/section/move':
         return this.threadSectionMove(asRecord(params))
       case 'threadSection/list':
@@ -4033,7 +4033,10 @@ export class CodexClaudeAppServer {
                 reasoningEffort: null,
                 agentsStates: {},
               }
-              this.store.appendItem(turn.id, closeBegin)
+              // History keeps it, marked, for a legacy App reading the thread
+              // back: an App with the completed kind hides the child if it
+              // reads it.
+              this.store.appendItem(turn.id, { ...closeBegin, legacyOnly: true })
               this.notify(peer, {
                 method: 'item/started',
                 params: {
@@ -4048,7 +4051,7 @@ export class CodexClaudeAppServer {
                 status: collabStatus,
                 agentsStates: { [ctx.childThreadId]: { status: agentStatus, message: null } },
               }
-              this.store.updateItem(turn.id, closeId, () => closeEnd)
+              this.store.updateItem(turn.id, closeId, () => ({ ...closeEnd, legacyOnly: true }))
               this.notify(peer, {
                 method: 'item/completed',
                 params: {
@@ -4735,19 +4738,31 @@ export class CodexClaudeAppServer {
     this.emitItemLifecycle(peer, parentThreadId, parentTurnId, item)
   }
 
-  // Reads replay history. A client that predates the started/completed
-  // activity kinds gets only the items it would have been sent live.
+  // Reads replay history, and each client gets only the items it would have
+  // been sent live. One that predates the started/completed activity kinds
+  // gets neither kind, and only such a client gets the closeAgent kept for it.
   private historyForPeer(peer: RpcPeer, result: unknown): unknown {
-    if (this.supportsCompletedSubagentActivity(peer)) return result
+    const current = this.supportsCompletedSubagentActivity(peer)
     const sentLive = (item: unknown): boolean => {
       const record = asRecord(item)
-      return record.type !== 'subAgentActivity' || record.kind === 'interrupted'
+      if (record.legacyOnly === true) return !current
+      return current || record.type !== 'subAgentActivity' || record.kind === 'interrupted'
+    }
+    const unmarked = (item: unknown): unknown => {
+      if (asRecord(item).legacyOnly !== true) return item
+      const { legacyOnly: _mark, ...rest } = asRecord(item)
+      return rest
     }
     const turnForPeer = (turn: unknown): unknown => {
       const record = asRecord(turn)
       return Array.isArray(record.items)
-        ? { ...record, items: record.items.filter(sentLive) }
+        ? { ...record, items: record.items.filter(sentLive).map(unmarked) }
         : turn
+    }
+    const entryForPeer = (entry: unknown): unknown => {
+      const fields = asRecord(entry)
+      if ('items' in fields) return turnForPeer(entry)
+      return 'item' in fields ? { ...fields, item: unmarked(fields.item) } : unmarked(entry)
     }
     const record = asRecord(result)
     const thread = asRecord(record.thread)
@@ -4762,7 +4777,7 @@ export class CodexClaudeAppServer {
             // Turns, items/list entries, timeline entries.
             return 'items' in fields || sentLive('item' in fields ? fields.item : entry)
           })
-          .map(turnForPeer),
+          .map(entryForPeer),
       }
     return result
   }
@@ -4873,7 +4888,9 @@ export class CodexClaudeAppServer {
           reasoningEffort: null,
           agentsStates: {},
         }
-        this.store.appendItem(turn.id, closeBegin)
+        // Marked like the closeAgent of a failed child result above.
+        // App rule: subagent-close-hides
+        this.store.appendItem(turn.id, { ...closeBegin, legacyOnly: true })
         this.notify(peer, {
           method: 'item/started',
           params: {
@@ -4888,7 +4905,7 @@ export class CodexClaudeAppServer {
           status: 'failed',
           agentsStates: { [context.childThreadId]: { status: agentState, message } },
         }
-        this.store.updateItem(turn.id, closeId, () => closeEnd)
+        this.store.updateItem(turn.id, closeId, () => ({ ...closeEnd, legacyOnly: true }))
         this.notify(peer, {
           method: 'item/completed',
           params: {

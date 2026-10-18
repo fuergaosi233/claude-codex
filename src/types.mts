@@ -339,6 +339,10 @@ export type ThreadItem =
           message: string | null
         }
       >
+      // Stored only: marks a closeAgent kept for Apps without the completed
+      // subagent activity kind. historyForPeer hides it from every other
+      // client and strips the mark.
+      legacyOnly?: true
     }
   // Canonical MultiAgent V2 display/liveness item. Codex App discovers the
   // child from `started` and clears its working state from `completed` or
