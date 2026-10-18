@@ -40,6 +40,7 @@ line a rule touches.
 | `delete-missing-rollout` | retries `thread/delete` with `missingRolloutRecovery` after `no rollout found for thread id <id>` | deleting all archived chats empties the list |
 | `quiet-turn-heartbeat` | leaves a thread read and sends no notification when the turn's last agent message ends with a `<heartbeat>` block deciding `DONT_NOTIFY`, and hides the block once the message completes | a turn that leaves a background agent running ends without an unread dot or visible block; the agent's report lights the dot |
 | `helper-thread-model` | generates titles, descriptions and turn summaries in ephemeral helper threads on its own OpenAI model, accepting another one, with `model: null` and an `outputSchema` on `turn/start`; keeps the first words as the title when that fails | with Codex routing off, a new chat gets a generated title |
+| `prewarmed-threads` | starts a new chat's thread before anything is sent, hides it from `thread/list` until its first `turn/start`, and forgets it when the connection drops or the App quits | after an adapter restart, a new chat left empty does not show in the sidebar |
 
 The full text of each rule, including the adapter side, is in
 `src/app-compat.mts`.

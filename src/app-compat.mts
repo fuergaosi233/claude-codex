@@ -174,6 +174,14 @@ export const APP_RULES: readonly AppRule[] = [
     verify:
       'With Codex routing off, send the first message of a new chat: the chat gets a generated title, not its first words.',
   },
+  {
+    id: 'prewarmed-threads',
+    app: 'Starts the thread of a new chat with thread/start before the user sends anything, keeps it out of thread/list and holds back its thread/started until it sends turn/start there, and deletes it with thread/delete once the chat goes unused for 10 minutes. It forgets such threads when the app-server connection drops or the App quits.',
+    adapter:
+      'Lists and searches a thread only once it has a turn or a preview, as Codex lists a thread only once it has a user message, so a prewarmed chat the App forgot does not show up empty in the sidebar. The archive, a chosen section and subagent queries still list every thread.',
+    verify:
+      'Open a new chat without sending anything, restart the adapter and reload the App: no empty chat shows in the sidebar.',
+  },
 ]
 
 // The methods the App starts calling, or sends new parameters to, once the

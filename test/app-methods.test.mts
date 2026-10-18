@@ -219,6 +219,7 @@ test('thread/search matches what the user sees and pages past the store prefilte
     const keyOnly = await server.startThread()
     await server.runTurn(keyOnly, 'nothing to see')
     const named = await server.startThread()
+    await server.runTurn(named, 'plain notes')
     await server.request('thread/name/set', { threadId: named, name: 'agentMessage notes' })
 
     // updated_at is in whole seconds, so threads touched in the same second
@@ -271,16 +272,59 @@ test('thread/search matches what the user sees and pages past the store prefilte
 
 test('thread/list pages through threads created in the same second', async () => {
   await withServer(async (server) => {
+    // Every other thread is a chat nothing was sent to, which the list skips.
     const threads: string[] = []
-    for (let index = 0; index < 5; index += 1) threads.push(await server.startThread())
-    const seen: string[] = []
+    for (let index = 0; index < 10; index += 1) {
+      const threadId = await server.startThread()
+      if (index % 2 === 0) continue
+      await server.runTurn(threadId, `chat ${index}`)
+      threads.push(threadId)
+    }
+    const pages: string[][] = []
     let cursor: string | null = null
     do {
       const page: any = await server.request('thread/list', { limit: 2, cursor })
-      seen.push(...ids(page))
+      pages.push(ids(page))
       cursor = page.nextCursor
-    } while (cursor !== null && seen.length < 10)
-    assert.deepEqual(seen.toSorted(), threads.toSorted())
+    } while (cursor !== null && pages.length < 10)
+    assert.deepEqual(
+      pages.map((page) => page.length),
+      [2, 2, 1],
+    )
+    assert.deepEqual(pages.flat().toSorted(), threads.toSorted())
+  })
+})
+
+test('a chat nothing was sent to stays out of the thread list and search', async () => {
+  await withServer(async (server) => {
+    const used = await server.startThread()
+    await server.runTurn(used, 'find the needle')
+    const empty = await server.startThread()
+    await server.request('thread/name/set', { threadId: empty, name: 'needle notes' })
+    assert.deepEqual(ids(await server.request('thread/list')), [used])
+    const search = async () =>
+      (await server.request('thread/search', { searchTerm: 'needle' })).data
+        .map((entry: any) => entry.thread.id)
+        .toSorted()
+    assert.deepEqual(await search(), [used])
+
+    // It still reads and resumes, and the App still finds it loaded.
+    const { thread } = await server.request('thread/read', { threadId: empty, includeTurns: true })
+    assert.equal(thread.id, empty)
+    assert.deepEqual(thread.turns, [])
+    const resumed = await server.request('thread/resume', { threadId: empty })
+    assert.equal(resumed.thread.id, empty)
+    assert.ok((await server.request('thread/loaded/list')).data.includes(empty))
+
+    // Its first turn lists it.
+    await server.runTurn(empty, 'now it starts')
+    assert.deepEqual(ids(await server.request('thread/list')).toSorted(), [used, empty].toSorted())
+    assert.deepEqual(await search(), [used, empty].toSorted())
+
+    // The archive lists every thread, as Codex does.
+    const archived = await server.startThread()
+    await server.request('thread/archive', { threadId: archived })
+    assert.deepEqual(ids(await server.request('thread/list', { archived: true })), [archived])
   })
 })
 
@@ -691,10 +735,12 @@ test('projects persist, order, and carry their threads', async () => {
     const inAlpha = started.thread.id
     assert.equal(started.thread.projectId, alpha.id)
     await assert.rejects(server.startThread({ projectId: 'nope' }), /project not found: nope/)
+    await server.runTurn(inAlpha, 'in alpha')
     const { thread: fork } = await server.request('thread/fork', { threadId: inAlpha })
     assert.equal(fork.projectId, alpha.id)
 
     const loose = await server.startThread()
+    await server.runTurn(loose, 'loose')
     from = server.mark()
     await server.request('thread/metadata/update', { threadId: loose, projectId: beta.id })
     assert.deepEqual(server.notified('thread/project/updated', from), [

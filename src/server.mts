@@ -1320,6 +1320,7 @@ export class CodexClaudeAppServer {
             ? (params.cwd as string | string[])
             : null,
         includeEphemeral: params.includeEphemeral === true,
+        excludeEmpty: true,
         parentThreadId,
         ancestorThreadId,
         sourceKinds,

@@ -382,6 +382,8 @@ export class SessionStore {
       // Keeps threads whose name, preview or stored items contain the text.
       // A prefilter: a match inside item JSON may be a key, not visible text.
       searchTerm?: string | undefined
+      // Leaves out threads that have no turn and no preview yet.
+      excludeEmpty?: boolean
       sortKey?: 'created_at' | 'updated_at' | 'recency_at' | 'section_position'
       sortDirection?: 'asc' | 'desc'
     } = {},
@@ -499,6 +501,18 @@ export class SessionStore {
     const topologyQuery =
       parentThreadId != null || ancestorThreadId != null || hasSubagentSourceFilter
     if (!options.includeEphemeral && !topologyQuery) where.push('t.ephemeral = 0')
+    // Codex lists a thread once it has a preview, except in the archive, a
+    // chosen section or a topology query. A turn counts too, since an image or
+    // handoff turn leaves the preview empty.
+    // App rule: prewarmed-threads
+    if (
+      options.excludeEmpty &&
+      !topologyQuery &&
+      archived === 0 &&
+      typeof options.sectionId !== 'string'
+    ) {
+      where.push("(t.preview <> '' OR EXISTS (SELECT 1 FROM turns u WHERE u.thread_id = t.id))")
+    }
 
     const cwdList = Array.isArray(options.cwd) ? options.cwd : options.cwd ? [options.cwd] : []
     if (cwdList.length > 0) {

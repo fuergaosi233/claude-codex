@@ -5675,6 +5675,10 @@ test('thread/start with ephemeral=true is hidden from thread/list and surfaces t
     )
     const userStart = await reader.nextResponse(2)
     const userId = userStart.result.thread.id
+    proc.stdin.write(
+      json({ id: 10, method: 'turn/start', params: { threadId: userId, input: textInput('hi') } }),
+    )
+    await awaitMessage(reader, (message) => message.method === 'turn/completed')
 
     proc.stdin.write(json({ id: 3, method: 'thread/list', params: {} }))
     const list = await reader.nextResponse(3)
@@ -8616,6 +8620,15 @@ test('thread/list honors isPinned and metadata updates persist the pin state', a
     proc.stdin.write(json({ id: 2, method: 'thread/start', params: { cwd: process.cwd() } }))
     const second = await reader.nextResponse(2)
     const secondId = second.result.thread.id
+    for (const [id, threadId] of [
+      [10, firstId],
+      [11, secondId],
+    ]) {
+      proc.stdin.write(
+        json({ id, method: 'turn/start', params: { threadId, input: textInput('hi') } }),
+      )
+      await awaitMessage(reader, (message) => message.method === 'turn/completed')
+    }
 
     proc.stdin.write(
       json({
