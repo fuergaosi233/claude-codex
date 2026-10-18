@@ -101,6 +101,17 @@ versioning or publishing metadata.
   goes back to the server.
 - `mcpServerStatus/list` honours `serverName`, and `mcpServer/resource/read`
   answers with the `originCallId` the protocol requires.
+- Claude threads can show inline visualizations. New threads, forks and
+  subagents get UUIDv7 ids, without which the App refuses to read a thread's
+  visualizations; the `visualize` plugin the App installs is remembered, and
+  its skill is listed in the desktop prompt with the `::codex-inline-vis{…}`
+  line the App renders and the thread's visualization folder, which Claude may
+  read without an approval prompt. Chats created before cannot render them.
+- A visualization Claude names with a plain `visualize{…}` line, without the
+  invisible marks the App's visualize skill puts around it, renders instead of
+  showing as text: the adapter adds the marks outside code fences when the
+  message completes and in history reads; streamed deltas keep the line as
+  written.
 
 ### Provider and multi-agent boundaries
 

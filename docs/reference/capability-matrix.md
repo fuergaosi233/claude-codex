@@ -10,7 +10,7 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 | Area | Status | Notes |
 | --- | --- | --- |
 | Remote transport | Supported | SSH starts `codex app-server --listen unix://` + `proxy`; the shim reports a Codex-compatible version/user agent. |
-| Thread lifecycle | Supported | start/resume/fork/archive/list/read/delete + turn listing, backed by SQLite + Claude session ids. `thread/delete` also removes the thread's subagents, ending its running background agents first; an unknown thread fails with Codex's missing-rollout text so the App's `missingRolloutRecovery` retry succeeds. |
+| Thread lifecycle | Supported | start/resume/fork/archive/list/read/delete + turn listing, backed by SQLite + Claude session ids. New threads, forks and subagents get UUIDv7 ids, as Codex issues them. `thread/delete` also removes the thread's subagents, ending its running background agents first; an unknown thread fails with Codex's missing-rollout text so the App's `missingRolloutRecovery` retry succeeds. |
 | Rollback / revert | Supported | `thread/rollback` and `thread/revert` drop turns and make Claude forget them: the next turn resumes the newest remaining turn's checkpoint in a forked session (a fork's own start point when none remain). Turns from before checkpoints keep Claude's context. |
 | History paging & search | Supported | `thread/turns/list` pages either way from a turn cursor; `thread/items/list` pages items, and `thread/timeline/list` pages turn events from the newest back, as Codex does. `thread/search` matches names, previews and visible message text; `thread/searchOccurrences` serves find-in-conversation. |
 | Projects | Supported | `project/*` keeps projects and thread membership in SQLite, with `project/changed` and `thread/project/updated` notifications. |
@@ -66,6 +66,7 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 | --- | --- | --- |
 | MCP config/status/tools | Supported | Reads Claude MCP config, passes servers into turns, calls stdio/HTTP tools directly. `mcpServerStatus/list` enumerates real `tools`/`resources`/`resourceTemplates` per server (10s cache, graceful empty fallback on spawn/timeout), or one server's with `serverName`. `mcpServer/resource/read` answers `originCallId: null`: no hosted app scopes the read. |
 | Turn-item paging | Supported | `thread/turns/list` honors `itemsView` — `summary` (default: first userMessage + final agentMessage), `full`, and `notLoaded` — instead of always shipping every item. |
+| Inline visualizations | Supported | The App's bundled `visualize` skill, remembered from `plugin/install`, is listed in the desktop prompt of threads with a UUIDv7 id, with the `::codex-inline-vis{path="…"}` line the App renders and the thread's visualization folder; Claude reads the skill and that folder without an approval prompt. A plain `visualize{…}` line written without the App's invisible marks gets them when the message completes and in history reads. Threads created before the adapter issued UUIDv7 ids cannot render them. See [Using the Codex App](/guide/gui#inline-visualizations). |
 | Skills & hooks | Supported | `skills/list` reads `.claude/skills/*/SKILL.md` (user+repo scope) and offers the CLI's built-in skills (`/simplify`, `/code-review`, …) as system skills that run as slash commands; `hooks/list` reads `settings.json` hooks, mapping Claude events to Codex `HookEventName` (unmappable events dropped). |
 | Fuzzy file search | Supported | One-shot `fuzzyFileSearch` plus the stateful session API (`sessionStart/Update/Stop`) that streams `fuzzyFileSearch/sessionUpdated` results and a final `sessionCompleted`. |
 | Filesystem RPCs | Supported | `fs/readFile`, write, metadata, list, remove, copy, watch/unwatch (Codex v2-shaped). |
@@ -79,7 +80,7 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 | Area | Status | Notes |
 | --- | --- | --- |
 | Realtime audio | Unsupported | No Claude audio channel; methods ack so capability probe doesn't error; listVoices returns empty. |
-| Plugins/marketplace/apps | N/A | No Codex plugin marketplace; methods return empty schema-shaped responses. (Claude skills/hooks are surfaced — see Utilities.) |
+| Plugins/marketplace/apps | N/A | No Codex plugin marketplace; methods return empty schema-shaped responses. `plugin/install` of the App's bundled `visualize` plugin is remembered for inline visualizations, and `plugin/uninstall` forgets it. (Claude skills/hooks are surfaced — see Utilities.) |
 | Account/rate limits/auth | N/A | Claude manages its own auth; account/OpenAI-auth panels report null/empty. `account/usage/read` reports the longest turn and day streaks from local history, with token counts `null`. |
 | Remote control / passkeys | Unsupported | `remoteControl/*` reports a disabled installation; `userVerification/*` reports the provider unavailable, with the error data the App reads. |
 | External agent import | Stub | `externalAgentConfig/detect` and import return empty; the import histories the App records are kept and listed. |
