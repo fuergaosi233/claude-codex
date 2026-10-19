@@ -117,6 +117,9 @@ versioning or publishing metadata.
   state on `turn/completed` only, so such a turn kept the thread spinning for
   the rest of the connection — with the answer already written to Claude's
   transcript — until the user interrupted it by hand.
+- The Claude Agent SDK is 0.3.304, which bundles Claude Code 2.1.304. The
+  adapter always passes a permission mode, so the CLI's changed default for
+  SDK sessions without one does not reach Claude threads.
 
 ### Provider and multi-agent boundaries
 
