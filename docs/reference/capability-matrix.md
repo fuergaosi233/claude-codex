@@ -47,7 +47,7 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 | Claude Code tools | Supported | Not restricted by default; set `CLAUDE_CODEX_ALLOWED_TOOLS` to restrict. |
 | Approval policy / sandbox | Supported | App's approvalPolicy + sandbox persist on the thread and map to Claude permission_mode. "Full access" drops the can_use_tool callback; read-only restricts tools to read/search. |
 | Bash approval | Supported | can_use_tool → Codex `item/commandExecution/requestApproval`. Bypassed when approvalPolicy=never / Full access. |
-| File edit approval | Supported | Edit/Write/MultiEdit → Codex fileChange items with approval + diff updates. |
+| File edit approval | Supported | Edit/Write/MultiEdit → Codex fileChange items with approval + diff updates. The card opens and grows (`item/fileChange/patchUpdated`, at most every 500 ms) while Claude is still writing the call, and takes the finished change before any approval (`CLAUDE_CODEX_LIVE_FILE_CHANGES=0` turns this off). |
 | Bash output | Supported | Forwarded as command output on completion (SDK has no incremental tool-output streaming). |
 | Generic Claude tools | Supported | Non-command/file tools → mcpToolCall items under the `claude-code` pseudo server. |
 | Subagent (Task) | Supported | Task spawns an ephemeral child thread and emits native `subAgentActivity` lifecycle events (capability-gated `completed`) plus `spawnAgent`/`wait` tool state; inner events are hidden, and the final result lands as one agentMessage on the child thread. |

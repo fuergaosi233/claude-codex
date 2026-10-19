@@ -485,6 +485,14 @@ export type RuntimeEvent =
   | { type: 'text_delta'; delta: string }
   | { type: 'reasoning_delta'; delta: string }
   | { type: 'tool_use'; toolUseId: string; toolName: string; input: Record<string, unknown> }
+  // The input of a file tool call (Edit, Write, MultiEdit) as far as the
+  // model has written it; the finished call follows as `tool_use`.
+  | {
+      type: 'tool_input_progress'
+      toolUseId: string
+      toolName: string
+      input: Record<string, unknown>
+    }
   | { type: 'tool_output_delta'; toolUseId: string; delta: string }
   | {
       type: 'tool_result'

@@ -43,6 +43,7 @@ line a rule touches.
 | `quiet-turn-heartbeat` | leaves a thread read and sends no notification when the turn's last agent message ends with a `<heartbeat>` block deciding `DONT_NOTIFY`, and hides the block once the message completes | a turn that leaves a background agent running ends without an unread dot or visible block; the agent's report lights the dot |
 | `helper-thread-model` | generates titles, descriptions and turn summaries in ephemeral helper threads on its own OpenAI model, accepting another one, with `model: null` and an `outputSchema` declaring JSON Schema draft 2020-12 on `turn/start`, waiting 30 seconds for the answer; keeps the first words as the title when that fails | with Codex routing off, a new chat gets a generated title |
 | `prewarmed-threads` | starts a new chat's thread before anything is sent, hides it from `thread/list` until its first `turn/start`, and forgets it when the connection drops or the App quits | after an adapter restart, a new chat left empty does not show in the sidebar |
+| `file-change-preview` | replaces a `fileChange` item's changes with each `item/fileChange/patchUpdated`, adding the item if it has none of that id, and redraws its card while it is in progress; the approval card shows the changes the item holds | a long new file Claude writes shows up and grows while Claude writes it, and the approval shows the whole file |
 
 The full text of each rule, including the adapter side, is in
 `src/app-compat.mts`.

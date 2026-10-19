@@ -3455,25 +3455,69 @@ export class CodexClaudeAppServer {
         })
       planItemId = null
     }
-    const completeOpenToolItems = (message: string): void => {
-      for (const itemId of openToolItems) {
-        const started = itemStartedAtMs.get(itemId)
-        const durationMs = started == null ? null : Math.max(0, nowMillis() - started)
-        const updated = this.store.updateItem(turn.id, itemId, (item) => {
-          if (item.type === 'commandExecution') return { ...item, status: 'failed', durationMs }
-          if (item.type === 'fileChange') return { ...item, status: 'failed' }
-          if (item.type === 'mcpToolCall')
-            return { ...item, status: 'failed', error: { message }, durationMs }
-          return item
+    const failToolItem = (itemId: string, message: string): void => {
+      openToolItems.delete(itemId)
+      const started = itemStartedAtMs.get(itemId)
+      const durationMs = started == null ? null : Math.max(0, nowMillis() - started)
+      const updated = this.store.updateItem(turn.id, itemId, (item) => {
+        if (item.type === 'commandExecution') return { ...item, status: 'failed', durationMs }
+        if (item.type === 'fileChange') return { ...item, status: 'failed' }
+        if (item.type === 'mcpToolCall')
+          return { ...item, status: 'failed', error: { message }, durationMs }
+        return item
+      })
+      const item = updated?.items.find((candidate) => candidate.id === itemId)
+      if (item)
+        this.notify(peer, {
+          method: 'item/completed',
+          params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
         })
-        const item = updated?.items.find((candidate) => candidate.id === itemId)
-        if (item)
-          this.notify(peer, {
-            method: 'item/completed',
-            params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
-          })
-      }
+    }
+    const completeOpenToolItems = (message: string): void => {
+      for (const itemId of openToolItems) failToolItem(itemId, message)
       openToolItems.clear()
+    }
+    // File tool calls drawn from Claude's streamed input whose finished call
+    // has not arrived yet. Codex streams its own apply_patch input the same
+    // way: the card opens with the first part of the change and grows through
+    // item/fileChange/patchUpdated while the model writes the rest.
+    const previewToolUseIds = new Set<string>()
+    const patchFileChange = (
+      toolUseId: string,
+      toolName: string,
+      input: Record<string, unknown>,
+    ): void => {
+      const itemId = itemIds.get(toolUseId)
+      if (!itemId) return
+      const changes = fileChangeFromTool(toolName, input)
+      this.store.updateItem(turn.id, itemId, (item) =>
+        item.type === 'fileChange' ? { ...item, changes } : item,
+      )
+      this.notify(peer, {
+        method: 'item/fileChange/patchUpdated',
+        params: { threadId: thread.id, turnId: turn.id, itemId, changes },
+      })
+    }
+    // The finished call replaces what streamed, so the card, the approval and
+    // the completed item show exactly the change Claude makes.
+    const finishPreview = (
+      toolUseId: string,
+      toolName: string,
+      input: Record<string, unknown>,
+    ): boolean => {
+      if (!previewToolUseIds.delete(toolUseId)) return false
+      patchFileChange(toolUseId, toolName, input)
+      return true
+    }
+    // A model response that ended without finishing a call (its stream broke
+    // and Claude asked again) leaves a card no result will close.
+    const abandonPreviews = (): void => {
+      for (const toolUseId of previewToolUseIds) {
+        const itemId = itemIds.get(toolUseId)
+        if (itemId && openToolItems.has(itemId))
+          failToolItem(itemId, 'Claude did not finish this call.')
+      }
+      previewToolUseIds.clear()
     }
 
     // Allow per-turn override of policy (Codex App may attach updated values
@@ -3729,7 +3773,8 @@ export class CodexClaudeAppServer {
             if (
               event.type === 'text_delta' ||
               event.type === 'reasoning_delta' ||
-              event.type === 'message_boundary'
+              event.type === 'message_boundary' ||
+              event.type === 'tool_input_progress'
             )
               return
             if (event.type === 'tool_use' && !isSubagentToolName(event.toolName)) return
@@ -3744,9 +3789,43 @@ export class CodexClaudeAppServer {
           }
           if (event.type === 'message_boundary') {
             completeMessage()
+            abandonPreviews()
             return
           }
-          if (event.type === 'tool_use' && !itemIds.has(event.toolUseId)) completeMessage()
+          if (
+            (event.type === 'tool_use' || event.type === 'tool_input_progress') &&
+            !itemIds.has(event.toolUseId)
+          )
+            completeMessage()
+          if (event.type === 'tool_input_progress') {
+            // App rule: file-change-preview
+            if (itemIds.has(event.toolUseId)) {
+              if (previewToolUseIds.has(event.toolUseId))
+                patchFileChange(event.toolUseId, event.toolName, event.input)
+              return
+            }
+            const item = this.toolUseToItem({ ...event, type: 'tool_use' }, thread.cwd)
+            if (item.type !== 'fileChange') return
+            previewToolUseIds.add(event.toolUseId)
+            itemIds.set(event.toolUseId, item.id)
+            itemStartedAtMs.set(item.id, nowMillis())
+            openToolItems.add(item.id)
+            this.store.appendItem(turn.id, item)
+            this.notify(peer, {
+              method: 'item/started',
+              params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: nowMillis() },
+            })
+            this.notify(peer, {
+              method: 'item/fileChange/patchUpdated',
+              params: {
+                threadId: thread.id,
+                turnId: turn.id,
+                itemId: item.id,
+                changes: item.changes,
+              },
+            })
+            return
+          }
           if (
             event.type === 'tool_use' &&
             ((event.toolName === 'SendMessage' &&
@@ -4237,6 +4316,9 @@ export class CodexClaudeAppServer {
             // anything slips through we'd otherwise create a husk
             // commandExecution item that never closes (the second emit
             // overwrites itemIds[] so the husk never sees its tool_result).
+            // A file change already drawn from the streamed input keeps its
+            // card and takes the finished input.
+            if (finishPreview(event.toolUseId, event.toolName, event.input)) return
             if (itemIds.has(event.toolUseId)) return
             // Claude's TodoWrite is the equivalent of Codex's `update_plan`
             // todo/checklist tool, which the real app-server maps to a
@@ -4489,6 +4571,9 @@ export class CodexClaudeAppServer {
         onPermissionRequest: async (event) => {
           if (!turnIsActive()) return { decision: 'cancel' }
           completeMessage()
+          // The request can overtake the finished call; the approval must
+          // show the whole change, not the part that streamed.
+          finishPreview(event.toolUseId, event.toolName, event.input)
           let itemId = itemIds.get(event.toolUseId)
           if (!itemId) {
             const item = this.toolUseToItem(

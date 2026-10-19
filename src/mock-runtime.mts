@@ -186,6 +186,60 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    // A Write whose input streams in before the finished call, as the native
+    // runtime reports it. With "approval first" the permission request
+    // overtakes the finished call; with "abandoned" a first response breaks
+    // off in the middle of a call and Claude asks again; with "nested" a
+    // subagent streams a call of its own.
+    if (/live patch check/i.test(context.prompt)) {
+      const path = join(context.cwd, 'live.txt')
+      const content = 'one\ntwo\nthree\n'
+      const toolUseId = `tool-live-${Date.now()}`
+      const progress = (id: string, input: Record<string, unknown>) =>
+        handlers.onEvent({ type: 'tool_input_progress', toolUseId: id, toolName: 'Write', input })
+      if (/abandoned/i.test(context.prompt)) {
+        await progress(`${toolUseId}-lost`, { file_path: path, content: 'on' })
+        await handlers.onEvent({ type: 'message_boundary' })
+      }
+      if (/nested/i.test(context.prompt)) {
+        const taskId = `task-live-${Date.now()}`
+        await handlers.onEvent({
+          type: 'tool_use',
+          toolUseId: taskId,
+          toolName: 'Task',
+          input: { description: 'writes a file', prompt: 'write the other file' },
+        })
+        await progress(`${toolUseId}-nested`, { file_path: join(context.cwd, 'nested.txt') })
+        await handlers.onEvent({ type: 'tool_result', toolUseId: taskId, content: 'nested done' })
+      }
+      await handlers.onEvent({ type: 'text_delta', delta: 'writing live.txt' })
+      await progress(toolUseId, { file_path: path })
+      await progress(toolUseId, { file_path: path, content: 'one\ntw' })
+      const input = { file_path: path, content }
+      const approvalFirst = /approval first/i.test(context.prompt)
+      if (!approvalFirst)
+        await handlers.onEvent({ type: 'tool_use', toolUseId, toolName: 'Write', input })
+      const decision = await handlers.onPermissionRequest({
+        type: 'permission_request',
+        requestId: `perm-${toolUseId}`,
+        toolUseId,
+        toolName: 'Write',
+        input,
+      })
+      if (approvalFirst)
+        await handlers.onEvent({ type: 'tool_use', toolUseId, toolName: 'Write', input })
+      const accepted = decision.decision === 'accept' || decision.decision === 'acceptForSession'
+      if (accepted) await writeFile(path, content)
+      await handlers.onEvent({
+        type: 'tool_result',
+        toolUseId,
+        content: accepted ? 'wrote live.txt' : 'declined',
+        isError: !accepted,
+      })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'wrote live.txt' })
+      return
+    }
+
     // Keeps running until a steer says "release", so a test can count on the
     // turn still running when its next requests arrive.
     if (/hold this turn until released/i.test(context.prompt)) {

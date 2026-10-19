@@ -54,6 +54,7 @@ import {
 import { echoedUuids, TurnInput, type TurnInputMessage } from './native-turn-input.mjs'
 import { sdkHooks } from './sdk-hooks.mjs'
 import { readTaskResult } from './task-output.mjs'
+import { ToolInputPreviews } from './tool-input-preview.mjs'
 import type {
   ClaudeRuntime,
   ElicitationResponse,
@@ -121,6 +122,9 @@ interface PendingTurn {
   // ToolUseBlock twice; we keep only the AssistantMessage copy because
   // content_block_start arrives with empty input).
   toolStartSeen: Set<string>
+  // The streamed input of the current response's file tool calls, null when
+  // CLAUDE_CODEX_LIVE_FILE_CHANGES=0 turns the live preview off.
+  toolInputPreviews: ToolInputPreviews | null
   // Buffer + tool ids for StructuredOutput coercion: when the SDK ships a
   // synthetic StructuredOutput tool_use we want to suppress the streamed
   // text and emit only the final coerced JSON.
@@ -971,6 +975,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       skippedWorkflowTaskIds: new Set(),
       workflowTasks: new Map(),
       toolStartSeen: new Set(),
+      toolInputPreviews:
+        process.env.CLAUDE_CODEX_LIVE_FILE_CHANGES === '0' ? null : new ToolInputPreviews(),
       structuredBuffer: '',
       pendingUserMessage: null,
       deferredResult: null,
@@ -1973,14 +1979,30 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         // full block lands later inside the AssistantMessage. Without this
         // we'd emit one orphan inProgress item per tool and a real one.
         if (id) pending.toolStartSeen.add(id)
+        // A file tool's input is followed as it streams, so the App can draw
+        // the change while Claude is still writing it.
+        if (typeof event.index === 'number') {
+          pending.toolInputPreviews?.start(event.index, id, String(block.name ?? ''))
+        }
       }
+      return
+    }
+    if (eventType === 'content_block_stop') {
+      if (typeof event.index === 'number') pending.toolInputPreviews?.stop(event.index)
       return
     }
     if (eventType === 'content_block_delta') {
       const delta = event.delta as Record<string, unknown> | undefined
       if (!delta) return
       const deltaType = String(delta.type ?? '')
-      if (deltaType === 'text_delta') {
+      if (deltaType === 'input_json_delta') {
+        if (typeof event.index !== 'number') return
+        const preview = pending.toolInputPreviews?.push(
+          event.index,
+          String(delta.partial_json ?? ''),
+        )
+        if (preview) await pending.handlers.onEvent({ type: 'tool_input_progress', ...preview })
+      } else if (deltaType === 'text_delta') {
         const text = String(delta.text ?? '')
         if (!text) return
         this.recordStreamedBlock(pending, event.index, 'text', text)
@@ -2008,6 +2030,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (messageId ? messageId === pending.assistantMessageId : !streamStart) return
     pending.assistantMessageId = messageId
     pending.streamedBlocks = new Map()
+    pending.toolInputPreviews?.clear()
     if (!pending.context?.outputFormat) {
       await pending.handlers.onEvent({ type: 'message_boundary' })
     }

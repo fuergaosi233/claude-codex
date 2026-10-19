@@ -198,6 +198,14 @@ export const APP_RULES: readonly AppRule[] = [
     verify:
       'Open a new chat without sending anything, restart the adapter and reload the App: no empty chat shows in the sidebar.',
   },
+  {
+    id: 'file-change-preview',
+    app: 'Replaces the changes of the fileChange item with each item/fileChange/patchUpdated, adding an inProgress fileChange item when it has none of that id, and redraws its card while the item is still in progress. Its approval card shows the changes the item holds when the request comes.',
+    adapter:
+      "Opens the fileChange card of an Edit, Write or MultiEdit call once Claude's streamed input names the file, sends the change written so far at most every 500 ms as Codex does for apply_patch, and replaces it with the finished call's change before any approval. A card whose call never finished fails at the next model response. CLAUDE_CODEX_LIVE_FILE_CHANGES=0 turns it off.",
+    verify:
+      'Ask Claude to write a long new file: its card shows up while Claude is still writing and grows, and the approval and the completed card show the whole file.',
+  },
 ]
 
 // The methods the App starts calling, or sends new parameters to, once the

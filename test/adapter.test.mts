@@ -19,6 +19,7 @@ import test from 'node:test'
 import WebSocket from 'ws'
 import type { ProviderLoopConfigProjectionResult } from '../src/provider-loop-config.mjs'
 import { QUIET_TURN_HEARTBEAT } from '../src/quiet-turns.mjs'
+import { fileChangeFromTool } from '../src/server-helpers.mjs'
 import { SessionStore } from '../src/store.mjs'
 
 const adapter = resolve('dist/src/adapter.mjs')
@@ -6997,6 +6998,168 @@ test('file change approval emits patch and git diff updates', { timeout: 15_000 
     assert.match(diff, /changed by mock runtime/)
   } finally {
     await stopProcess(proc)
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+// Runs a `live patch check` turn, accepting its file change, and returns what
+// the App saw: every notification, and the changes of the item the approval
+// was asked for as they stood when it was asked.
+async function runLivePatchTurn(prompt: string): Promise<{
+  home: string
+  threadId: string
+  messages: any[]
+  approved: { itemId: string; changes: unknown } | null
+  stored: any[]
+}> {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(
+      json({ id: 1, method: 'thread/start', params: { cwd: home, permissions: ':workspace' } }),
+    )
+    const threadId = (await reader.nextResponse(1)).result.thread.id
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: [{ type: 'text', text: prompt, text_elements: [] }] },
+      }),
+    )
+    const messages: any[] = []
+    const changes = new Map<string, unknown>()
+    let approved: { itemId: string; changes: unknown } | null = null
+    for (let i = 0; i < 200; i += 1) {
+      const message = await reader.next()
+      messages.push(message)
+      if (message.method === 'item/started' && message.params.item.type === 'fileChange')
+        changes.set(message.params.item.id, message.params.item.changes)
+      if (message.method === 'item/fileChange/patchUpdated')
+        changes.set(message.params.itemId, message.params.changes)
+      if (message.method === 'item/fileChange/requestApproval') {
+        approved = { itemId: message.params.itemId, changes: changes.get(message.params.itemId) }
+        proc.stdin.write(json({ id: message.id, result: { decision: 'accept' } }))
+      }
+      // A subagent's turn completes in its own thread.
+      if (message.method === 'turn/completed' && message.params.threadId === threadId) break
+    }
+    proc.stdin.write(
+      json({ id: 3, method: 'thread/read', params: { threadId, includeTurns: true } }),
+    )
+    const read = await reader.nextResponse(3)
+    return { home, threadId, messages, approved, stored: read.result.thread.turns.at(-1).items }
+  } finally {
+    await stopProcess(proc)
+  }
+}
+
+function fileChangeItems(messages: any[], method: string): any[] {
+  return messages
+    .filter((message) => message.method === method && message.params.item?.type === 'fileChange')
+    .map((message) => message.params.item)
+}
+
+for (const variant of ['', 'approval first']) {
+  test(`a file change shows while Claude writes it${variant ? ` (${variant})` : ''}`, async () => {
+    const { home, messages, approved, stored } = await runLivePatchTurn(
+      `live patch check ${variant}`,
+    )
+    try {
+      const path = join(home, 'live.txt')
+      const final = fileChangeFromTool('Write', { file_path: path, content: 'one\ntwo\nthree\n' })
+      const started = fileChangeItems(messages, 'item/started')
+      assert.equal(started.length, 1, 'one card, not a second one for the finished call')
+      const [item] = started
+      // The card opens with the file and nothing written yet.
+      assert.deepEqual(item.changes, fileChangeFromTool('Write', { file_path: path }))
+      assert.equal(item.status, 'inProgress')
+      // The commentary before the call is complete by then.
+      const agentDone = messages.findIndex(
+        (message) =>
+          message.method === 'item/completed' && message.params.item.type === 'agentMessage',
+      )
+      const cardStart = messages.findIndex(
+        (message) => message.method === 'item/started' && message.params.item.id === item.id,
+      )
+      assert.ok(agentDone >= 0 && agentDone < cardStart)
+      const patches = messages
+        .filter((message) => message.method === 'item/fileChange/patchUpdated')
+        .map((message) => {
+          assert.equal(message.params.itemId, item.id)
+          return message.params.changes
+        })
+      assert.deepEqual(patches, [
+        fileChangeFromTool('Write', { file_path: path }),
+        fileChangeFromTool('Write', { file_path: path, content: 'one\ntw' }),
+        final,
+      ])
+      // The approval, the completed card and history hold the finished call.
+      assert.deepEqual(approved, { itemId: item.id, changes: final })
+      const completed = fileChangeItems(messages, 'item/completed')
+      assert.equal(completed.length, 1)
+      assert.equal(completed[0].id, item.id)
+      assert.equal(completed[0].status, 'completed')
+      assert.deepEqual(completed[0].changes, final)
+      const kept = stored.filter((entry) => entry.type === 'fileChange')
+      assert.deepEqual(
+        kept.map((entry) => [entry.id, entry.status, entry.changes]),
+        [[item.id, 'completed', final]],
+      )
+      assert.equal(await readFile(path, 'utf8'), 'one\ntwo\nthree\n')
+    } finally {
+      await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+    }
+  })
+}
+
+test('a file change Claude never finished fails when the next response starts', async () => {
+  const { home, messages, stored } = await runLivePatchTurn('live patch check abandoned')
+  try {
+    const started = fileChangeItems(messages, 'item/started')
+    const completed = fileChangeItems(messages, 'item/completed')
+    assert.equal(started.length, 2)
+    const [lost, live] = started
+    assert.deepEqual(
+      completed.map((entry) => [entry.id, entry.status]),
+      [
+        [lost.id, 'failed'],
+        [live.id, 'completed'],
+      ],
+    )
+    // The lost card failed before the next one opened.
+    const lostDone = messages.findIndex(
+      (message) => message.method === 'item/completed' && message.params.item.id === lost.id,
+    )
+    const liveStart = messages.findIndex(
+      (message) => message.method === 'item/started' && message.params.item.id === live.id,
+    )
+    assert.ok(lostDone >= 0 && lostDone < liveStart)
+    assert.deepEqual(
+      stored.filter((entry) => entry.type === 'fileChange').map((entry) => entry.status),
+      ['failed', 'completed'],
+    )
+  } finally {
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test("a subagent's streamed file change stays out of the parent's timeline", async () => {
+  const { home, messages } = await runLivePatchTurn('live patch check nested')
+  try {
+    const started = fileChangeItems(messages, 'item/started')
+    assert.deepEqual(
+      started.map((item) => item.changes[0].path),
+      [join(home, 'live.txt')],
+    )
+    assert.equal(
+      messages.some((message) => JSON.stringify(message).includes('nested.txt')),
+      false,
+    )
+  } finally {
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
