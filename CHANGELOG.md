@@ -112,6 +112,11 @@ versioning or publishing metadata.
   showing as text: the adapter adds the marks outside code fences when the
   message completes and in history reads; streamed deltas keep the line as
   written.
+- A turn its Claude session no longer holds as the current one ends when that
+  session does, instead of staying in progress. The App leaves its running
+  state on `turn/completed` only, so such a turn kept the thread spinning for
+  the rest of the connection — with the answer already written to Claude's
+  transcript — until the user interrupted it by hand.
 
 ### Provider and multi-agent boundaries
 
