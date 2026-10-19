@@ -1429,6 +1429,19 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     const pending = session.current
     session.current = null
     if (pending && !pending.resolved) await this.finishTurnAtSessionEnd(pending, failure)
+    // A turn of this session that is no longer its current one ends with it
+    // too. Taken off the session (the CLI's turn was abandoned, a replacement
+    // session took over) it still owns the server's run, and with the session
+    // gone no message can reach it: the run would never settle and the turn
+    // would stay in progress for the rest of the connection.
+    for (const stray of [...this.turns.values()]) {
+      if (stray.session !== session || stray.resolved) continue
+      debugLog('native.session.stray_turn', {
+        threadId: session.threadId,
+        turnId: stray.context.turnId,
+      })
+      await this.finishTurnAtSessionEnd(stray, failure)
+    }
     session.backlog.length = 0
     const liveTasks = [...session.liveTasks]
     session.liveTasks.clear()

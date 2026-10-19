@@ -1193,3 +1193,41 @@ test('native forked session leaves its parent the cron jobs scheduled before the
     rmSync(home, { recursive: true, force: true })
   }
 })
+
+test('native turn the session no longer holds as current ends when the session does', async () => {
+  const { runtime, queries } = fakeRuntime()
+  const listener = recordingListener()
+  runtime.setBackgroundListener(listener)
+
+  const events: RuntimeEvent[] = []
+  let ended = false
+  const settled = () => {
+    ended = true
+  }
+  const turn = runtime.runTurn(context, handlers(events)).then(settled, settled)
+  const query = await waitFor(() => queries[0], 'session')
+  query.push(init, assistant('m1', [text('Working on it.')]))
+  await waitFor(() => textDeltas(events).length > 0, 'the turn to produce output')
+
+  // The session stops holding the turn as its current one, without ending it:
+  // what the CLI sends next reaches no turn. Whatever takes it off (an
+  // abandoned CLI turn, a session taking over), the turn is still the
+  // server's, and still unfinished.
+  const sessions = Reflect.get(runtime, 'sessions') as Map<string, { current: unknown }>
+  const session = sessions.get('thread')
+  assert.ok(session, 'the session must still be registered')
+  assert.ok(session.current, 'the session must still hold the turn')
+  session.current = null
+
+  // The CLI session goes away, so nothing else can end the turn.
+  query.close()
+  await waitFor(() => ended, 'the turn to end with its session')
+  const terminal = events.filter((event) => event.type === 'completed' || event.type === 'error')
+  assert.deepEqual(
+    terminal.map((event) => event.type),
+    ['completed'],
+  )
+  await waitFor(() => listener.released.length === 1, 'session release')
+  await turn
+  await runtime.stop()
+})
