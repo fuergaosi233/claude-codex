@@ -70,8 +70,25 @@ export const APP_RULES: readonly AppRule[] = [
   {
     id: 'optimistic-user-message',
     app: 'Draws its own user message for every turn/start it sends.',
-    adapter: 'Publishes the userMessage item only for turns it starts from the server-side queue.',
+    adapter:
+      'Publishes the userMessage item only for turns it starts itself: from the server-side queue, or for the leader tools.',
     verify: 'A sent message shows once; a queued one shows when it starts.',
+  },
+  {
+    id: 'server-started-threads',
+    app: "Adds a thread it did not start to the sidebar as soon as thread/started announces it on its connection, and follows that thread's turns live from then on.",
+    adapter:
+      "Announces a chat the leader tools start with thread/started on the leader's connection before the chat's first turn starts.",
+    verify:
+      'With CLAUDE_CODEX_LEADER_TOOLS=1, ask Claude to start a chat with thread_start: it shows in the sidebar, and its first message and answer stream in when opened.',
+  },
+  {
+    id: 'created-thread-card',
+    app: 'Shows a card for a chat from a `::created-thread{threadId="…"}` line of its own in a reply, which its instructions for its own thread tools ask for after create_thread, and refreshes the card\'s status with thread/read (includeTurns false) and thread/turns/list (limit 1). It reads the line from a completed reply.',
+    adapter:
+      "Ends a successful thread_start result with that line for the new chat; the tool's description asks Claude to put the line in its final response.",
+    verify:
+      'With CLAUDE_CODEX_LEADER_TOOLS=1, ask Claude to start a chat: its reply shows a card for the new chat, and the card follows that chat while its first turn runs and ends.',
   },
   {
     id: 'tool-output-turns',

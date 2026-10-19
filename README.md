@@ -269,6 +269,20 @@ the program, ends it after 30 seconds and writes its stderr to the debug log.
 Summaries and other internal turns, and Codex model threads (whose own Codex
 runs it), do not notify; a project's `.codex/config.toml` cannot set it.
 
+### Leader chats
+
+With `CLAUDE_CODEX_LEADER_TOOLS=1` (off by default), Claude in a chat you
+started gets the `codex_leader` MCP server, whose tools start other Claude chats
+(`thread_start`), list them (`thread_list`), wait for them (`thread_wait`), send
+them messages (`thread_prompt`) and read them (`thread_read`). Each started chat
+is an ordinary chat in the Codex App sidebar, which you can open and keep talking
+to, and Claude's reply shows a card for it, as Codex does for the chats it starts.
+Chats a leader starts cannot lead in turn, a leader has at most
+`CLAUDE_CODEX_LEADER_MAX_RUNNING` (default 4) chats working at once, and it never
+answers their approvals or questions: those stay with you. The tools need the
+native Claude Agent SDK backend; see
+**[Using the Codex App](https://fuergaosi233.github.io/claude-codex/guide/gui#leader-chats)**.
+
 ### `/workflows` compatibility
 
 With the native Claude Agent SDK backend, `/workflows <task>` is translated to Claude's

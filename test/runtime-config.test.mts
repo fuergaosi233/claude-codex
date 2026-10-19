@@ -188,6 +188,83 @@ test('native SDK runtime approves goal tools without shadowing canUseTool', asyn
   assert.ok(plan.allowedTools.includes('mcp__codex_goal'))
 })
 
+test('native SDK runtime serves the leader tools, and only the looking ones in plan mode', async () => {
+  const runtime = new NativeClaudeRuntime()
+  Reflect.set(runtime, 'zod', z)
+  const sdk = {
+    tool: (...args: unknown[]) => args,
+    createSdkMcpServer: (config: Record<string, unknown>) => ({ type: 'sdk', ...config }),
+  }
+  const calls: Array<{ tool: string; input: unknown; signal: unknown }> = []
+  const record =
+    (tool: string) =>
+    async (input: unknown, signal?: AbortSignal): Promise<string> => {
+      calls.push({ tool, input, signal })
+      return `${tool} ok`
+    }
+  const leaderTools = {
+    list: record('list'),
+    start: record('start'),
+    prompt: record('prompt'),
+    wait: record('wait'),
+    read: record('read'),
+  }
+  const buildOptions = Reflect.get(runtime, 'buildOptions')
+  const build = (overrides: Partial<RuntimeTurnContext>) =>
+    buildOptions.call(runtime, sdk, nativeTurnContext(overrides), new AbortController(), () => null)
+
+  assert.equal(build({}).mcpServers, undefined)
+  const options = build({
+    leaderTools,
+    approvalPolicy: 'on-request',
+    sandboxMode: 'workspace-write',
+  })
+  const server = options.mcpServers.codex_leader
+  const tools = new Map<string, any[]>(server.tools.map((tool: any[]) => [tool[0], tool]))
+  assert.deepEqual(
+    [...tools.keys()],
+    ['thread_list', 'thread_start', 'thread_prompt', 'thread_wait', 'thread_read'],
+  )
+  assert.match(tools.get('thread_start')?.[1], /Agent tool/)
+  assert.match(tools.get('thread_start')?.[1], /::created-thread line[^\n]*final response/)
+  assert.deepEqual(
+    [...tools.values()].filter((tool) => tool[4]?.annotations?.readOnlyHint).map((tool) => tool[0]),
+    ['thread_list', 'thread_wait', 'thread_read'],
+  )
+  // The SDK's abort signal reaches the waiting handlers; a thrown error
+  // becomes an error result.
+  const signal = new AbortController().signal
+  const result = await tools.get('thread_wait')?.[3]({ threadIds: ['a'] }, { signal })
+  assert.deepEqual(result, { content: [{ type: 'text', text: 'wait ok' }] })
+  assert.deepEqual(calls.at(-1), { tool: 'wait', input: { threadIds: ['a'] }, signal })
+  leaderTools.read = async () => {
+    throw new Error('unknown thread: gone')
+  }
+  const failed = await build({ leaderTools }).mcpServers.codex_leader.tools[4][3]({
+    threadId: 'gone',
+  })
+  assert.deepEqual(failed, {
+    content: [{ type: 'text', text: 'unknown thread: gone' }],
+    isError: true,
+  })
+  // Allowed without asking, like the goal tools, while other tools still ask.
+  assert.deepEqual(
+    await options.canUseTool('mcp__codex_leader__thread_start', { prompt: 'x' }, { signal }),
+    { behavior: 'allow' },
+  )
+  assert.equal((await options.canUseTool('Bash', { command: 'true' }, { signal })).behavior, 'deny')
+
+  const plan = build({ leaderTools, planMode: true })
+  assert.deepEqual(
+    plan.allowedTools.filter((tool: string) => tool.startsWith('mcp__codex_leader')),
+    [
+      'mcp__codex_leader__thread_list',
+      'mcp__codex_leader__thread_read',
+      'mcp__codex_leader__thread_wait',
+    ],
+  )
+})
+
 test('explicit native SDK bypass includes the required dangerous opt-in flag', () => {
   const previous = process.env.CLAUDE_CODEX_PERMISSION_MODE
   process.env.CLAUDE_CODEX_PERMISSION_MODE = 'bypassPermissions'

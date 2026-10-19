@@ -51,6 +51,15 @@ import {
   GET_GOAL_DESCRIPTION,
   UPDATE_GOAL_DESCRIPTION,
 } from './goal-prompts.mjs'
+import {
+  LEADER_MCP_SERVER,
+  LEADER_READ_ONLY_TOOLS,
+  THREAD_LIST_DESCRIPTION,
+  THREAD_PROMPT_DESCRIPTION,
+  THREAD_READ_DESCRIPTION,
+  THREAD_START_DESCRIPTION,
+  THREAD_WAIT_DESCRIPTION,
+} from './leader-tools.mjs'
 import { echoedUuids, TurnInput, type TurnInputMessage } from './native-turn-input.mjs'
 import { sdkHooks } from './sdk-hooks.mjs'
 import { readTaskResult } from './task-output.mjs'
@@ -61,6 +70,7 @@ import type {
   HookOutputEntry,
   HookRunStatus,
   ImageInput,
+  LeaderToolHandlers,
   PermissionDecision,
   RuntimeBackgroundListener,
   RuntimeHandlers,
@@ -618,6 +628,14 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         [GOAL_MCP_SERVER]: goalToolServer(sdk, this.zod, context.goalTools),
       }
     }
+    let leaderServer = false
+    if (context.leaderTools && this.zod && typeof sdk.createSdkMcpServer === 'function') {
+      leaderServer = true
+      opts.mcpServers = {
+        ...((opts.mcpServers as Record<string, unknown> | undefined) ?? {}),
+        [LEADER_MCP_SERVER]: leaderToolServer(sdk, this.zod, context.leaderTools),
+      }
+    }
     if (context.outputFormat) opts.outputFormat = context.outputFormat
 
     // Codex App's pinned policies map onto Claude SDK's permissionMode. plan
@@ -635,6 +653,14 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       opts.allowedTools = [
         ...((opts.allowedTools as string[] | undefined) ?? []),
         `mcp__${GOAL_MCP_SERVER}`,
+      ]
+    }
+    // Leader tools likewise, but a plan only looks: no starting or prompting
+    // other chats.
+    if (leaderServer && mode === 'plan') {
+      opts.allowedTools = [
+        ...((opts.allowedTools as string[] | undefined) ?? []),
+        ...LEADER_READ_ONLY_TOOLS.map((tool) => `mcp__${LEADER_MCP_SERVER}__${tool}`),
       ]
     }
 
@@ -686,6 +712,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       { behavior: 'allow'; updatedInput?: unknown } | { behavior: 'deny'; message: string }
     > => {
       if (toolName.startsWith(`mcp__${GOAL_MCP_SERVER}__`)) return { behavior: 'allow' }
+      // The chats leader tools start ask for their own approvals.
+      if (toolName.startsWith(`mcp__${LEADER_MCP_SERVER}__`)) return { behavior: 'allow' }
       const toolUseId = options.toolUseID || `tool-${newId()}`
       const session = sessionRef()
       const pending = session?.current
@@ -2751,6 +2779,103 @@ function goalToolServer(sdk: ClaudeSdk, z: Zod, goal: GoalToolHandlers) {
   })
 }
 
+// The tool call's abort signal, which the SDK passes in `extra`.
+function toolSignal(extra: unknown): AbortSignal | undefined {
+  const signal = (extra as { signal?: unknown } | null)?.signal
+  return signal instanceof AbortSignal ? signal : undefined
+}
+
+function leaderToolServer(sdk: ClaudeSdk, z: Zod, leader: LeaderToolHandlers) {
+  const run = async (call: () => Promise<string>) => {
+    try {
+      return { content: [{ type: 'text' as const, text: await call() }] }
+    } catch (error) {
+      const text = error instanceof Error ? error.message : String(error)
+      return { content: [{ type: 'text' as const, text }], isError: true }
+    }
+  }
+  const readOnly = { annotations: { readOnlyHint: true } }
+  const threadId = z.string().describe('The threadId thread_start or thread_list returned.')
+  const timeoutSec = z
+    .number()
+    .min(0)
+    .optional()
+    .describe('Seconds to wait at most (default 300, at most 3600).')
+  return sdk.createSdkMcpServer({
+    name: LEADER_MCP_SERVER,
+    version: '1.0.0',
+    tools: [
+      sdk.tool(
+        'thread_list',
+        THREAD_LIST_DESCRIPTION,
+        {
+          scope: z
+            .enum(['children', 'all'])
+            .optional()
+            .describe('"children" (default): the chats you started. "all": recent chats too.'),
+        },
+        (args) => run(() => leader.list(args)),
+        readOnly,
+      ),
+      sdk.tool(
+        'thread_start',
+        THREAD_START_DESCRIPTION,
+        {
+          prompt: z.string().describe('The first message of the new chat, complete on its own.'),
+          title: z.string().optional().describe('A short title for the sidebar.'),
+          cwd: z
+            .string()
+            .optional()
+            .describe("Absolute working directory. Defaults to this chat's."),
+          model: z.string().optional().describe("Claude model id. Defaults to this chat's."),
+        },
+        (args) => run(() => leader.start(args)),
+      ),
+      sdk.tool(
+        'thread_prompt',
+        THREAD_PROMPT_DESCRIPTION,
+        {
+          threadId,
+          text: z.string().describe('The message to send.'),
+          wait: z
+            .boolean()
+            .optional()
+            .describe('Wait for the turn that takes the message to finish and return its result.'),
+          timeoutSec,
+        },
+        (args, extra) => run(() => leader.prompt(args, toolSignal(extra))),
+      ),
+      sdk.tool(
+        'thread_wait',
+        THREAD_WAIT_DESCRIPTION,
+        {
+          threadIds: z.array(z.string()).min(1).describe('Chats you started to wait for.'),
+          until: z
+            .enum(['any', 'all'])
+            .optional()
+            .describe('"any" (default): return when one is done or blocked. "all": when all are.'),
+          timeoutSec,
+        },
+        (args, extra) => run(() => leader.wait(args, toolSignal(extra))),
+        readOnly,
+      ),
+      sdk.tool(
+        'thread_read',
+        THREAD_READ_DESCRIPTION,
+        {
+          threadId,
+          sinceCursor: z
+            .string()
+            .optional()
+            .describe('The cursor a previous thread_read returned, to read only what came after.'),
+        },
+        (args) => run(() => leader.read(args)),
+        readOnly,
+      ),
+    ],
+  })
+}
+
 // Codex's approval policy says "never ask" (or the sandbox is wide open) and
 // no explicit permission mode overrides it: tools run without a prompt.
 function autoAllowsTools(context: RuntimeTurnContext): boolean {
@@ -2810,6 +2935,7 @@ function sessionSignature(context: RuntimeTurnContext): string {
     context.systemPromptAddendum ?? '',
     context.mcpServers ?? null,
     context.goalTools ? GOAL_MCP_SERVER : null,
+    context.leaderTools ? LEADER_MCP_SERVER : null,
     context.addDirs ?? [],
     context.allowedTools ?? [],
     inheritedAllowedTools(context),

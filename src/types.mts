@@ -448,6 +448,10 @@ export interface RuntimeTurnContext {
   // The thread has a goal: expose Codex's goal tools (get_goal, create_goal,
   // update_goal) to Claude. Backends without in-process tools ignore it.
   goalTools?: GoalToolHandlers | null
+  // The thread may lead other threads: expose the thread_* tools that start,
+  // prompt, wait on and read separate chats. Off unless the adapter enables
+  // them; backends without in-process tools ignore it.
+  leaderTools?: LeaderToolHandlers | null
 }
 
 // Each handler returns the text of the tool result; a thrown Error becomes an
@@ -457,6 +461,33 @@ export interface GoalToolHandlers {
   getGoal(): Promise<string>
   createGoal(objective: string, tokenBudget: number | null): Promise<string>
   updateGoal(status: string): Promise<string>
+}
+
+// Same contract as GoalToolHandlers: each returns the tool result text (JSON
+// here), a thrown Error becomes an error result. `signal` aborts a wait when
+// Claude's tool call is cancelled.
+export interface LeaderToolHandlers {
+  list(input: { scope?: string | undefined }): Promise<string>
+  start(input: {
+    prompt: string
+    cwd?: string | undefined
+    model?: string | undefined
+    title?: string | undefined
+  }): Promise<string>
+  prompt(
+    input: {
+      threadId: string
+      text: string
+      wait?: boolean | undefined
+      timeoutSec?: number | undefined
+    },
+    signal?: AbortSignal,
+  ): Promise<string>
+  wait(
+    input: { threadIds: string[]; until?: string | undefined; timeoutSec?: number | undefined },
+    signal?: AbortSignal,
+  ): Promise<string>
+  read(input: { threadId: string; sinceCursor?: string | undefined }): Promise<string>
 }
 
 export interface ImageInput {

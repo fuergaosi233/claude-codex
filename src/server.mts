@@ -29,6 +29,7 @@ import {
 } from './goal-prompts.mjs'
 import { accountUsage, hostMethod, RpcError } from './host-methods.mjs'
 import { inheritedAgents, inheritedHooks, inheritedPermissionRules } from './inherited-config.mjs'
+import { LeaderThreads } from './leader-tools.mjs'
 import {
   callMcpTool,
   listMcpServerStatuses,
@@ -434,6 +435,8 @@ export class CodexClaudeAppServer {
   // running turn, before its result settles the turn's usage.
   private goalProgressByThread = new Map<string, Map<string, number>>()
   private goalToolHandlers = new Map<string, GoalToolHandlers>()
+  // Chats a thread started with the leader tools, and the waits on them.
+  private readonly leaderThreads: LeaderThreads
   private elicitationCounts = new Map<string, number>()
   private tokenUsageByThread = new Map<string, TokenUsageBreakdown>()
   // Like Codex's last_token_usage, `last` is one API call: the main loop's
@@ -465,6 +468,12 @@ export class CodexClaudeAppServer {
   constructor(store: SessionStore, runtime: ClaudeRuntime) {
     this.store = store
     this.runtime = runtime
+    this.leaderThreads = new LeaderThreads({
+      store,
+      activeTurnId: (threadId) => this.activeTurnByThread.get(threadId) ?? null,
+      startThread: (leader, options) => this.startLeaderThread(leader, options),
+      sendInput: (threadId, text) => this.sendLeaderInput(threadId, text),
+    })
     this.loadPersistedConfig()
     // A CLI reported a different set of built-in commands: the App refetches
     // skills/list, which serves them as skills.
@@ -518,6 +527,7 @@ export class CodexClaudeAppServer {
     if (this.stopped) return
     this.stopped = true
     this.stopCommandsListener()
+    this.leaderThreads.stop()
     try {
       // Child turns are created directly from Task/Workflow events and are not
       // registered in activeTurnByThread. Finalize them before aborting the
@@ -1086,6 +1096,72 @@ export class CodexClaudeAppServer {
     this.activePeerByThread.set(id, peer)
     this.notify(peer, { method: 'thread/started', params: { thread: this.toThread(thread, []) } })
     return this.threadEnvelope(thread)
+  }
+
+  // thread_start: the chat goes through thread/start and turn/start as if
+  // the App had sent them on the leader's connection, with the leader's
+  // settings. thread/started puts it in the App's sidebar and the App then
+  // follows its turns live; the App drew no user message, so it is published.
+  // App rule: server-started-threads
+  private async startLeaderThread(
+    leader: ThreadRecord,
+    options: { prompt: string; cwd: string; model: string; title: string | null },
+  ): Promise<{ threadId: string; turnId: string }> {
+    // Claude chats only, for now: on the Codex proxy a new chat runs there.
+    if (
+      resolveProviderLoopSelection(this.providerLoopSelectionInput()).runtimeType === 'codex-proxy'
+    )
+      throw new Error(
+        'new chats run on the Codex proxy right now; thread_start starts Claude chats only',
+      )
+    const peer = this.peerForThread(leader.id)
+    const started = this.threadStart(peer, {
+      cwd: options.cwd,
+      model: options.model,
+      effort: leader.reasoningEffort,
+      approvalPolicy: leader.approvalPolicy,
+      sandbox: leader.sandboxMode,
+      permissions: leader.permissionProfileId,
+      baseInstructions: leader.baseInstructions,
+      developerInstructions: leader.developerInstructions,
+      personality: leader.personality,
+      projectId: leader.projectId,
+      threadSource: 'user',
+    })
+    const threadId = stringOr(asRecord(asRecord(started).thread).id, '')
+    // No App follows the leader right now: let the chat find its peer when
+    // the App opens it, instead of pinning it to nobody.
+    if (peer === DETACHED_PEER) this.activePeerByThread.delete(threadId)
+    // Linked before its turn starts, so that turn already gets no leader tools.
+    this.store.addLeaderThread(threadId, leader.id)
+    if (options.title) this.threadNameSet({ threadId, name: options.title })
+    const result = await this.turnStart(peer, {
+      threadId,
+      input: [{ type: 'text', text: options.prompt, text_elements: [] }],
+      _emitUserMessage: true,
+    })
+    return { threadId, turnId: stringOr(asRecord(asRecord(result).turn).id, '') }
+  }
+
+  // thread_prompt: input goes in as the App sends a message. A running turn
+  // takes it as a steer, like the App's default follow-up mode; there is no
+  // queue to wait behind while the leader waits for an answer.
+  private async sendLeaderInput(
+    threadId: string,
+    text: string,
+  ): Promise<{ turnId: string; steered: boolean }> {
+    const running = this.activeTurnByThread.get(threadId) ?? null
+    const leaderId = this.store.leaderOf(threadId)
+    const peer =
+      this.activePeerByThread.get(threadId) ??
+      (leaderId ? this.peerForThread(leaderId) : DETACHED_PEER)
+    const result = await this.turnStart(peer, {
+      threadId,
+      input: [{ type: 'text', text, text_elements: [] }],
+      _emitUserMessage: true,
+    })
+    const turnId = stringOr(asRecord(asRecord(result).turn).id, '')
+    return { turnId, steered: running !== null && turnId === running }
   }
 
   private threadResume(peer: RpcPeer, params: Record<string, unknown>): unknown {
@@ -1729,6 +1805,7 @@ export class CodexClaudeAppServer {
     this.goalClockByThread.delete(threadId)
     this.goalTurnByThread.delete(threadId)
     this.goalToolHandlers.delete(threadId)
+    this.leaderThreads.forget(threadId)
     this.elicitationCounts.delete(threadId)
   }
 
@@ -3698,6 +3775,10 @@ export class CodexClaudeAppServer {
           !thread.ephemeral &&
           process.env.CLAUDE_CODEX_GOAL_TOOLS !== '0'
             ? this.goalToolsFor(thread.id)
+            : null,
+        leaderTools:
+          turnPurpose === 'normal' && !isCodexThread && this.leaderThreads.allowed(thread)
+            ? this.leaderThreads.handlersFor(thread.id)
             : null,
         ...(continuation ? { continuation: true } : {}),
       },
@@ -7222,6 +7303,7 @@ export class CodexClaudeAppServer {
     const target = peer ?? this.activePeerByThread.get(threadId)
     if (target)
       this.notify(target, { method: 'thread/status/changed', params: { threadId, status } })
+    this.leaderThreads.threadChanged()
   }
 
   // An aborted `signal` drops the request and rejects; the caller's

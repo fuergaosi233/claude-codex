@@ -146,6 +146,8 @@ export CLAUDE_CODEX_NODE="/absolute/path/to/node"
 | `CLAUDE_CODEX_QUIET_BACKGROUND_TURNS` | `0` marks every finished turn unread in the Codex App again. By default a turn that ends while its background agents or workflows still run leaves the chat read and sends no notification (background Bash shells do not count, since one can run for the rest of the chat); see [Background work and the unread dot](/guide/gui#background-work-and-the-unread-dot). |
 | `CLAUDE_CODEX_SESSION_SETTLE_MS` | How long an idle session waits for Claude to answer a task that just ended, when the CLI does not report session state (default `15000`). |
 | `CLAUDE_CODEX_GOAL_TOOLS` | `0` keeps the goal tools (the `codex_goal` MCP server) away from Claude. |
+| `CLAUDE_CODEX_LEADER_TOOLS` | `1` gives Claude in chats you start the leader tools (the `codex_leader` MCP server), to start and drive other chats; off by default. See [Leader chats](/guide/gui#leader-chats). |
+| `CLAUDE_CODEX_LEADER_MAX_RUNNING` | How many chats one leader may have working at once (default `4`). |
 | `CLAUDE_CODEX_REAP_ORPHANED_CLI` | `0` stops the adapter from ending Claude CLI processes a previous adapter left running (on by default; never on Windows). |
 | `CLAUDE_CODEX_MOCK` | Run the protocol without Claude credentials. |
 | `CLAUDE_CODEX_STATE_DB_TIMEOUT_MS` | How long a state-database write waits for another connection's lock before it fails (default `5000`). |
