@@ -32,6 +32,28 @@ Selecting it does not itself enable plan mode, so an ordinary conversation may
 correctly run on Sonnet. Choose **Claude Opus** to use Opus throughout. See the
 [Claude Code model configuration](https://code.claude.com/docs/en/model-config#opusplan-model-setting).
 
+## Thinking and reasoning summaries
+
+With the default native Claude Agent SDK backend, Claude's thinking shows
+above its reply the way Codex shows a reasoning summary, while it streams and
+after the chat is reopened. The adapter asks the Claude CLI for summarized
+thinking (`--thinking-display summarized`), since recent models otherwise
+return their thinking redacted, and streams each run of thinking into the
+reasoning item's summary, the only part of it the App renders. Title and
+compaction turns do not ask for it.
+
+Thinking the adapter stored before it did this, as raw reasoning content,
+shows as the summary when history is read.
+
+To keep the thinking out of the conversation, set **Settings > Agent >
+Configuration > Reasoning summary** to **None** (`model_reasoning_summary =
+"none"`) or start the adapter with `CLAUDE_CODEX_REASONING_VISIBLE=0`. The
+setting applies from the next turn. The thinking is then kept as raw reasoning
+content, which the App does not show, and the CLI is not passed the flag; use
+the variable as well with a Claude CLI pinned through `CLAUDE_CODEX_CLI` that
+predates the flag. Whether a model or provider returns summarized thinking at
+all is up to them; when it returns none, nothing shows.
+
 ## Inline visualizations
 
 With the default native Claude Agent SDK backend, Claude can answer with a

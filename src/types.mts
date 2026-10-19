@@ -448,6 +448,10 @@ export interface RuntimeTurnContext {
   // The thread has a goal: expose Codex's goal tools (get_goal, create_goal,
   // update_goal) to Claude. Backends without in-process tools ignore it.
   goalTools?: GoalToolHandlers | null
+  // Ask Claude to return its thinking as readable summaries (the CLI's
+  // --thinking-display). Unset keeps the CLI's default, which recent models
+  // answer with redacted thinking. Backends without the flag ignore it.
+  thinkingDisplay?: 'summarized' | null
 }
 
 // Each handler returns the text of the tool result; a thrown Error becomes an

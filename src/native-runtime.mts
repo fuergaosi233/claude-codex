@@ -595,9 +595,14 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (allowedTools.length > 0) opts.allowedTools = allowedTools
     if (context.disallowedTools && context.disallowedTools.length > 0)
       opts.disallowedTools = context.disallowedTools
+    const extraArgs: Record<string, string | null> = {}
     // The servers go to the CLI in a file, off its command line.
     const mcpConfig = writeCliMcpConfig(context.mcpServers)
-    if (mcpConfig) opts.extraArgs = { 'mcp-config': mcpConfig }
+    if (mcpConfig) extraArgs['mcp-config'] = mcpConfig
+    // Passed as a flag rather than the SDK's thinking option, which would
+    // also switch the model to adaptive thinking whatever the effort says.
+    if (context.thinkingDisplay) extraArgs['thinking-display'] = context.thinkingDisplay
+    if (Object.keys(extraArgs).length > 0) opts.extraArgs = extraArgs
     if (context.agents && Object.keys(context.agents).length > 0) opts.agents = context.agents
     // The source the CLI would give this session's SessionStart hooks.
     const origin = !resume ? 'startup' : opts.forkSession ? 'fork' : 'resume'
@@ -2822,6 +2827,7 @@ function sessionSignature(context: RuntimeTurnContext): string {
     parseWorkflowCommand(context.prompt)?.type === 'run',
     context.planMode === true,
     configuredPermissionMode(),
+    context.thinkingDisplay ?? null,
   ])
 }
 

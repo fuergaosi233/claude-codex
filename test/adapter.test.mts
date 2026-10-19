@@ -2752,48 +2752,134 @@ test('review/start and thread/compact/start emit real turn items', async () => {
   }
 })
 
-test('Claude thinking maps to Codex reasoning content without a duplicate summary', async () => {
+// Runs the mock thinking turn and returns what it sent about reasoning.
+async function runThinkingTurn(
+  reader: JsonLineReader,
+  proc: ChildProcessWithoutNullStreams,
+  threadId: string,
+  id: number,
+): Promise<{ reasoning: any[]; completed: any; text: string }> {
+  proc.stdin.write(
+    json({ id, method: 'turn/start', params: { threadId, input: textInput('thinking check') } }),
+  )
+  const seen = await readUntil(reader, (message) => message.method === 'turn/completed')
+  const reasoning = seen.filter(
+    (message) =>
+      message.method?.startsWith('item/reasoning/') ||
+      (message.method?.startsWith('item/') && message.params?.item?.type === 'reasoning'),
+  )
+  const completed = seen.find(
+    (message) => message.method === 'item/completed' && message.params.item.type === 'reasoning',
+  )?.params.item
+  const text = seen
+    .filter((message) => message.method === 'item/agentMessage/delta')
+    .map((message) => message.params.delta)
+    .join('')
+  return { reasoning, completed, text }
+}
+
+async function readReasoningItems(
+  reader: JsonLineReader,
+  proc: ChildProcessWithoutNullStreams,
+  threadId: string,
+  id: number,
+): Promise<any[]> {
+  proc.stdin.write(json({ id, method: 'thread/read', params: { threadId, includeTurns: true } }))
+  const read = await reader.nextResponse(id)
+  return read.result.thread.turns
+    .flatMap((turn: any) => turn.items)
+    .filter((item: any) => item.type === 'reasoning')
+}
+
+test('Claude thinking streams as the Codex reasoning summary', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
-  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
-    stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
-  })
+  const proc = spawnMockAdapter(home)
   const reader = new JsonLineReader(proc)
   try {
-    proc.stdin.write(
-      json({
-        id: 1,
-        method: 'thread/start',
-        params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false },
-      }),
+    const threadId = await startMockThread(reader, proc)
+    const { reasoning, completed, text } = await runThinkingTurn(reader, proc, threadId, 2)
+
+    // The CLI is asked for readable thinking, which the App shows only as a
+    // summary: the part opens first, then the text streams into it.
+    assert.equal(text, 'done thinkingDisplay=summarized')
+    assert.deepEqual(
+      reasoning.map((message) => message.method),
+      [
+        'item/started',
+        'item/reasoning/summaryPartAdded',
+        'item/reasoning/summaryTextDelta',
+        'item/completed',
+      ],
     )
-    const start = await reader.nextResponse(1)
-    const threadId = start.result.thread.id
+    assert.deepEqual(reasoning[0].params.item.summary, [''])
+    assert.deepEqual(reasoning[0].params.item.content, [])
+    assert.equal(reasoning[1].params.summaryIndex, 0)
+    assert.equal(reasoning[1].params.itemId, completed.id)
+    assert.equal(reasoning[2].params.summaryIndex, 0)
+    assert.equal(reasoning[2].params.delta, 'mock thinking')
+    assert.deepEqual(completed.summary, ['mock thinking'])
+    assert.deepEqual(completed.content, [])
+
+    const stored = await readReasoningItems(reader, proc, threadId, 3)
+    assert.deepEqual(
+      stored.map((item) => [item.summary, item.content]),
+      [[['mock thinking'], []]],
+    )
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('with reasoning summaries off Claude thinking stays raw reasoning content', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  let proc = spawnMockAdapter(home, { CLAUDE_CODEX_REASONING_VISIBLE: '0' })
+  let reader = new JsonLineReader(proc)
+  let threadId = ''
+  try {
+    threadId = await startMockThread(reader, proc)
+    const { reasoning, completed, text } = await runThinkingTurn(reader, proc, threadId, 2)
+    assert.equal(text, 'done thinkingDisplay=default')
+    assert.deepEqual(
+      reasoning.map((message) => message.method),
+      ['item/started', 'item/reasoning/textDelta', 'item/completed'],
+    )
+    assert.equal(reasoning[1].params.contentIndex, 0)
+    assert.deepEqual(completed.summary, [])
+    assert.deepEqual(completed.content, ['mock thinking'])
+  } finally {
+    proc.kill()
+    await once(proc, 'exit')
+  }
+
+  // Without the opt-out the thinking stored as content reads back as the
+  // summary, until model_reasoning_summary turns summaries off again.
+  proc = spawnMockAdapter(home)
+  reader = new JsonLineReader(proc)
+  try {
+    const shown = await readReasoningItems(reader, proc, threadId, 1)
+    assert.deepEqual(
+      shown.map((item) => [item.summary, item.content]),
+      [[['mock thinking'], ['mock thinking']]],
+    )
 
     proc.stdin.write(
       json({
         id: 2,
-        method: 'turn/start',
-        params: { threadId, input: [{ type: 'text', text: 'thinking check', text_elements: [] }] },
+        method: 'config/value/write',
+        params: { keyPath: 'model_reasoning_summary', value: 'none' },
       }),
     )
     await reader.nextResponse(2)
-
-    let sawSummary = false
-    let sawContent = false
-    let completedReasoning: any = null
-    for (let i = 0; i < 500; i += 1) {
-      const message = await reader.next()
-      if (message.method === 'item/reasoning/summaryTextDelta') sawSummary = true
-      if (message.method === 'item/reasoning/textDelta') sawContent = true
-      if (message.method === 'item/completed' && message.params.item.type === 'reasoning')
-        completedReasoning = message.params.item
-      if (message.method === 'turn/completed') break
-    }
-    assert.equal(sawSummary, false)
-    assert.equal(sawContent, true)
-    assert.deepEqual(completedReasoning.summary, [])
-    assert.deepEqual(completedReasoning.content, ['mock thinking'])
+    const hidden = await readReasoningItems(reader, proc, threadId, 3)
+    assert.deepEqual(
+      hidden.map((item) => [item.summary, item.content]),
+      [[[], ['mock thinking']]],
+    )
+    const { completed, text } = await runThinkingTurn(reader, proc, threadId, 4)
+    assert.equal(text, 'done thinkingDisplay=default')
+    assert.deepEqual(completed.summary, [])
+    assert.deepEqual(completed.content, ['mock thinking'])
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })

@@ -101,6 +101,7 @@ import {
   projectRoots,
   readConfigReasoningEffort,
   reasoningEffortFromParams,
+  reasoningSummariesVisible,
   reviewLabel,
   reviewPrompt,
   sandboxEnvelope,
@@ -3398,20 +3399,35 @@ export class CodexClaudeAppServer {
       })
       return agentItemId
     }
+    // The Codex App renders a reasoning item from its summary alone, so
+    // Claude's thinking streams as one summary part unless summaries are off;
+    // then it stays raw content, kept in history but not shown.
+    // App rule: reasoning-summary
+    const reasoningVisible = reasoningSummariesVisible(this.configOverrides)
     const ensureReasoningItem = (): string => {
       if (reasoningItemId) return reasoningItemId
       reasoningItemId = newId()
       const item: ThreadItem = {
         type: 'reasoning',
         id: reasoningItemId,
-        summary: [],
-        content: [''],
+        summary: reasoningVisible ? [''] : [],
+        content: reasoningVisible ? [] : [''],
       }
       this.store.appendItem(turn.id, item)
       this.notify(peer, {
         method: 'item/started',
         params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: nowMillis() },
       })
+      if (reasoningVisible)
+        this.notify(peer, {
+          method: 'item/reasoning/summaryPartAdded',
+          params: {
+            threadId: thread.id,
+            turnId: turn.id,
+            itemId: reasoningItemId,
+            summaryIndex: 0,
+          },
+        })
       return reasoningItemId
     }
     const completeReasoningItem = (): void => {
@@ -3699,6 +3715,8 @@ export class CodexClaudeAppServer {
           process.env.CLAUDE_CODEX_GOAL_TOOLS !== '0'
             ? this.goalToolsFor(thread.id)
             : null,
+        // Title and compaction turns never show their thinking.
+        thinkingDisplay: reasoningVisible && turnPurpose === 'normal' ? 'summarized' : null,
         ...(continuation ? { continuation: true } : {}),
       },
       {
@@ -4204,22 +4222,21 @@ export class CodexClaudeAppServer {
             completeAgentItem('commentary')
             const itemId = ensureReasoningItem()
             this.store.updateItem(turn.id, itemId, (item) => {
-              if (item.type === 'reasoning') {
-                return {
-                  ...item,
-                  content: [(item.content[0] ?? '') + event.delta],
-                }
-              }
-              return item
+              if (item.type !== 'reasoning') return item
+              return reasoningVisible
+                ? { ...item, summary: [(item.summary[0] ?? '') + event.delta] }
+                : { ...item, content: [(item.content[0] ?? '') + event.delta] }
             })
             this.notify(peer, {
-              method: 'item/reasoning/textDelta',
+              method: reasoningVisible
+                ? 'item/reasoning/summaryTextDelta'
+                : 'item/reasoning/textDelta',
               params: {
                 threadId: thread.id,
                 turnId: turn.id,
                 itemId,
                 delta: event.delta,
-                contentIndex: 0,
+                ...(reasoningVisible ? { summaryIndex: 0 } : { contentIndex: 0 }),
               },
             })
             return
@@ -4886,7 +4903,22 @@ export class CodexClaudeAppServer {
       const text = markVisualizeLines(record.text)
       return text === record.text ? item : { ...record, text }
     }
-    const itemForPeer = (item: unknown): unknown => withVisualizeMarks(unmarked(item))
+    // Thinking stored before it went to the summary shows as one, too.
+    // App rule: reasoning-summary
+    const visibleReasoning = reasoningSummariesVisible(this.configOverrides)
+    const withReasoningSummary = (item: unknown): unknown => {
+      const record = asRecord(item)
+      if (!visibleReasoning || record.type !== 'reasoning') return item
+      const filled = (parts: unknown): string[] =>
+        Array.isArray(parts)
+          ? parts.filter((part): part is string => typeof part === 'string' && part.length > 0)
+          : []
+      const content = filled(record.content)
+      if (filled(record.summary).length > 0 || content.length === 0) return item
+      return { ...record, summary: content }
+    }
+    const itemForPeer = (item: unknown): unknown =>
+      withReasoningSummary(withVisualizeMarks(unmarked(item)))
     const turnForPeer = (turn: unknown): unknown => {
       const record = asRecord(turn)
       return Array.isArray(record.items)

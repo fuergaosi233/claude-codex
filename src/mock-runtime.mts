@@ -377,7 +377,10 @@ export class MockRuntime implements ClaudeRuntime {
 
     if (/thinking check/i.test(context.prompt)) {
       await handlers.onEvent({ type: 'reasoning_delta', delta: 'mock thinking' })
-      await handlers.onEvent({ type: 'text_delta', delta: 'done' })
+      await handlers.onEvent({
+        type: 'text_delta',
+        delta: `done thinkingDisplay=${context.thinkingDisplay ?? 'default'}`,
+      })
       await handlers.onEvent({ type: 'completed', success: true, result: 'thinking check' })
       return
     }

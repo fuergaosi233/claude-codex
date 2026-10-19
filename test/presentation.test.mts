@@ -246,12 +246,18 @@ test('reasoning appears once and completes before visible prose', async () => {
       { type: 'text_delta', delta: 'Answer.' },
     ]),
   )
-  const reasoning = turn.items.find((item) => item.type === 'reasoning')
-  assert.equal(reasoning?.type, 'reasoning')
-  assert.deepEqual(reasoning.summary, [])
-  assert.deepEqual(reasoning.content, ['Think carefully.'])
+  // The App renders reasoning from its summary alone.
+  const reasoning = turn.items.flatMap((item) => (item.type === 'reasoning' ? [item] : []))
+  assert.deepEqual(
+    reasoning.map((item) => [item.summary, item.content]),
+    [[['Think carefully.'], []]],
+  )
   assert.equal(
-    messages.some((message) => message.method === 'item/reasoning/summaryTextDelta'),
+    messages.filter((message) => message.method === 'item/reasoning/summaryPartAdded').length,
+    1,
+  )
+  assert.equal(
+    messages.some((message) => message.method === 'item/reasoning/textDelta'),
     false,
   )
   const reasoningDone = messages.findIndex(

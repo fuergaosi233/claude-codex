@@ -191,6 +191,14 @@ export const APP_RULES: readonly AppRule[] = [
       'With Codex routing off, send the first message of a new chat: the chat gets a generated title, not its first words.',
   },
   {
+    id: 'reasoning-summary',
+    app: 'Shows a reasoning item only through its summary parts: one part as it is, several with the first in bold as a title, and an item with an empty summary not at all. Fills the parts from item/reasoning/summaryTextDelta by summaryIndex, and keeps the raw content of item/reasoning/textDelta without rendering it.',
+    adapter:
+      'Asks the Claude CLI for summarized thinking (--thinking-display summarized) on a chat\'s own turns and streams each thinking run into one summary part; history reads show content-only items stored before as their summary. CLAUDE_CODEX_REASONING_VISIBLE=0 or model_reasoning_summary = "none" keeps the thinking in content only.',
+    verify:
+      'Ask a question Claude thinks about: its thinking shows above the reply while it streams and after the chat is reopened.',
+  },
+  {
     id: 'prewarmed-threads',
     app: 'Starts the thread of a new chat with thread/start before the user sends anything, keeps it out of thread/list and holds back its thread/started until it sends turn/start there, and deletes it with thread/delete once the chat goes unused for 10 minutes. It forgets such threads when the app-server connection drops or the App quits.',
     adapter:

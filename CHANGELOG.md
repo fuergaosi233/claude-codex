@@ -117,6 +117,13 @@ versioning or publishing metadata.
   state on `turn/completed` only, so such a turn kept the thread spinning for
   the rest of the connection — with the answer already written to Claude's
   transcript — until the user interrupted it by hand.
+- Claude's thinking shows in the Codex App. The CLI is asked for summarized
+  thinking (`--thinking-display summarized`), which recent models otherwise
+  redact, and it streams as the reasoning summary, the only part of a
+  reasoning item the App renders (`item/reasoning/summaryPartAdded`, then
+  `summaryTextDelta`). Thinking stored before as raw content reads back as
+  the summary. `CLAUDE_CODEX_REASONING_VISIBLE=0` or the App's Reasoning
+  summary setting set to None keeps the previous behavior.
 
 ### Provider and multi-agent boundaries
 

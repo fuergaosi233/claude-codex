@@ -505,6 +505,15 @@ export function readConfigReasoningEffort(config: unknown): string | null {
   return null
 }
 
+// The Codex App shows a reasoning item only through its summary, so Claude's
+// thinking goes there unless the user turned summaries off, with
+// CLAUDE_CODEX_REASONING_VISIBLE=0 or Codex's model_reasoning_summary = "none".
+export function reasoningSummariesVisible(config: Record<string, unknown>): boolean {
+  return (
+    process.env.CLAUDE_CODEX_REASONING_VISIBLE !== '0' && config.model_reasoning_summary !== 'none'
+  )
+}
+
 // Codex v2 `ThreadSource` is a strict 3-variant enum with no `serde(other)`
 // fallback. Anything outside this set (including an empty string) makes the
 // App's ts-rs deserializer panic on `thread/list` / `thread/read` — which the
