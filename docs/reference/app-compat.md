@@ -22,6 +22,7 @@ line a rule touches.
 | `feature-gates` | turns features on by the app-server version in the `initialize` userAgent, and rejects one below its minimum | `check:app-upgrade` lists the gates |
 | `config-warnings` | lists `configWarning` notifications under Settings > Agent > Configuration | an unlisted build shows the warning there |
 | `bedrock-account` | filters the model picker through its OpenAI allowlist unless `account/read` returns a Bedrock account | the picker lists the Claude models |
+| `model-efforts` | offers each model the `model/list` efforts that are also enabled under Settings > Agent > Model features (max is off by default and listed once a model offers it), and falls back to the model's `defaultReasoningEffort` | after a Claude turn, Max is listed there; with it on, Claude Opus offers Max and Claude Haiku no effort levels |
 | `bedrock-auth-status` | reads its feature flags in the main process only when `getAuthStatus` names the auth method it derives from `account/read`; otherwise a thread it resumes on its own never becomes ready | a message queued during a turn is sent when the turn ends; a new chat gets a title |
 | `skills-popup` | fills the "/" popup from `skills/list` and sends a picked skill as a `[$name](path)` link | `/simplify` is listed and runs |
 | `optimistic-user-message` | draws its own user message for every `turn/start` it sends | a message shows once; a queued one when it starts |

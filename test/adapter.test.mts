@@ -700,6 +700,170 @@ test('model/list exposes Claude model aliases and Codex-safe reasoning efforts',
   }
 })
 
+test('model/list offers each Claude model the efforts Claude Code reported for it', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const adapterHome = join(home, 'adapter')
+  const all = ['low', 'medium', 'high', 'xhigh', 'max']
+  const opusDescription = 'Opus 4.7 · Most capable for complex work'
+  // What an earlier Claude session reported (see claude-models.mts).
+  await mkdir(adapterHome, { recursive: true })
+  await writeFile(
+    join(adapterHome, 'claude-models.json'),
+    JSON.stringify({
+      models: [
+        {
+          value: 'default',
+          resolvedModel: 'claude-opus-4-7',
+          displayName: 'Default (recommended)',
+          description: opusDescription,
+          efforts: all,
+        },
+        {
+          value: 'opus',
+          resolvedModel: 'claude-opus-4-7',
+          displayName: 'Opus',
+          description: opusDescription,
+          efforts: all,
+        },
+        {
+          value: 'sonnet',
+          resolvedModel: 'claude-sonnet-4-6',
+          displayName: 'Sonnet',
+          description: 'Sonnet 4.6 · Best for everyday tasks',
+          efforts: ['low', 'medium', 'high'],
+        },
+        {
+          value: 'haiku',
+          resolvedModel: 'claude-haiku-4-5',
+          displayName: 'Haiku',
+          description: 'Haiku 4.5 · Fastest for quick answers',
+          efforts: [],
+        },
+        {
+          value: 'opusplan',
+          resolvedModel: 'claude-opus-4-7',
+          displayName: 'Opus Plan Mode',
+          description: 'Use Opus in plan mode, Sonnet otherwise',
+          efforts: all,
+        },
+      ],
+    }),
+  )
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      CODEX_HOME: home,
+      CLAUDE_CODEX_HOME: adapterHome,
+      CLAUDE_CODEX_MOCK: '1',
+      CLAUDE_CODEX_MODELS: JSON.stringify([
+        'opus',
+        'sonnet',
+        'sonnet-1m',
+        'haiku',
+        'opus-plan',
+        { id: 'team-opus', sdkModel: 'claude-opus-4-7', displayName: 'Team Opus' },
+        'glm-5',
+      ]),
+      CLAUDE_CODEX_MODEL_ALIASES: '',
+      CLAUDE_CODEX_EFFORT_ALIASES: '',
+      CLAUDE_CODEX_DEFAULT_MODEL: 'opus',
+      CLAUDE_CODEX_DEFAULT_EFFORT: 'max',
+      NODE_NO_WARNINGS: '1',
+    },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'config/read', params: {} }))
+    const config = await reader.nextResponse(1)
+    assert.equal(config.result.config.model_reasoning_effort, 'max')
+
+    proc.stdin.write(json({ id: 2, method: 'model/list', params: {} }))
+    const models = await reader.nextResponse(2)
+    // Ids and names stay the adapter's own.
+    assert.deepEqual(
+      models.result.data.map((model: any) => model.id),
+      ['opus', 'sonnet', 'sonnet-1m', 'haiku', 'opus-plan', 'team-opus', 'glm-5'],
+    )
+    const byId = new Map<string, any>(models.result.data.map((model: any) => [model.id, model]))
+    const efforts = (id: string) =>
+      byId.get(id).supportedReasoningEfforts.map((entry: any) => entry.reasoningEffort)
+
+    const opus = byId.get('opus')
+    assert.deepEqual(efforts('opus'), all)
+    assert.equal(opus.defaultReasoningEffort, 'max')
+    assert.equal(opus.displayName, 'Claude Opus')
+    assert.equal(opus.description, opusDescription)
+    assert.equal(opus.isDefault, true)
+    assert.deepEqual(opus.supportedReasoningEfforts.at(-1), {
+      reasoningEffort: 'max',
+      description: 'Maximum reasoning',
+    })
+    // A model without max defaults to the closest level below.
+    assert.deepEqual(efforts('sonnet'), ['low', 'medium', 'high'])
+    assert.equal(byId.get('sonnet').defaultReasoningEffort, 'high')
+    // Claude Code listed no 1M variant: Sonnet's efforts, the adapter's text.
+    assert.deepEqual(efforts('sonnet-1m'), ['low', 'medium', 'high'])
+    assert.equal(byId.get('sonnet-1m').description, 'Claude Code runtime model')
+    // Haiku takes no effort, which Codex reports as 'none'.
+    assert.deepEqual(efforts('haiku'), [])
+    assert.equal(byId.get('haiku').defaultReasoningEffort, 'none')
+    // Opus Plan keeps the adapter's description of the hybrid mode.
+    assert.deepEqual(efforts('opus-plan'), all)
+    assert.match(byId.get('opus-plan').description, /does not enable plan mode/)
+    // A gateway alias finds its model by the id it passes to Claude Code.
+    assert.deepEqual(efforts('team-opus'), all)
+    assert.equal(byId.get('team-opus').displayName, 'Team Opus')
+    assert.equal(byId.get('team-opus').description, opusDescription)
+    // A model Claude Code never reported keeps the static list.
+    assert.deepEqual(efforts('glm-5'), ['low', 'medium', 'high', 'xhigh'])
+    assert.equal(byId.get('glm-5').defaultReasoningEffort, 'xhigh')
+
+    // Max is a thread effort like the others and reaches Claude Code.
+    proc.stdin.write(
+      json({
+        id: 3,
+        method: 'thread/start',
+        params: {
+          cwd: process.cwd(),
+          model: 'opus',
+          experimentalRawEvents: false,
+          persistExtendedHistory: false,
+        },
+      }),
+    )
+    const start = await reader.nextResponse(3)
+    const threadId = start.result.thread.id
+    assert.equal(start.result.reasoningEffort, 'max')
+    proc.stdin.write(
+      json({
+        id: 4,
+        method: 'turn/start',
+        params: {
+          threadId,
+          model: 'opus',
+          effort: 'max',
+          input: [{ type: 'text', text: 'model effort check', text_elements: [] }],
+        },
+      }),
+    )
+    await reader.nextResponse(4)
+    let text = ''
+    for (let i = 0; i < 500; i += 1) {
+      const message = await reader.next()
+      if (message.method === 'item/agentMessage/delta') text += message.params.delta
+      if (message.method === 'turn/completed') break
+    }
+    assert.equal(text, 'model=opus effort=max')
+    proc.stdin.write(json({ id: 5, method: 'thread/resume', params: { threadId } }))
+    const resume = await reader.nextResponse(5)
+    assert.equal(resume.result.reasoningEffort, 'max')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('config/read exposes sanitized provider loop selection over stdio', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {

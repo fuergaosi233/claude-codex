@@ -26,6 +26,13 @@ an alias selects depend on your account, provider, and Claude Code version. The
 list is not an account entitlement check. `CLAUDE_CODEX_MODELS` replaces the
 default Claude list when you need to customize it.
 
+Each Claude model offers the reasoning efforts Claude Code reports for it, from
+the first Claude turn on: **Max** on the models that take it, and no effort
+levels on Claude Haiku. The App shows Max only after you turn it on under
+Settings > Agent > Model features > Available reasoning efforts. Until a Claude
+turn has run, every model offers Low to Extra High. See
+[Models & effort](/guide/configuration#models-effort).
+
 **Claude Opus Plan / Sonnet Execute** keeps the `opus-plan` option ID and maps to Claude
 Code's `opusplan` hybrid mode: Opus during planning, Sonnet during execution.
 Selecting it does not itself enable plan mode, so an ordinary conversation may

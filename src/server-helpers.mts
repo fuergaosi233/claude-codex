@@ -154,7 +154,7 @@ export function modelFromParams(params: Record<string, unknown>, fallback: strin
 export function reasoningEffortFromParams(
   params: Record<string, unknown>,
   fallback: string | null,
-): 'low' | 'medium' | 'high' | 'xhigh' | null {
+): 'low' | 'medium' | 'high' | 'xhigh' | 'max' | null {
   const config = asRecord(params.config)
   const effort =
     typeof params.effort === 'string'
@@ -470,13 +470,14 @@ export function normalizePersonality(value: unknown): string | null {
   return null
 }
 
-// Codex v2 ReasoningEffort enum (top-level, used by collabAgentToolCall and
-// elsewhere). No serde(other) fallback — anything outside this set crashes
-// the App's deserializer (same trap as threadSource = ""). Pass any value
-// through here before emitting it on the wire.
+// Codex v2 ReasoningEffort as the App's schema knows it (top-level, used by
+// collabAgentToolCall and elsewhere). Anything outside this set, an empty
+// string included, crashes the App's deserializer (same trap as
+// threadSource = ""). Pass any value through here before emitting it on the
+// wire.
 export function normalizeReasoningEffortEnum(
   value: string | null | undefined,
-): 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | null {
+): 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | null {
   if (typeof value !== 'string') return null
   const v = value.trim()
   if (
@@ -485,7 +486,8 @@ export function normalizeReasoningEffortEnum(
     v === 'low' ||
     v === 'medium' ||
     v === 'high' ||
-    v === 'xhigh'
+    v === 'xhigh' ||
+    v === 'max'
   )
     return v
   return null
