@@ -124,6 +124,14 @@ versioning or publishing metadata.
   `summaryTextDelta`). Thinking stored before as raw content reads back as
   the summary. `CLAUDE_CODEX_REASONING_VISIBLE=0` or the App's Reasoning
   summary setting set to None keeps the previous behavior.
+- API retries show in the turn as Codex shows a stream retry: each
+  `system/api_retry` of the main loop becomes an `error` notification with
+  `willRetry` and the message `Reconnecting... n/m`, which the App folds into
+  one passing row, and is not stored. Errors and failed turns carry a Codex
+  `codexErrorInfo` code from the CLI's terminal reason, error category and
+  HTTP status (`serverOverloaded` for a 529, `contextWindowExceeded`,
+  `rateLimitExceeded`, ...), never one the App answers with a ChatGPT account
+  flow. CLI notifications of high or immediate priority show as warnings.
 
 ### Provider and multi-agent boundaries
 

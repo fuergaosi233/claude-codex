@@ -4,12 +4,13 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { CodexClaudeAppServer } from '../src/server.mjs'
-import { parseSubagentTrailer } from '../src/server-helpers.mjs'
+import { codexErrorInfo, parseSubagentTrailer, retryTurnError } from '../src/server-helpers.mjs'
 import { SessionStore } from '../src/store.mjs'
 import type {
   ClaudeRuntime,
   RpcPeer,
   RuntimeEvent,
+  RuntimeFailure,
   RuntimeHandlers,
   ThreadItem,
   WireMessage,
@@ -369,6 +370,113 @@ test('failed partial messages are completed as commentary, never final answers',
   assert.equal(turn.status, 'failed')
   assert.equal(assistantItems(turn.items)[0]?.phase, 'commentary')
   assert.equal(messages.filter((message) => message.method === 'item/completed').length, 1)
+  // An error with no Codex code is 'other', as Codex reports one.
+  const expected = { message: 'Connection lost', codexErrorInfo: 'other', additionalDetails: null }
+  assert.deepEqual(turn.error, expected)
+  assert.deepEqual(
+    messages.filter((message) => message.method === 'error').map((message) => message.params),
+    [{ threadId: turn.threadId, turnId: turn.id, willRetry: false, error: expected }],
+  )
+})
+
+test('Claude failures map onto the Codex error codes the App knows', () => {
+  const failure = (fields: Partial<RuntimeFailure>): RuntimeFailure => ({
+    terminalReason: 'api_error',
+    category: null,
+    status: null,
+    ...fields,
+  })
+  const cases: Array<[RuntimeFailure | null, unknown]> = [
+    [
+      failure({ terminalReason: 'prompt_too_long', category: 'invalid_request', status: 400 }),
+      'contextWindowExceeded',
+    ],
+    [failure({ category: 'overloaded', status: 529 }), 'serverOverloaded'],
+    [failure({ status: 529 }), 'serverOverloaded'],
+    [failure({ category: 'rate_limit', status: 429 }), 'rateLimitExceeded'],
+    [failure({ category: 'invalid_request', status: 400 }), 'badRequest'],
+    [failure({ category: 'server_error', status: 500 }), 'internalServerError'],
+    [failure({ status: 503 }), 'internalServerError'],
+    [failure({}), { httpConnectionFailed: { httpStatusCode: null } }],
+    [failure({ category: 'unknown' }), { httpConnectionFailed: { httpStatusCode: null } }],
+    // The App answers these codes with ChatGPT account flows.
+    [failure({ category: 'authentication_failed', status: 401 }), 'other'],
+    [failure({ category: 'billing_error', status: 402 }), 'other'],
+    [failure({ terminalReason: 'max_turns' }), 'other'],
+    [null, 'other'],
+  ]
+  for (const [input, code] of cases) {
+    assert.deepEqual(codexErrorInfo(input), code, JSON.stringify(input))
+  }
+  // A retry is a disconnected stream, as Codex reports every stream retry,
+  // except an overloaded API, which the App shows as a busy server.
+  assert.deepEqual(codexErrorInfo(failure({ category: 'server_error', status: 500 }), true), {
+    responseStreamDisconnected: { httpStatusCode: 500 },
+  })
+  assert.deepEqual(codexErrorInfo(failure({ category: 'rate_limit', status: 429 }), true), {
+    responseStreamDisconnected: { httpStatusCode: 429 },
+  })
+  assert.equal(
+    codexErrorInfo(failure({ category: 'overloaded', status: 529 }), true),
+    'serverOverloaded',
+  )
+  assert.deepEqual(
+    retryTurnError({
+      type: 'retrying',
+      attempt: 3,
+      maxRetries: 10,
+      status: 500,
+      category: 'server_error',
+      delayMs: 4_400,
+    }),
+    {
+      message: 'Reconnecting... 3/10',
+      codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: 500 } },
+      additionalDetails: 'HTTP 500 server error; retrying in 4s',
+    },
+  )
+})
+
+test('retries show as passing Reconnecting errors in chats, not in helper turns', async () => {
+  const retrying: RuntimeEvent[] = [
+    {
+      type: 'retrying',
+      attempt: 1,
+      maxRetries: 10,
+      status: 429,
+      category: 'rate_limit',
+      delayMs: 600,
+    },
+    { type: 'text_delta', delta: '{"result":"ok"}' },
+  ]
+  const chat = await present(emit(retrying))
+  assert.equal(chat.turn.status, 'completed')
+  assert.deepEqual(
+    chat.messages.filter((message) => message.method === 'error').map((message) => message.params),
+    [
+      {
+        threadId: chat.turn.threadId,
+        turnId: chat.turn.id,
+        willRetry: true,
+        error: {
+          message: 'Reconnecting... 1/10',
+          codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: 429 } },
+          additionalDetails: 'HTTP 429 rate limit; retrying in 1s',
+        },
+      },
+    ],
+  )
+  assert.equal(chat.turn.error, null)
+  assert.equal(
+    chat.replay.items.some((item: { type: string }) => item.type === 'error'),
+    false,
+  )
+
+  const helper = await present(emit(retrying), {
+    outputSchema: { type: 'object', properties: { result: { type: 'string' } } },
+  })
+  assert.equal(helper.turn.status, 'completed')
+  assert.equal(helper.messages.filter((message) => message.method === 'error').length, 0)
 })
 
 test('plan output retains its native plan item and complete Markdown', async () => {

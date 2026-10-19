@@ -549,8 +549,37 @@ export type RuntimeEvent =
       category: string | null
       message: string
     }
-  | { type: 'completed'; claudeSessionId?: string | null; result?: string | null; success: boolean }
+  // A model request of the main loop failed and Claude will send it again
+  // after `delayMs`. `status` is the API's HTTP status (null when nothing
+  // answered) and `category` the SDK's error category ('overloaded', ...).
+  | {
+      type: 'retrying'
+      attempt: number
+      maxRetries: number
+      status: number | null
+      category: string | null
+      delayMs: number | null
+    }
+  | {
+      type: 'completed'
+      claudeSessionId?: string | null
+      result?: string | null
+      success: boolean
+      // Why a failed turn failed, when the backend can tell.
+      failure?: RuntimeFailure | null
+    }
   | { type: 'error'; message: string }
+
+// Why a Claude turn failed, in Claude's terms. The server maps it onto the
+// error codes the Codex App knows.
+export interface RuntimeFailure {
+  // The result's terminal_reason ('prompt_too_long', 'max_turns', ...).
+  terminalReason: string | null
+  // The SDK's API error category of the last response ('overloaded', ...).
+  category: string | null
+  // The HTTP status of the API error that ended the turn.
+  status: number | null
+}
 
 // Codex's request_user_input primitive — surfaces Claude's AskUserQuestion as a
 // native choice card in the App instead of a generic mcpToolCall blob. Matches

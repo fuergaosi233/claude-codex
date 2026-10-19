@@ -102,6 +102,7 @@ import {
   readConfigReasoningEffort,
   reasoningEffortFromParams,
   reasoningSummariesVisible,
+  retryTurnError,
   reviewLabel,
   reviewPrompt,
   sandboxEnvelope,
@@ -115,6 +116,8 @@ import {
   todoWriteToPlanSteps,
   tokenBreakdownFromClaudeUsage,
   toolResultText,
+  turnErrorOf,
+  turnFailure,
   userInputAnswersAsContent,
   visualizationDirNote,
   wrapMcpToolError,
@@ -2236,7 +2239,7 @@ export class CodexClaudeAppServer {
           debugLog('queue.dispatch.failed', { threadId, error: String(error) })
           this.notify(peer, {
             method: 'error',
-            params: { threadId, turnId: null, willRetry: false, error: { message: String(error) } },
+            params: { threadId, turnId: null, willRetry: false, error: turnErrorOf(error) },
           })
         })
         return this.activeTurnByThread.has(threadId)
@@ -4390,6 +4393,25 @@ export class CodexClaudeAppServer {
             }
             return
           }
+          if (event.type === 'retrying') {
+            debugLog('turn.runtime.retrying', { threadId: thread.id, turnId: turn.id, ...event })
+            // Codex reports a model request it will send again as an `error`
+            // with willRetry, which the App shows as a passing
+            // "Reconnecting" row; like Codex, it is not kept in history.
+            // Helper turns the App starts for structured output show nothing.
+            if (turnPurpose === 'normal') {
+              this.notify(peer, {
+                method: 'error',
+                params: {
+                  threadId: thread.id,
+                  turnId: turn.id,
+                  willRetry: true,
+                  error: retryTurnError(event),
+                },
+              })
+            }
+            return
+          }
           if (event.type === 'usage') {
             this.recordTokenUsage(peer, thread.id, turn.id, event.usage, {
               contextWindow: event.contextWindow ?? null,
@@ -4497,7 +4519,8 @@ export class CodexClaudeAppServer {
                 this.store.updateClaudeSessionId(thread.id, event.claudeSessionId)
               }
             }
-            if (!event.success) throw new Error(event.result ?? 'Claude turn failed')
+            if (!event.success)
+              throw turnFailure(event.result ?? 'Claude turn failed', event.failure)
           }
           if (event.type === 'error') {
             throw new Error(event.message)
@@ -7389,7 +7412,8 @@ export class CodexClaudeAppServer {
   // database past its busy timeout. Returns false for a turn that had already
   // ended, e.g. through turn/interrupt.
   private failTurn(peer: RpcPeer, threadId: string, turn: TurnRecord, error: Error): boolean {
-    const completed = this.endTurn(turn, 'failed', { message: error.message })
+    const turnError = turnErrorOf(error)
+    const completed = this.endTurn(turn, 'failed', turnError)
     if (!completed) {
       // Its end was recorded, but whatever ended it never let go of the
       // thread.
@@ -7401,7 +7425,7 @@ export class CodexClaudeAppServer {
     }
     this.notify(peer, {
       method: 'error',
-      params: { threadId, turnId: turn.id, willRetry: false, error: { message: error.message } },
+      params: { threadId, turnId: turn.id, willRetry: false, error: turnError },
     })
     this.notify(peer, {
       method: 'turn/completed',

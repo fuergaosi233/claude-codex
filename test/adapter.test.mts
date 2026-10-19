@@ -2886,6 +2886,98 @@ test('with reasoning summaries off Claude thinking stays raw reasoning content',
   }
 })
 
+test('API retries show as Reconnecting errors and a failed turn carries its Codex error code', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  try {
+    const threadId = await startMockThread(reader, proc)
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: textInput('api retry check') },
+      }),
+    )
+    const retried = await readUntil(reader, (message) => message.method === 'turn/completed')
+    const retries = retried.filter((message) => message.method === 'error')
+    const turnId = retried.at(-1)?.params.turn.id
+    // The App counts attempts only from a message of exactly this form.
+    assert.deepEqual(
+      retries.map((message) => message.params),
+      [
+        {
+          threadId,
+          turnId,
+          willRetry: true,
+          error: {
+            message: 'Reconnecting... 1/10',
+            codexErrorInfo: 'serverOverloaded',
+            additionalDetails: 'HTTP 529 overloaded; retrying in 1s',
+          },
+        },
+        {
+          threadId,
+          turnId,
+          willRetry: true,
+          error: {
+            message: 'Reconnecting... 2/10',
+            codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: null } },
+            additionalDetails: 'no response',
+          },
+        },
+      ],
+    )
+    for (const retry of retries) {
+      assert.match(retry.params.error.message, /^Reconnecting(?:\.\.\.)?\s+(\d+)\/(\d+)$/)
+    }
+    assert.equal(retried.at(-1)?.params.turn.status, 'completed')
+    assert.equal(retried.at(-1)?.params.turn.error, null)
+
+    proc.stdin.write(
+      json({
+        id: 3,
+        method: 'turn/start',
+        params: { threadId, input: textInput('overloaded failure check') },
+      }),
+    )
+    const failed = await readUntil(reader, (message) => message.method === 'turn/completed')
+    const expected = {
+      message: 'API Error: 529 Overloaded',
+      codexErrorInfo: 'serverOverloaded',
+      additionalDetails: 'HTTP 529 overloaded',
+    }
+    const errors = failed.filter((message) => message.method === 'error')
+    assert.deepEqual(
+      errors.map((message) => [message.params.willRetry, message.params.error]),
+      [[false, expected]],
+    )
+    assert.equal(failed.at(-1)?.params.turn.status, 'failed')
+    assert.deepEqual(failed.at(-1)?.params.turn.error, expected)
+
+    // History keeps the failure with its code, and none of the retries.
+    proc.stdin.write(
+      json({ id: 4, method: 'thread/read', params: { threadId, includeTurns: true } }),
+    )
+    const read = await reader.nextResponse(4)
+    const turns = read.result.thread.turns
+    assert.deepEqual(
+      turns.map((turn: any) => [turn.status, turn.error]),
+      [
+        ['completed', null],
+        ['failed', expected],
+      ],
+    )
+    assert.equal(
+      turns.flatMap((turn: any) => turn.items).some((item: any) => item.type === 'error'),
+      false,
+    )
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('the context gauge follows the last API call and child tokens add to the total', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawnMockAdapter(home)

@@ -21,7 +21,9 @@ Implemented as real remote/runtime behavior:
   form or link prompt.
 - **Streaming** — turn started/completed, thread status changes, agent text
   deltas, reasoning deltas, command output deltas, file patches, generic tool
-  item completion, hook runs, model reroutes, and aggregated git diff updates.
+  item completion, hook runs, model reroutes, aggregated git diff updates, and
+  `error` notifications for API retries (`willRetry`) and failed turns, with
+  Codex error codes.
 - **Remote utilities** — file read/write/list/metadata/copy/remove/watch,
   command exec with stdin/terminate, process spawn/stdin/kill, fuzzy file
   search, direct MCP stdio/HTTP tool and resource calls.

@@ -385,6 +385,38 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    if (/api retry check/i.test(context.prompt)) {
+      await handlers.onEvent({
+        type: 'retrying',
+        attempt: 1,
+        maxRetries: 10,
+        status: 529,
+        category: 'overloaded',
+        delayMs: 600,
+      })
+      await handlers.onEvent({
+        type: 'retrying',
+        attempt: 2,
+        maxRetries: 10,
+        status: null,
+        category: null,
+        delayMs: null,
+      })
+      await handlers.onEvent({ type: 'text_delta', delta: 'answered after retrying' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'api retry check' })
+      return
+    }
+
+    if (/overloaded failure check/i.test(context.prompt)) {
+      await handlers.onEvent({
+        type: 'completed',
+        success: false,
+        result: 'API Error: 529 Overloaded',
+        failure: { terminalReason: 'api_error', category: 'overloaded', status: 529 },
+      })
+      return
+    }
+
     if (/policy check/i.test(context.prompt)) {
       await handlers.onEvent({
         type: 'text_delta',

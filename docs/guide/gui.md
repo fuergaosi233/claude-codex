@@ -54,6 +54,26 @@ the variable as well with a Claude CLI pinned through `CLAUDE_CODEX_CLI` that
 predates the flag. Whether a model or provider returns summarized thinking at
 all is up to them; when it returns none, nothing shows.
 
+## Retries and errors
+
+When the Claude API is overloaded or unreachable, the Claude CLI retries the
+request on its own. With the default native backend, each retry shows in the
+turn as Codex shows a stream retry: a passing **Reconnecting 1/10** row that
+counts up and leaves once Claude answers, with the HTTP status and the wait
+under it. Like Codex, the adapter does not store these rows, so they are gone
+when the chat is reopened. Retries inside a subagent do not show.
+
+A turn that fails tells the App why, with the error code Codex would send:
+the context window is full, the server is busy (HTTP 529), a rate limit, a bad
+request, a server error, or a failed connection; anything else is a plain
+error. An overloaded API shows as **Server is busy**. The adapter never sends
+the codes the App answers with ChatGPT account flows, so a Claude
+authentication or billing failure shows its message instead of a ChatGPT plan
+upgrade or sign-in prompt.
+
+Notices the Claude CLI would show an interactive user at once, such as a
+failed compaction, show as warnings, each once a turn.
+
 ## Inline visualizations
 
 With the default native Claude Agent SDK backend, Claude can answer with a
