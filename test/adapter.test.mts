@@ -858,6 +858,33 @@ test('model/list offers each Claude model the efforts Claude Code reported for i
     proc.stdin.write(json({ id: 5, method: 'thread/resume', params: { threadId } }))
     const resume = await reader.nextResponse(5)
     assert.equal(resume.result.reasoningEffort, 'max')
+
+    // On Haiku the App sends its defaultReasoningEffort, 'none': the turn
+    // reaches Claude Code without an effort, and the thread keeps its own.
+    proc.stdin.write(
+      json({
+        id: 6,
+        method: 'turn/start',
+        params: {
+          threadId,
+          model: 'haiku',
+          effort: 'none',
+          input: [{ type: 'text', text: 'model effort check', text_elements: [] }],
+        },
+      }),
+    )
+    await reader.nextResponse(6)
+    text = ''
+    for (let i = 0; i < 500; i += 1) {
+      const message = await reader.next()
+      if (message.method === 'item/agentMessage/delta') text += message.params.delta
+      if (message.method === 'turn/completed') break
+    }
+    assert.equal(text, 'model=haiku effort=default')
+    proc.stdin.write(json({ id: 7, method: 'thread/resume', params: { threadId } }))
+    const haikuResume = await reader.nextResponse(7)
+    assert.equal(haikuResume.result.model, 'haiku')
+    assert.equal(haikuResume.result.reasoningEffort, 'max')
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
