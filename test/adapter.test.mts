@@ -3461,7 +3461,7 @@ test('thread/inject_items appends a synthetic turn carrying the injected text', 
   }
 })
 
-test('turn/start planMode=true flows into Claude SDK permission_mode plan', async () => {
+test('collaborationMode/list offers the Plan and Default presets', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -3469,36 +3469,174 @@ test('turn/start planMode=true flows into Claude SDK permission_mode plan', asyn
   })
   const reader = new JsonLineReader(proc)
   try {
-    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
-    const start = await reader.nextResponse(1)
-    const threadId = start.result.thread.id
+    proc.stdin.write(json({ id: 1, method: 'collaborationMode/list', params: {} }))
+    const listed = await reader.nextResponse(1)
+    assert.deepEqual(listed.result, {
+      data: [
+        { name: 'Plan', mode: 'plan', model: null, reasoning_effort: null },
+        { name: 'Default', mode: 'default', model: null, reasoning_effort: null },
+      ],
+    })
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
 
+test('Plan mode: the thread keeps the mode and ExitPlanMode becomes one plan card', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  let id = 0
+  let threadId = ''
+  const mode = (name: 'plan' | 'default') => ({
+    mode: name,
+    settings: { model: '', reasoning_effort: null, developer_instructions: null },
+  })
+  // Runs one turn and sorts what it streamed.
+  const runTurn = async (params: Record<string, unknown>) => {
+    const requestId = ++id
+    proc.stdin.write(
+      json({
+        id: requestId,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'plan mode check', text_elements: [] }],
+          ...params,
+        },
+      }),
+    )
+    await reader.nextResponse(requestId)
+    const seen = {
+      text: '',
+      planDelta: '',
+      planStarted: [] as any[],
+      planCompleted: [] as any[],
+      tools: [] as any[],
+      planUpdated: false,
+      status: '',
+    }
+    for (;;) {
+      const message = await reader.next()
+      if (message.method === 'item/agentMessage/delta') seen.text += message.params.delta
+      if (message.method === 'item/plan/delta') seen.planDelta += message.params.delta
+      if (message.method === 'turn/plan/updated') seen.planUpdated = true
+      if (message.method === 'item/started') {
+        const item = message.params.item
+        if (item.type === 'plan') seen.planStarted.push(item)
+        else if (item.type !== 'agentMessage' && item.type !== 'userMessage') seen.tools.push(item)
+      }
+      if (message.method === 'item/completed' && message.params.item.type === 'plan')
+        seen.planCompleted.push(message.params.item)
+      if (message.method === 'turn/completed') {
+        seen.status = message.params.turn.status
+        break
+      }
+    }
+    return seen
+  }
+  try {
+    proc.stdin.write(json({ id: ++id, method: 'thread/start', params: { cwd: process.cwd() } }))
+    threadId = (await reader.nextResponse(id)).result.thread.id
+    const plan = '# Mock plan\n\n1. Inspect the code\n2. Make the change'
+
+    // The App's Plan toggle: the mode rides in collaborationMode, with the
+    // top-level model and effort null.
+    const planned = await runTurn({ model: null, effort: null, collaborationMode: mode('plan') })
+    assert.equal(planned.status, 'completed', 'the App offers to implement only completed turns')
+    assert.equal(planned.text, 'planMode=truePlan ready.', 'prose around the plan stays prose')
+    assert.equal(planned.planStarted.length, 1, 'exactly one plan card')
+    assert.equal(planned.planStarted[0].text, '')
+    assert.equal(planned.planDelta, plan)
+    assert.equal(planned.planCompleted.length, 1)
+    assert.equal(planned.planCompleted[0].text, plan)
+    assert.deepEqual(planned.tools, [], 'ExitPlanMode is the card, not a tool item')
+    assert.equal(planned.planUpdated, false, 'turn/plan/updated is for the TodoWrite checklist')
+
+    // The plan item is part of the turn's history.
+    proc.stdin.write(
+      json({ id: ++id, method: 'thread/read', params: { threadId, includeTurns: true } }),
+    )
+    const read = await reader.nextResponse(id)
+    const items = read.result.thread.turns.at(-1).items
+    assert.deepEqual(
+      items.filter((item: any) => item.type === 'plan').map((item: any) => item.text),
+      [plan],
+    )
+
+    // A turn that names no mode keeps the thread's.
+    const kept = await runTurn({})
+    assert.equal(kept.planStarted.length, 1)
+    assert.match(kept.text, /^planMode=true/)
+
+    // Implementing the plan switches back to Default, which sticks too.
+    const implemented = await runTurn({ collaborationMode: mode('default') })
+    assert.equal(implemented.text, 'planMode=false')
+    assert.equal(implemented.planStarted.length, 0)
+    assert.equal((await runTurn({})).text, 'planMode=false')
+
+    // The legacy planMode flag still plans a single turn.
+    const legacy = await runTurn({ planMode: true })
+    assert.equal(legacy.planStarted.length, 1)
+    assert.match(legacy.text, /^planMode=true/)
+    assert.equal((await runTurn({})).text, 'planMode=false')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('turn/start takes the model and effort a collaborationMode carries', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      CODEX_HOME: home,
+      CLAUDE_CODEX_MOCK: '1',
+      CLAUDE_CODEX_MODELS: '',
+      CLAUDE_CODEX_MODEL_ALIASES: '',
+      NODE_NO_WARNINGS: '1',
+    },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(
+      json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), model: 'sonnet' } }),
+    )
+    const threadId = (await reader.nextResponse(1)).result.thread.id
     proc.stdin.write(
       json({
         id: 2,
         method: 'turn/start',
         params: {
           threadId,
-          planMode: true,
-          input: [{ type: 'text', text: 'plan mode check', text_elements: [] }],
+          model: null,
+          effort: null,
+          collaborationMode: {
+            mode: 'default',
+            settings: { model: 'haiku', reasoning_effort: 'low', developer_instructions: null },
+          },
+          input: [{ type: 'text', text: 'model effort check', text_elements: [] }],
         },
       }),
     )
     await reader.nextResponse(2)
-
-    // Plan-mode text routes to a Plan ThreadItem via item/plan/delta so the
-    // App's Plan UI lights up. turn/plan/updated is NOT used for plan-mode text;
-    // it is reserved for the update_plan/TodoWrite checklist tool.
-    let planText = ''
-    let sawPlanUpdated = false
-    for (let i = 0; i < 200; i += 1) {
+    let text = ''
+    for (;;) {
       const message = await reader.next()
-      if (message.method === 'item/plan/delta') planText += message.params.delta
-      if (message.method === 'turn/plan/updated') sawPlanUpdated = true
+      if (message.method === 'item/agentMessage/delta') text += message.params.delta
       if (message.method === 'turn/completed') break
     }
-    assert.match(planText, /planMode=true/, 'plan deltas should carry the runtime context')
-    assert.equal(sawPlanUpdated, false, 'plan-mode text must not emit turn/plan/updated')
+    assert.equal(text, 'model=haiku effort=low')
+    proc.stdin.write(json({ id: 3, method: 'thread/resume', params: { threadId } }))
+    const resumed = await reader.nextResponse(3)
+    assert.equal(resumed.result.model, 'haiku')
+    assert.equal(resumed.result.reasoningEffort, 'low')
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -9037,11 +9175,89 @@ test('thread/settings/update preserves model and effort compatibility', async ()
     assert.equal(settingsNotification.params.threadSettings.model, 'haiku')
     assert.equal(settingsNotification.params.threadSettings.effort, 'xhigh')
     assert.equal(settingsNotification.params.threadSettings.personality, 'friendly')
+    assert.equal(settingsNotification.params.threadSettings.collaborationMode.mode, 'default')
 
     proc.stdin.write(json({ id: 3, method: 'thread/resume', params: { threadId } }))
     const read = await reader.nextResponse(3)
     assert.equal(read.result.model, 'haiku')
     assert.equal(read.result.reasoningEffort, 'xhigh')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('thread/settings/update keeps the Plan toggle and thread/resume reports it', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  // Sends a settings update and returns the mode thread/settings/updated echoed.
+  const update = async (id: number, params: Record<string, unknown>) => {
+    proc.stdin.write(json({ id, method: 'thread/settings/update', params }))
+    let echoed: any = null
+    let answered = false
+    for (let attempt = 0; attempt < 20 && (!answered || !echoed); attempt += 1) {
+      const message = await reader.next()
+      if (message.id === id && message.method == null) answered = true
+      if (message.method === 'thread/settings/updated')
+        echoed = message.params.threadSettings.collaborationMode
+    }
+    assert.ok(echoed)
+    return echoed
+  }
+  try {
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const threadId = (await reader.nextResponse(1)).result.thread.id
+
+    // The App adopts the echoed mode, so it must be the thread's real one.
+    const planned = await update(2, {
+      threadId,
+      collaborationMode: {
+        mode: 'plan',
+        settings: { model: '', reasoning_effort: null, developer_instructions: null },
+      },
+    })
+    assert.equal(planned.mode, 'plan')
+    // An update that names no mode leaves it alone.
+    assert.equal((await update(3, { threadId, personality: 'friendly' })).mode, 'plan')
+
+    proc.stdin.write(json({ id: 4, method: 'thread/resume', params: { threadId } }))
+    const resumed = await reader.nextResponse(4)
+    assert.equal(resumed.result.collaborationMode.mode, 'plan')
+    assert.equal(resumed.result.collaborationMode.settings.model, resumed.result.model)
+
+    // The stored mode drives the next turn that names none.
+    proc.stdin.write(
+      json({
+        id: 5,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'plan mode check', text_elements: [] }],
+        },
+      }),
+    )
+    await reader.nextResponse(5)
+    let text = ''
+    for (;;) {
+      const message = await reader.next()
+      if (message.method === 'item/agentMessage/delta') text += message.params.delta
+      if (message.method === 'turn/completed') break
+    }
+    assert.match(text, /^planMode=true/)
+
+    assert.equal(
+      (
+        await update(6, {
+          threadId,
+          collaborationMode: { mode: 'default', settings: { developer_instructions: null } },
+        })
+      ).mode,
+      'default',
+    )
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })

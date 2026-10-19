@@ -45,6 +45,9 @@ export interface RpcPeer {
   close(): void
 }
 
+// Codex `ModeKind`: the collaboration modes the App's composer offers.
+export type CollaborationModeKind = 'plan' | 'default'
+
 export interface ThreadRecord {
   id: string
   sessionId: string
@@ -95,6 +98,10 @@ export interface ThreadRecord {
   // Keep it alongside the normalized policies so the profile survives resume
   // and the settings UI can round-trip its selection.
   permissionProfileId?: string | null
+  // The App's collaboration mode (the /plan toggle), as last sent on
+  // turn/start or thread/settings/update. Null until the App names one; a
+  // turn that names none runs in the stored mode.
+  collaborationMode?: CollaborationModeKind | null
   // Codex App marks transient title-generation / consolidation threads as
   // ephemeral — these should not appear in the user-facing thread list.
   ephemeral: boolean
@@ -433,9 +440,9 @@ export interface RuntimeTurnContext {
   // Folders outside the workspace Claude may read without asking, such as
   // the Codex App skills the prompt lists. Writes still follow the policy.
   readableRoots?: string[]
-  // Drive Claude SDK permission_mode='plan' for this turn — Claude generates
-  // a plan but does not execute tools. Set when the App requests `planMode`
-  // on turn/start (or when CLAUDE_CODEX_PERMISSION_MODE=plan globally).
+  // Drive Claude SDK permission_mode='plan' for this turn — Claude explores
+  // read-only and proposes a plan through ExitPlanMode. Set when the thread's
+  // collaboration mode is 'plan' (or the legacy `planMode` flag is on).
   planMode: boolean
   // Multimodal input attached to the turn. localImage gets read + base64
   // encoded; image (URL) is passed through as-is. Sidecar reshapes the
@@ -509,6 +516,9 @@ export type RuntimeEvent =
       questions: UserInputQuestion[]
     }
   | { type: 'notice'; level: 'info' | 'warning' | 'error'; message: string }
+  // A plan-mode turn's finished plan: the text Claude handed to ExitPlanMode.
+  // The App shows it as the turn's plan card and offers to implement it.
+  | { type: 'proposed_plan'; toolUseId: string; text: string }
   // A result's usage. `child` marks tokens a subagent or workflow spent:
   // they add to the thread's total, not to its context window.
   | {

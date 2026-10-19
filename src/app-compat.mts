@@ -191,6 +191,22 @@ export const APP_RULES: readonly AppRule[] = [
       'With Codex routing off, send the first message of a new chat: the chat gets a generated title, not its first words.',
   },
   {
+    id: 'collaboration-modes',
+    app: "Enables /plan and the composer's Plan toggle only when collaborationMode/list returns a preset with mode plan, and keeps only the plan and default presets. Sends the chosen mode as collaborationMode through thread/settings/update and on turn/start, where it sets the top-level model and effort to null and puts the picker's model and effort in collaborationMode.settings. Adopts the collaborationMode of thread/settings/updated and of the thread/resume response as the composer's mode.",
+    adapter:
+      "Lists a Plan and a Default preset without a model or effort, takes a turn's model and effort from collaborationMode.settings, keeps the mode per thread for turns that name none, and reports the thread's real mode in thread/settings/updated and thread/resume.",
+    verify:
+      'In a Claude chat, /plan is enabled; turn the Plan toggle on and send a message: the toggle stays on and the model picker keeps its choice.',
+  },
+  {
+    id: 'plan-implementation',
+    app: 'When a turn completes, takes the text of its last plan item and asks "Implement this plan?"; accepting switches the composer to the default mode and sends the plan back as a new turn.',
+    adapter:
+      'In plan mode turns the plan Claude hands to ExitPlanMode into one plan item (started, one delta, completed) and refuses the tool call without an interrupt, so the turn completes; what Claude writes around it stays agent messages.',
+    verify:
+      'Ask for a plan in Plan mode: one plan card shows, "Implement this plan?" follows, and accepting runs the plan outside plan mode.',
+  },
+  {
     id: 'prewarmed-threads',
     app: 'Starts the thread of a new chat with thread/start before the user sends anything, keeps it out of thread/list and holds back its thread/started until it sends turn/start there, and deletes it with thread/delete once the chat goes unused for 10 minutes. It forgets such threads when the app-server connection drops or the App quits.',
     adapter:

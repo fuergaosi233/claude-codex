@@ -28,9 +28,21 @@ default Claude list when you need to customize it.
 
 **Claude Opus Plan / Sonnet Execute** keeps the `opus-plan` option ID and maps to Claude
 Code's `opusplan` hybrid mode: Opus during planning, Sonnet during execution.
-Selecting it does not itself enable plan mode, so an ordinary conversation may
-correctly run on Sonnet. Choose **Claude Opus** to use Opus throughout. See the
+Selecting it does not itself enable plan mode (see [Plan mode](#plan-mode)), so
+an ordinary conversation may correctly run on Sonnet. Choose **Claude Opus** to
+use Opus throughout. See the
 [Claude Code model configuration](https://code.claude.com/docs/en/model-config#opusplan-model-setting).
+
+## Plan mode
+
+`/plan` and the composer's **Plan** toggle work in Claude chats as they do in
+Codex chats. A turn sent in Plan mode runs in Claude Code's plan mode: Claude
+explores read-only, may ask you questions, and hands its finished plan over,
+which the App shows as a plan card. When the turn ends the App asks
+**Implement this plan?**: accepting switches the chat back to Default and sends
+the plan as a new turn, in which Claude carries it out; writing feedback instead
+keeps Plan mode on for a revised plan. In Plan mode a tool call that would need
+your approval (a command, an edit) is refused rather than asked about.
 
 ## Inline visualizations
 

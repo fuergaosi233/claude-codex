@@ -87,6 +87,16 @@ type Zod = typeof import('zod')
 // In-process MCP server carrying Codex's thread-goal tools.
 const GOAL_MCP_SERVER = 'codex_goal'
 
+// What Claude reads back from ExitPlanMode in plan mode. The App shows the
+// plan as a card and asks the user whether to implement it after the turn
+// ends, so Claude must stop here rather than retry or start the work.
+const PLAN_DELIVERED_MESSAGE =
+  'The plan was delivered to the user, who will decide in the app whether to implement it. ' +
+  'You are still in plan mode: do not call ExitPlanMode again and do not start implementing. ' +
+  'End your turn now, with at most one short sentence.'
+const PLAN_MISSING_MESSAGE =
+  'There is no plan to present yet. Write the plan to the plan file, then call ExitPlanMode again.'
+
 interface PendingTurn {
   context: RuntimeTurnContext
   handlers: RuntimeHandlers
@@ -610,9 +620,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         await end?.('other', budget)
       },
     })
-    let goalServer = false
     if (context.goalTools && this.zod && typeof sdk.createSdkMcpServer === 'function') {
-      goalServer = true
       opts.mcpServers = {
         ...((opts.mcpServers as Record<string, unknown> | undefined) ?? {}),
         [GOAL_MCP_SERVER]: goalToolServer(sdk, this.zod, context.goalTools),
@@ -628,15 +636,6 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     const mode = derivePermissionMode(context.approvalPolicy, context.sandboxMode, context.planMode)
     opts.permissionMode = mode
     if (mode === 'bypassPermissions') opts.allowDangerouslySkipPermissions = true
-    // Goal bookkeeping never needs the user's approval. canUseTool allows it
-    // where installed; a bare allowedTools entry there would shadow the
-    // callback and make the SDK warn on every session.
-    if (goalServer && mode === 'plan') {
-      opts.allowedTools = [
-        ...((opts.allowedTools as string[] | undefined) ?? []),
-        `mcp__${GOAL_MCP_SERVER}`,
-      ]
-    }
 
     // Workflows are on by default except on Pro plans; the env switch turns
     // them on there too. It deliberately avoids --settings, which pinned
@@ -647,9 +646,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
 
     // Per-tool approval round-trip with Codex App. In App-level Full Access,
     // the bridge auto-allows every permission request without surfacing a UI
-    // prompt. Explicit SDK bypass omits the callback because Claude never calls
-    // it in that mode.
-    if (mode !== 'plan' && mode !== 'bypassPermissions') {
+    // prompt. Plan mode needs the callback too: it carries AskUserQuestion and
+    // ExitPlanMode to the App and allows goal bookkeeping (a bare allowedTools
+    // entry would shadow the callback and make the SDK warn on every
+    // session). Explicit SDK bypass omits it because Claude never calls it in
+    // that mode.
+    if (mode !== 'bypassPermissions') {
       opts.canUseTool = this.makeCanUseTool(sessionRef)
     }
     // MCP elicitations go to the App in every mode: they ask the user for
@@ -692,7 +694,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       if (!session || !pending || pending.resolved) {
         // A background task asked between turns. There is no turn to surface
         // an approval in, so only the thread's standing policy can answer.
-        if (session && toolName !== 'AskUserQuestion' && autoAllowsTools(session.lastContext)) {
+        if (
+          session &&
+          toolName !== 'AskUserQuestion' &&
+          !plans(session.lastContext) &&
+          autoAllowsTools(session.lastContext)
+        ) {
           return { behavior: 'allow' }
         }
         return { behavior: 'deny', message: 'no active turn to ask the user for approval' }
@@ -731,6 +738,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         }
       }
 
+      if (plans(context)) return this.planModeDecision(toolName, input, toolUseId, pending)
+
       // Auto-allow when the App has selected Full Access / bypassPermissions —
       // matches the previous behaviour of skipping the canUseTool round-trip
       // entirely for those modes.
@@ -764,6 +773,31 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         return { behavior: 'allow', updatedInput: decision.updatedInput ?? input }
       }
       return { behavior: 'deny', message: 'denied by user' }
+    }
+  }
+
+  // Plan mode asks the user nothing but questions (above). ExitPlanMode
+  // hands over the finished plan: it becomes the turn's plan card, and the
+  // App asks the user whether to implement it once the turn completes, so
+  // the call is refused without an interrupt to let the turn end normally.
+  // Anything else that needs an approval is refused, as it was before plan
+  // mode had this callback; a read of a readable root needs none.
+  private async planModeDecision(
+    toolName: string,
+    input: Record<string, unknown>,
+    toolUseId: string,
+    pending: PendingTurn,
+  ): Promise<{ behavior: 'allow' } | { behavior: 'deny'; message: string }> {
+    if (toolName === 'ExitPlanMode') {
+      const plan = typeof input.plan === 'string' ? input.plan.trim() : ''
+      if (!plan) return { behavior: 'deny', message: PLAN_MISSING_MESSAGE }
+      await pending.handlers.onEvent({ type: 'proposed_plan', toolUseId, text: plan })
+      return { behavior: 'deny', message: PLAN_DELIVERED_MESSAGE }
+    }
+    if (readsWithin(toolName, input, pending.context.readableRoots)) return { behavior: 'allow' }
+    return {
+      behavior: 'deny',
+      message: `${toolName} is not available in plan mode. Explore with read-only tools, then present the plan with ExitPlanMode; the user decides whether to implement it.`,
     }
   }
 
@@ -2749,6 +2783,13 @@ function goalToolServer(sdk: ClaudeSdk, z: Zod, goal: GoalToolHandlers) {
       ),
     ],
   })
+}
+
+// A turn in Claude's plan mode, by the App's Plan toggle or the env override.
+function plans(context: RuntimeTurnContext): boolean {
+  return (
+    derivePermissionMode(context.approvalPolicy, context.sandboxMode, context.planMode) === 'plan'
+  )
 }
 
 // Codex's approval policy says "never ask" (or the sandbox is wide open) and

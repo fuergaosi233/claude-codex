@@ -8,6 +8,7 @@ import { stripQuietTurnHeartbeat } from './quiet-turns.mjs'
 import type { SessionStore } from './store.mjs'
 import type {
   ClaudeRuntime,
+  CollaborationModeKind,
   FileUpdateChange,
   ImageInput,
   JsonRpcId,
@@ -144,8 +145,19 @@ export function normalizeSelectableModelId(value: string, fallback: string): str
   return defaultModel
 }
 
+// Codex: a request's collaborationMode "takes precedence over model,
+// reasoning_effort, and developer instructions". The App relies on it: a
+// turn/start that names a mode sends `model: null, effort: null` and puts the
+// picker's choice in collaborationMode.settings. An empty model or a null
+// effort there means "keep the current one".
+function collaborationSettings(params: Record<string, unknown>): Record<string, unknown> {
+  return asRecord(asRecord(params.collaborationMode).settings)
+}
+
 export function modelFromParams(params: Record<string, unknown>, fallback: string | null): string {
   const config = asRecord(params.config)
+  const modeModel = collaborationSettings(params).model
+  if (typeof modeModel === 'string' && modeModel.length > 0) return modeModel
   if (typeof params.model === 'string' && params.model.length > 0) return params.model
   if (typeof config.model === 'string' && config.model.length > 0) return config.model
   return fallback ?? ''
@@ -156,13 +168,53 @@ export function reasoningEffortFromParams(
   fallback: string | null,
 ): 'low' | 'medium' | 'high' | 'xhigh' | null {
   const config = asRecord(params.config)
+  const modeEffort = collaborationSettings(params).reasoning_effort
   const effort =
-    typeof params.effort === 'string'
-      ? params.effort
-      : typeof config.model_reasoning_effort === 'string'
-        ? config.model_reasoning_effort
-        : fallback
+    typeof modeEffort === 'string'
+      ? modeEffort
+      : typeof params.effort === 'string'
+        ? params.effort
+        : typeof config.model_reasoning_effort === 'string'
+          ? config.model_reasoning_effort
+          : fallback
   return normalizeCodexReasoningEffort(effort)
+}
+
+// The model and effort a turn/start's collaborationMode carries, lifted to
+// the top-level `model` / `effort` keys the runtime reads.
+export function collaborationModeSettings(params: Record<string, unknown>): {
+  model?: string
+  effort?: string
+} {
+  const settings = collaborationSettings(params)
+  return {
+    ...(typeof settings.model === 'string' && settings.model.length > 0
+      ? { model: settings.model }
+      : {}),
+    ...(typeof settings.reasoning_effort === 'string' ? { effort: settings.reasoning_effort } : {}),
+  }
+}
+
+// The mode a request's `collaborationMode` names, or null when it names none
+// (the thread then keeps its stored mode).
+export function collaborationModeFromParams(
+  params: Record<string, unknown>,
+): CollaborationModeKind | null {
+  const mode = asRecord(params.collaborationMode).mode
+  return mode === 'plan' || mode === 'default' ? mode : null
+}
+
+// Codex `CollaborationMode` for a thread, as thread/settings/updated and
+// thread/resume report it. The App adopts it as the composer's mode.
+export function collaborationModeEnvelope(thread: ThreadRecord): Record<string, unknown> {
+  return {
+    mode: thread.collaborationMode ?? 'default',
+    settings: {
+      model: thread.model,
+      reasoning_effort: thread.reasoningEffort,
+      developer_instructions: thread.developerInstructions,
+    },
+  }
 }
 
 export function numberOr(value: unknown, fallback: number): number {

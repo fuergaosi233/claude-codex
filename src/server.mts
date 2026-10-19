@@ -60,6 +60,9 @@ import {
   asRecord,
   buildSystemPromptAddendum,
   coerceStructuredValue,
+  collaborationModeEnvelope,
+  collaborationModeFromParams,
+  collaborationModeSettings,
   commandArray,
   commandEnv,
   compactSummary,
@@ -807,7 +810,16 @@ export class CodexClaudeAppServer {
       case 'experimentalFeature/enablement/set':
         return { enablement: asRecord(asRecord(params).enablement) }
       case 'collaborationMode/list':
-        return method === 'collaborationMode/list' ? { data: [] } : {}
+        // The composer enables /plan and its Plan toggle only with a plan
+        // preset. It puts the picker's model and effort into the mode it
+        // sends, so the presets name neither.
+        // App rule: collaboration-modes
+        return {
+          data: [
+            { name: 'Plan', mode: 'plan', model: null, reasoning_effort: null },
+            { name: 'Default', mode: 'default', model: null, reasoning_effort: null },
+          ],
+        }
       case 'mock/experimentalMethod':
         return {
           echoed: typeof asRecord(params).value === 'string' ? asRecord(params).value : null,
@@ -1137,6 +1149,8 @@ export class CodexClaudeAppServer {
       thread.developerInstructions = nullIfEmpty(params.developerInstructions)
     if (typeof params.personality === 'string')
       thread.personality = normalizePersonality(params.personality)
+    thread.collaborationMode =
+      collaborationModeFromParams(params) ?? thread.collaborationMode ?? null
     this.store.upsertThread(thread)
     recordRunEvent('thread.resumed', {
       threadId,
@@ -1148,10 +1162,14 @@ export class CodexClaudeAppServer {
     })
     this.activePeerByThread.set(threadId, peer)
     this.bindPeerToDescendants(peer, threadId)
-    return this.threadEnvelope(
-      thread,
-      params.excludeTurns === true ? [] : this.store.listTurns(thread.id),
-    )
+    return {
+      ...this.threadEnvelope(
+        thread,
+        params.excludeTurns === true ? [] : this.store.listTurns(thread.id),
+      ),
+      // Codex reports the thread's effective mode on resume.
+      collaborationMode: collaborationModeEnvelope(thread),
+    }
   }
 
   private threadFork(peer: RpcPeer, params: Record<string, unknown>): unknown {
@@ -1213,6 +1231,8 @@ export class CodexClaudeAppServer {
       // The App forks a thread to describe it and asks for an ephemeral fork;
       // like any helper thread, it stays out of the thread list.
       ephemeral: params.ephemeral === true || parent.ephemeral,
+      // A helper fork never inherits the Plan toggle.
+      collaborationMode: params.ephemeral === true ? null : (parent.collaborationMode ?? null),
       threadSource:
         typeof params.threadSource === 'string'
           ? normalizeThreadSource(params.threadSource)
@@ -2207,12 +2227,14 @@ export class CodexClaudeAppServer {
 
   // Settings for a turn the adapter starts on the user's behalf: whatever the
   // last user turn used, minus its input. Queued messages never carry a
-  // collaboration mode (the App keeps those in the window queue).
+  // collaboration mode (the App keeps those in the window queue), and these
+  // turns stay out of plan mode without changing the thread's stored mode.
   private followUpParams(threadId: string): Record<string, unknown> {
     const {
       input: _input,
       clientUserMessageId: _clientId,
       outputSchema: _schema,
+      collaborationMode: _mode,
       ...rest
     } = this.lastTurnParamsByThread.get(threadId) ?? {}
     return { ...rest, threadId, planMode: false }
@@ -2341,6 +2363,8 @@ export class CodexClaudeAppServer {
           : null
     if (developerInstructions !== null)
       thread.developerInstructions = nullIfEmpty(developerInstructions)
+    thread.collaborationMode =
+      collaborationModeFromParams(params) ?? thread.collaborationMode ?? null
 
     const permissionProfileId = permissionProfileIdFromParams(params)
     const permissionProfile = permissionProfilePolicy(permissionProfileId)
@@ -2377,14 +2401,10 @@ export class CodexClaudeAppServer {
           serviceTier: null,
           effort: thread.reasoningEffort,
           summary: null,
-          collaborationMode: {
-            mode: 'default',
-            settings: {
-              model: thread.model,
-              reasoning_effort: thread.reasoningEffort,
-              developer_instructions: thread.developerInstructions,
-            },
-          },
+          // The App adopts this as the composer's mode, so it has to be the
+          // thread's real one or the Plan toggle switches itself off.
+          // App rule: collaboration-modes
+          collaborationMode: collaborationModeEnvelope(thread),
           personality: thread.personality,
         },
       },
@@ -3032,6 +3052,20 @@ export class CodexClaudeAppServer {
       if (joined) return { turn: this.toLifecycleTurn(joined) }
     }
     if (typeof params.cwd === 'string' && params.cwd.length > 0) thread.cwd = params.cwd
+    // The App's Plan toggle. collaborationMode.mode names the mode and the
+    // thread keeps it for turns that name none; the legacy planMode flag
+    // sets one turn (the adapter's own follow-ups use it to stay out of
+    // plan mode). A structured title or summary turn never plans.
+    // App rule: collaboration-modes
+    const namedMode = collaborationModeFromParams(params)
+    if (namedMode) thread.collaborationMode = namedMode
+    const planMode =
+      params.outputSchema == null &&
+      (namedMode != null
+        ? namedMode === 'plan'
+        : typeof params.planMode === 'boolean'
+          ? params.planMode
+          : thread.collaborationMode === 'plan')
     const requestedModel = modelFromParams(params, thread.model)
     // A helper thread on Claude maps a Codex model like thread/start does.
     // Structured summary/title turns map theirs to the summary model anyway.
@@ -3147,7 +3181,9 @@ export class CodexClaudeAppServer {
       // them to the runtime context without re-parsing user input.
       this.launchRuntimeTurn(peer, thread, turn, prompt, {
         ...params,
+        ...collaborationModeSettings(params),
         ...(helperModel ? { model: helperModel } : {}),
+        planMode,
         _imageInputs: images,
       })
     })
@@ -3359,28 +3395,13 @@ export class CodexClaudeAppServer {
       thread.forkedFromId != null &&
       thread.claudeSessionId != null &&
       this.store.listTurns(thread.id).length <= 1
-    // Plan mode: Claude SDK runs with permissionMode='plan' — it produces
-    // planning text but does not execute tools. We surface the planning
-    // output as Codex's native `plan` ThreadItem (instead of agentMessage)
-    // and stream deltas via item/plan/delta + turn/plan/updated so the
-    // App's Plan-mode UI lights up properly. Detection:
-    //   * turn/start.planMode === true (App's explicit request)
-    //   * thread.approvalPolicy / sandbox flags don't suppress it
-    // The current planMode flag for this turn was computed above as
-    // `params.planMode === true`; reproduce here so the helpers can check it.
+    // Plan mode (turnStart resolved the flag): Claude runs with
+    // permissionMode 'plan', explores read-only and hands its finished plan
+    // to ExitPlanMode. The runtime reports that plan as a `proposed_plan`
+    // event, which becomes the turn's Codex `plan` item; what Claude says
+    // around it stays an agent message, so the turn has one plan card.
     const planMode = params.planMode === true
     let planItemId: string | null = null
-    const ensurePlanItem = (): string => {
-      if (planItemId) return planItemId
-      planItemId = newId()
-      const item: ThreadItem = { type: 'plan', id: planItemId, text: '' }
-      this.store.appendItem(turn.id, item)
-      this.notify(peer, {
-        method: 'item/started',
-        params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: nowMillis() },
-      })
-      return planItemId
-    }
     const ensureAgentItem = (): string => {
       if (agentItemId) return agentItemId
       agentItemId = newId()
@@ -3446,14 +3467,43 @@ export class CodexClaudeAppServer {
       completeReasoningItem()
       completeAgentItem(phase)
     }
-    const completePlanItem = (): void => {
-      const item = this.store.getTurn(turn.id)?.items.find((item) => item.id === planItemId)
-      if (item)
-        this.notify(peer, {
-          method: 'item/completed',
-          params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
-        })
-      planItemId = null
+    // App rule: plan-implementation
+    // When the turn completes, the App offers to implement its last `plan`
+    // item. A plan Claude revises within the turn replaces the card.
+    const deliverPlan = (text: string): void => {
+      completeMessage()
+      if (planItemId) {
+        const updated = this.store.updateItem(turn.id, planItemId, (item) =>
+          item.type === 'plan' ? { ...item, text } : item,
+        )
+        const item = updated?.items.find((item) => item.id === planItemId)
+        if (item)
+          this.notify(peer, {
+            method: 'item/completed',
+            params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
+          })
+        return
+      }
+      planItemId = newId()
+      const item: ThreadItem = { type: 'plan', id: planItemId, text }
+      this.store.appendItem(turn.id, item)
+      this.notify(peer, {
+        method: 'item/started',
+        params: {
+          threadId: thread.id,
+          turnId: turn.id,
+          item: { ...item, text: '' },
+          startedAtMs: nowMillis(),
+        },
+      })
+      this.notify(peer, {
+        method: 'item/plan/delta',
+        params: { threadId: thread.id, turnId: turn.id, itemId: planItemId, delta: text },
+      })
+      this.notify(peer, {
+        method: 'item/completed',
+        params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
+      })
     }
     const completeOpenToolItems = (message: string): void => {
       for (const itemId of openToolItems) {
@@ -3603,7 +3653,6 @@ export class CodexClaudeAppServer {
     })
     this.closeStreamingItemsByTurn.set(turn.id, () => {
       completeMessage()
-      completePlanItem()
       completeOpenToolItems('Interrupted by the user.')
     })
     this.flushQueuedSubagentActivity(peer, thread.id, turn.id)
@@ -3688,7 +3737,7 @@ export class CodexClaudeAppServer {
           ...appSkills.appSkills.map((skill) => dirname(skill.path)),
           ...(appSkills.visualizationDir ? [appSkills.visualizationDir] : []),
         ],
-        planMode: params.planMode === true,
+        planMode,
         imageInputs: Array.isArray(params._imageInputs)
           ? (params._imageInputs as ImageInput[])
           : [],
@@ -4172,22 +4221,6 @@ export class CodexClaudeAppServer {
             if (event.delta.length === 0) return
             completeReasoningItem()
             hasTextOutput = true
-            // In plan mode, text is the plan body — route to a Plan item +
-            // item/plan/delta + (later) turn/plan/updated so the App's
-            // Plan-mode UI lights up natively. Outside plan mode it's a
-            // normal agentMessage delta.
-            if (planMode) {
-              const itemId = ensurePlanItem()
-              this.store.updateItem(turn.id, itemId, (item) => {
-                if (item.type === 'plan') return { ...item, text: item.text + event.delta }
-                return item
-              })
-              this.notify(peer, {
-                method: 'item/plan/delta',
-                params: { threadId: thread.id, turnId: turn.id, itemId, delta: event.delta },
-              })
-              return
-            }
             const itemId = ensureAgentItem()
             this.store.updateItem(turn.id, itemId, (item) => {
               if (item.type === 'agentMessage') return { ...item, text: item.text + event.delta }
@@ -4252,6 +4285,12 @@ export class CodexClaudeAppServer {
                   params: { threadId: thread.id, turnId: turn.id, explanation: null, plan },
                 })
               }
+              itemIds.set(event.toolUseId, '')
+              return
+            }
+            // In plan mode ExitPlanMode is the plan card (see deliverPlan),
+            // not a tool call.
+            if (planMode && event.toolName === 'ExitPlanMode') {
               itemIds.set(event.toolUseId, '')
               return
             }
@@ -4358,6 +4397,10 @@ export class CodexClaudeAppServer {
                 params: { threadId: thread.id, turnId: turn.id, diff },
               })
             }
+            return
+          }
+          if (event.type === 'proposed_plan') {
+            if (event.text.trim()) deliverPlan(event.text)
             return
           }
           if (event.type === 'notice') {
@@ -4696,7 +4739,6 @@ export class CodexClaudeAppServer {
     // App rule: quiet-turn-heartbeat
     this.quietTurnIfWorkRuns(peer, thread, turn.id, params, agentItemId)
     completeMessage('final_answer')
-    completePlanItem()
     const completed: TurnRecord = this.store.completeTurn(turn.id, 'completed') ?? turn
     recordRunEvent('turn.completed', {
       threadId: thread.id,
@@ -4717,10 +4759,10 @@ export class CodexClaudeAppServer {
     // Codex runs the config's notify program for its own threads' turns.
     if (params.outputSchema == null && thread.runtimeBackend !== 'codex' && !thread.ephemeral)
       this.notifyTurnComplete(peer, thread, completed, turnCwd)
-    // Plan-mode text streams through the `plan` ThreadItem + item/plan/delta
-    // events; turn/plan/updated is reserved for the update_plan/TodoWrite
-    // checklist tool (see the tool_use handler), matching the real app-server
-    // which keeps those two surfaces separate.
+    // A plan-mode plan is a `plan` item (see deliverPlan); turn/plan/updated
+    // is reserved for the update_plan/TodoWrite checklist tool (see the
+    // tool_use handler), matching the real app-server which keeps those two
+    // surfaces separate.
     this.notify(peer, {
       method: 'turn/completed',
       params: { threadId: thread.id, turn: this.toLifecycleTurn(completed) },
@@ -6978,7 +7020,7 @@ export class CodexClaudeAppServer {
     }
   }
 
-  private threadEnvelope(thread: ThreadRecord, turns: TurnRecord[] = []): unknown {
+  private threadEnvelope(thread: ThreadRecord, turns: TurnRecord[] = []): Record<string, unknown> {
     const activePermissionProfileId = threadPermissionProfileId(
       thread.permissionProfileId,
       thread.approvalPolicy,

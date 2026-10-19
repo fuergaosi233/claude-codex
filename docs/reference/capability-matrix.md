@@ -38,6 +38,7 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 | Model mapping | Supported | Native Claude aliases pass through; unknown Codex/OpenAI ids fall back to the default model. App model/effort selections are remembered and echoed via `config/read`. |
 | Reasoning effort | Best effort | Codex efforts normalized, mappable via `CLAUDE_CODEX_EFFORT_ALIASES`; older SDKs may ignore unsupported options. |
 | Structured title/summary turns | Supported (fallback) | Codex internal model ids (e.g. gpt-5.4-mini) map to `CLAUDE_CODEX_SUMMARY_MODEL` (default haiku) when an outputSchema is present; falls back to schema-shaped JSON if Claude emits plain text. With `CLAUDE_CODEX_DISABLE_CODEX_PROXY=1`, the App's ephemeral title and summary threads, which name a Codex model, run on Claude as well, on `CLAUDE_CODEX_SUMMARY_MODEL` (else `CLAUDE_CODEX_TITLE_MODEL`, else haiku), instead of going to Codex. Its ephemeral description fork stays on the chat's model. |
+| Plan mode | Supported | `collaborationMode/list` offers Plan and Default, so `/plan` and the Plan toggle work. A `collaborationMode` on `turn/start`, `thread/settings/update` or `thread/resume` sets the thread's mode (and the turn's model and effort from its settings), which later turns keep and `thread/settings/updated` / `thread/resume` report. A Plan turn runs in Claude Code's plan mode: `AskUserQuestion` still reaches the App, a call that needs an approval is refused, and the plan Claude hands to `ExitPlanMode` becomes the turn's `plan` item, after which the App offers "Implement this plan?". The legacy `planMode` flag still plans a single turn. |
 | SDK option compatibility | Supported | When an older SDK rejects an option, the sidecar drops it one at a time (least essential first) and emits an info notice. |
 
 ## Tools, approvals & events
@@ -131,8 +132,8 @@ codex.
 - `turn/plan/updated` is reserved for the `update_plan`/TodoWrite checklist tool
   and ships the spec shape `{ explanation, plan: [{ step, status }] }` (status
   ∈ pending/inProgress/completed); the checklist tool is not also surfaced as a
-  timeline item. Plan-mode prose stays on the separate `plan` ThreadItem +
-  `item/plan/delta` channel.
+  timeline item. A plan-mode plan, the one Claude hands to `ExitPlanMode`, is
+  the separate `plan` ThreadItem + `item/plan/delta` channel.
 - A turn that ends early (interrupt, failure, subagent watchdog) completes
   what Claude was still streaming as commentary and fails the tool calls still
   running, before `turn/completed`, so no card keeps spinning in a stopped

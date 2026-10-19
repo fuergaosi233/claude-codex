@@ -178,6 +178,8 @@ export class SessionStore {
     this.ensureColumn('threads', 'approval_policy', 'TEXT')
     this.ensureColumn('threads', 'sandbox_mode', 'TEXT')
     this.ensureColumn('threads', 'permission_profile_id', 'TEXT')
+    // The App's collaboration mode ('plan' / 'default'); NULL until named.
+    this.ensureColumn('threads', 'collaboration_mode', 'TEXT')
     this.ensureColumn('threads', 'ephemeral', 'INTEGER NOT NULL DEFAULT 0')
     this.ensureColumn('threads', 'thread_source', 'TEXT')
     this.ensureColumn('threads', 'agent_role', 'TEXT')
@@ -290,10 +292,11 @@ export class SessionStore {
           preview, name, archived, cwd, model, reasoning_effort, model_provider, claude_session_id,
           source, created_at, updated_at, status_json,
           approval_policy, sandbox_mode, permission_profile_id, ephemeral, thread_source, agent_role, agent_nickname,
-          base_instructions, developer_instructions, personality, runtime_backend, codex_session_id
+          base_instructions, developer_instructions, personality, runtime_backend, codex_session_id,
+          collaboration_mode
         ) VALUES (
           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         ON CONFLICT(id) DO UPDATE SET
           session_id=excluded.session_id,
@@ -324,7 +327,8 @@ export class SessionStore {
           developer_instructions=excluded.developer_instructions,
           personality=excluded.personality,
           runtime_backend=excluded.runtime_backend,
-          codex_session_id=excluded.codex_session_id
+          codex_session_id=excluded.codex_session_id,
+          collaboration_mode=excluded.collaboration_mode
       `)
       .run(
         thread.id,
@@ -358,6 +362,7 @@ export class SessionStore {
         thread.personality,
         thread.runtimeBackend,
         thread.codexSessionId,
+        thread.collaborationMode ?? null,
       )
   }
 
@@ -1471,6 +1476,10 @@ export class SessionStore {
       sandboxMode: row.sandbox_mode == null ? null : String(row.sandbox_mode),
       permissionProfileId:
         row.permission_profile_id == null ? null : String(row.permission_profile_id),
+      collaborationMode:
+        row.collaboration_mode === 'plan' || row.collaboration_mode === 'default'
+          ? row.collaboration_mode
+          : null,
       ephemeral: Number(row.ephemeral ?? 0) === 1,
       threadSource: row.thread_source == null ? null : String(row.thread_source),
       agentRole: row.agent_role == null ? null : String(row.agent_role),

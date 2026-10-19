@@ -485,12 +485,32 @@ export class MockRuntime implements ClaudeRuntime {
     }
 
     if (/plan mode check/i.test(context.prompt)) {
-      // plan mode should never reach the per-tool approval path; mirror that
-      // here by emitting a tool_use *without* invoking onPermissionRequest.
+      // Reports the flag, then, in plan mode, does what the native runtime
+      // does with Claude's ExitPlanMode call: the tool_use streams, the plan
+      // goes out as `proposed_plan`, the call is refused and Claude signs off.
       await handlers.onEvent({
         type: 'text_delta',
         delta: `planMode=${context.planMode}`,
       })
+      if (context.planMode) {
+        const toolUseId = 'mock-exit-plan'
+        const plan = '# Mock plan\n\n1. Inspect the code\n2. Make the change'
+        await handlers.onEvent({ type: 'message_boundary' })
+        await handlers.onEvent({
+          type: 'tool_use',
+          toolUseId,
+          toolName: 'ExitPlanMode',
+          input: { plan, planFilePath: '/tmp/mock-plan.md' },
+        })
+        await handlers.onEvent({ type: 'proposed_plan', toolUseId, text: plan })
+        await handlers.onEvent({
+          type: 'tool_result',
+          toolUseId,
+          content: 'The plan was delivered to the user.',
+          isError: true,
+        })
+        await handlers.onEvent({ type: 'text_delta', delta: 'Plan ready.' })
+      }
       await handlers.onEvent({ type: 'completed', success: true, result: 'plan mode check' })
       return
     }

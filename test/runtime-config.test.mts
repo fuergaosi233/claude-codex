@@ -182,10 +182,17 @@ test('native SDK runtime approves goal tools without shadowing canUseTool', asyn
   )
   assert.equal((await options.canUseTool('Bash', { command: 'true' }, { signal })).behavior, 'deny')
 
-  // Plan mode installs no callback, so the server rides on allowedTools.
-  const plan = build({ planMode: true })
-  assert.equal(plan.canUseTool, undefined)
-  assert.ok(plan.allowedTools.includes('mcp__codex_goal'))
+  // Plan mode keeps the callback too, and it allows goal bookkeeping there.
+  const plan = build({ planMode: true, approvalPolicy: 'never' })
+  assert.equal(plan.permissionMode, 'plan')
+  assert.equal(typeof plan.canUseTool, 'function')
+  assert.equal(plan.allowedTools?.includes('mcp__codex_goal') ?? false, false)
+  assert.deepEqual(
+    await plan.canUseTool('mcp__codex_goal__update_goal', { status: 'complete' }, { signal }),
+    { behavior: 'allow' },
+  )
+  // Between turns, plan mode's read-only promise outranks Full Access.
+  assert.equal((await plan.canUseTool('Bash', { command: 'true' }, { signal })).behavior, 'deny')
 })
 
 test('explicit native SDK bypass includes the required dangerous opt-in flag', () => {
@@ -1947,6 +1954,93 @@ test('native SDK permission request between turns falls back to the standing pol
       .behavior,
     'deny',
   )
+})
+
+test('native SDK plan mode carries ExitPlanMode and AskUserQuestion to the App', async () => {
+  const runtime = new NativeClaudeRuntime()
+  const makeCanUseTool = Reflect.get(runtime, 'makeCanUseTool')
+  const options = { toolUseID: 'exit-1', signal: new AbortController().signal }
+  // Full Access must not loosen plan mode.
+  const context = nativeTurnContext({
+    planMode: true,
+    approvalPolicy: 'never',
+    sandboxMode: 'danger-full-access',
+  })
+  const events: unknown[] = []
+  const questions: unknown[] = []
+  const approvals: unknown[] = []
+  const current = {
+    context,
+    resolved: false,
+    handlers: {
+      onEvent: async (event: unknown) => {
+        events.push(event)
+      },
+      onPermissionRequest: async (event: unknown) => {
+        approvals.push(event)
+        return { decision: 'accept' }
+      },
+      onUserInputRequest: async (event: any) => {
+        questions.push(event)
+        return { answers: { [event.questions[0].id]: { answers: ['API Key'] } } }
+      },
+    },
+  }
+  const canUseTool = makeCanUseTool.call(runtime, () => ({ current, lastContext: context }))
+
+  // The finished plan becomes one proposed_plan event; the refusal, without
+  // an interrupt, lets the turn complete so the App can offer to implement.
+  const plan = '## Plan\n\n1. Inspect\n2. Implement'
+  const exit = await canUseTool(
+    'ExitPlanMode',
+    { plan: `${plan}\n`, planFilePath: '/tmp/plan.md' },
+    options,
+  )
+  assert.equal(exit.behavior, 'deny')
+  assert.equal(exit.interrupt, undefined)
+  assert.match(exit.message, /delivered to the user/)
+  assert.deepEqual(events, [{ type: 'proposed_plan', toolUseId: 'exit-1', text: plan }])
+
+  // No plan text yet: nothing reaches the App.
+  const empty = await canUseTool('ExitPlanMode', { plan: '  ' }, options)
+  assert.equal(empty.behavior, 'deny')
+  assert.match(empty.message, /plan file/)
+  assert.equal(events.length, 1)
+
+  // AskUserQuestion still reaches the user.
+  const asked = await canUseTool(
+    'AskUserQuestion',
+    {
+      questions: [
+        {
+          question: 'Which auth?',
+          header: 'Auth',
+          options: [
+            { label: 'OAuth', description: 'Browser sign-in' },
+            { label: 'API Key', description: 'Static key' },
+          ],
+          multiSelect: false,
+        },
+      ],
+    },
+    { ...options, toolUseID: 'ask-1' },
+  )
+  assert.equal(questions.length, 1)
+  assert.equal(asked.behavior, 'deny')
+  assert.match(asked.message, /API Key/)
+
+  // Anything else that needs an approval is refused without asking.
+  const bash = await canUseTool('Bash', { command: 'rm -rf build' }, options)
+  assert.equal(bash.behavior, 'deny')
+  assert.match(bash.message, /plan mode/)
+  assert.equal(approvals.length, 0)
+
+  // Outside plan mode ExitPlanMode is an ordinary approval.
+  const plain = { ...current, context: nativeTurnContext({ approvalPolicy: 'on-request' }) }
+  const outside = makeCanUseTool.call(runtime, () => ({ current: plain, lastContext: context }))
+  assert.equal((await outside('ExitPlanMode', { plan }, options)).behavior, 'allow')
+  assert.equal(approvals.length, 1)
+  assert.equal(events.length, 1)
 })
 
 test('HTTP agent runtime streams agentapi-compatible message updates', async () => {
