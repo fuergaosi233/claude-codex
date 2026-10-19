@@ -3,7 +3,11 @@
 Implemented as real remote/runtime behavior:
 
 - **Transports** — stdio, WebSocket, Unix-socket daemon, and `app-server proxy`
-  raw stdio forwarding.
+  raw stdio forwarding. The WebSocket listener supports Codex's
+  `--ws-auth capability-token` (`--ws-token-file`, `--ws-token-sha256`) and,
+  like `codex app-server`, refuses a non-loopback address without it unless
+  `--ws-allow-unauthenticated` is passed; `signed-bearer-token` is not
+  implemented.
 - **Thread lifecycle** — start, resume, fork, list, read, turns list, name,
   archive/unarchive, unsubscribe, interrupt, delete, and rollback/revert that
   rewind Claude's session to the kept turns.

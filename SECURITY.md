@@ -40,3 +40,14 @@ persist, print, or redistribute those credentials.
 For tests that need real Claude access, run them only in an environment where
 the required credentials are already provided by the user. Use
 `CLAUDE_CODEX_MOCK=1` for protocol tests that do not require live credentials.
+
+## Network listeners
+
+The Codex App reaches the adapter over stdio or a unix socket in a private
+directory. `--listen ws://` opens a TCP listener for other clients; whoever
+can connect to it can run the agent as the adapter's user. On a non-loopback
+address the adapter refuses to start without a capability token
+(`--ws-auth capability-token`), and it refuses browser origins it was not told
+to allow. `--ws-allow-unauthenticated` turns the first check off; use it only
+when something else protects the listener. See
+[WebSocket listener](docs/guide/configuration.md#websocket-listener).

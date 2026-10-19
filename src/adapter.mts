@@ -10,6 +10,7 @@ import { SessionStore } from './store.mjs'
 import {
   normalizeListenUrl,
   parseProxySockArg,
+  prepareWebSocketAuth,
   type RunningTransport,
   runProxy,
   startStdioTransport,
@@ -74,6 +75,26 @@ async function main(): Promise<void> {
 
   const listen = getArg(args, '--listen') ?? 'stdio://'
   if (listen === 'off') return
+  const wsAuth = {
+    auth: getArg(args, '--ws-auth'),
+    tokenFile: getArg(args, '--ws-token-file'),
+    tokenSha256: getArg(args, '--ws-token-sha256'),
+    allowedOrigins: getArg(args, '--ws-allowed-origins'),
+  }
+  const allowUnauthenticated = args.includes('--ws-allow-unauthenticated')
+  // Before anything else starts, so a listener that would be unprotected
+  // fails without touching the store or other processes.
+  const preparedWsAuth = checkOptions(() => {
+    if (
+      !listen.startsWith('ws://') &&
+      (allowUnauthenticated || Object.values(wsAuth).some((value) => value !== null))
+    ) {
+      throw new Error(
+        '--ws-auth, --ws-token-file, --ws-token-sha256, --ws-allowed-origins and --ws-allow-unauthenticated need --listen ws://',
+      )
+    }
+    return prepareWebSocketAuth(normalizeListenUrl(listen), { ...wsAuth, allowUnauthenticated })
+  })
   const isUnixDaemon = listen.startsWith('unix://')
   let pidFile: string | null = null
   if (isUnixDaemon) {
@@ -211,7 +232,22 @@ async function main(): Promise<void> {
     startStdioTransport(onMessage, onClose)
     return
   }
-  transport = await startWebSocketTransport(normalized, onMessage, onClose, onConnect)
+  transport = await startWebSocketTransport(normalized, onMessage, onClose, onConnect, {
+    ...(preparedWsAuth ? { auth: preparedWsAuth } : {}),
+  })
+}
+
+// A bad option ends the process with its message alone, like the usage text:
+// a stack trace would read as a crash.
+function checkOptions<T>(check: () => T): T {
+  try {
+    return check()
+  } catch (error) {
+    process.stderr.write(
+      `[claude-codex-adapter] ${error instanceof Error ? error.message : String(error)}\n`,
+    )
+    process.exit(1)
+  }
 }
 
 function getArg(args: string[], name: string): string | null {
@@ -259,6 +295,8 @@ function usage(code: number): never {
   claude-codex-adapter app-server --listen stdio://
   claude-codex-adapter app-server --listen unix://
   claude-codex-adapter app-server --listen ws://127.0.0.1:8788
+      [--ws-auth capability-token|none] [--ws-token-file ABS_PATH | --ws-token-sha256 HEX]
+      [--ws-allowed-origins ORIGIN,...] [--ws-allow-unauthenticated]
   claude-codex-adapter app-server proxy [--sock PATH]
 `
   ;(code === 0 ? process.stdout : process.stderr).write(text)
