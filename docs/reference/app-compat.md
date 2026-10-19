@@ -24,7 +24,7 @@ line a rule touches.
 | `bedrock-account` | filters the model picker through its OpenAI allowlist unless `account/read` returns a Bedrock account | the picker lists the Claude models |
 | `bedrock-auth-status` | reads its feature flags in the main process only when `getAuthStatus` names the auth method it derives from `account/read`; otherwise a thread it resumes on its own never becomes ready | a message queued during a turn is sent when the turn ends; a new chat gets a title |
 | `skills-popup` | fills the "/" popup from `skills/list` and sends a picked skill as a `[$name](path)` link | `/simplify` is listed and runs |
-| `optimistic-user-message` | draws its own user message for every `turn/start` it sends | a message shows once; a queued one when it starts |
+| `optimistic-user-message` | draws its own user message for every `turn/start` it sends | a message shows once; a queued one when it starts; a second window on the chat shows it too |
 | `tool-output-turns` | with `turnToolOutput` on, sends a thread handoff or a message from another thread as a `turn/start` with empty input and the text in `toolOutput`, and shows a `functionCallOutput` item as that turn's user message | a chat handed off to a new thread shows the text, and Claude answers it |
 | `continue-turns` | offers Continue on a chat whose last turn did not finish, and sends it as a `turn/start` with empty input | after a restart mid-turn, Continue gets the message sent in that turn answered |
 | `steer-errors` | matches `turn/steer` error texts to fall back to a new turn or retry another turn id | a message sent as a turn ends still arrives |

@@ -282,9 +282,20 @@ interface BackgroundSubagent {
 
 type SubagentActivityKind = 'started' | 'interacted' | 'interrupted' | 'completed'
 
-// Notifications are routed by thread id (see peerForParams), so work that
+interface PendingServerRequest {
+  readonly method: string
+  readonly threadId: string | null
+  readonly turnId: string | null
+  readonly request: WireMessage
+  // Ids of the peers the request was sent to, which a replay skips.
+  readonly targets: Set<string>
+  resolve(value: unknown): void
+  reject(error: Error): void
+}
+
+// Notifications are routed by thread id (see targetsForParams), so work that
 // outlives its request can publish through this stub and still reach
-// whichever peer currently follows the thread.
+// whichever peers currently follow the thread.
 const DETACHED_PEER: RpcPeer = { id: 'detached', send: () => {}, close: () => {} }
 
 const MAX_TRACKED_TASK_IDS = 512
@@ -384,11 +395,13 @@ function claudeHelperModel(model: string): string {
 }
 
 export class CodexClaudeAppServer {
-  private pendingServerRequests = new Map<
-    string,
-    { resolve: (value: unknown) => void; reject: (error: Error) => void }
-  >()
-  private activePeerByThread = new Map<string, RpcPeer>()
+  // Keyed by request id. A request goes to every peer following its thread;
+  // the first answer resolves it.
+  private pendingServerRequests = new Map<string, PendingServerRequest>()
+  // The peers following each thread, by peer id, the latest subscriber last.
+  // A thread's notifications and server requests go to all of them, the way
+  // Codex app-server connections each subscribe to the threads they open.
+  private subscribersByThread = new Map<string, Map<string, RpcPeer>>()
   private peerFeatures = new WeakMap<RpcPeer, PeerFeatures>()
   private activeTurnByThread = new Map<string, string>()
   // Turns whose runtime run has not returned yet. A running turn outside this
@@ -502,16 +515,18 @@ export class CodexClaudeAppServer {
         id: message.id,
         hasError: Boolean((message as JsonRpcResponse).error),
       })
-      this.resolveServerRequest(message as JsonRpcResponse)
+      this.resolveServerRequest(peer, message as JsonRpcResponse)
     }
   }
 
   closePeer(peer: RpcPeer): void {
     debugLog('peer.close', { peerId: peer.id })
     this.peers.delete(peer.id)
-    for (const [threadId, activePeer] of this.activePeerByThread.entries()) {
-      if (activePeer.id === peer.id) this.activePeerByThread.delete(threadId)
+    for (const [threadId, subscribers] of this.subscribersByThread.entries()) {
+      if (subscribers.delete(peer.id) && subscribers.size === 0)
+        this.subscribersByThread.delete(threadId)
     }
+    for (const pending of this.pendingServerRequests.values()) pending.targets.delete(peer.id)
   }
 
   async stop(): Promise<void> {
@@ -563,6 +578,7 @@ export class CodexClaudeAppServer {
         ok: true,
       })
       this.sendResponse(peer, request.id, result)
+      this.replayPendingServerRequests(peer)
     } catch (error) {
       debugLog('rpc.response', {
         peerId: peer.id,
@@ -1083,7 +1099,7 @@ export class CodexClaudeAppServer {
       threadSource: thread.threadSource,
       ephemeral: thread.ephemeral,
     })
-    this.activePeerByThread.set(id, peer)
+    this.subscribe(id, peer)
     this.notify(peer, { method: 'thread/started', params: { thread: this.toThread(thread, []) } })
     return this.threadEnvelope(thread)
   }
@@ -1146,7 +1162,7 @@ export class CodexClaudeAppServer {
       threadSource: thread.threadSource,
       ephemeral: thread.ephemeral,
     })
-    this.activePeerByThread.set(threadId, peer)
+    this.subscribe(threadId, peer)
     this.bindPeerToDescendants(peer, threadId)
     return this.threadEnvelope(
       thread,
@@ -1256,7 +1272,7 @@ export class CodexClaudeAppServer {
       threadSource: thread.threadSource,
       ephemeral: thread.ephemeral,
     })
-    this.activePeerByThread.set(id, peer)
+    this.subscribe(id, peer)
     this.notify(peer, { method: 'thread/started', params: { thread: this.toThread(thread, []) } })
     return this.threadEnvelope(
       thread,
@@ -1734,16 +1750,16 @@ export class CodexClaudeAppServer {
 
   private threadUnsubscribe(peer: RpcPeer, params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
-    const active = this.activePeerByThread.get(threadId)
-    if (!active) return { status: 'notSubscribed' }
-    if (active.id !== peer.id) return { status: 'notSubscribed' }
-    this.activePeerByThread.delete(threadId)
-    this.notify(peer, { method: 'thread/closed', params: { threadId } })
+    const subscribers = this.subscribersByThread.get(threadId)
+    if (!subscribers?.delete(peer.id)) return { status: 'notSubscribed' }
+    if (subscribers.size === 0) this.subscribersByThread.delete(threadId)
+    // The thread's other followers keep it open; only this peer hears it close.
+    this.sendNotification(peer, { method: 'thread/closed', params: { threadId } })
     return { status: 'unsubscribed' }
   }
 
   private threadLoadedList(params: Record<string, unknown>): unknown {
-    const loaded = Array.from(this.activePeerByThread.keys())
+    const loaded = Array.from(this.subscribersByThread.keys())
     const limit = numberOr(params.limit, loaded.length || 50)
     return {
       data: loaded.slice(0, limit),
@@ -1834,7 +1850,7 @@ export class CodexClaudeAppServer {
   private threadGoalSet(peer: RpcPeer, params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     this.goalThread(threadId)
-    this.activePeerByThread.set(threadId, peer)
+    this.subscribe(threadId, peer)
     if (params.status != null && !isGoalStatus(params.status))
       throw new Error(`invalid goal status: ${String(params.status)}`)
     const status = isGoalStatus(params.status) ? params.status : null
@@ -1892,7 +1908,7 @@ export class CodexClaudeAppServer {
 
   private threadGoalClear(peer: RpcPeer, params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
-    if (this.store.getThread(threadId)) this.activePeerByThread.set(threadId, peer)
+    if (this.store.getThread(threadId)) this.subscribe(threadId, peer)
     const cleared = this.store.deleteGoal(threadId)
     this.goalIdleStreaks.delete(threadId)
     this.goalClockByThread.delete(threadId)
@@ -2104,7 +2120,7 @@ export class CodexClaudeAppServer {
   private threadQueueAdd(peer: RpcPeer, params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     this.queueThread(threadId)
-    this.activePeerByThread.set(threadId, peer)
+    this.subscribe(threadId, peer)
     const submission: QueuedSubmission = {
       id: newId(),
       input: queuedInput(params.input),
@@ -2125,7 +2141,7 @@ export class CodexClaudeAppServer {
   private threadQueueUpdate(peer: RpcPeer, params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     this.queueThread(threadId)
-    this.activePeerByThread.set(threadId, peer)
+    this.subscribe(threadId, peer)
     const id = stringOr(params.queuedSubmissionId, '')
     const updated: QueuedSubmission = {
       ...this.queuedSubmission(threadId, id),
@@ -2141,7 +2157,7 @@ export class CodexClaudeAppServer {
   private threadQueueDelete(peer: RpcPeer, params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     this.queueThread(threadId)
-    this.activePeerByThread.set(threadId, peer)
+    this.subscribe(threadId, peer)
     const id = stringOr(params.queuedSubmissionId, '')
     const items = this.store.listQueue(threadId)
     const rest = items.filter((entry) => entry.id !== id)
@@ -2153,7 +2169,7 @@ export class CodexClaudeAppServer {
   private threadQueueReorder(peer: RpcPeer, params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     this.queueThread(threadId)
-    this.activePeerByThread.set(threadId, peer)
+    this.subscribe(threadId, peer)
     const order = Array.isArray(params.queuedSubmissionIds)
       ? params.queuedSubmissionIds.filter((id): id is string => typeof id === 'string')
       : []
@@ -2502,8 +2518,12 @@ export class CodexClaudeAppServer {
       this.lastTurnParamsByThread.delete(id)
       this.goalProgressByThread.delete(id)
       this.backgroundSubagents.delete(id)
-      this.activePeerByThread.delete(id)
-      this.notify(peer, { method: 'thread/deleted', params: { threadId: id } })
+      // Whoever deleted the thread hears it, and so does every follower.
+      const targets = new Map([[peer.id, peer]])
+      for (const follower of this.subscribersOf(id)) targets.set(follower.id, follower)
+      this.subscribersByThread.delete(id)
+      for (const target of targets.values())
+        this.sendNotification(target, { method: 'thread/deleted', params: { threadId: id } })
     }
     return {}
   }
@@ -2559,7 +2579,7 @@ export class CodexClaudeAppServer {
     params: Record<string, unknown>,
   ): Promise<unknown> {
     const threadId = stringOr(params.threadId, '')
-    if (threadId) this.activePeerByThread.set(threadId, peer)
+    if (threadId) this.subscribe(threadId, peer)
     const shells = (this.runtime.liveTasks?.(threadId) ?? []).filter(
       (task) => task.taskType === 'local_bash',
     )
@@ -2613,7 +2633,7 @@ export class CodexClaudeAppServer {
         item?.processId === processId || `claude-task:${task.taskId}` === processId,
     )
     if (!shell) return { terminated: false }
-    this.activePeerByThread.set(threadId, peer)
+    this.subscribe(threadId, peer)
     const terminated =
       (await this.runtime.stopTask?.(threadId, shell.task.taskId).catch(() => false)) === true
     debugLog('thread.backgroundTerminals.terminate', { threadId, processId, terminated })
@@ -2730,7 +2750,7 @@ export class CodexClaudeAppServer {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
     if (!thread) throw new Error(`unknown thread: ${threadId}`)
-    this.activePeerByThread.set(threadId, peer)
+    this.subscribe(threadId, peer)
     const turnId = newId()
     const review = reviewLabel(params.target)
     const prompt = reviewPrompt(params.target)
@@ -2984,7 +3004,7 @@ export class CodexClaudeAppServer {
     const thread = this.store.getThread(threadId)
     if (!thread) throw new Error(`unknown thread: ${threadId}`)
     // Follow-up turns the adapter starts itself have no requesting peer.
-    if (peer !== DETACHED_PEER) this.activePeerByThread.set(threadId, peer)
+    if (peer !== DETACHED_PEER) this.subscribe(threadId, peer)
 
     const turnId = newId()
     const input = turnInput(params)
@@ -3126,9 +3146,12 @@ export class CodexClaudeAppServer {
       this.notify(peer, { method: 'turn/started', params: { threadId, turn: publicTurn } })
       // The App renders its own optimistic user message for turn/start; a
       // turn started from the server-side queue has none, so publish it.
+      // The thread's other followers did not send the message, so they get it.
       // App rule: optimistic-user-message
       if (userItem && params._emitUserMessage === true)
         this.emitItemLifecycle(peer, threadId, turnId, userItem)
+      else if (userItem && peer !== DETACHED_PEER)
+        this.emitItemLifecycleToOthers(peer, threadId, turnId, userItem)
       for (const item of imageItems) {
         this.notify(peer, {
           method: 'item/started',
@@ -3820,10 +3843,12 @@ export class CodexClaudeAppServer {
               codexSessionId: null,
             }
             this.store.upsertThread(childThread)
-            // Child notifications must follow the current parent peer. This
-            // matters after unix-daemon reconnects, when the old peer is gone
-            // before the child publishes its response.
-            this.activePeerByThread.set(childThreadId, peer)
+            // Child notifications must follow the parent's current followers.
+            // This matters after unix-daemon reconnects, when the old peer is
+            // gone before the child publishes its response.
+            this.subscribe(childThreadId, peer)
+            for (const follower of this.subscribersOf(thread.id))
+              this.subscribe(childThreadId, follower)
             const childTurn: TurnRecord = {
               id: newId(),
               threadId: childThreadId,
@@ -4117,47 +4142,9 @@ export class CodexClaudeAppServer {
             // makes the bundled client hide the finished child. Keep the
             // legacy closeAgent cleanup only for failed results.
             // App rule: subagent-close-hides
-            if (!this.supportsCompletedSubagentActivity(peer) && event.isError) {
-              const closeId = newId()
-              const closeBegin: ThreadItem = {
-                type: 'collabAgentToolCall',
-                id: closeId,
-                tool: 'closeAgent',
-                status: 'inProgress',
-                senderThreadId: thread.id,
-                receiverThreadIds: [ctx.childThreadId],
-                prompt: null,
-                model: null,
-                reasoningEffort: null,
-                agentsStates: {},
-              }
-              // History keeps it, marked, for a legacy App reading the thread
-              // back: an App with the completed kind hides the child if it
-              // reads it.
-              this.store.appendItem(turn.id, { ...closeBegin, legacyOnly: true })
-              this.notify(peer, {
-                method: 'item/started',
-                params: {
-                  threadId: thread.id,
-                  turnId: turn.id,
-                  item: closeBegin,
-                  startedAtMs: nowMillis(),
-                },
-              })
-              const closeEnd: ThreadItem = {
-                ...closeBegin,
-                status: collabStatus,
-                agentsStates: { [ctx.childThreadId]: { status: agentStatus, message: null } },
-              }
-              this.store.updateItem(turn.id, closeId, () => ({ ...closeEnd, legacyOnly: true }))
-              this.notify(peer, {
-                method: 'item/completed',
-                params: {
-                  threadId: thread.id,
-                  turnId: turn.id,
-                  item: closeEnd,
-                  completedAtMs: nowMillis(),
-                },
+            if (event.isError) {
+              this.emitLegacyCloseAgent(peer, thread.id, turn.id, ctx.childThreadId, collabStatus, {
+                [ctx.childThreadId]: { status: agentStatus, message: null },
               })
             }
             // Keep the context discoverable until the child turn and wait
@@ -4855,10 +4842,57 @@ export class CodexClaudeAppServer {
     // historyForPeer hides the ones a legacy client was never sent.
     this.store.appendItem(parentTurnId, item)
     // Codex App 26.818 treats a started marker as liveness but has no
-    // terminal kind besides interrupted, so it only ever gets that one.
+    // terminal kind besides interrupted, so it only ever gets that one:
+    // peerTakesNotification decides for each follower, whoever started the
+    // turn.
     // App rule: subagent-completed-kind
-    if (!this.supportsCompletedSubagentActivity(peer) && kind !== 'interrupted') return
     this.emitItemLifecycle(peer, parentThreadId, parentTurnId, item)
+  }
+
+  // A follower without the completed activity kind gets a closeAgent after a
+  // failed child, or its agent list never lets the child go. History keeps
+  // the items, marked, for such an App reading the thread back, unless only
+  // Apps with the completed kind follow: an App with that kind hides the
+  // child if it reads them.
+  // App rule: subagent-close-hides
+  private emitLegacyCloseAgent(
+    peer: RpcPeer,
+    threadId: string,
+    turnId: string,
+    childThreadId: string,
+    status: 'completed' | 'failed',
+    agentsStates: Extract<ThreadItem, { type: 'collabAgentToolCall' }>['agentsStates'],
+  ): void {
+    const legacy = this.targetsForParams(peer, { threadId }).filter(
+      (target) => !this.supportsCompletedSubagentActivity(target),
+    )
+    if (legacy.length === 0) return
+    const closeId = newId()
+    const closeBegin: ThreadItem = {
+      type: 'collabAgentToolCall',
+      id: closeId,
+      tool: 'closeAgent',
+      status: 'inProgress',
+      senderThreadId: threadId,
+      receiverThreadIds: [childThreadId],
+      prompt: null,
+      model: null,
+      reasoningEffort: null,
+      agentsStates: {},
+    }
+    this.store.appendItem(turnId, { ...closeBegin, legacyOnly: true })
+    for (const target of legacy)
+      this.sendNotification(target, {
+        method: 'item/started',
+        params: { threadId, turnId, item: closeBegin, startedAtMs: nowMillis() },
+      })
+    const closeEnd: ThreadItem = { ...closeBegin, status, agentsStates }
+    this.store.updateItem(turnId, closeId, () => ({ ...closeEnd, legacyOnly: true }))
+    for (const target of legacy)
+      this.sendNotification(target, {
+        method: 'item/completed',
+        params: { threadId, turnId, item: closeEnd, completedAtMs: nowMillis() },
+      })
   }
 
   // Reads replay history, and each client gets only the items it would have
@@ -4943,6 +4977,26 @@ export class CodexClaudeAppServer {
     })
   }
 
+  // The item's lifecycle for the thread's followers other than `peer`.
+  private emitItemLifecycleToOthers(
+    peer: RpcPeer,
+    threadId: string,
+    turnId: string,
+    item: ThreadItem,
+  ): void {
+    for (const other of this.subscribersOf(threadId)) {
+      if (other.id === peer.id) continue
+      this.sendNotification(other, {
+        method: 'item/started',
+        params: { threadId, turnId, item, startedAtMs: nowMillis() },
+      })
+      this.sendNotification(other, {
+        method: 'item/completed',
+        params: { threadId, turnId, item, completedAtMs: nowMillis() },
+      })
+    }
+  }
+
   private supportsCompletedSubagentActivity(peer: RpcPeer): boolean {
     if (process.env.CLAUDE_CODEX_SUBAGENT_COMPLETED === '1') return true
     if (process.env.CLAUDE_CODEX_SUBAGENT_COMPLETED === '0') return false
@@ -5008,53 +5062,16 @@ export class CodexClaudeAppServer {
           completedAtMs: nowMillis(),
         },
       })
-      if (!this.supportsCompletedSubagentActivity(peer)) {
-        const closeId = newId()
-        const closeBegin: ThreadItem = {
-          type: 'collabAgentToolCall',
-          id: closeId,
-          tool: 'closeAgent',
-          status: 'inProgress',
-          senderThreadId: thread.id,
-          receiverThreadIds: [context.childThreadId],
-          prompt: null,
-          model: null,
-          reasoningEffort: null,
-          agentsStates: {},
-        }
-        // Marked like the closeAgent of a failed child result above.
-        // App rule: subagent-close-hides
-        this.store.appendItem(turn.id, { ...closeBegin, legacyOnly: true })
-        this.notify(peer, {
-          method: 'item/started',
-          params: {
-            threadId: thread.id,
-            turnId: turn.id,
-            item: closeBegin,
-            startedAtMs: nowMillis(),
-          },
-        })
-        const closeEnd: ThreadItem = {
-          ...closeBegin,
-          status: 'failed',
-          agentsStates: { [context.childThreadId]: { status: agentState, message } },
-        }
-        this.store.updateItem(turn.id, closeId, () => ({ ...closeEnd, legacyOnly: true }))
-        this.notify(peer, {
-          method: 'item/completed',
-          params: {
-            threadId: thread.id,
-            turnId: turn.id,
-            item: closeEnd,
-            completedAtMs: nowMillis(),
-          },
-        })
-      }
+      this.emitLegacyCloseAgent(peer, thread.id, turn.id, context.childThreadId, 'failed', {
+        [context.childThreadId]: { status: agentState, message },
+      })
     }
   }
 
+  // The thread's latest follower, standing in for all of them: notify() and
+  // sendServerRequest() fan out by thread id.
   private peerForThread(threadId: string): RpcPeer {
-    return this.peerForParams(DETACHED_PEER, { threadId })
+    return this.targetsForParams(DETACHED_PEER, { threadId }).at(-1) ?? DETACHED_PEER
   }
 
   private backgroundSubagent(
@@ -5807,7 +5824,7 @@ export class CodexClaudeAppServer {
   private async turnInterrupt(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
     const threadId = stringOr(params.threadId, '')
     const requestedTurnId = stringOr(params.turnId, '')
-    this.activePeerByThread.set(threadId, peer)
+    this.subscribe(threadId, peer)
     // A background child has no runtime turn of its own; stop its task.
     const background = this.backgroundSubagents.get(threadId)
     if (background?.running) {
@@ -5881,7 +5898,7 @@ export class CodexClaudeAppServer {
     // App rule: quiet-turn-heartbeat
     const prompt = stripQuietTurnHeartbeat(skillLinksToCommand(textPrompt || textFromInput(input)))
     if (!prompt.trim() && images.length === 0) throw new Error('steer input must not be empty')
-    if (peer !== DETACHED_PEER) this.activePeerByThread.set(threadId, peer)
+    if (peer !== DETACHED_PEER) this.subscribe(threadId, peer)
     const item = turnInputItem(params, input)
     // The message joins the turn once Claude takes it in (between tool
     // rounds). Publishing it then, with the App's clientUserMessageId, lets
@@ -7175,14 +7192,55 @@ export class CodexClaudeAppServer {
     // already have closed, while persistence still needs to settle child and
     // parent state without throwing on a broken pipe.
     if (this.stopped) return
-    const target = this.peerForParams(peer, notification.params)
+    const targets = this.targetsForParams(peer, notification.params)
     debugLog('rpc.notify', {
-      peerId: target.id,
-      originalPeerId: target.id === peer.id ? null : peer.id,
+      ...this.targetFields(peer, targets),
       method: notification.method,
       params: summarizeRpcParams(notification.method, notification.params),
     })
-    target.send({ jsonrpc: '2.0', method: notification.method, params: notification.params })
+    const message: WireMessage = {
+      jsonrpc: '2.0',
+      method: notification.method,
+      params: notification.params,
+    }
+    for (const target of targets) {
+      if (this.peerTakesNotification(target, notification)) target.send(message)
+    }
+  }
+
+  // To this peer only, whoever else follows the notification's thread.
+  private sendNotification(peer: RpcPeer, notification: { method: string; params: unknown }): void {
+    if (this.stopped) return
+    debugLog('rpc.notify', {
+      peerId: peer.id,
+      originalPeerId: null,
+      method: notification.method,
+      params: summarizeRpcParams(notification.method, notification.params),
+    })
+    peer.send({ jsonrpc: '2.0', method: notification.method, params: notification.params })
+  }
+
+  // The debug log names the one peer a message went to, as before several
+  // could follow a thread, or all of them.
+  private targetFields(peer: RpcPeer, targets: RpcPeer[]): Record<string, unknown> {
+    const [only] = targets
+    return targets.length === 1 && only
+      ? { peerId: only.id, originalPeerId: only.id === peer.id ? null : peer.id }
+      : { peerIds: targets.map((target) => target.id), originalPeerId: peer.id }
+  }
+
+  // A thread's followers can be Apps of different builds: only those with the
+  // completed kind get the started and completed subagent activity items.
+  // App rule: subagent-completed-kind
+  private peerTakesNotification(
+    peer: RpcPeer,
+    notification: { method: string; params: unknown },
+  ): boolean {
+    if (notification.method !== 'item/started' && notification.method !== 'item/completed')
+      return true
+    const item = asRecord(asRecord(notification.params).item)
+    if (item.type !== 'subAgentActivity' || item.kind === 'interrupted') return true
+    return this.supportsCompletedSubagentActivity(peer)
   }
 
   // Shared state (skills, projects) changed: every connected peer hears it,
@@ -7199,7 +7257,7 @@ export class CodexClaudeAppServer {
   }
 
   private notifyThread(threadId: string, notification: { method: string; params: unknown }): void {
-    const peer = this.activePeerByThread.get(threadId)
+    const peer = this.subscribersOf(threadId).at(-1)
     if (peer) this.notify(peer, notification)
   }
 
@@ -7219,13 +7277,16 @@ export class CodexClaudeAppServer {
         error: error instanceof Error ? error.message : String(error),
       })
     }
-    const target = peer ?? this.activePeerByThread.get(threadId)
+    const target = peer ?? this.subscribersOf(threadId).at(-1)
     if (target)
       this.notify(target, { method: 'thread/status/changed', params: { threadId, status } })
   }
 
   // An aborted `signal` drops the request and rejects; the caller's
-  // serverRequest/resolved then takes the App's card down.
+  // serverRequest/resolved then takes the App's card down. The request goes to
+  // every peer following the thread, as Codex's app-server sends it to every
+  // connection subscribed to the thread; the first answer wins, and the
+  // caller's serverRequest/resolved takes the other cards down.
   private sendServerRequest(
     peer: RpcPeer,
     method: string,
@@ -7233,26 +7294,31 @@ export class CodexClaudeAppServer {
     params: unknown,
     signal?: AbortSignal,
   ): Promise<unknown> {
-    const target = this.peerForParams(peer, params)
-    const key = `${target.id}:${id}`
+    const targets = this.targetsForParams(peer, params)
     return new Promise((resolve, reject) => {
       if (signal?.aborted) {
         reject(new Error(`${method} was cancelled`))
         return
       }
       debugLog('rpc.serverRequest', {
-        peerId: target.id,
-        originalPeerId: target.id === peer.id ? null : peer.id,
+        ...this.targetFields(peer, targets),
         id,
         method,
         params: summarizeRpcParams(method, params),
       })
       const onAbort = () => {
-        if (!this.pendingServerRequests.delete(key)) return
+        if (!this.pendingServerRequests.delete(id)) return
         reject(new Error(`${method} was cancelled`))
       }
       signal?.addEventListener('abort', onAbort, { once: true })
-      this.pendingServerRequests.set(key, {
+      const request: WireMessage = { jsonrpc: '2.0', id, method, params }
+      const fields = asRecord(params)
+      this.pendingServerRequests.set(id, {
+        method,
+        threadId: nullIfEmpty(stringOr(fields.threadId, '')),
+        turnId: nullIfEmpty(stringOr(fields.turnId, '')),
+        request,
+        targets: new Set(targets.map((target) => target.id)),
         resolve: (value) => {
           signal?.removeEventListener('abort', onAbort)
           resolve(value)
@@ -7262,18 +7328,43 @@ export class CodexClaudeAppServer {
           reject(error)
         },
       })
-      target.send({ jsonrpc: '2.0', id, method, params })
+      for (const target of targets) target.send(request)
     })
   }
 
-  private resolveServerRequest(response: JsonRpcResponse): void {
-    for (const [key, pending] of this.pendingServerRequests.entries()) {
-      if (key.endsWith(`:${String(response.id)}`)) {
-        this.pendingServerRequests.delete(key)
-        if (response.error) pending.reject(new Error(response.error.message))
-        else pending.resolve(response.result)
-        return
-      }
+  // Any client may answer a pending request, as in Codex's app-server: the App
+  // back from a reconnect is a new peer, and it may answer before it reopens
+  // the thread.
+  private resolveServerRequest(peer: RpcPeer, response: JsonRpcResponse): void {
+    const id = String(response.id)
+    const pending = this.pendingServerRequests.get(id)
+    // Too late: another follower answered first, or the request was withdrawn.
+    if (!pending) {
+      debugLog('rpc.responseFromClient.ignored', {
+        peerId: peer.id,
+        id: id.slice(0, 40),
+        reason: 'notPending',
+      })
+      return
+    }
+    this.pendingServerRequests.delete(id)
+    if (response.error) pending.reject(new Error(response.error.message))
+    else pending.resolve(response.result)
+  }
+
+  // A peer that starts following a thread after a request went out (a second
+  // client opening it, or the App after a reconnect) gets the request too, as
+  // Codex's app-server replays a thread's pending requests on thread/resume.
+  // A request whose turn has ended is not shown again.
+  private replayPendingServerRequests(peer: RpcPeer): void {
+    if (this.pendingServerRequests.size === 0 || peer === DETACHED_PEER) return
+    for (const [id, pending] of this.pendingServerRequests.entries()) {
+      if (pending.threadId === null || pending.targets.has(peer.id)) continue
+      if (!this.subscribersByThread.get(pending.threadId)?.has(peer.id)) continue
+      if (pending.turnId && this.store.getTurn(pending.turnId)?.status !== 'inProgress') continue
+      pending.targets.add(peer.id)
+      debugLog('rpc.serverRequest.replay', { peerId: peer.id, id, method: pending.method })
+      peer.send(pending.request)
     }
   }
 
@@ -7295,7 +7386,7 @@ export class CodexClaudeAppServer {
         this.subagentStateByTurn.delete(turnId)
         continue
       }
-      const peer = this.activePeerByThread.get(state.thread.id) ?? {
+      const peer = this.subscribersOf(state.thread.id).at(-1) ?? {
         id: 'shutdown',
         send: () => {},
         close: () => {},
@@ -7433,23 +7524,44 @@ export class CodexClaudeAppServer {
     timer.unref?.()
   }
 
-  private peerForParams(peer: RpcPeer, params: unknown): RpcPeer {
+  // The peers a thread's message goes to: its followers, else those of the
+  // nearest forked-from ancestor (which the thread then inherits), else the
+  // peer that caused it.
+  private targetsForParams(peer: RpcPeer, params: unknown): RpcPeer[] {
     const threadId = stringOr(asRecord(params).threadId, '')
-    if (!threadId) return peer
-    const direct = this.activePeerByThread.get(threadId)
-    if (direct) return direct
+    if (!threadId) return [peer]
+    const direct = this.subscribersByThread.get(threadId)
+    if (direct?.size) return [...direct.values()]
     const seen = new Set<string>()
     let current = this.store.getThread(threadId)
     while (current?.forkedFromId && !seen.has(current.forkedFromId)) {
       seen.add(current.forkedFromId)
-      const ancestorPeer = this.activePeerByThread.get(current.forkedFromId)
-      if (ancestorPeer) {
-        this.activePeerByThread.set(threadId, ancestorPeer)
-        return ancestorPeer
+      const ancestor = this.subscribersByThread.get(current.forkedFromId)
+      if (ancestor?.size) {
+        this.subscribersByThread.set(threadId, new Map(ancestor))
+        return [...ancestor.values()]
       }
       current = this.store.getThread(current.forkedFromId)
     }
-    return peer
+    return [peer]
+  }
+
+  private subscribersOf(threadId: string): RpcPeer[] {
+    return [...(this.subscribersByThread.get(threadId)?.values() ?? [])]
+  }
+
+  // Adds a follower to the thread, or moves it to the end as the latest.
+  // Neither the detached stub nor a peer that has disconnected meanwhile (a
+  // turn outliving its client) is added.
+  private subscribe(threadId: string, peer: RpcPeer): void {
+    if (!threadId || !this.peers.has(peer.id)) return
+    let subscribers = this.subscribersByThread.get(threadId)
+    if (!subscribers) {
+      subscribers = new Map()
+      this.subscribersByThread.set(threadId, subscribers)
+    }
+    subscribers.delete(peer.id)
+    subscribers.set(peer.id, peer)
   }
 
   private bindPeerToDescendants(peer: RpcPeer, rootThreadId: string): void {
@@ -7465,7 +7577,7 @@ export class CodexClaudeAppServer {
         sortKey: 'created_at',
         sortDirection: 'asc',
       })) {
-        this.activePeerByThread.set(child.id, peer)
+        this.subscribe(child.id, peer)
         queue.push(child.id)
       }
     }

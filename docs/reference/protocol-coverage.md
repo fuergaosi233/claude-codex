@@ -7,6 +7,10 @@ Implemented as real remote/runtime behavior:
 - **Thread lifecycle** — start, resume, fork, list, read, turns list, name,
   archive/unarchive, unsubscribe, interrupt, delete, and rollback/revert that
   rewind Claude's session to the kept turns.
+- **Several clients per thread** — every connection that opens a thread follows
+  it: notifications reach all of them, approvals and questions go to each and
+  the first answer wins, and one that opens the thread while a request is
+  pending gets it replayed.
 - **History and search** — turn, item and timeline paging; thread search over
   names, previews and messages; find-in-conversation occurrences.
 - **Projects and attachments** — `project/*` and `thread/attachment/*`, kept in

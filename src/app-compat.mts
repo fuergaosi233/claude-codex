@@ -70,8 +70,10 @@ export const APP_RULES: readonly AppRule[] = [
   {
     id: 'optimistic-user-message',
     app: 'Draws its own user message for every turn/start it sends.',
-    adapter: 'Publishes the userMessage item only for turns it starts from the server-side queue.',
-    verify: 'A sent message shows once; a queued one shows when it starts.',
+    adapter:
+      "Publishes the userMessage item for turns it starts from the server-side queue, and to a thread's other followers, which did not send the message.",
+    verify:
+      'A sent message shows once; a queued one shows when it starts; a second window open on the chat shows it too.',
   },
   {
     id: 'tool-output-turns',
