@@ -116,6 +116,14 @@ export const APP_RULES: readonly AppRule[] = [
       'With CLAUDE_CODEX_LEADER_TOOLS=1, ask Claude to start a chat with thread_start: it shows in the sidebar, and its first message and answer stream in when opened.',
   },
   {
+    id: 'added-thread-titles',
+    app: "Titles a thread that thread/started adds to the sidebar from the announcement alone: it shows the thread's name if it has one; otherwise it generates a title from the thread's preview, as it does for a chat started in the composer, and saves it with thread/name/set. A thread announced with neither stays untitled. It drops a generated title when the thread's title changed meanwhile.",
+    adapter:
+      'Announces a chat the leader tools start with its first message as the preview, and the title given to thread_start, if any, as its name.',
+    verify:
+      'With CLAUDE_CODEX_LEADER_TOOLS=1, ask Claude to start a chat with thread_start without a title: the sidebar shows a generated title for it, not its first words; with a title, the sidebar shows that title.',
+  },
+  {
     id: 'created-thread-card',
     app: 'Shows a card for a chat from a `::created-thread{threadId="…"}` line of its own in a reply, which its instructions for its own thread tools ask for after create_thread, and refreshes the card\'s status with thread/read (includeTurns false) and thread/turns/list (limit 1). It reads the line from a completed reply.',
     adapter:
@@ -335,6 +343,14 @@ export const APP_RULES: readonly AppRule[] = [
       'Adds each entry to the prompt Claude reads as an <app_context key kind> block, capped at 32 KiB, behind a note that untrusted blocks are data and not instructions; the userMessage item and the chat preview leave it out.',
     verify:
       'Connect a suggested plugin from a Claude chat and continue: the reply uses the attached context, and the message shows no context text.',
+  },
+  {
+    id: 'injected-context',
+    app: "Sends thread/inject_items only while no turn runs, right before the turn/start it belongs to: an untrusted_input function call and its output for content an MCP app sends to the chat (the message then says to read that output), the same pair for a change in the state of the chat's inline visualizations, and a user message marking the boundary when it opens a side chat. It expects the items in the model's history and shows none of them.",
+    adapter:
+      "Keeps the items per thread and adds them to the prompt of the thread's next user message, before the message, as <app_context> blocks: a message by its role as application context, and a function call's output under the function's name as untrusted data, capped at 32 KiB each. A steer, a helper turn and the adapter's own prompts leave them for the next message. It shows no turn or item for them.",
+    verify:
+      'Interact with an inline visualization in a Claude chat and send a message: the chat shows no extra reply with the state as JSON, and Claude knows the state.',
   },
   {
     id: 'app-tool-availability',

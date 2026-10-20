@@ -68,35 +68,6 @@ export function stringOr(value: unknown, fallback: string): string {
   return typeof value === 'string' && value.length > 0 ? value : fallback
 }
 
-// Pull a human-readable line out of a raw Responses-API item. Items are
-// free-form JSON; common shapes include {type, content:[{type:'text', text}]}
-// for assistant/user turns and {type:'message', role, content} for chat
-// segments. Fall back to a stringified JSON snippet otherwise.
-export function summarizeInjectedItem(raw: unknown): string {
-  if (raw == null) return ''
-  if (typeof raw === 'string') return raw.slice(0, 1000)
-  if (typeof raw !== 'object') return String(raw).slice(0, 1000)
-  const rec = raw as Record<string, unknown>
-  const content = rec.content
-  if (Array.isArray(content)) {
-    const texts: string[] = []
-    for (const block of content) {
-      if (block && typeof block === 'object') {
-        const b = block as Record<string, unknown>
-        if (typeof b.text === 'string') texts.push(b.text)
-      }
-    }
-    if (texts.length > 0) return texts.join('\n').slice(0, 2000)
-  }
-  if (typeof rec.text === 'string') return rec.text.slice(0, 2000)
-  // Last-resort dump so something shows up in the transcript.
-  try {
-    return JSON.stringify(raw).slice(0, 500)
-  } catch {
-    return '[non-serializable item]'
-  }
-}
-
 export function configEdits(
   params: Record<string, unknown>,
 ): Array<{ keyPath: string; value: unknown }> {

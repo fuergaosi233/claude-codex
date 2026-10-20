@@ -198,7 +198,8 @@ test('thread_start announces a chat the App lists and runs its first turn', asyn
     const from = server.mark()
     const started = await server.tool(leader, 'thread_start', {
       prompt: 'count to three',
-      title: 'Counter',
+      // Kept to one line, as the sidebar shows it.
+      title: ' Counter\n',
     })
     const childId = started.threadId
     assert.notEqual(childId, leader)
@@ -211,15 +212,16 @@ test('thread_start announces a chat the App lists and runs its first turn', asyn
     assert.deepEqual(started.lines, [`::created-thread{threadId="${childId}"}`])
     assert.match(childId, /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
 
-    // What the App needs to show the chat: thread/started, its title, and the
-    // turn with the user message it did not draw itself.
+    // What the App needs to show the chat: thread/started with its name and
+    // first message, and the turn with the user message it did not draw itself.
     const announced = await server.waitFor(
       'thread/started',
       (params) => params.thread.id === childId,
       from,
     )
     assert.equal(announced.thread.ephemeral, false)
-    await server.waitFor('thread/name/updated', (params) => params.threadId === childId, from)
+    assert.equal(announced.thread.name, 'Counter')
+    assert.equal(announced.thread.preview, 'count to three')
     const turnStarted = await server.waitFor(
       'turn/started',
       (params) => params.threadId === childId,
@@ -272,6 +274,26 @@ test('thread_start announces a chat the App lists and runs its first turn', asyn
     })
     assert.equal(reset.cursorReset, true)
     assert.equal(reset.turns.length, 1)
+  })
+})
+
+test('thread_start leaves a chat without a title for the App to title from its prompt', async () => {
+  await withServer(LEADER_ENV, async (server) => {
+    const leader = await server.startThread()
+    const from = server.mark()
+    const started = await server.tool(leader, 'thread_start', {
+      prompt: '  count to three ',
+      title: ' \n ',
+    })
+    const announced = await server.waitFor(
+      'thread/started',
+      (params) => params.thread.id === started.threadId,
+      from,
+    )
+    assert.equal(announced.thread.name, null)
+    assert.equal(announced.thread.preview, 'count to three')
+    assert.equal(started.title, 'count to three')
+    await server.waitFor('turn/completed', (params) => params.threadId === started.threadId, from)
   })
 })
 

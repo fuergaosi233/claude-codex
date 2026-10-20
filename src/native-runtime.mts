@@ -194,6 +194,8 @@ interface PendingTurn {
   // synthetic StructuredOutput tool_use we want to suppress the streamed
   // text and emit only the final coerced JSON.
   structuredBuffer: string
+  // The input of the main loop's latest StructuredOutput call, as JSON.
+  structuredInput: string | null
   pendingUserMessage: null | { resolve: (v: { message: unknown }) => void }
   deferredResult: PendingTurnResult | null
   workflowFailure: string | null
@@ -1607,6 +1609,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       toolInputPreviews:
         process.env.CLAUDE_CODEX_LIVE_FILE_CHANGES === '0' ? null : new ToolInputPreviews(),
       structuredBuffer: '',
+      structuredInput: null,
       pendingUserMessage: null,
       deferredResult: null,
       workflowFailure: null,
@@ -3024,6 +3027,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         if (nestedMessage && !isSubagentTool(name)) continue
         if (name === 'StructuredOutput') {
           // Defer emission; the final coercion happens at result-time.
+          pending.structuredInput = JSON.stringify(input)
           continue
         }
         if (name === 'AskUserQuestion') {
@@ -3472,9 +3476,18 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       numTurns: numberOrNull(message.num_turns),
       costUsd: numberOrNull(message.total_cost_usd),
     })
-    // If we suppressed text for StructuredOutput, emit the coerced JSON now.
-    if (pending.context.outputFormat && pending.structuredBuffer) {
-      await pending.handlers.onEvent({ type: 'text_delta', delta: pending.structuredBuffer.trim() })
+    // A structured turn's answer is what Claude passed to StructuredOutput,
+    // which the CLI reports as structured_output; text Claude wrote around
+    // the call is not. Only a turn that never called it falls back to the
+    // text it held back.
+    if (pending.context.outputFormat) {
+      const structured =
+        message.structured_output != null
+          ? JSON.stringify(message.structured_output)
+          : success && pending.structuredInput
+            ? pending.structuredInput
+            : pending.structuredBuffer.trim()
+      if (structured) await pending.handlers.onEvent({ type: 'text_delta', delta: structured })
     }
     // Why it failed, in the terms the server maps onto Codex error codes. A
     // CLI that refused to start says why in startup_failure_reason; its
@@ -3851,7 +3864,12 @@ function leaderToolServer(sdk: ClaudeSdk, z: Zod, leader: LeaderToolHandlers) {
         THREAD_START_DESCRIPTION,
         {
           prompt: z.string().describe('The first message of the new chat, complete on its own.'),
-          title: z.string().optional().describe('A short title for the sidebar.'),
+          title: z
+            .string()
+            .optional()
+            .describe(
+              "A short title for the sidebar. Leave it out to let the Codex App title the chat from its prompt, as it titles the user's own chats.",
+            ),
           cwd: z
             .string()
             .optional()
