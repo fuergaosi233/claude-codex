@@ -226,7 +226,7 @@ export const APP_RULES: readonly AppRule[] = [
     id: 'app-tool-availability',
     app: 'Writes developerInstructions for every local thread that describe its own tools (create_thread, read_thread, automation_update, create_worktree, sidebar tools and others) and the ::created-thread directive, and gives Codex threads those tools.',
     adapter:
-      'Gives Claude threads none of them, so it appends a short "# Tool availability" section after the developer instructions naming the tools they mention, and asks Claude not to look for them or write their directives and to send the user to the App instead.',
+      'Gives Claude threads none of them, so it appends a short "# Tool availability" section after the developer instructions naming the tools they mention, and asks Claude not to look for them or write their directives and to send the user to the App instead. appToolAvailabilityNote in src/turn-context.mts builds it, and leaves out the tools and the directive advice a thread is given as having.',
     verify:
       "In a Claude chat, ask to start a new thread or a worktree: Claude says to do it in the App instead of searching for the tool. Search the new build's thread-start instructions for tool names missing from the list in src/turn-context.mts.",
   },

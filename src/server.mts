@@ -6005,7 +6005,7 @@ export class CodexClaudeAppServer {
     server: string,
     tool: string,
   ): Promise<PermissionDecision> {
-    const sessionKey = JSON.stringify(['mcp', event.toolName])
+    const sessionKey = approvalSessionKey(event.toolName, event.input)
     // App rule: auto-review
     const userOnly = event.requiresUser === true
     if (!userOnly && this.sessionApprovals.get(threadId)?.has(sessionKey))

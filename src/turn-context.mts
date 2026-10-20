@@ -153,12 +153,45 @@ const APP_TOOLS = [
   'compile_latex_document',
 ]
 
-export function appToolAvailabilityNote(instructions: string | null): string | null {
+// The requests the note gives as examples, each with the tool it needs.
+const APP_TOOL_EXAMPLES: ReadonlyArray<readonly [string, string]> = [
+  ['create_thread', 'a new thread'],
+  ['create_worktree', 'a worktree'],
+  ['automation_update', 'an automation'],
+]
+
+export interface AppToolNoteOptions {
+  // App tools the thread does have, through some other route: the note
+  // leaves them out.
+  available?: ReadonlySet<string>
+  // The thread starts threads itself and reports them as Codex does, so the
+  // note leaves out the advice not to write `::created-thread`.
+  reportsCreatedThreads?: boolean
+}
+
+// The note for instructions that name App tools: which of them the thread
+// lacks, and what to do instead. Null when it lacks none of them.
+export function appToolAvailabilityNote(
+  instructions: string | null,
+  options: AppToolNoteOptions = {},
+): string | null {
   if (!instructions) return null
-  const named = APP_TOOLS.filter((tool) => new RegExp(`\\b${tool}\\b`).test(instructions))
-  if (named.length === 0) return null
+  const lacking = APP_TOOLS.filter(
+    (tool) => !options.available?.has(tool) && new RegExp(`\\b${tool}\\b`).test(instructions),
+  )
+  if (lacking.length === 0) return null
+  const directives = options.reportsCreatedThreads
+    ? ''
+    : ", and don't write the directives that report their results, such as `::created-thread`"
+  const examples = APP_TOOL_EXAMPLES.filter(([tool]) => !options.available?.has(tool)).map(
+    ([, request]) => request,
+  )
+  const suchAs =
+    examples.length === 0
+      ? ''
+      : `, such as ${examples.length === 1 ? examples[0] : `${examples.slice(0, -1).join(', ')} or ${examples.at(-1)}`}`
   return [
     '# Tool availability',
-    `This thread does not have the Codex App tools the instructions above mention: ${named.map((tool) => `\`${tool}\``).join(', ')}. Don't search for them or say you used them, and don't write the directives that report their results, such as \`::created-thread\`. When a request needs one, such as a new thread, a worktree or an automation, do what you can with your own tools and ask the user to do the rest in the Codex App.`,
+    `This thread does not have the Codex App tools the instructions above mention: ${lacking.map((tool) => `\`${tool}\``).join(', ')}. Don't search for them or say you used them${directives}. When a request needs one${suchAs}, do what you can with your own tools and ask the user to do the rest in the Codex App.`,
   ].join('\n')
 }

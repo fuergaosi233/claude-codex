@@ -8,7 +8,11 @@ import { claudeCommandManifest } from '../src/claude-commands.mjs'
 import { CodexClaudeAppServer } from '../src/server.mjs'
 import { buildSystemPromptAddendum } from '../src/server-helpers.mjs'
 import { SessionStore } from '../src/store.mjs'
-import { CONTEXT_ENTRY_LIMIT, SKILL_FILE_LIMIT } from '../src/turn-context.mjs'
+import {
+  appToolAvailabilityNote,
+  CONTEXT_ENTRY_LIMIT,
+  SKILL_FILE_LIMIT,
+} from '../src/turn-context.mjs'
 import type { ClaudeRuntime, RpcPeer, RuntimeTurnContext } from '../src/types.mjs'
 import { threadVisualizationDir } from '../src/util.mjs'
 
@@ -337,6 +341,30 @@ test('desktop prompt names the App tools its instructions mention and Claude lac
     buildSystemPromptAddendum({ ...instructions, desktopPresentation: true }) ?? '',
     /Tool availability/,
   )
+
+  // A thread that has some of the tools after all gets a note without them;
+  // one that reports the threads it starts gets no advice against
+  // `::created-thread`; one with every tool named gets no note.
+  assert.equal(
+    appToolAvailabilityNote(developerInstructions, {
+      available: new Set(['create_thread', 'read_thread']),
+      reportsCreatedThreads: true,
+    }),
+    "# Tool availability\nThis thread does not have the Codex App tools the instructions above mention: `automation_update`. Don't search for them or say you used them. When a request needs one, such as a worktree or an automation, do what you can with your own tools and ask the user to do the rest in the Codex App.",
+  )
+  assert.equal(
+    appToolAvailabilityNote(developerInstructions, {
+      available: new Set(['create_thread', 'read_thread', 'automation_update', 'create_worktree']),
+    }),
+    null,
+  )
+  assert.equal(
+    appToolAvailabilityNote('Use `list_threads` to find one.', {
+      available: new Set(['create_thread', 'automation_update', 'create_worktree']),
+    }),
+    "# Tool availability\nThis thread does not have the Codex App tools the instructions above mention: `list_threads`. Don't search for them or say you used them, and don't write the directives that report their results, such as `::created-thread`. When a request needs one, do what you can with your own tools and ask the user to do the rest in the Codex App.",
+  )
+  assert.equal(appToolAvailabilityNote(null), null)
 })
 
 test('server adds the SKILL.md of a picked skill to the prompt Claude reads', async () => {

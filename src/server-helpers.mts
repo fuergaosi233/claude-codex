@@ -1063,9 +1063,11 @@ export function acceptsAmendment(response: unknown, prefix: string[] | null): bo
 }
 
 // What an approval "for this session" covers: a shell command by its exact
-// text, any other tool by its exact input.
+// text, an MCP tool as a whole (as Codex keys it by server and tool), any
+// other tool by its exact input.
 export function approvalSessionKey(toolName: string, input: Record<string, unknown>): string {
   if (toolName === 'Bash') return JSON.stringify(['command', String(input.command ?? '')])
+  if (toolName.startsWith('mcp__')) return JSON.stringify(['mcp', toolName])
   return JSON.stringify(['tool', toolName, input])
 }
 
