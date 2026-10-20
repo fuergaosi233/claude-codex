@@ -144,6 +144,20 @@ test('a short display path names the innermost meaningful directory', () => {
   assert.equal(shortDisplayPath('/repo/dist/build'), 'repo')
   assert.equal(shortDisplayPath('src'), 'src')
   assert.equal(shortDisplayPath('.'), '.')
+  assert.equal(shortDisplayPath('/'), '')
+})
+
+test('long commands parse in linear time or show as the plain command', () => {
+  // A long run of slashes inside a path once took quadratic time.
+  const slashes = `ls a${'/'.repeat(200_000)}b`
+  const started = Date.now()
+  assert.deepEqual(parseCommandActions(slashes, cwd), [list(slashes, 'b')])
+  assert.ok(Date.now() - started < 2_000, 'a long path parses at once')
+
+  const reads = (count: number) =>
+    Array.from({ length: count }, (_, i) => `cat f${i}.txt`).join(' && ')
+  assert.equal(parseCommandActions(reads(100), cwd).length, 100)
+  assert.deepEqual(parseCommandActions(reads(101), cwd), unknown(reads(101)))
 })
 
 test('Claude file exploration tools show as commands with matching actions', () => {

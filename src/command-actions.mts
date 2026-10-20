@@ -160,7 +160,12 @@ function splitWordOnlyCommands(script: string): ShellSequence | null {
 // The last path component, skipping build/dist/node_modules/src, as Codex
 // names a listed or searched directory.
 export function shortDisplayPath(path: string): string {
-  const trimmed = path.replace(/\\/g, '/').replace(/\/+$/, '')
+  const normalized = path.replace(/\\/g, '/')
+  // A loop, not /\/+$/, which backtracks quadratically on a long run of
+  // slashes that does not end the path.
+  let end = normalized.length
+  while (end > 0 && normalized[end - 1] === '/') end -= 1
+  const trimmed = normalized.slice(0, end)
   const parts = trimmed
     .split('/')
     .reverse()
@@ -666,12 +671,17 @@ function simplifyOnce(commands: Parsed[]): Parsed[] | null {
   return null
 }
 
+// Simplifying a command list is quadratic in its length, as in Codex; longer
+// lists show as the plain command.
+const MAX_COMMANDS = 100
+
 // The CommandActions of a shell command run in `cwd`. Returns one `unknown`
 // action unless every part of the command reads, lists or searches files.
 export function parseCommandActions(script: string, cwd: string): CommandAction[] {
   const unknown: CommandAction[] = [{ type: 'unknown', command: script }]
   const sequence = splitWordOnlyCommands(script)
-  if (!sequence || sequence.commands.length === 0) return unknown
+  if (!sequence || sequence.commands.length === 0 || sequence.commands.length > MAX_COMMANDS)
+    return unknown
   const hadMultipleCommands = sequence.commands.length > 1
   const kept = sequence.commands.filter((command) => !isSmallFormattingCommand(command.words))
   if (kept.length === 0) return unknown
