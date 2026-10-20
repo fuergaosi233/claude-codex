@@ -767,6 +767,9 @@ export interface RuntimeFailure {
   category: string | null
   // The HTTP status of the API error that ended the turn.
   status: number | null
+  // Why Claude Code refused to start, when it said so: the SDK's
+  // startup_failure_reason ('org_config_refused', 'proxy_invalid', ...).
+  startupFailure?: string | null
 }
 
 // Codex's request_user_input primitive — surfaces Claude's AskUserQuestion as a
@@ -984,6 +987,9 @@ export interface ClaudeRuntime {
   stopTask?(threadId: string, taskId: string): Promise<boolean>
   // Background tasks still running in the thread's live session.
   liveTasks?(threadId: string): RuntimeLiveTask[]
+  // The Claude Code version the thread's live session runs, null until its
+  // CLI reported one.
+  cliVersion?(threadId: string): string | null
   // True while a session outlives its turns: background tasks are running or
   // Claude may still answer one that just reported back.
   hasBackgroundWork?(): boolean

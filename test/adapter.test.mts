@@ -4097,6 +4097,53 @@ test('API retries show as Reconnecting errors and a failed turn carries its Code
   }
 })
 
+test('a Claude Code that refused to start fails the turn with why, retryable only when a retry can help', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  try {
+    const threadId = await startMockThread(reader, proc)
+    const cases = [
+      ['org_config_required_unavailable', { httpConnectionFailed: { httpStatusCode: null } }],
+      ['org_config_refused', 'other'],
+      ['provider_not_allowed', 'other'],
+      ['proxy_invalid', 'other'],
+    ] as const
+    let id = 2
+    for (const [reason, code] of cases) {
+      proc.stdin.write(
+        json({
+          id,
+          method: 'turn/start',
+          params: { threadId, input: textInput(`startup failure check ${reason}`) },
+        }),
+      )
+      id += 1
+      const failed = await readUntil(reader, (message) => message.method === 'turn/completed')
+      const error = failed.at(-1)?.params.turn.error
+      assert.equal(failed.at(-1)?.params.turn.status, 'failed', reason)
+      assert.deepEqual(error.codexErrorInfo, code, reason)
+      assert.equal(error.additionalDetails, `Claude Code startup failure: ${reason}`)
+      assert.match(error.message, /^Claude Code |^Anthropic |^Your organization|^A proxy/, reason)
+      assert.deepEqual(
+        failed
+          .filter((message) => message.method === 'error')
+          .map((message) => [message.params.willRetry, message.params.error]),
+        [[false, error]],
+        reason,
+      )
+      // The CLI's own text, with the proxy's credentials, reaches no one.
+      assert.doesNotMatch(JSON.stringify(failed), /secret|proxy\.invalid/, reason)
+    }
+    proc.stdin.write(json({ id, method: 'thread/read', params: { threadId, includeTurns: true } }))
+    const read = await reader.nextResponse(id)
+    assert.doesNotMatch(JSON.stringify(read.result), /secret|proxy\.invalid/)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('the context gauge follows the last API call and child tokens add to the total', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawnMockAdapter(home)
@@ -7344,6 +7391,41 @@ test("the spawn card shows an agent's own model and effort, and a fork's parent 
       json({ id: 3, method: 'thread/read', params: { threadId: fork?.receiverThreadIds[0] } }),
     )
     assert.equal((await reader.nextResponse(3)).result.thread.agentRole, 'fork')
+
+    // A CLI older than the Agent effort input runs the agent at its parent's
+    // effort; one that has it honors it. An unknown version (above) honors it.
+    let id = 4
+    for (const [cli, effort] of [
+      ['2.1.291', 'medium'],
+      ['2.1.292', 'xhigh'],
+    ] as const) {
+      proc.stdin.write(
+        json({
+          id,
+          method: 'turn/start',
+          params: {
+            threadId,
+            input: [
+              { type: 'text', text: `subagent effort check on cli ${cli}`, text_elements: [] },
+            ],
+          },
+        }),
+      )
+      await reader.nextResponse(id)
+      id += 1
+      const gated = await readUntil(
+        reader,
+        (m) => m.method === 'turn/completed' && m.params.threadId === threadId,
+      )
+      const item = gated.find(
+        (m) =>
+          m.method === 'item/completed' &&
+          m.params.item.tool === 'spawnAgent' &&
+          m.params.item.prompt === 'own agent',
+      )?.params.item
+      assert.equal(item?.model, 'opus', cli)
+      assert.equal(item?.reasoningEffort, effort, cli)
+    }
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })

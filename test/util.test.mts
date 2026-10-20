@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import test from 'node:test'
 import {
+  claudeCodeAtLeast,
   codexProxyModelOptions,
   defaultSocketPath,
   isPathInside,
@@ -39,6 +40,20 @@ test('threadVisualizationDir follows the App layout for UUIDv7 ids only', () => 
   } finally {
     if (previous == null) delete process.env.CODEX_HOME
     else process.env.CODEX_HOME = previous
+  }
+})
+
+test('claudeCodeAtLeast compares Claude Code versions and treats an unreadable one as new enough', () => {
+  assert.equal(claudeCodeAtLeast('2.1.287', '2.1.287'), true)
+  assert.equal(claudeCodeAtLeast('2.1.286', '2.1.287'), false)
+  assert.equal(claudeCodeAtLeast('2.1.300', '2.1.287'), true)
+  assert.equal(claudeCodeAtLeast('2.2.0', '2.1.292'), true)
+  assert.equal(claudeCodeAtLeast('1.9.999', '2.1.292'), false)
+  assert.equal(claudeCodeAtLeast('2.1.10', '2.1.9'), true)
+  assert.equal(claudeCodeAtLeast('v2.1.291 (Claude Code)', '2.1.292'), false)
+  assert.equal(claudeCodeAtLeast('2.1.292-beta.1', '2.1.292'), true)
+  for (const unknown of [null, undefined, '', 'dev', '2.1']) {
+    assert.equal(claudeCodeAtLeast(unknown, '2.1.292'), true, String(unknown))
   }
 })
 

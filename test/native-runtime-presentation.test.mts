@@ -580,6 +580,32 @@ test('a failed native turn says why it failed, and a successful one carries no f
     failure: { terminalReason: 'prompt_too_long', category: null, status: null },
   })
 
+  // A CLI that refused to start names the reason; its stderr stays behind.
+  const refused = await completedEvent([
+    {
+      type: 'result',
+      subtype: 'error_during_execution',
+      is_error: true,
+      duration_ms: 0,
+      num_turns: 0,
+      startup_failure_reason: 'proxy_invalid',
+      errors: ['Invalid proxy URL: http://user:secret@proxy.invalid:8080'],
+    },
+  ])
+  assert.equal(refused.outcome, 'Claude turn failed')
+  assert.deepEqual(refused.completed, {
+    type: 'completed',
+    success: false,
+    result: null,
+    claudeSessionId: null,
+    failure: {
+      terminalReason: null,
+      category: null,
+      status: null,
+      startupFailure: 'proxy_invalid',
+    },
+  })
+
   const succeeded = await completedEvent([
     system('api_retry', {
       attempt: 1,

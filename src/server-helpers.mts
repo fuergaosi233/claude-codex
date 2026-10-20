@@ -538,18 +538,139 @@ export interface CodexTurnError {
   additionalDetails: string | null
 }
 
+// Why Claude Code refused to start (the SDK's SDKStartupFailureReason), told
+// as what fixes it. Only these messages are shown: the CLI's own text can
+// carry a proxy URL with its credentials. `retry` marks the failures a retry
+// can fix, where something could not be loaded or checked right now; the
+// others need a new sign-in, an administrator or a change on this machine.
+const STARTUP_FAILURES: Record<string, { retry: boolean; message: string }> = {
+  org_config_required_unavailable: {
+    retry: true,
+    message:
+      'Claude Code could not load the policy limits and settings your organization requires before a session starts. Check the network or proxy, then try again.',
+  },
+  remote_settings_required_unavailable: {
+    retry: true,
+    message:
+      'Claude Code could not load the managed settings your organization requires. Check the network or proxy, then try again.',
+  },
+  org_verify_failed: {
+    retry: true,
+    message:
+      "Claude Code could not verify your sign-in's organization. Check the network, then try again; if it keeps failing, sign in to Claude Code again.",
+  },
+  worktree_unverified: {
+    retry: true,
+    message: "Claude Code could not verify this session's worktree right now. Try again.",
+  },
+  org_config_refused: {
+    retry: false,
+    message:
+      "Anthropic refused your organization's policy limits and settings for this sign-in. Sign in to Claude Code again (claude /login), or ask an administrator to allow Claude Code for this account.",
+  },
+  gateway_signin_required: {
+    retry: false,
+    message: 'The Claude gateway ended this sign-in. Sign in to Claude Code again (claude /login).',
+  },
+  gateway_access_denied: {
+    retry: false,
+    message:
+      'The Claude gateway refused managed settings for this account. Ask an administrator for access.',
+  },
+  org_pin_api_key_conflict: {
+    retry: false,
+    message:
+      "Your organization's managed settings require a Claude sign-in, but an Anthropic API key or auth token is configured. Remove it from the adapter's environment and sign in to Claude Code (claude /login).",
+  },
+  org_pin_mismatch: {
+    retry: false,
+    message:
+      'This Claude sign-in belongs to an organization your managed settings do not allow. Sign in to Claude Code with an allowed account (claude /login).',
+  },
+  provider_not_allowed: {
+    retry: false,
+    message:
+      "Your organization's managed settings do not allow the API provider this session is set up for. Switch to an allowed provider.",
+  },
+  managed_settings_invalid: {
+    retry: false,
+    message:
+      'Claude Code could not use your managed settings: they cannot be read, name no organization, or leave no allowed model. Ask an administrator to fix them.',
+  },
+  proxy_invalid: {
+    retry: false,
+    message:
+      "A proxy setting in Claude Code's environment or settings is not a complete URL. Fix it, then try again.",
+  },
+  temp_dir_unusable: {
+    retry: false,
+    message:
+      "Claude Code's temporary directory is unsafe or could not be created. Check the system temporary directory and its permissions.",
+  },
+  cwd_unavailable: {
+    retry: false,
+    message:
+      "This thread's working directory was deleted, moved or cannot be read. Restore it, or start the thread in a folder that exists.",
+  },
+  shell_tool_missing: {
+    retry: false,
+    message:
+      'Claude Code found no shell to run commands with. Install Git for Windows (Git Bash), or turn on the PowerShell tool.',
+  },
+  session_held_by_background: {
+    retry: false,
+    message:
+      'This conversation is running as a Claude Code background session. Stop that session, then try again.',
+  },
+  worktree_resume_refused: {
+    retry: false,
+    message:
+      'Claude Code refused to resume this session: its worktree failed a safety check, or the resume started inside the worktree.',
+  },
+  cli_version_too_old: {
+    retry: false,
+    message:
+      'This Claude Code version is older than the minimum Anthropic requires. Update Claude Code.',
+  },
+  bypass_root: {
+    retry: false,
+    message:
+      'Full access (bypass permissions) cannot run as root. Run the adapter as another user, or choose another approval mode.',
+  },
+}
+
+function startupFailure(reason: string): { retry: boolean; message: string } {
+  const known = Object.hasOwn(STARTUP_FAILURES, reason) ? STARTUP_FAILURES[reason] : undefined
+  if (known) return known
+  const name = startupReasonName(reason)
+  return { retry: false, message: `Claude Code refused to start${name ? ` (${name})` : ''}.` }
+}
+
+// A reason is named only when it looks like one, as a reason newer than the
+// table above still would.
+function startupReasonName(reason: string): string | null {
+  return /^[a-z][a-z0-9_]{0,63}$/.test(reason) ? reason : null
+}
+
 // The Codex error code for a Claude failure. `retrying` describes a request
 // Claude will send again: Codex reports every such retry as a disconnected
 // stream with the HTTP status, except an overloaded API, which the App shows
 // as "Server is busy". Codes the App answers with ChatGPT account flows are
 // never used: usageLimitExceeded opens a plan upgrade card and cyberPolicy a
 // safety notice, and an authentication failure stays 'other' rather than
-// 'unauthorized'.
+// 'unauthorized'. A CLI that refused to start for a reason a retry can fix
+// is a failed connection, which the App offers to retry; any other refusal
+// is 'other', which it does not.
 // App rule: error-codes
 export function codexErrorInfo(
   failure: RuntimeFailure | null | undefined,
   retrying = false,
 ): CodexErrorInfo {
+  if (failure?.startupFailure) {
+    return startupFailure(failure.startupFailure).retry
+      ? { httpConnectionFailed: { httpStatusCode: null } }
+      : 'other'
+  }
   const terminalReason = failure?.terminalReason ?? null
   const category = failure?.category ?? null
   const status = failure?.status ?? null
@@ -595,10 +716,19 @@ export function retryTurnError(event: Extract<RuntimeEvent, { type: 'retrying' }
 }
 
 // An Error for a failed turn that carries its Codex error code to failTurn.
+// A CLI that refused to start is told by why, never by its own text.
 export function turnFailure(message: string, failure: RuntimeFailure | null | undefined): Error {
-  return Object.assign(new Error(message), {
+  const reason = failure?.startupFailure
+  if (!reason) {
+    return Object.assign(new Error(message), {
+      codexErrorInfo: codexErrorInfo(failure),
+      additionalDetails: apiErrorDetails(failure),
+    })
+  }
+  const name = startupReasonName(reason)
+  return Object.assign(new Error(startupFailure(reason).message), {
     codexErrorInfo: codexErrorInfo(failure),
-    additionalDetails: apiErrorDetails(failure),
+    additionalDetails: name ? `Claude Code startup failure: ${name}` : null,
   })
 }
 

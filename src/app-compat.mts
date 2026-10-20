@@ -276,7 +276,7 @@ export const APP_RULES: readonly AppRule[] = [
     id: 'error-codes',
     app: 'Reads codexErrorInfo on `error` notifications and failed turns: serverOverloaded shows "Server is busy" and may offer a retry, usageLimitExceeded opens a ChatGPT plan upgrade card, cyberPolicy a safety notice, and unauthorized is only counted.',
     adapter:
-      'Gives every error a code from what the Claude CLI reported: contextWindowExceeded, serverOverloaded, rateLimitExceeded, badRequest, internalServerError, httpConnectionFailed, responseStreamDisconnected with the HTTP status for a retry, and other for the rest. It never sends usageLimitExceeded or cyberPolicy, and an authentication failure stays other.',
+      "Gives every error a code from what the Claude CLI reported: contextWindowExceeded, serverOverloaded, rateLimitExceeded, badRequest, internalServerError, httpConnectionFailed, responseStreamDisconnected with the HTTP status for a retry, and other for the rest. It never sends usageLimitExceeded or cyberPolicy, and an authentication failure stays other. A CLI that refused to start is httpConnectionFailed when a retry can fix the reason it gave and other when it cannot, with a message the adapter writes and never the CLI's own output.",
     verify:
       'Let the API stay overloaded until Claude gives up: the failed turn says the server is busy instead of showing a bare error.',
   },

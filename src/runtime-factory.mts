@@ -148,6 +148,16 @@ class SelectableRuntime implements ClaudeRuntime {
     return this.activeRuntimeByThread.get(threadId)?.filtersNestedEvents?.(threadId) === true
   }
 
+  cliVersion(threadId: string): string | null {
+    const active = this.activeRuntimeByThread.get(threadId)
+    if (active) return active.cliVersion?.(threadId) ?? null
+    for (const runtime of this.runtimes.values()) {
+      const version = runtime.cliVersion?.(threadId)
+      if (version) return version
+    }
+    return null
+  }
+
   hasPendingContinuation(threadId: string): boolean {
     return [...this.runtimes.values()].some(
       (runtime) => runtime.hasPendingContinuation?.(threadId) === true,

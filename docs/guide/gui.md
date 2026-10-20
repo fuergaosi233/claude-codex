@@ -98,6 +98,19 @@ the codes the App answers with ChatGPT account flows, so a Claude
 authentication or billing failure shows its message instead of a ChatGPT plan
 upgrade or sign-in prompt.
 
+When the Claude CLI refuses to start a session, the turn fails with a message
+the adapter writes for the reason Claude Code gave, saying what fixes it, and
+the reason's name under it (for example `Claude Code startup failure:
+org_config_refused`). A failure a retry can fix, such as organization settings
+that could not be loaded, is a failed connection, which the App offers to
+retry. A refused sign-in, a provider or account the organization does not
+allow, invalid managed settings or a problem on this machine (a broken proxy
+setting, a missing working directory, an outdated CLI) is a plain error. The
+CLI's own output is never shown, since it can contain a proxy URL with its
+credentials. The adapter asks the CLI to report every startup failure this
+way by setting `CLAUDE_CODE_STARTUP_FAILURE_RESULTS=1`; a value in the
+adapter's environment takes its place.
+
 Notices the Claude CLI would show an interactive user at once, such as a
 failed compaction, go out as `warning` notifications, each once a turn. The
 Codex App opts out of `warning` notifications in `initialize`, as it does with

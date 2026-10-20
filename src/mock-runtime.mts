@@ -43,6 +43,8 @@ export class MockRuntime implements ClaudeRuntime {
   // runs until it is interrupted.
   private failingCompactions = new Set<string>()
   private holdingCompactions = new Set<string>()
+  // The Claude Code version a scenario's session reports ("on cli x.y.z").
+  private cliVersions = new Map<string, string>()
 
   async runTurn(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void> {
     // A session slow to come up (the CLI's, while an interrupted turn is
@@ -777,6 +779,20 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    // Claude Code refused to start for the named reason, as its zeroed
+    // error result says, with the CLI's stderr (here a proxy URL with its
+    // credentials) in the result's errors.
+    const startupFailure = /startup failure check (\S+)/i.exec(context.prompt)?.[1]
+    if (startupFailure) {
+      await handlers.onEvent({
+        type: 'completed',
+        success: false,
+        result: 'Invalid proxy URL: http://user:secret@proxy.invalid:8080',
+        failure: { terminalReason: null, category: null, status: null, startupFailure },
+      })
+      return
+    }
+
     if (/policy check/i.test(context.prompt)) {
       await handlers.onEvent({
         type: 'text_delta',
@@ -1295,7 +1311,10 @@ export class MockRuntime implements ClaudeRuntime {
 
     if (/subagent effort check/i.test(context.prompt)) {
       // An agent asked to run on its own model and effort, and a fork asked
-      // the same: Claude ignores both inputs for a fork.
+      // the same: Claude ignores both inputs for a fork. "on cli x.y.z"
+      // plays a session whose CLI reports that version.
+      const cli = /\bon cli (\d+\.\d+\.\d+)/i.exec(context.prompt)?.[1]
+      if (cli) this.cliVersions.set(context.threadId, cli)
       const ownId = `task-own-${Date.now()}`
       const forkId = `task-fork-${Date.now()}`
       const namedForkId = `task-named-fork-${Date.now()}`
@@ -1499,6 +1518,10 @@ export class MockRuntime implements ClaudeRuntime {
 
   filtersNestedEvents(threadId: string): boolean {
     return this.nestedFiltered.has(threadId)
+  }
+
+  cliVersion(threadId: string): string | null {
+    return this.cliVersions.get(threadId) ?? null
   }
 
   async stop(): Promise<void> {

@@ -1847,6 +1847,74 @@ test('native without get_task_output shows Bash output only with the result', as
   })
 })
 
+test('native reads Bash output only from a CLI that can answer get_task_output, or one whose version is unknown', async () => {
+  await withCommandOutputPollMs(5, async () => {
+    for (const [version, streams] of [
+      ['2.1.286', false],
+      ['2.1.287', true],
+      [undefined, true],
+      ['not a version', true],
+    ] as const) {
+      const { runtime, queries } = fakeRuntime((prompt) => new ShellQuery(prompt))
+      const events: RuntimeEvent[] = []
+      const turn = runtime.runTurn(context, handlers(events))
+      const query = await waitFor(() => queries[0], 'session')
+      query.outputs.set('t1', 'compiling\n')
+      query.push(
+        {
+          type: 'system',
+          subtype: 'init',
+          session_id: 'session',
+          ...(version === undefined ? {} : { claude_code_version: version }),
+        },
+        assistant('m1', [bash('bash-a', 'make')]),
+        bashTask('t1', 'bash-a', false),
+      )
+      if (streams) await waitFor(() => outputDeltas(events, 'bash-a').length, 'output')
+      else await sleep(40)
+      const label = `CLI ${version ?? 'without a version'}`
+      assert.equal(runtime.cliVersion('thread'), version ?? null, label)
+      query.push(toolResult('bash-a', 'compiling\n'), assistant('m2', [text('done')]), {
+        type: 'result',
+        subtype: 'success',
+        result: 'done',
+      })
+      await turn
+      assert.equal(query.reads > 0, streams, label)
+      assert.equal(outputDeltas(events, 'bash-a').length > 0, streams, label)
+      await runtime.stop()
+    }
+  })
+})
+
+test('native takes the CLI version from the initialize reply before the first turn starts', async () => {
+  await withCommandOutputPollMs(5, async () => {
+    class InitializedQuery extends ShellQuery {
+      async initializationResult(): Promise<unknown> {
+        return { commands: [], claude_code_version: '2.1.250' }
+      }
+    }
+    const { runtime, queries } = fakeRuntime((prompt) => new InitializedQuery(prompt))
+    const events: RuntimeEvent[] = []
+    const turn = runtime.runTurn(context, handlers(events))
+    const query = await waitFor(() => queries[0], 'session')
+    await waitFor(() => runtime.cliVersion('thread'), 'version')
+    query.outputs.set('t1', 'compiling\n')
+    query.push(assistant('m1', [bash('bash-a', 'make')]), bashTask('t1', 'bash-a', false))
+    await sleep(40)
+    assert.equal(runtime.cliVersion('thread'), '2.1.250')
+    query.push(toolResult('bash-a', 'compiling\n'), assistant('m2', [text('done')]), {
+      type: 'result',
+      subtype: 'success',
+      result: 'done',
+    })
+    await turn
+    assert.equal(query.reads, 0)
+    assert.deepEqual(outputDeltas(events, 'bash-a'), [])
+    await runtime.stop()
+  })
+})
+
 test('native background shell reports its output to the thread after its call returned, and how it ended', async () => {
   await withCommandOutputPollMs(5, async () => {
     const { runtime, queries } = fakeRuntime((prompt) => new ShellQuery(prompt))

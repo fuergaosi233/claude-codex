@@ -235,6 +235,8 @@ import type {
 } from './types.mjs'
 import {
   adapterHome,
+  CLAUDE_CODE_AGENT_EFFORT_VERSION,
+  claudeCodeAtLeast,
   claudeModelOptions,
   claudeOutputFormat,
   codexCliVersion,
@@ -4679,14 +4681,21 @@ export class CodexClaudeAppServer {
               typeof event.input.subagent_type === 'string' ? event.input.subagent_type : null
             // A fork runs on its parent's model and effort; Claude ignores
             // the Agent tool's model and effort inputs for it. Claude matches
-            // the agent type ignoring case.
+            // the agent type ignoring case. A CLI older than the effort input
+            // runs every subagent at its parent's effort.
             const forkSubagent = subType?.trim().toLowerCase() === 'fork'
             const subagentModel =
               !forkSubagent && typeof event.input.model === 'string'
                 ? event.input.model
                 : thread.model
+            const effortInput =
+              !forkSubagent &&
+              claudeCodeAtLeast(
+                this.runtime.cliVersion?.(thread.id),
+                CLAUDE_CODE_AGENT_EFFORT_VERSION,
+              )
             const subagentEffort =
-              (forkSubagent ? null : subagentEffortFromInput(event.input.effort)) ??
+              (effortInput ? subagentEffortFromInput(event.input.effort) : null) ??
               thread.reasoningEffort
             const childThreadId = newThreadId()
             // The id's random tail: its head is a timestamp, shared by agents

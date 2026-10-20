@@ -254,6 +254,20 @@ versioning or publishing metadata.
   `rateLimitExceeded`, ...), never one the App answers with a ChatGPT account
   flow. CLI notifications of high or immediate priority go out as `warning`
   notifications, which the App opts out of, as it does with Codex.
+- A Claude CLI that refuses to start fails the turn with an adapter-written
+  message for its `startup_failure_reason` and the reason's name as details,
+  never the CLI's own output, which can hold proxy credentials. Reasons a
+  retry can fix (`org_config_required_unavailable`, organization settings or
+  checks that could not be reached) are `httpConnectionFailed`, which the App
+  offers to retry; refused sign-ins, `provider_not_allowed`, invalid managed
+  settings and local problems are `other`. The adapter sets
+  `CLAUDE_CODE_STARTUP_FAILURE_RESULTS=1` so every startup failure is reported
+  this way unless the environment sets it.
+- The adapter keeps the Claude Code version each session reports (in the
+  initialize reply from 2.1.296, in `system/init` from every CLI) and leaves
+  off what an older CLI cannot do: live Bash output needs 2.1.287
+  (`get_task_output`), and a spawn card shows an Agent call's own `effort`
+  only from 2.1.292. While the version is unknown, both stay on.
 - Claude chats show their branch in the App sidebar. Threads carry Codex
   `gitInfo` (commit, branch, and the `origin` remote without credentials),
   looked up after `thread/start`, when a thread without it resumes and when a
