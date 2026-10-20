@@ -3193,7 +3193,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     const success = subtype === 'success' && !message.is_error && pending.workflowFailure == null
     const resultText =
       pending.workflowFailure ?? (message.result == null ? null : String(message.result))
-    const claudeSessionId = message.session_id == null ? null : String(message.session_id)
+    // A CLI that refused to start (startup_failure_reason, see below) never
+    // loaded the session it was to resume: the session id of its zeroed
+    // result has no transcript, and adopting it would lose the thread's.
+    const startupFailure = stringOrNull(message.startup_failure_reason)
+    const claudeSessionId =
+      startupFailure || message.session_id == null ? null : String(message.session_id)
     await pending.handlers.onEvent({
       type: 'metrics',
       durationMs: numberOrNull(message.duration_ms),
@@ -3208,7 +3213,6 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     // Why it failed, in the terms the server maps onto Codex error codes. A
     // CLI that refused to start says why in startup_failure_reason; its
     // errors repeat the CLI's stderr, which is never passed on.
-    const startupFailure = stringOrNull(message.startup_failure_reason)
     const failure: RuntimeFailure | null =
       success || pending.workflowFailure != null
         ? null
