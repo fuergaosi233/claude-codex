@@ -159,7 +159,9 @@ versioning or publishing metadata.
   does. Read, Grep, Glob and LS calls are command items named after the tool
   (`Read src/app.ts`) with Codex `read`, `search` and `listFiles` command
   actions, and a Bash command that only reads, lists or searches files gets
-  its actions from a port of Codex's command parser. The App keeps the first
+  its actions from a port of Codex's command parser, which unlike Codex's
+  never folds a command that can write files or start other programs, such
+  as `find -delete` or `| xargs rm`. The App keeps the first
   30,000 characters of their output; Claude still gets all of it. A Read of
   an image is an `imageView`, WebFetch a `webSearch` item opening the page,
   and an MCP tool names its server, split by the turn's configured server

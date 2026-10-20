@@ -109,8 +109,11 @@ Claude's tool calls show as the items Codex uses for its own:
   `cat`, `sed -n`, `rg`, `find` or `ls`, folds in the same way: the adapter
   parses it as Codex parses its own commands, following `cd` and skipping
   helpers such as `| head -n 20`. Anything else, including redirects,
-  variables and globs, shows as the plain command. The App keeps the first
-  30,000 characters of a file or search result; Claude gets all of it.
+  variables and globs, shows as the plain command. So does a command that
+  can write files or start other programs, such as `find -delete`,
+  `| xargs rm` or `| tee out.txt`, even where Codex would fold it. The App
+  keeps the first 30,000 characters of a file or search result; Claude gets
+  all of it.
 - **Images.** A Read of an image file shows the image. If the Read fails, or
   the turn stops before it ends, it shows as the failed Read instead.
 - **The web.** WebSearch shows as a web search, and WebFetch as opening the

@@ -138,6 +138,67 @@ test('anything else is one unknown action holding the whole command', () => {
     assert.deepEqual(parseCommandActions(script, cwd), unknown(script), script)
 })
 
+test('commands that can write files or run other programs never fold', () => {
+  // Codex folds each of these into "Explored", hiding what they change.
+  for (const script of [
+    "find . -name '*.tmp' -delete",
+    "find . -type f -exec rm '{}' ';'",
+    "find . -name '*.log' -fprint list.txt",
+    "find . -name '*.log' | xargs rm -f",
+    'ls | xargs rm',
+    'ls | xargs -e rm',
+    'cat cmds.txt | xargs sh',
+    'rg -l TODO | xargs rg --pre ./convert.sh FIXME',
+    'rg TODO | tee todo.txt',
+    'cat a.txt | tee -a b.txt',
+    'ls && sort -o out.txt in.txt',
+    'ls | sort -ro out.txt',
+    'ls && uniq in.txt out.txt',
+    'fd -e orig -X rm',
+    'fd -HIx wc -l',
+    'fd --exec=rm',
+    'rg --pre ./convert.sh TODO',
+    'git grep -O TODO',
+    'tree -o tree.txt',
+    'awk \'{system("rm " $1)}\' list.txt',
+    'cat a.txt | awk \'BEGIN { system("touch x") }\'',
+    'awk \'{print > "out.txt"}\' data.csv',
+    'awk \'{print | "sh"}\' data.csv',
+    'awk -f prog.awk data.csv',
+    "awk -i inplace '{print}' data.csv",
+    "cat f.txt && sed -I '' 's/a/b/' f.txt",
+    "cat a.txt | sed 's/x/y/w out.txt'",
+    "cat a.txt | sed 'e date'",
+    'cat a.txt | sed -f script.sed',
+    "sed -n -e 1,5p -e 'w out.txt' f.txt",
+    'python3 -c "import os; [os.remove(f) for f in os.listdir(\'.\')]"',
+  ])
+    assert.deepEqual(parseCommandActions(script, cwd), unknown(script), script)
+})
+
+test('read-only helpers that run on a command still fold', () => {
+  const cases: [string, CommandAction[]][] = [
+    ['rg -l TODO | xargs grep -n FIXME', [search('rg -l TODO', 'TODO', null)]],
+    ['rg --files | xargs wc -l', [list('rg --files', null)]],
+    ['rg --files | xargs', [list('rg --files', null)]],
+    ['rg --files | sort | uniq -c', [list('rg --files', null)]],
+    ['rg TODO | tee', [search('rg TODO', 'TODO', null)]],
+    ["cat a.txt | sed 's/a/b/g'", [read('cat a.txt', 'a.txt', '/repo/a.txt')]],
+    ["cat a.txt | sed '/^$/d'", [read('cat a.txt', 'a.txt', '/repo/a.txt')]],
+    ["rg -n TODO | sed -n '1,20p'", [search('rg -n TODO', 'TODO', null)]],
+    ["cat a.txt | awk '{print $1}'", [read('cat a.txt', 'a.txt', '/repo/a.txt')]],
+    [
+      "awk -F '|' '{print $2}' data.csv",
+      [read("awk -F '|' '{print $2}' data.csv", 'data.csv', '/repo/data.csv')],
+    ],
+    ['sed -n -e 1,5p -e 10p f.txt', [read('sed -n -e 1,5p -e 10p f.txt', 'f.txt', '/repo/f.txt')]],
+    ['fd -t x', [list('fd -t x', null)]],
+    ['tree -L 2', [list('tree -L 2', null)]],
+  ]
+  for (const [script, expected] of cases)
+    assert.deepEqual(parseCommandActions(script, cwd), expected, script)
+})
+
 test('a short display path names the innermost meaningful directory', () => {
   assert.equal(shortDisplayPath('src/lib/'), 'lib')
   assert.equal(shortDisplayPath('a/b/node_modules'), 'b')

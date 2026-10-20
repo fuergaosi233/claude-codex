@@ -5,6 +5,11 @@
 // Bash-compatible scripts: plain words joined by `&&`, `||`, `|`, `;` or
 // newlines. Anything else (redirects, expansions, globs, subshells, ...) is a
 // single `unknown` action, which the App renders as the plain command.
+//
+// Unlike Codex, a command that can write files or start other programs never
+// folds: `find -delete`, `fd -x`, `rg --pre`, `| xargs rm`, `| tee out`, an
+// awk program that calls `system` and a sed script that writes all show as
+// the plain command, so "Explored" never hides a change.
 import { isAbsolute, join } from 'node:path'
 import type { CommandAction } from './types.mjs'
 
@@ -248,7 +253,8 @@ function sedHasInPlaceFlag(args: string[]): boolean {
     const options = arg.slice(1)
     for (let j = 0; j < options.length; j += 1) {
       const option = options[j]
-      if (option === 'i') return true
+      // BSD sed, as on macOS, edits in place with `-I`.
+      if (option === 'i' || option === 'I') return true
       if (option === 'e' || option === 'f') {
         if (j === options.length - 1) i += 1
         break
@@ -258,85 +264,171 @@ function sedHasInPlaceFlag(args: string[]): boolean {
   return false
 }
 
+// The scripts a sed command runs: its `-e` values, or else its first operand.
+// Null when a script comes from a file.
+function sedScripts(args: string[]): string[] | null {
+  const scripts: string[] = []
+  let firstOperand: string | undefined
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i] as string
+    if (arg === '--') {
+      firstOperand ??= args[i + 1]
+      break
+    }
+    if (arg === '--file' || arg.startsWith('--file=')) return null
+    if (arg === '--expression') {
+      const script = args[i + 1]
+      if (script === undefined) return null
+      scripts.push(script)
+      i += 1
+    } else if (arg.startsWith('--expression=')) {
+      scripts.push(arg.slice('--expression='.length))
+    } else if (arg.startsWith('-') && !arg.startsWith('--') && arg.length > 1) {
+      const options = arg.slice(1)
+      for (let j = 0; j < options.length; j += 1) {
+        const option = options[j]
+        if (option === 'f') return null
+        if (option === 'e') {
+          const attached = options.slice(j + 1)
+          const script = attached === '' ? args[i + 1] : attached
+          if (script === undefined) return null
+          scripts.push(script)
+          if (attached === '') i += 1
+          break
+        }
+        // `-l N` sets the line length.
+        if (option === 'l') {
+          if (j === options.length - 1) i += 1
+          break
+        }
+      }
+    } else if (!arg.startsWith('-')) {
+      firstOperand ??= arg
+    }
+  }
+  if (scripts.length === 0 && firstOperand !== undefined) scripts.push(firstOperand)
+  return scripts
+}
+
+const SED_ADDRESS = String.raw`(?:\d+|\$|/(?:\\.|[^\\/\n])*/)`
+// A sed script that only prints, substitutes, deletes or quits: a single
+// command without the `w`, `e` or `r` commands and flags, which write files,
+// run commands or read other files.
+const PLAIN_SED_SCRIPT = new RegExp(
+  String.raw`^(?:s([^\\\n])(?:\\.|(?!\1)[^\\\n])*\1(?:\\.|(?!\1)[^\\\n])*\1[gIiMmp0-9]*|(?:${SED_ADDRESS}(?:,${SED_ADDRESS})?)?[dpq])$`,
+)
+
 // The file a `sed -n <range>p <file>` prints from.
 function sedReadPath(args: string[]): string | null {
   if (sedHasInPlaceFlag(args) || !args.includes('-n')) return null
-  let hasRange = false
-  for (let i = 0; i < args.length; i += 1) {
-    const arg = args[i] as string
-    if (arg === '-e' || arg === '--expression') {
-      if (isSedRange(args[i + 1])) hasRange = true
-      i += 1
-    } else if (arg === '-f' || arg === '--file') {
-      i += 1
-    }
-  }
-  if (!hasRange) hasRange = args.some((arg) => !arg.startsWith('-') && isSedRange(arg))
-  if (!hasRange) return null
+  const scripts = sedScripts(args)
+  if (!scripts?.length || !scripts.every((script) => isSedRange(script))) return null
   const operands = nonFlags(skipFlagValues(args, ['-e', '-f', '--expression', '--file']))
   if (operands.length === 0) return null
   if (isSedRange(operands[0])) return operands[1] ?? null
   return operands[0] as string
 }
 
-function awkDataFile(args: string[]): string | null {
-  if (args.length === 0) return null
-  const hasScriptFile = args.some((arg) => arg === '-f' || arg === '--file')
-  const operands = nonFlags(
-    skipFlagValues(args, ['-F', '-v', '-f', '--field-separator', '--assign', '--file']),
+const AWK_FLAGS_WITH_VALUES = ['-F', '-v', '--field-separator', '--assign']
+
+// Whether an awk command may write files or run commands: its program
+// redirects output (`print > "out"`), pipes (`|`), calls `system` or
+// `getline`, or loads code (`@load`), or the program comes from a file or
+// an option the command does not show. Comparisons look like redirects, so
+// `awk '$3 > 1' data.csv` shows as the plain command too.
+function awkMayWrite(args: string[]): boolean {
+  if (args.some((arg) => /^-(?:[efilEW]|-(?:exec|file|include|load|source)(?:=|$))/.test(arg)))
+    return true
+  return nonFlags(skipFlagValues(args, AWK_FLAGS_WITH_VALUES)).some((arg) =>
+    /system|getline|[|>@]/.test(arg),
   )
-  if (hasScriptFile) return operands[0] ?? null
-  return operands[1] ?? null
 }
 
-function hasInPlaceFlag(args: string[]): boolean {
-  return args.some(
-    (arg) => arg.startsWith('-i') || arg.startsWith('-pi') || arg.startsWith('--in-place'),
-  )
+function awkDataFile(args: string[]): string | null {
+  return nonFlags(skipFlagValues(args, AWK_FLAGS_WITH_VALUES))[1] ?? null
 }
+
+const hasPreprocessor = (args: string[]): boolean =>
+  args.some((arg) => arg === '--pre' || arg.startsWith('--pre='))
 
 function xargsSubcommand(words: string[]): string[] | null {
   for (let i = 1; i < words.length; i += 1) {
     const word = words[i] as string
     if (word === '--') return words.length > i + 1 ? words.slice(i + 1) : null
     if (!word.startsWith('-')) return words.slice(i)
-    if (['-E', '-e', '-I', '-L', '-n', '-P', '-s'].includes(word)) i += 1
+    // GNU's `-e` and `-i` take only an attached value, so unlike Codex the
+    // word after them is the program, as in `xargs -e rm`.
+    if (['-a', '-d', '-E', '-I', '-L', '-n', '-P', '-s'].includes(word)) i += 1
   }
   return null
 }
 
-function isMutatingXargs(words: string[]): boolean {
+// Programs xargs can run on its input and still only read or print.
+const XARGS_READERS = new Set([
+  'cat',
+  'echo',
+  'egrep',
+  'fgrep',
+  'grep',
+  'head',
+  'ls',
+  'rg',
+  'tail',
+  'wc',
+])
+
+// An xargs that echoes its input or runs a program that only reads. Codex
+// drops any xargs but one that runs an in-place editor; every other program
+// it runs can write too.
+function xargsOnlyReads(words: string[]): boolean {
   const sub = xargsSubcommand(words)
-  if (!sub) return false
-  const [head, ...tail] = sub
-  if (head === 'perl' || head === 'ruby') return hasInPlaceFlag(tail)
-  if (head === 'sed') return sedHasInPlaceFlag(tail)
-  if (head === 'rg') return tail.includes('--replace')
-  return false
+  if (sub === null) return true
+  const [head, ...tail] = sub as [string, ...string[]]
+  return XARGS_READERS.has(head) && !(head === 'rg' && hasPreprocessor(tail))
 }
 
 const isCount = (value: string, allowPlus: boolean): boolean =>
   isDigits(allowPlus && value.startsWith('+') ? value.slice(1) : value)
 
 // Helpers that only format another command's output in a pipeline, such as
-// `wc -l` or `head -n 40`. Variants that name a file stay.
+// `wc -l` or `head -n 40`. Variants that name a file stay, and so do
+// variants that write one, which Codex drops.
 function isSmallFormattingCommand(words: string[]): boolean {
   const [head, ...tail] = words
   switch (head) {
     case 'wc':
     case 'tr':
     case 'cut':
-    case 'sort':
-    case 'uniq':
-    case 'tee':
     case 'column':
     case 'yes':
     case 'printf':
       return true
+    case 'tee':
+      return nonFlags(tail).length === 0
+    case 'sort':
+      // `sort -o out`, also bundled as in `-ro out`.
+      return !tail.some(
+        (arg) =>
+          /^-[^-]*o/.test(arg) ||
+          arg.startsWith('--output') ||
+          arg.startsWith('--compress-program'),
+      )
+    case 'uniq':
+      // `uniq in out` writes `out`.
+      return (
+        positionalOperands(tail, [
+          '-f',
+          '-s',
+          '-w',
+          '--skip-fields',
+          '--skip-chars',
+          '--check-chars',
+        ]).length < 2
+      )
     case 'xargs':
-      return !isMutatingXargs(words)
+      return xargsOnlyReads(words)
     case 'awk':
-      return awkDataFile(tail) === null
+      return !awkMayWrite(tail) && awkDataFile(tail) === null
     case 'head':
     case 'tail': {
       if (tail.length === 0) return true
@@ -347,8 +439,11 @@ function isSmallFormattingCommand(words: string[]): boolean {
       }
       return false
     }
-    case 'sed':
-      return !sedHasInPlaceFlag(tail) && sedReadPath(tail) === null
+    case 'sed': {
+      if (sedHasInPlaceFlag(tail) || sedReadPath(tail) !== null) return false
+      const scripts = sedScripts(tail)
+      return scripts?.every((script) => PLAIN_SED_SCRIPT.test(script)) === true
+    }
     default:
       return false
   }
@@ -442,18 +537,21 @@ const isPathish = (value: string): boolean =>
   value.includes('/') ||
   value.includes('\\')
 
-const PYTHON_WALKS = [
-  'os.walk',
-  'os.listdir',
-  'os.scandir',
-  'glob.glob',
-  'glob.iglob',
-  'pathlib.Path',
-  '.rglob(',
-]
+// Options that make a listing or search tool delete, write files or run
+// another program.
+const WRITING_OPTIONS = new Map<string, RegExp>([
+  ['find', /^-(?:delete|exec|execdir|ok|okdir|fls|fprint|fprint0|fprintf)$/],
+  ['fd', /^(?:--exec(?:-batch)?(?:=|$)|-[^-]*[xX])/],
+  ['rg', /^--pre(?:=|$)/],
+  ['rga', /^--pre(?:=|$)/],
+  ['ripgrep-all', /^--pre(?:=|$)/],
+  ['tree', /^(?:-o|-R$)/],
+])
 
 function summarize({ words, text: command }: ShellCommand): CommandAction {
   const [head, ...tail] = words as [string, ...string[]]
+  const writing = WRITING_OPTIONS.get(head)
+  if (writing && tail.some((arg) => writing.test(arg))) return { type: 'unknown', command }
   switch (head) {
     case 'ls':
       return listFiles(
@@ -524,6 +622,9 @@ function summarize({ words, text: command }: ShellCommand): CommandAction {
     }
     case 'git': {
       const [sub, ...rest] = tail
+      // `git grep -O` opens the matching files in a pager.
+      if (sub === 'grep' && rest.some((arg) => /^(?:-[^-]*O|--open-files-in-pager)/.test(arg)))
+        return { type: 'unknown', command }
       if (sub === 'grep') return grepLike(command, rest)
       if (sub === 'ls-files')
         return listFiles(
@@ -613,7 +714,7 @@ function summarize({ words, text: command }: ShellCommand): CommandAction {
     case 'tail':
       return read(command, headTailReadPath(head, tail))
     case 'awk':
-      return read(command, awkDataFile(tail))
+      return awkMayWrite(tail) ? { type: 'unknown', command } : read(command, awkDataFile(tail))
     case 'nl':
       return read(
         command,
@@ -622,13 +723,9 @@ function summarize({ words, text: command }: ShellCommand): CommandAction {
       )
     case 'sed':
       return read(command, sedReadPath(tail))
+    // Codex lists files for a `python -c` whose code mentions `os.walk` and
+    // the like, whatever else the code does; here it is the plain command.
     default:
-      if (/^python([23](\..*)?)?$/.test(head)) {
-        const flag = tail.indexOf('-c')
-        const code = flag >= 0 ? tail[flag + 1] : undefined
-        if (code !== undefined && PYTHON_WALKS.some((needle) => code.includes(needle)))
-          return listFiles(command, null)
-      }
       return { type: 'unknown', command }
   }
 }
