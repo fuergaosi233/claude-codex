@@ -230,11 +230,13 @@ versioning or publishing metadata.
   Codex answers without a thread. The App uses these to show server names and
   logos and a tool discovery error, and to retry a plugin's servers.
 - Codex's `model_auto_compact_token_limit` now sets the compaction window of
-  Claude threads: from the config a thread starts, resumes or forks with,
-  `config/value/write`, or the user's or a trusted project's `config.toml`,
-  it reaches the Claude CLI as `CLAUDE_CODE_AUTO_COMPACT_WINDOW` (kept within
-  100,000 to 1,000,000 tokens), and `config/read` reports it instead of
-  `null`. Without the key nothing changes. Bridged Claude Code subagents keep
+  Claude threads: from the config a thread starts, resumes or forks with, or
+  `config/value/write`, it reaches the Claude CLI as
+  `CLAUDE_CODE_AUTO_COMPACT_WINDOW` (kept within 100,000 to 1,000,000
+  tokens), and `config/read` reports it instead of `null`. The user's and
+  trusted projects' `config.toml` count only with
+  `CLAUDE_CODEX_CODEX_AUTO_COMPACT=1`, since users set the key there for Codex
+  models. Without the key nothing changes. Bridged Claude Code subagents keep
   their `autoCompactWindow` frontmatter, which used to be dropped.
 
 ### Provider and multi-agent boundaries

@@ -296,13 +296,15 @@ the program, ends it after 30 seconds and writes its stderr to the debug log.
 Summaries and other internal turns, and Codex model threads (whose own Codex
 runs it), do not notify; a project's `.codex/config.toml` cannot set it.
 
-`model_auto_compact_token_limit` needs no switch, since only the user sets it.
-Set in `CODEX_HOME/config.toml`, a trusted project's `.codex/config.toml`, with
-`config/value/write`, or in the config a thread starts with, it becomes Claude
-Code's auto-compact window for Claude threads (`CLAUDE_CODE_AUTO_COMPACT_WINDOW`,
-kept within the 100,000 to 1,000,000 tokens Claude Code takes), winning over
-the window in Claude Code's own settings. Unset, Claude Code keeps its own
-window. See
+`model_auto_compact_token_limit`, set with `config/value/write` or in the config
+a thread starts with, becomes Claude Code's auto-compact window for Claude
+threads (`CLAUDE_CODE_AUTO_COMPACT_WINDOW`, kept within the 100,000 to
+1,000,000 tokens Claude Code takes), winning over the window in Claude Code's
+own settings. With `CLAUDE_CODEX_CODEX_AUTO_COMPACT=1`, the key in
+`CODEX_HOME/config.toml` or a trusted project's `.codex/config.toml` counts
+too. This is off by default because users set that key for Codex models, and
+it would otherwise replace their Claude Code window on every Claude thread.
+Unset, Claude Code keeps its own window. See
 **[Configuration](https://fuergaosi233.github.io/claude-codex/guide/configuration#context-compaction)**.
 
 ### Leader chats

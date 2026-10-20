@@ -115,28 +115,36 @@ export CLAUDE_CODEX_ENABLE_FILE_CHECKPOINTING=1
 ## Context compaction
 
 ```toml
-# CODEX_HOME/config.toml: Claude threads compact their conversation at about
-# this many tokens.
+# CODEX_HOME/config.toml, read for Claude threads only with
+# CLAUDE_CODEX_CODEX_AUTO_COMPACT=1: Claude threads compact their conversation
+# at about this many tokens.
 model_auto_compact_token_limit = 300000
 ```
 
-Codex's `model_auto_compact_token_limit` needs no switch, since only you set it.
-Claude threads take the first of these that sets it:
+Claude threads take Codex's `model_auto_compact_token_limit` from the first of
+these that sets it:
 
 1. the `config` a thread is started, resumed or forked with (kept until the
    adapter restarts, as Codex keeps it; a fork also takes its parent's);
 2. what a client wrote with `config/value/write` or `config/batchWrite`;
-3. the Codex config files: `CODEX_HOME/config.toml`, then the
-   `.codex/config.toml` files of a project Codex trusts, from the repository
-   root down to the thread's folder.
+3. with `CLAUDE_CODEX_CODEX_AUTO_COMPACT=1`, the Codex config files:
+   `CODEX_HOME/config.toml`, then the `.codex/config.toml` files of a project
+   Codex trusts, from the repository root down to the thread's folder.
+
+The files are off by default: you set the key there for Codex models, where
+it is a token count Codex caps at 90% of the model's context window, and it
+would otherwise replace the window of your Claude Code settings on every
+Claude thread.
 
 The limit becomes Claude Code's auto-compact window: the CLI starts with
 `CLAUDE_CODE_AUTO_COMPACT_WINDOW` set to it, kept within the 100,000 to
 1,000,000 tokens Claude Code takes. The CLI compacts a little before the
-window fills, as Codex compacts once the limit is reached. The window wins
-over `autoCompactWindow` in Claude Code's own settings, a window saved with
-`/autocompact`, and a `CLAUDE_CODE_AUTO_COMPACT_WINDOW` the adapter was started
-with. A thread whose window changes starts a new Claude session on its next
+window fills, as Codex compacts once the limit is reached, and caps the window
+at the model's context window, so a larger value compacts once the context is
+nearly full. The window wins over `autoCompactWindow` in Claude Code's own
+settings, a window saved with `/autocompact`, and a
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW` the adapter was started with. A thread
+whose window changes starts a new Claude session on its next
 turn and resumes the conversation in it. Without the key, nothing is set and
 Claude Code keeps its own window. `config/read` reports the window in effect
 for its `cwd`, or `null`. Values that are not a whole number of tokens count as
@@ -243,7 +251,7 @@ The same settings exist as flags: `--ws-auth capability-token|none`,
 | `CLAUDE_CODEX_AGENT_LOOP` | Agent-loop id (`native-claude-code-sdk` or `codex-jsonl-proxy`) mapped only to existing runtime behavior. |
 | `provider_loop_provider` | Saved config key for provider descriptor selection via `config/value/write`. |
 | `provider_loop_agent_loop` | Saved config key for agent-loop selection via `config/value/write`. |
-| `model_auto_compact_token_limit` | Codex config key (thread `config`, `config/value/write`, user or trusted project `config.toml`): the token count Claude threads compact at, as Claude Code's auto-compact window (100,000 to 1,000,000). Unset leaves Claude Code's own window. See [Context compaction](#context-compaction). |
+| `model_auto_compact_token_limit` | Codex config key (thread `config`, `config/value/write`, and with `CLAUDE_CODEX_CODEX_AUTO_COMPACT=1` user or trusted project `config.toml`): the token count Claude threads compact at, as Claude Code's auto-compact window (100,000 to 1,000,000). Unset leaves Claude Code's own window. See [Context compaction](#context-compaction). |
 | `CLAUDE_CODEX_DEFAULT_MODEL` / `_EFFORT` | Defaults for new threads. |
 | `CLAUDE_CODEX_MODELS` | Codex App model picker list. |
 | `CLAUDE_CODEX_CODEX_MODELS` | Codex models the picker offers through the bundled `codex` (comma-separated). Without it the list comes from `model_catalog.json` in `CODEX_HOME`. |
@@ -251,6 +259,7 @@ The same settings exist as flags: `--ws-auth capability-token|none`,
 | `CLAUDE_CODEX_MCP_SERVERS` | MCP server config (JSON or path to a JSON file; a file may wrap the servers in `mcpServers` as `.mcp.json` does). Wins a name over inherited servers. |
 | `CLAUDE_CODEX_CODEX_MCP_SERVERS` | `1` starts the Codex config's `[mcp_servers]` (user `config.toml` and trusted project `.codex/config.toml`) in Claude threads; off otherwise, since the Codex App writes its own desktop servers into that file. See [Inherited configuration](https://github.com/fuergaosi233/claude-codex#inherited-configuration). |
 | `CLAUDE_CODEX_CODEX_NOTIFY` | `1` runs the Codex config's `notify` program when a Claude thread's turn completes; off otherwise, since the Codex App sets `notify` to its own turn-ended program. See [Inherited configuration](https://github.com/fuergaosi233/claude-codex#inherited-configuration). |
+| `CLAUDE_CODEX_CODEX_AUTO_COMPACT` | `1` takes `model_auto_compact_token_limit` from the Codex config files (user `config.toml` and trusted project `.codex/config.toml`) as the auto-compact window of Claude threads; off otherwise, since users set it there for Codex models and it would replace their Claude Code window. See [Context compaction](#context-compaction). |
 | `CLAUDE_CODEX_APP_PLUGIN_MCP` | `1` runs the MCP server of the Codex App's bundled `code-review` plugin for the App's Pull Requests panel calls, from the plugin's folder with a short environment allowlist; a comma-separated list names other plugins instead (`codex-app-tools` and `browser-use` never run). Off otherwise; Claude threads never get these servers. The plugin uses the host's GitHub credentials, such as an existing `gh` login; the adapter passes it no token. See [Pull Requests panel](/guide/gui#pull-requests-panel). |
 | `CLAUDE_CODEX_ALLOWED_TOOLS` | Pre-approved tools. |
 | `CLAUDE_CODEX_ADD_DIRS` | Extra directories exposed to Claude. |

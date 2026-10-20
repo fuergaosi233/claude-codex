@@ -25,7 +25,7 @@ import {
   reasoningEffortOptions,
   reportedClaudeModel,
 } from './claude-models.mjs'
-import { codexConfigValue } from './codex-config.mjs'
+import { codexAutoCompactLimit } from './codex-config.mjs'
 import { runCodexNotify } from './codex-notify.mjs'
 import { appendCommandOutput } from './command-output.mjs'
 import {
@@ -6885,13 +6885,14 @@ export class CodexClaudeAppServer {
 
   // The auto-compact window of a thread's Claude sessions, from the first to
   // set model_auto_compact_token_limit of: the config the thread came with,
-  // what the App wrote with config/value/write, and the Codex config files
-  // for its folder. Null when none does, and Claude Code keeps its own window.
+  // what a client wrote with config/value/write, and, when the user asks for
+  // it, the Codex config files for its folder. Null when none does, and
+  // Claude Code keeps its own window.
   private autoCompactWindowFor(threadId: string | null, cwd: string | null): number | null {
     return autoCompactWindow(
       threadId ? this.threadAutoCompactLimits.get(threadId) : undefined,
       this.configOverrides[AUTO_COMPACT_KEY],
-      codexConfigValue(cwd, AUTO_COMPACT_KEY),
+      codexAutoCompactLimit(cwd),
     )
   }
 
