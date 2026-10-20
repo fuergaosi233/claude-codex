@@ -63,8 +63,29 @@ shows the approval card a Codex chat would:
 
 **Allow for this session** approves the same command, the same tool call, or
 for an MCP tool every call of that tool, for the rest of the thread while the
-adapter runs; it is not saved, and "always allow" is not offered. For an edit it
-approves only that edit.
+adapter runs. For an edit it approves only that edit. It also adds what Claude
+Code offers for the session with the call, such as the folder outside the
+workspace that the call reads or writes in. It never switches the thread's
+permission mode, and it saves nothing.
+
+Claude Code sometimes offers to remember an approval: the "don't ask again"
+choice of its own prompt. The card then offers to save a rule:
+
+- **Allow similar commands**, on a command card, appears when Claude offers a
+  single rule for a shell command. The card shows the command prefix that the
+  rule covers, such as `npm test` for `Bash(npm test *)`.
+- **Always allow**, on an MCP tool card, saves a rule for that tool of that
+  server, `mcp__<server>__<tool>`. Claude Code matches a rule's server name
+  exactly, so the rule covers no other server whose name starts the same way.
+
+Claude Code writes the rule itself, always to the project's uncommitted
+`.claude/settings.local.json`. It never writes to your user settings or to the
+checked-in `.claude/settings.json`. From then on, calls the rule covers run
+without asking, in this chat and in later ones. To be asked again, remove the
+rule from that file. Nothing is saved unless you pick one of these two choices:
+**Allow** and **Allow for this session** save nothing. A card offers neither
+choice for a compound command line, for a call Claude offers no "always allow"
+for, or for a call that only you may answer.
 
 **Decline** refuses the call: its card shows as declined, and Claude is told and
 goes on. **Cancel** refuses it and stops the turn, as the Stop button does. A

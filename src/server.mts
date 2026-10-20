@@ -37,6 +37,12 @@ import {
   readMcpConfig,
   readMcpResource,
 } from './mcp.mjs'
+import {
+  mcpToolAllowRule,
+  savedAllowRules,
+  savedCommandPrefix,
+  sessionApproval,
+} from './permission-suggestions.mjs'
 import { projectInstructions } from './project-instructions.mjs'
 import { projectProviderLoopConfig } from './provider-loop-config.mjs'
 import {
@@ -56,6 +62,7 @@ import {
 import { recordRunEvent } from './run-registry.mjs'
 import { normalizeRuntimeType } from './runtime-config.mjs'
 import {
+  acceptsAmendment,
   addedFileDiff,
   allSelectableModelOptions,
   approvalSessionKey,
@@ -5877,7 +5884,12 @@ export class CodexClaudeAppServer {
     const mcpTool = /^mcp__(.+?)__(.+)$/.exec(event.toolName)
     if (mcpTool) {
       const server = event.mcpServer || mcpTool[1] || ''
-      return this.requestMcpToolApproval(peer, threadId, turnId, event, server, mcpTool[2] ?? '')
+      // A server name may hold `__` itself: the tool is what follows it.
+      const named = `mcp__${server.replace(/[^A-Za-z0-9_-]/g, '_')}__`
+      const tool = event.toolName.startsWith(named)
+        ? event.toolName.slice(named.length)
+        : (mcpTool[2] ?? '')
+      return this.requestMcpToolApproval(peer, threadId, turnId, event, server, tool)
     }
     const sessionKey = approvalSessionKey(event.toolName, event.input)
     if (!userOnly && this.sessionApprovals.get(threadId)?.has(sessionKey))
@@ -5897,6 +5909,15 @@ export class CodexClaudeAppServer {
       ? 'item/fileChange/requestApproval'
       : 'item/commandExecution/requestApproval'
     const blockedPath = event.blockedPath ?? null
+    // App rule: command-approval-amendment
+    // "Allow similar commands" saves the rule Claude offers for a shell
+    // command, shown as the command prefix it covers. The App offers it for
+    // any prefix it gets, so a call without a session choice gets none.
+    const saved =
+      allowSession && !isFileChange && event.toolName === 'Bash'
+        ? savedAllowRules(event.suggestions)
+        : null
+    const prefix = savedCommandPrefix(saved)
     const params = isFileChange
       ? {
           threadId,
@@ -5904,8 +5925,9 @@ export class CodexClaudeAppServer {
           itemId,
           startedAtMs: nowMillis(),
           reason,
-          // The folder outside the workspace the edit asks to write in. The
-          // adapter grants no more than this edit, even for the session.
+          // The folder outside the workspace the edit asks to write in. "For
+          // this session" adds what Claude offers for the session, such as
+          // that folder, but no mode in which edits stop asking.
           grantRoot: blockedPath && isAbsolute(blockedPath) ? dirname(blockedPath) : null,
         }
       : {
@@ -5922,10 +5944,18 @@ export class CodexClaudeAppServer {
           cwd: String(event.input.cwd ?? thread?.cwd ?? ''),
           commandActions: [],
           additionalPermissions: null,
-          proposedExecpolicyAmendment: null,
+          proposedExecpolicyAmendment: prefix,
           proposedNetworkPolicyAmendments: null,
           availableDecisions: allowSession
-            ? ['accept', 'acceptForSession', 'decline', 'cancel']
+            ? [
+                'accept',
+                ...(prefix
+                  ? [{ acceptWithExecpolicyAmendment: { execpolicy_amendment: prefix } }]
+                  : []),
+                'acceptForSession',
+                'decline',
+                'cancel',
+              ]
             : ['accept', 'decline', 'cancel'],
         }
 
@@ -5938,8 +5968,16 @@ export class CodexClaudeAppServer {
     }
     const decision = normalizeDecision(response)
     if (decision === 'acceptForSession' && userOnly) return { decision: 'accept' }
-    if (decision === 'acceptForSession' && !isFileChange && allowSession)
+    // Only the prefix the card showed saves the rule: Claude Code writes it
+    // to the project's local settings and asks no more for what it covers.
+    if (saved && acceptsAmendment(response, prefix)) {
       this.rememberSessionApproval(threadId, sessionKey)
+      return { decision: 'acceptForSession', updatedPermissions: [saved] }
+    }
+    if (decision === 'acceptForSession' && allowSession) {
+      if (!isFileChange) this.rememberSessionApproval(threadId, sessionKey)
+      return sessionApproval(event.suggestions)
+    }
     return { decision }
   }
 
@@ -5951,7 +5989,8 @@ export class CodexClaudeAppServer {
 
   // A Claude MCP tool call asks as a Codex one does: an MCP elicitation the
   // App draws as its tool approval card, with "Allow for this session" when
-  // Claude offers one. "Always allow" is not offered.
+  // Claude offers one, and "Always allow" when Claude also offers to save a
+  // rule for the tool.
   private async requestMcpToolApproval(
     peer: RpcPeer,
     threadId: string,
@@ -5966,6 +6005,10 @@ export class CodexClaudeAppServer {
     if (!userOnly && this.sessionApprovals.get(threadId)?.has(sessionKey))
       return { decision: 'accept' }
     const allowSession = !event.suppressSessionApproval && !userOnly
+    // "Always allow" saves a rule naming this tool of this server alone,
+    // whatever rule Claude offered (see mcpToolAllowRule).
+    const saved =
+      allowSession && savedAllowRules(event.suggestions) ? mcpToolAllowRule(event.toolName) : null
     const reason = event.reason || event.title || null
     let response: Record<string, unknown>
     try {
@@ -5982,7 +6025,7 @@ export class CodexClaudeAppServer {
           requestedSchema: { type: 'object', properties: {} },
           _meta: {
             codex_approval_kind: 'mcp_tool_call',
-            ...(allowSession ? { persist: 'session' } : {}),
+            ...(allowSession ? { persist: saved ? ['session', 'always'] : 'session' } : {}),
             tool_name: tool,
             tool_params: event.input,
             ...(reason ? { reason } : {}),
@@ -5999,9 +6042,13 @@ export class CodexClaudeAppServer {
     const meta = response._meta
     const persist =
       meta && typeof meta === 'object' ? (meta as Record<string, unknown>).persist : null
+    if (saved && persist === 'always') {
+      this.rememberSessionApproval(threadId, sessionKey)
+      return { decision: 'acceptForSession', updatedPermissions: [saved] }
+    }
     if (allowSession && persist === 'session') {
       this.rememberSessionApproval(threadId, sessionKey)
-      return { decision: 'acceptForSession' }
+      return sessionApproval(event.suggestions)
     }
     return { decision: 'accept' }
   }

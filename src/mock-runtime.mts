@@ -1,7 +1,9 @@
 import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type {
+  ClaudePermissionUpdate,
   ClaudeRuntime,
+  PermissionDecision,
   RuntimeBackgroundListener,
   RuntimeHandlers,
   RuntimeLiveTask,
@@ -274,8 +276,8 @@ export class MockRuntime implements ClaudeRuntime {
       // or Full access, skip the permission round-trip and run the tool.
       const autoApprove =
         context.approvalPolicy === 'never' || context.sandboxMode === 'danger-full-access'
-      const decision = autoApprove
-        ? { decision: 'accept' as const }
+      const decision: PermissionDecision = autoApprove
+        ? { decision: 'accept' }
         : await handlers.onPermissionRequest({
             type: 'permission_request',
             requestId: `perm-${toolUseId}`,
@@ -283,10 +285,15 @@ export class MockRuntime implements ClaudeRuntime {
             toolName: 'Bash',
             input: { command: 'echo mock approval' },
             reason: 'mock approval reason',
+            ...(/strict/i.test(context.prompt) ? { suppressSessionApproval: true } : {}),
+            ...(/always allow/i.test(context.prompt)
+              ? { suggestions: mockSuggestions('Bash', 'echo mock *') }
+              : {}),
           })
       if (decision.decision === 'accept' || decision.decision === 'acceptForSession') {
         await handlers.onEvent({ type: 'tool_output_delta', toolUseId, delta: 'mock approval\n' })
         await handlers.onEvent({ type: 'tool_result', toolUseId, content: 'mock approval\n' })
+        await reportPermissionUpdates(handlers, decision)
       } else {
         await handlers.onEvent({
           type: 'tool_result',
@@ -336,8 +343,14 @@ export class MockRuntime implements ClaudeRuntime {
     if (askTool) {
       const kind = (askTool[1] ?? '').toLowerCase()
       const toolUseId = `tool-${Date.now()}`
+      // "server <name>" names the MCP server, "Docs Server" by default.
+      const server = /\bserver (\S+)/i.exec(context.prompt)?.[1] ?? 'Docs Server'
       const toolName =
-        kind === 'mcp' ? 'mcp__Docs_Server__lookup' : kind === 'fetch' ? 'WebFetch' : 'Bash'
+        kind === 'mcp'
+          ? `mcp__${server.replace(/[^A-Za-z0-9_-]/g, '_')}__lookup`
+          : kind === 'fetch'
+            ? 'WebFetch'
+            : 'Bash'
       const input: Record<string, unknown> =
         kind === 'mcp'
           ? { query: 'claude codex' }
@@ -366,8 +379,16 @@ export class MockRuntime implements ClaudeRuntime {
           toolName,
           input,
           reason: 'mock tool reason',
-          ...(kind === 'mcp' ? { mcpServer: 'Docs Server' } : {}),
+          ...(kind === 'mcp' ? { mcpServer: server } : {}),
           ...(/strict/i.test(context.prompt) ? { suppressSessionApproval: true } : {}),
+          ...(/always allow/i.test(context.prompt)
+            ? {
+                suggestions:
+                  kind === 'mcp'
+                    ? mockSuggestions(toolName)
+                    : mockSuggestions(toolName, 'domain:example.com'),
+              }
+            : {}),
         })
         const allowed = decision.decision === 'accept' || decision.decision === 'acceptForSession'
         await handlers.onEvent({
@@ -376,6 +397,7 @@ export class MockRuntime implements ClaudeRuntime {
           content: allowed ? `${toolName} ran` : `${decision.decision} by user`,
           isError: !allowed,
         })
+        if (allowed) await reportPermissionUpdates(handlers, decision)
       }
       await handlers.onEvent({ type: 'text_delta', delta: `${kind} ask done` })
       await handlers.onEvent({ type: 'completed', success: true, result: `${kind} ask done` })
@@ -1274,4 +1296,31 @@ function fileChangeFromPrompt(context: RuntimeTurnContext): {
       /with exactly this content(?: and no extra whitespace)?:\s*([^\n]+)/i,
     )?.[1] ?? 'changed by mock runtime\n'
   return { name, path: join(context.cwd, name), content }
+}
+
+// The permission changes Claude Code offers with a tool's approval when the
+// prompt says "always allow": a rule to save to the project's local
+// settings, and for a web fetch its session choices too, a switch of
+// permission mode among them.
+function mockSuggestions(toolName: string, ruleContent?: string): ClaudePermissionUpdate[] {
+  const rules = [ruleContent ? { toolName, ruleContent } : { toolName }]
+  const saved = { type: 'addRules', rules, behavior: 'allow', destination: 'localSettings' }
+  if (toolName !== 'WebFetch') return [saved]
+  return [
+    saved,
+    { type: 'addRules', rules, behavior: 'allow', destination: 'session' },
+    { type: 'setMode', mode: 'acceptEdits', destination: 'session' },
+  ]
+}
+
+// What an approval has Claude Code apply, as text tests can read.
+async function reportPermissionUpdates(
+  handlers: RuntimeHandlers,
+  decision: PermissionDecision,
+): Promise<void> {
+  if (!decision.updatedPermissions) return
+  await handlers.onEvent({
+    type: 'text_delta',
+    delta: `updatedPermissions=${JSON.stringify(decision.updatedPermissions)}\n`,
+  })
 }

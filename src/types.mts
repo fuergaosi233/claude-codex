@@ -538,6 +538,9 @@ export type RuntimeEvent =
       // card is the tool's own interface, or the ask only shows locally): only
       // the user may answer it, never a policy or an earlier session approval.
       requiresUser?: boolean
+      // The permission changes Claude offers with this approval, the "don't
+      // ask again" choices of its own prompt (see permission-suggestions.mts).
+      suggestions?: ClaudePermissionUpdate[]
     }
   // Claude refused a tool call without asking (a deny rule, a hook, the
   // permission mode). `autoReview` is set when Claude's auto-mode classifier
@@ -661,6 +664,21 @@ export interface ThreadTokenUsage {
 export interface PermissionDecision {
   decision: 'accept' | 'acceptForSession' | 'decline' | 'cancel'
   updatedInput?: Record<string, unknown>
+  // What Claude Code applies as it runs the call: the rule the user chose to
+  // save, or what "for this session" adds for the session.
+  updatedPermissions?: ClaudePermissionUpdate[]
+}
+
+// A change to Claude Code's permission settings (the Agent SDK's
+// PermissionUpdate): rules to add for a tool, folders to add, or a mode, for
+// the session or one of its settings files.
+export interface ClaudePermissionUpdate {
+  type: string
+  destination: string
+  behavior?: string
+  rules?: { toolName: string; ruleContent?: string }[]
+  directories?: string[]
+  mode?: string
 }
 
 export interface RuntimeHandlers {

@@ -201,7 +201,10 @@ Codex approval prompt; the user's rules always count, a project's only once the
 project is trusted (those of a `settings.local.json` the repository supplies
 never), and none in plan mode or a read-only sandbox, where Codex would not let
 those tools run unasked. A user rule's `/path` stays relative to the config
-folder, as in Claude Code. `defaultMode` and `additionalDirectories` are not
+folder, as in Claude Code. A rule saved from an approval card ("Allow similar
+commands", "Always allow"; see [Approvals](docs/guide/gui.md#approvals)) goes
+to the project's `.claude/settings.local.json`, so it counts here once the
+project is trusted. `defaultMode` and `additionalDirectories` are not
 carried over: the Codex approval policy and sandbox decide the mode and the
 folders.
 

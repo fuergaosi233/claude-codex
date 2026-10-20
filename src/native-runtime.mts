@@ -52,6 +52,7 @@ import {
   UPDATE_GOAL_DESCRIPTION,
 } from './goal-prompts.mjs'
 import { echoedUuids, TurnInput, type TurnInputMessage } from './native-turn-input.mjs'
+import { appliedPermissionUpdates, permissionSuggestions } from './permission-suggestions.mjs'
 import { sdkHooks } from './sdk-hooks.mjs'
 import { readTaskResult } from './task-output.mjs'
 import type {
@@ -86,6 +87,11 @@ type Zod = typeof import('zod')
 
 // In-process MCP server carrying Codex's thread-goal tools.
 const GOAL_MCP_SERVER = 'codex_goal'
+// The goal tools by the names Claude calls them, approved without asking.
+// Whole names: a server named `codex_goal__x` has tools that start the same.
+const GOAL_TOOL_NAMES = new Set(
+  ['get_goal', 'create_goal', 'update_goal'].map((tool) => `mcp__${GOAL_MCP_SERVER}__${tool}`),
+)
 
 // What Claude reads back from ExitPlanMode in plan mode. The App shows the
 // plan as a card and asks the user whether to implement it after the turn
@@ -709,12 +715,13 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         mcpServer?: { name: string; source: string }
         suppressAlwaysAllowRule?: boolean
         requiresUserInteraction?: boolean
+        suggestions?: unknown[]
       },
     ): Promise<
-      | { behavior: 'allow'; updatedInput?: unknown }
+      | { behavior: 'allow'; updatedInput?: unknown; updatedPermissions?: unknown[] }
       | { behavior: 'deny'; message: string; interrupt?: boolean }
     > => {
-      if (toolName.startsWith(`mcp__${GOAL_MCP_SERVER}__`)) return { behavior: 'allow' }
+      if (GOAL_TOOL_NAMES.has(toolName)) return { behavior: 'allow' }
       const toolUseId = options.toolUseID || `tool-${newId()}`
       // Claude Code says the user has to answer this ask themselves (the card
       // is the tool's own interface, or its disclosure only shows locally): no
@@ -782,6 +789,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         return { behavior: 'allow' }
 
       const requestId = `${context.threadId}:${context.turnId}:${toolName}:${toolUseId}`
+      const suggestions = permissionSuggestions(options.suggestions)
       // Subagent-aware approval suppression: when Claude is mid-subagent we
       // still want THIS tool to be approved by the user (otherwise nested
       // tools would silently bypass approval). The server-side already
@@ -801,6 +809,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
             mcpServer: options.mcpServer?.name || null,
             ...(options.suppressAlwaysAllowRule ? { suppressSessionApproval: true } : {}),
             ...(userOnly ? { requiresUser: true } : {}),
+            ...(suggestions.length > 0 ? { suggestions } : {}),
           }),
         ).then((d) => {
           // The handler may resolve synchronously via the App's permission
@@ -811,7 +820,18 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       })
 
       if (decision.decision === 'accept' || decision.decision === 'acceptForSession') {
-        return { behavior: 'allow', updatedInput: decision.updatedInput ?? input }
+        // Claude Code applies the permission changes the user chose with the
+        // approval (see permission-suggestions.mts), and writes a rule to
+        // save to the project's local settings itself. A call only the user
+        // may answer grants no more than itself.
+        const updatedPermissions = userOnly
+          ? []
+          : appliedPermissionUpdates(decision.updatedPermissions)
+        return {
+          behavior: 'allow',
+          updatedInput: decision.updatedInput ?? input,
+          ...(updatedPermissions.length > 0 ? { updatedPermissions } : {}),
+        }
       }
       // Cancel stops the turn, as it does for a Codex thread; decline only
       // refuses this call and lets Claude go on.

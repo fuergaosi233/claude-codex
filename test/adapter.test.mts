@@ -6493,6 +6493,209 @@ test('other Claude tools ask as command approvals naming the tool', async () => 
   }
 })
 
+// The permission changes an approval had Claude Code apply, as the mock
+// runtime reports them, or null for none.
+function appliedUpdates(messages: any[]): unknown {
+  const text = messages
+    .filter((message) => message.method === 'item/agentMessage/delta')
+    .map((message) => message.params.delta)
+    .join('')
+  const match = /updatedPermissions=(.+)/.exec(text)
+  return match ? JSON.parse(match[1] ?? 'null') : null
+}
+
+test('"Allow similar commands" saves the Bash rule Claude offers, and only when picked', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  const amendment = (words: string[]) => ({
+    acceptWithExecpolicyAmendment: { execpolicy_amendment: words },
+  })
+  // Asks on a new thread and answers; what Claude Code was told to apply.
+  const answer = async (id: number, prompt: string, decision: unknown) => {
+    const threadId = await startAskingThread(reader, proc, id)
+    sendTurn(proc, id + 1, threadId, prompt)
+    const request = await awaitMessage(
+      reader,
+      (message) => message.method === 'item/commandExecution/requestApproval',
+    )
+    proc.stdin.write(json({ id: request.id, result: { decision } }))
+    const seen: any[] = []
+    await awaitMessage(reader, (message) => message.method === 'turn/completed', seen)
+    assert.equal(completedItem(seen, request.params.itemId)?.status, 'completed')
+    return { threadId, request, updates: appliedUpdates(seen) }
+  }
+  try {
+    // Claude offers to save Bash(echo mock *): the card offers the prefix.
+    let asked: any = null
+    const saved = await answer(1, 'always allow approval bash', amendment(['echo', 'mock']))
+    asked = saved.request
+    assert.deepEqual(asked.params.proposedExecpolicyAmendment, ['echo', 'mock'])
+    assert.deepEqual(asked.params.availableDecisions, [
+      'accept',
+      amendment(['echo', 'mock']),
+      'acceptForSession',
+      'decline',
+      'cancel',
+    ])
+    // Picking it has Claude Code save the rule to the project's local
+    // settings.
+    assert.deepEqual(saved.updates, [
+      {
+        type: 'addRules',
+        rules: [{ toolName: 'Bash', ruleContent: 'echo mock *' }],
+        behavior: 'allow',
+        destination: 'localSettings',
+      },
+    ])
+    // And the thread asks no more for the command.
+    sendTurn(proc, 3, saved.threadId, 'always allow approval bash')
+    const again: any[] = []
+    await awaitMessage(reader, (message) => message.method === 'turn/completed', again)
+    assert.equal(
+      again.some((message) => message.method === 'item/commandExecution/requestApproval'),
+      false,
+    )
+
+    // Approving once or for the session saves nothing, nor does a prefix
+    // other than the one the card showed.
+    assert.equal((await answer(4, 'always allow approval bash', 'accept')).updates, null)
+    assert.equal((await answer(6, 'always allow approval bash', 'acceptForSession')).updates, null)
+    assert.equal((await answer(8, 'always allow approval bash', amendment(['echo']))).updates, null)
+
+    // A call Claude offers no "always allow" for offers nothing to save.
+    const strict = await answer(
+      10,
+      'always allow approval bash strict',
+      amendment(['echo', 'mock']),
+    )
+    assert.equal(strict.request.params.proposedExecpolicyAmendment, null)
+    assert.deepEqual(strict.request.params.availableDecisions, ['accept', 'decline', 'cancel'])
+    assert.equal(strict.updates, null)
+
+    // Nor does a call Claude offers no rule for.
+    const plain = await answer(12, 'please run approval bash', 'acceptForSession')
+    assert.equal(plain.request.params.proposedExecpolicyAmendment, null)
+    assert.equal(plain.updates, null)
+  } finally {
+    await stopProcess(proc)
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('"Allow for this session" adds what Claude offers for the session, no mode switch', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  try {
+    const threadId = await startAskingThread(reader, proc, 1)
+    sendTurn(proc, 2, threadId, 'fetch ask check always allow')
+    const request = await awaitMessage(
+      reader,
+      (message) => message.method === 'item/commandExecution/requestApproval',
+    )
+    // Only a shell command offers a rule to save.
+    assert.equal(request.params.proposedExecpolicyAmendment, null)
+    assert.deepEqual(request.params.availableDecisions, [
+      'accept',
+      'acceptForSession',
+      'decline',
+      'cancel',
+    ])
+    proc.stdin.write(json({ id: request.id, result: { decision: 'acceptForSession' } }))
+    const seen: any[] = []
+    await awaitMessage(reader, (message) => message.method === 'turn/completed', seen)
+    assert.deepEqual(appliedUpdates(seen), [
+      {
+        type: 'addRules',
+        rules: [{ toolName: 'WebFetch', ruleContent: 'domain:example.com' }],
+        behavior: 'allow',
+        destination: 'session',
+      },
+    ])
+  } finally {
+    await stopProcess(proc)
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('"Always allow" on an MCP tool card saves a rule for that tool of that server alone', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  // Asks on the thread and answers; the card and what Claude Code was told
+  // to apply.
+  const answer = async (id: number, threadId: string, prompt: string, result: unknown) => {
+    sendTurn(proc, id, threadId, prompt)
+    const request = await awaitMessage(
+      reader,
+      (message) => message.method === 'mcpServer/elicitation/request',
+    )
+    proc.stdin.write(json({ id: request.id, result }))
+    const seen: any[] = []
+    await awaitMessage(reader, (message) => message.method === 'turn/completed', seen)
+    return { request, updates: appliedUpdates(seen) }
+  }
+  const always = { action: 'accept', content: null, _meta: { persist: 'always' } }
+  try {
+    const threadId = await startAskingThread(reader, proc, 1)
+    const saved = await answer(2, threadId, 'mcp ask check always allow server git', always)
+    assert.equal(saved.request.params.serverName, 'git')
+    assert.equal(saved.request.params._meta.tool_name, 'lookup')
+    assert.deepEqual(saved.request.params._meta.persist, ['session', 'always'])
+    assert.deepEqual(saved.updates, [
+      {
+        type: 'addRules',
+        rules: [{ toolName: 'mcp__git__lookup' }],
+        behavior: 'allow',
+        destination: 'localSettings',
+      },
+    ])
+
+    // Servers whose names start the same are other servers: their tools ask.
+    for (const [id, server] of [
+      [3, 'github'],
+      [4, 'git__hub'],
+    ] as const) {
+      const other = await answer(id, threadId, `mcp ask check always allow server ${server}`, {
+        action: 'decline',
+        content: null,
+      })
+      assert.equal(other.request.params.serverName, server)
+      assert.equal(other.request.params._meta.tool_name, 'lookup')
+      assert.equal(other.updates, null)
+    }
+
+    // "Allow for this session" saves nothing.
+    const sessionThreadId = await startAskingThread(reader, proc, 5)
+    const session = await answer(6, sessionThreadId, 'mcp ask check always allow server git', {
+      action: 'accept',
+      content: null,
+      _meta: { persist: 'session' },
+    })
+    assert.equal(session.updates, null)
+
+    // Without a rule from Claude the card offers the session only, and with
+    // no "always allow" from Claude nothing at all.
+    const plainThreadId = await startAskingThread(reader, proc, 7)
+    const plain = await answer(8, plainThreadId, 'mcp ask check server git', always)
+    assert.equal(plain.request.params._meta.persist, 'session')
+    assert.equal(plain.updates, null)
+    const strictThreadId = await startAskingThread(reader, proc, 9)
+    const strict = await answer(
+      10,
+      strictThreadId,
+      'mcp ask check always allow strict server git',
+      always,
+    )
+    assert.equal('persist' in strict.request.params._meta, false)
+    assert.equal(strict.updates, null)
+  } finally {
+    await stopProcess(proc)
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('a call Claude refuses without asking ends declined', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawnMockAdapter(home)

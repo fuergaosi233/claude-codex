@@ -181,6 +181,11 @@ test('native SDK runtime approves goal tools without shadowing canUseTool', asyn
     { behavior: 'allow' },
   )
   assert.equal((await options.canUseTool('Bash', { command: 'true' }, { signal })).behavior, 'deny')
+  // Only the goal server's own tools: a server whose name starts with it asks.
+  assert.equal(
+    (await options.canUseTool('mcp__codex_goal__x__update_goal', {}, { signal })).behavior,
+    'deny',
+  )
 
   // Plan mode keeps the callback too, and it allows goal bookkeeping there.
   const plan = build({ planMode: true, approvalPolicy: 'never' })
@@ -1984,6 +1989,77 @@ test('native SDK approvals carry why Claude asks and how the user answered', asy
   assert.equal(requests[2].blockedPath, '/repo/notes.md')
   assert.equal(requests[2].mcpServer, 'Docs Server')
   assert.equal(requests[2].suppressSessionApproval, true)
+})
+
+test('native SDK approvals pass on Claude suggestions and apply the changes the user chose', async () => {
+  const runtime = new NativeClaudeRuntime()
+  const requests: any[] = []
+  const decisions: unknown[] = []
+  const context = { threadId: 'thread', turnId: 'turn' }
+  const current = {
+    context,
+    resolved: false,
+    handlers: {
+      onPermissionRequest: async (event: unknown) => {
+        requests.push(event)
+        return decisions.shift()
+      },
+    },
+  }
+  const makeCanUseTool = Reflect.get(runtime, 'makeCanUseTool')
+  const canUseTool = makeCanUseTool.call(runtime, () => ({ current, lastContext: context }))
+  const signal = new AbortController().signal
+  const input = { command: 'npm test' }
+  const local = {
+    type: 'addRules',
+    rules: [{ toolName: 'Bash', ruleContent: 'npm test *' }],
+    behavior: 'allow',
+    destination: 'localSettings',
+  }
+  const session = { type: 'addDirectories', directories: ['/repo/docs'], destination: 'session' }
+  const user = { ...local, destination: 'userSettings' }
+  const project = { ...local, destination: 'projectSettings' }
+
+  // The well-formed suggestions reach the approval; a call without any has
+  // none.
+  decisions.push({ decision: 'accept' })
+  await canUseTool('Bash', input, {
+    toolUseID: 'tool-1',
+    signal,
+    suggestions: [local, null, { type: 'addRules' }, session],
+  })
+  assert.deepEqual(requests[0].suggestions, [local, session])
+  decisions.push({ decision: 'accept' })
+  await canUseTool('Bash', input, { toolUseID: 'tool-2', signal })
+  assert.equal('suggestions' in requests[1], false)
+
+  // Claude Code applies what the user chose, to the project's local settings
+  // and the session only; a plain approval applies nothing.
+  decisions.push({
+    decision: 'acceptForSession',
+    updatedPermissions: [local, user, project, session],
+  })
+  assert.deepEqual(
+    await canUseTool('Bash', input, { toolUseID: 'tool-3', signal, suggestions: [local] }),
+    { behavior: 'allow', updatedInput: input, updatedPermissions: [local, session] },
+  )
+  decisions.push({ decision: 'accept', updatedPermissions: [user] })
+  assert.deepEqual(await canUseTool('Bash', input, { toolUseID: 'tool-4', signal }), {
+    behavior: 'allow',
+    updatedInput: input,
+  })
+
+  // A call only the user may answer grants no more than itself.
+  decisions.push({ decision: 'accept', updatedPermissions: [local] })
+  assert.deepEqual(
+    await canUseTool('Bash', input, {
+      toolUseID: 'tool-5',
+      signal,
+      requiresUserInteraction: true,
+      suggestions: [local],
+    }),
+    { behavior: 'allow', updatedInput: input },
+  )
 })
 
 test('native SDK auto-denials decline the call and say why', async () => {

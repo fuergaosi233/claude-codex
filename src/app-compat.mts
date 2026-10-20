@@ -247,12 +247,20 @@ export const APP_RULES: readonly AppRule[] = [
       'In a Claude chat in the default permissions mode, have Claude fetch a web page: the approval card names WebFetch and the URL, and approving runs it.',
   },
   {
-    id: 'mcp-tool-approval',
-    app: 'Draws an mcpServer/elicitation/request whose _meta.codex_approval_kind is mcp_tool_call as a tool approval card: the message as its title, _meta.reason, the tool_params, and an "Allow for this session" choice when _meta.persist offers session. It answers accept, decline or cancel, with _meta.persist "session" for that choice.',
+    id: 'command-approval-amendment',
+    app: 'Offers "Allow similar commands" on a command approval card whenever proposedExecpolicyAmendment is an array whose words, joined with spaces, hold no line break, whatever availableDecisions lists, with a tooltip naming the prefix. It answers {acceptWithExecpolicyAmendment: {execpolicy_amendment}} with that array.',
     adapter:
-      'Asks for an mcp__<server>__<tool> call with that elicitation, as Codex does for its MCP tools, offering session approval unless Claude offers no "always allow" for the call. "Allow for this session" approves that tool for the rest of the thread in this adapter process; "always" is not offered.',
+      'Proposes the prefix of the one Bash rule Claude offers to save for the command (`npm test *` or `npm test:*` giving ["npm", "test"], an exact-command rule all its words) and null for anything else, a call without a session choice included. Only that answer with that prefix saves the rule: Claude Code writes it to the project\'s .claude/settings.local.json.',
     verify:
-      'Have Claude call a tool of a configured MCP server: the card asks to allow that server to run the tool, and after "Allow for this session" the next call of the tool does not ask.',
+      'In a Claude chat in the default permissions mode, have Claude run `npm test`: the card offers "Allow similar commands" for `npm test`; after picking it the project\'s .claude/settings.local.json allows Bash(npm test *) and the next `npm test -- --watch` does not ask.',
+  },
+  {
+    id: 'mcp-tool-approval',
+    app: 'Draws an mcpServer/elicitation/request whose _meta.codex_approval_kind is mcp_tool_call as a tool approval card: the message as its title, _meta.reason, the tool_params, an "Allow for this session" choice when _meta.persist offers session and an "Always allow" button when it offers always (a string, or an array for both). It answers accept, decline or cancel, with _meta.persist "session" or "always" for those choices.',
+    adapter:
+      'Asks for an mcp__<server>__<tool> call with that elicitation, as Codex does for its MCP tools, offering session approval unless Claude offers no "always allow" for the call, and "always" as well when Claude offers to save a rule. "Allow for this session" approves that tool for the rest of the thread in this adapter process; "Always allow" has Claude Code save a rule naming that tool of that server, mcp__<server>__<tool>, to the project\'s .claude/settings.local.json.',
+    verify:
+      'Have Claude call a tool of a configured MCP server: the card asks to allow that server to run the tool, after "Allow for this session" the next call of the tool does not ask, and after "Always allow" the project\'s .claude/settings.local.json allows mcp__<server>__<tool>.',
   },
   {
     id: 'declined-tool-items',

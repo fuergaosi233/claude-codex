@@ -1049,6 +1049,19 @@ export function normalizeDecision(response: unknown): PermissionDecision['decisi
   return 'decline'
 }
 
+// Whether the App answered with "Allow similar commands" for the prefix the
+// card showed: an acceptWithExecpolicyAmendment decision carrying it.
+export function acceptsAmendment(response: unknown, prefix: string[] | null): boolean {
+  if (!prefix) return false
+  const choice = asRecord(asRecord(response).decision).acceptWithExecpolicyAmendment
+  const words = asRecord(choice).execpolicy_amendment
+  return (
+    Array.isArray(words) &&
+    words.length === prefix.length &&
+    words.every((word, index) => word === prefix[index])
+  )
+}
+
 // What an approval "for this session" covers: a shell command by its exact
 // text, any other tool by its exact input.
 export function approvalSessionKey(toolName: string, input: Record<string, unknown>): string {
