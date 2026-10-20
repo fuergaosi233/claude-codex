@@ -1275,6 +1275,10 @@ export class CodexClaudeAppServer {
     this.store.upsertThread(thread)
     // A fork stays in its parent's project.
     if (parent.projectId) this.store.setThreadProject(id, parent.projectId)
+    // As in Codex, a fork that is kept holds its parent's attachments (the
+    // worktree it ran in, the pull requests opened from it), so
+    // thread/attachmentOwner/list names it too; an ephemeral fork holds none.
+    if (!thread.ephemeral) this.store.copyThreadAttachments(parent.id, id)
     if (forkPoint) {
       this.store.setForkCheckpoint(id, forkPoint)
       this.resumeClaudeAt(id, forkPoint)

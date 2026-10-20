@@ -72,7 +72,7 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 | Filesystem RPCs | Supported | `fs/readFile`, write, metadata, list, remove, copy, watch/unwatch (Codex v2-shaped). |
 | Command/process RPCs | Supported | `command/exec` and `process/spawn` implemented. |
 | Background terminals | Supported | Claude's background Bash shells are listed by `thread/backgroundTerminals/list` and stopped by `terminate`/`clean`. The CLI runs them, so there is no OS pid or usage. |
-| Thread attachments | Supported | `thread/attachment/*` keeps the App's per-thread JSON (archived worktree, linked pull requests). |
+| Thread attachments | Supported | `thread/attachment/*` keeps the App's per-thread JSON (archived worktree, linked pull requests), and `thread/attachmentOwner/list` finds the threads holding one. As in Codex, a fork that is not ephemeral starts with copies of its parent's attachments. |
 | Running-turn settings | Supported | `turn/settings/update` switches the running turn's model and effort in place; the next turn runs on its own settings again. A model must be one `model/list` offers for the thread's backend. The reviewer is always the user, so only `approvalsReviewer: "user"` is accepted, and `summary` and `serviceTier` have no Claude counterpart. The verified App sends only the reviewer, when permissions change during a turn. |
 
 ## Not applicable / unsupported

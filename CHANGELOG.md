@@ -123,6 +123,9 @@ versioning or publishing metadata.
   by thread id and with the `archived` filter; and a request the adapter has
   no case for fails with JSON-RPC `-32601` (method not found), the code the
   App treats as unsupported, instead of the generic `-32000`.
+- As in Codex, a fork that is kept holds the thread attachments its parent
+  held (the worktree, pull requests), so `thread/attachmentOwner/list` names
+  it too and the App keeps a worktree a fork of an archived chat still holds.
 - `npm run check:app-upgrade` also takes an `app.asar` or an extracted App,
   reads the protocol from a codex checkout with `--protocol-source` or skips
   it with `--bundle-only`, and lists every request the App's scripts name that

@@ -478,6 +478,21 @@ test('attachment owners list the threads holding a worktree, by thread id', asyn
     })
     assert.deepEqual(await owners({ cursor: '2' }), { data: [], nextCursor: null })
 
+    // A fork holds what its parent held, as in Codex, so it is an owner too;
+    // an ephemeral fork holds nothing.
+    const { thread: fork } = await server.request('thread/fork', { threadId: first })
+    await server.request('thread/fork', { threadId: first, ephemeral: true })
+    assert.deepEqual(
+      (await owners({ archived: false })).data,
+      [first, fork.id].sort().map((threadId) => ({ threadId, archived: false })),
+    )
+    const held = async (threadId: string | undefined) =>
+      (await server.request('thread/attachment/list', { threadId })).data
+    const [original] = await held(first)
+    const [copy] = await held(fork.id)
+    assert.notEqual(copy.id, original.id)
+    assert.deepEqual({ ...copy, id: original.id }, original)
+
     assert.deepEqual(
       await server.request('thread/attachmentOwner/list', {
         attachmentType: 'worktree',

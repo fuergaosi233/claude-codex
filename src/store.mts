@@ -17,7 +17,7 @@ import type {
   TurnRecord,
   TurnStatus,
 } from './types.mjs'
-import { adapterHome, jsonClone, nowSeconds } from './util.mjs'
+import { adapterHome, jsonClone, newId, nowSeconds } from './util.mjs'
 
 const require = createRequire(import.meta.url)
 
@@ -940,6 +940,30 @@ export class SessionStore {
       archived: unknown
     }>
     return rows.map((row) => ({ threadId: row.thread_id, archived: Number(row.archived) === 1 }))
+  }
+
+  // A fork holds what its parent held when it forked, as in Codex: each
+  // attachment is copied with its type, key, payload and time under a new id.
+  copyThreadAttachments(fromThreadId: string, toThreadId: string): void {
+    this.transaction(() => {
+      const rows = this.db
+        .prepare('SELECT * FROM thread_attachments WHERE thread_id = ? ORDER BY created_at, rowid')
+        .all(fromThreadId) as Array<Record<string, unknown>>
+      const insert = this.db.prepare(
+        `INSERT OR IGNORE INTO thread_attachments
+           (id, thread_id, attachment_type, identity_key, payload_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      for (const row of rows)
+        insert.run(
+          newId(),
+          toThreadId,
+          row.attachment_type,
+          row.identity_key,
+          row.payload_json,
+          row.created_at,
+        )
+    })
   }
 
   // Returns the removed attachment, or null when there was none.
