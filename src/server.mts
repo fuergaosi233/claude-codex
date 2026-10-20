@@ -3780,8 +3780,9 @@ export class CodexClaudeAppServer {
             const subType =
               typeof event.input.subagent_type === 'string' ? event.input.subagent_type : null
             // A fork runs on its parent's model and effort; Claude ignores
-            // the Agent tool's model and effort inputs for it.
-            const forkSubagent = subType === 'fork'
+            // the Agent tool's model and effort inputs for it. Claude matches
+            // the agent type ignoring case.
+            const forkSubagent = subType?.trim().toLowerCase() === 'fork'
             const subagentModel =
               !forkSubagent && typeof event.input.model === 'string'
                 ? event.input.model

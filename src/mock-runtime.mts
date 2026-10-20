@@ -865,9 +865,11 @@ export class MockRuntime implements ClaudeRuntime {
       // the same: Claude ignores both inputs for a fork.
       const ownId = `task-own-${Date.now()}`
       const forkId = `task-fork-${Date.now()}`
+      const namedForkId = `task-named-fork-${Date.now()}`
       for (const [toolUseId, input] of [
         [ownId, { prompt: 'own agent', subagent_type: 'reviewer', model: 'opus', effort: 'max' }],
         [forkId, { prompt: 'fork agent', subagent_type: 'fork', model: 'haiku', effort: 'low' }],
+        [namedForkId, { prompt: 'named fork', subagent_type: 'Fork', model: 'haiku' }],
       ] as const) {
         await handlers.onEvent({ type: 'tool_use', toolUseId, toolName: 'Agent', input })
         await handlers.onEvent({

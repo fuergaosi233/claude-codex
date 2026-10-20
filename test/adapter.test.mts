@@ -5606,6 +5606,8 @@ test("the spawn card shows an agent's own model and effort, and a fork's parent 
     assert.equal(fork?.model, start.model, "a fork runs on its parent's model")
     assert.notEqual(fork?.model, 'haiku')
     assert.equal(fork?.reasoningEffort, 'medium', "a fork runs at its parent's effort")
+    // Claude matches the agent type ignoring case.
+    assert.equal(spawned('named fork')?.model, start.model)
 
     proc.stdin.write(
       json({ id: 3, method: 'thread/read', params: { threadId: fork?.receiverThreadIds[0] } }),
