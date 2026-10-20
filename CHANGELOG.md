@@ -131,7 +131,8 @@ versioning or publishing metadata.
   `codexErrorInfo` code from the CLI's terminal reason, error category and
   HTTP status (`serverOverloaded` for a 529, `contextWindowExceeded`,
   `rateLimitExceeded`, ...), never one the App answers with a ChatGPT account
-  flow. CLI notifications of high or immediate priority show as warnings.
+  flow. CLI notifications of high or immediate priority go out as `warning`
+  notifications, which the App opts out of, as it does with Codex.
 - Claude chats show their branch in the App sidebar. Threads carry Codex
   `gitInfo` (commit, branch, and the `origin` remote without credentials),
   looked up after `thread/start`, when a thread without it resumes and when a
@@ -147,10 +148,23 @@ versioning or publishing metadata.
 - Notifications a client opts out of in `initialize`
   (`capabilities.optOutNotificationMethods`) are no longer sent to it. The App
   opts out of `turn/diff/updated`, so its threads also skip the whole-tree
-  `git diff` after every tool call.
+  `git diff` after every tool call. It also opts out of `warning`,
+  `thread/compacted`, `thread/closed`, `project/changed`,
+  `thread/project/updated` and `command/exec/outputDelta`, which it no longer
+  receives from the adapter, as from Codex.
 - `config/read` reports `web_search = "live"` instead of `"disabled"`, matching
   the web search `modelProvider/capabilities/read` advertises;
   `CLAUDE_CODEX_WEBSEARCH=0` turns both off.
+- Claude's file exploration folds into the App's "Explored" row, as Codex's
+  does. Read, Grep, Glob and LS calls are command items named after the tool
+  (`Read src/app.ts`) with Codex `read`, `search` and `listFiles` command
+  actions, and a Bash command that only reads, lists or searches files gets
+  its actions from a port of Codex's command parser. The App keeps the first
+  30,000 characters of their output; Claude still gets all of it. A Read of
+  an image is an `imageView`, WebFetch a `webSearch` item opening the page,
+  and an MCP tool names its server, split by the turn's configured server
+  names. A Read, Grep, Glob or LS call Claude Code asks about asks on the
+  command card, and only a Bash command can be allowed for the session.
 
 ### Provider and multi-agent boundaries
 

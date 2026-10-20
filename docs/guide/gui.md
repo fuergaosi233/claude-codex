@@ -74,7 +74,9 @@ authentication or billing failure shows its message instead of a ChatGPT plan
 upgrade or sign-in prompt.
 
 Notices the Claude CLI would show an interactive user at once, such as a
-failed compaction, show as warnings, each once a turn.
+failed compaction, go out as `warning` notifications, each once a turn. The
+Codex App opts out of `warning` notifications in `initialize`, as it does with
+Codex, so it does not show them; other clients do get them.
 
 ## The context gauge
 

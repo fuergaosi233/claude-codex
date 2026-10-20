@@ -19,6 +19,10 @@ Adapter internals. All files are `.mts` ESM, compiled to `dist/*.mjs`. See the
 - `worktree.mts` — optional per-thread git worktree isolation.
 - `git-info.mts` — a thread's Codex `gitInfo`: cached lookups and remote URL
   sanitizing.
+- `tool-items.mts` — how Claude's Read, Grep, Glob, LS, image and MCP tool
+  calls show as Codex items.
+- `command-actions.mts` — a port of Codex's `parse_command`: the command
+  actions that fold a read-only Bash command into the App's "Explored" row.
 
 ## Runtime backends
 
