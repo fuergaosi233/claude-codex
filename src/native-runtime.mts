@@ -52,6 +52,7 @@ import {
   GET_GOAL_DESCRIPTION,
   UPDATE_GOAL_DESCRIPTION,
 } from './goal-prompts.mjs'
+import { resolveClaudeModelProcess } from './model-profiles.mjs'
 import { echoedUuids, TurnInput, type TurnInputMessage } from './native-turn-input.mjs'
 import { sdkHooks } from './sdk-hooks.mjs'
 import { readTaskResult } from './task-output.mjs'
@@ -176,6 +177,9 @@ interface LiveSession {
   reusable: boolean
   signature: string
   lastContext: RuntimeTurnContext
+  // The environment the CLI runs with: its CLAUDE_CONFIG_DIR is where the
+  // session's transcripts live (a model process profile has its own).
+  transcriptEnv: NodeJS.ProcessEnv
   model: string | null
   effort: string | null
   permissionMode: string
@@ -586,9 +590,26 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       includeHookEvents: true,
       cwd: context.cwd,
     }
-    if (context.model) opts.model = context.model
+    // With model process profiles configured, every Claude turn runs in its
+    // profile's process: its own executable, provider env and config dir.
+    const modelProcess = resolveClaudeModelProcess(
+      context.modelProfileId,
+      process.env,
+      context.modelProfileFingerprint ?? null,
+    )
+    if (modelProcess) {
+      opts.model = modelProcess.sdkModel
+      opts.env = modelProcess.env
+      if (modelProcess.executable) opts.pathToClaudeCodeExecutable = modelProcess.executable
+    } else if (context.model) {
+      opts.model = context.model
+    }
     if (context.effort) opts.effort = context.effort
-    const resume = sdkResumeSessionId(context.claudeSessionId, context.cwd)
+    const resume = sdkResumeSessionId(
+      context.claudeSessionId,
+      context.cwd,
+      modelProcess ? defaultWorkflowTranscriptRoots(modelProcess.env, context.cwd)[0] : undefined,
+    )
     if (resume) opts.resume = resume
     if (resume && context.forkSession) opts.forkSession = true
     // A rewound thread continues from one of its own checkpoints. Forking
@@ -604,7 +625,10 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }
     // session_state_changed tells a session that outlives its turn when the
     // CLI has finished answering everything queued (see maybeRelease).
-    opts.env = { ...process.env, CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1' }
+    opts.env = {
+      ...((opts.env as NodeJS.ProcessEnv | undefined) ?? process.env),
+      CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1',
+    }
     // A forked thread resumes a transcript that opens with its parent's
     // history. Left alone, the CLI would schedule the parent's session cron
     // jobs a second time and report the parent's background tasks as its own
@@ -696,7 +720,9 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }
 
     // CLI binary override (for users pinning a specific claude-code build).
-    if (process.env.CLAUDE_CODEX_CLI) opts.pathToClaudeCodeExecutable = process.env.CLAUDE_CODEX_CLI
+    // A model process profile names its own executable instead.
+    if (!modelProcess && process.env.CLAUDE_CODEX_CLI)
+      opts.pathToClaudeCodeExecutable = process.env.CLAUDE_CODEX_CLI
 
     void sdk // keep parameter referenced for future SDK-version-gated options
     return opts
@@ -845,6 +871,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         reusable,
         signature: sessionSignature(context),
         lastContext: context,
+        transcriptEnv: process.env,
         model: context.model,
         effort: context.effort ?? null,
         permissionMode: derivePermissionMode(
@@ -896,7 +923,14 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   private startCli(sdk: ClaudeSdk, session: LiveSession): void {
     const context = session.lastContext
     const options = this.buildOptions(sdk, context, session.abort, () => session)
-    if (session.reusable) this.trackCronJobs(context, options)
+    session.transcriptEnv = (options.env as NodeJS.ProcessEnv | undefined) ?? process.env
+    if (session.reusable) this.trackCronJobs(context, options, session.transcriptEnv)
+    if (session.current) {
+      session.current.workflowTranscriptRoots = defaultWorkflowTranscriptRoots(
+        session.transcriptEnv,
+        session.current.context.cwd,
+      )
+    }
     session.query = sdk.query({ prompt: session.input, options })
   }
 
@@ -1048,7 +1082,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       completedWorkflowTasks: new Set(),
       workflowToolUseIds: new Set(),
       workflowLaunches: new Map(),
-      workflowTranscriptRoots: defaultWorkflowTranscriptRoots(process.env, context.cwd),
+      workflowTranscriptRoots: defaultWorkflowTranscriptRoots(session.transcriptEnv, context.cwd),
       skippedWorkflowTaskIds: new Set(),
       workflowTasks: new Map(),
       toolStartSeen: new Set(),
@@ -1070,7 +1104,14 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       setPermissionMode?: (mode: string) => Promise<void>
       applyFlagSettings?: (settings: { effortLevel?: string | null }) => Promise<void>
     }
-    if (context.model && context.model !== session.model && query.setModel) {
+    // A model process profile pins the model with its process (see
+    // sessionSignature); only a plain session switches models in place.
+    if (
+      !context.modelProfileId &&
+      context.model &&
+      context.model !== session.model &&
+      query.setModel
+    ) {
       session.model = context.model
       await settlesWithin(
         query.setModel(context.model).catch(() => {}),
@@ -1459,12 +1500,16 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   // What a new session starts with: nothing for a fresh Claude session, the
   // jobs tracked so far when it resumes the session this thread last ran,
   // and otherwise what the transcript it resumes still holds.
-  private trackCronJobs(context: RuntimeTurnContext, options: Record<string, unknown>): void {
+  private trackCronJobs(
+    context: RuntimeTurnContext,
+    options: Record<string, unknown>,
+    env: NodeJS.ProcessEnv,
+  ): void {
     const resume = stringOrNull(options.resume)
     const known = this.cronJobs.get(context.threadId)
     if (resume && known && known.sessionId === resume && options.forkSession !== true) return
     const jobs = new CronJobs()
-    const file = resume ? sessionTranscriptFile(resume, context.cwd) : null
+    const file = resume ? sessionTranscriptFile(resume, context.cwd, env) : null
     if (file) {
       try {
         jobs.scanTranscript(
@@ -2915,6 +2960,8 @@ function sessionSignature(context: RuntimeTurnContext): string {
     parseWorkflowCommand(context.prompt)?.type === 'run',
     context.planMode === true,
     configuredPermissionMode(),
+    context.modelProfileId ?? null,
+    context.modelProfileFingerprint ?? null,
   ])
 }
 
@@ -2939,8 +2986,12 @@ function truthyEnv(value: string | undefined): boolean {
 
 // The transcript the CLI resumes: its config directory, under the project
 // directory named after the session's cwd.
-function sessionTranscriptFile(sessionId: string, cwd: string): string | null {
-  const root = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')
+function sessionTranscriptFile(
+  sessionId: string,
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+): string | null {
+  const root = env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')
   const dirs = [cwd]
   try {
     const real = realpathSync(cwd)
@@ -2972,7 +3023,14 @@ function stringOrNull(value: unknown): string | null {
   return typeof value === 'string' && value.length > 0 ? value : null
 }
 
-export function sdkResumeSessionId(value: string | null, cwd?: string): string | null {
+// `configRoot` pins the lookup to one Claude config dir (a model process
+// profile's CLAUDE_CONFIG_DIR): its transcripts are only resumed from there and
+// never mirrored into other roots.
+export function sdkResumeSessionId(
+  value: string | null,
+  cwd?: string,
+  configRoot?: string,
+): string | null {
   if (!value) return null
   if (/^(agent-http|agentapi|claude-p):/.test(value)) return null
   if (cwd) {
@@ -2985,19 +3043,21 @@ export function sdkResumeSessionId(value: string | null, cwd?: string): string |
     } catch {}
 
     // Discover all candidate config directories (default ~/.claude plus any custom router / multi-model roots)
-    const configRoots = new Set<string>([join(home, '.claude')])
-    if (process.env.CLAUDE_CONFIG_DIR) configRoots.add(process.env.CLAUDE_CONFIG_DIR)
-    const extraRoots = (process.env.CLAUDE_CONFIG_DIRS || process.env.CLAUDE_ROUTER_DIR || '')
-      .split(/[,:]/)
-      .map((p) => p.trim())
-      .filter(Boolean)
+    const configRoots = new Set<string>([configRoot ?? join(home, '.claude')])
+    if (!configRoot && process.env.CLAUDE_CONFIG_DIR) configRoots.add(process.env.CLAUDE_CONFIG_DIR)
+    const extraRoots = configRoot
+      ? []
+      : (process.env.CLAUDE_CONFIG_DIRS || process.env.CLAUDE_ROUTER_DIR || '')
+          .split(/[,:]/)
+          .map((p) => p.trim())
+          .filter(Boolean)
     for (const extra of extraRoots) {
       if (existsSync(extra)) configRoots.add(extra)
     }
 
     // Generic discovery of cached multi-model router config workspaces under ~/.cache/*/claude-router
     const cacheBase = join(home, '.cache')
-    if (existsSync(cacheBase)) {
+    if (!configRoot && existsSync(cacheBase)) {
       try {
         for (const sub of readdirSync(cacheBase)) {
           const routerDir = join(cacheBase, sub, 'claude-router')

@@ -24,7 +24,11 @@ Codex App's model menu stays a **model selector** only — pick `Claude Sonnet`,
 The default picker exposes Claude Code aliases; model availability and the version
 an alias selects depend on your account, provider, and Claude Code version. The
 list is not an account entitlement check. `CLAUDE_CODEX_MODELS` replaces the
-default Claude list when you need to customize it.
+default Claude list when you need to customize it. With
+[model process profiles](/guide/configuration#model-process-profiles), the
+Claude list is the profiles, each running its own Claude Code; a chat then
+keeps its profile once it has a conversation, and picking another one asks for
+a new chat.
 
 Each Claude model offers the reasoning efforts Claude Code reports for it:
 **Max** on the models that take it, and no effort levels on Claude Haiku. Claude

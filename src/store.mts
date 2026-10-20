@@ -201,6 +201,8 @@ export class SessionStore {
     this.ensureColumn('turns', 'claude_message_uuid', 'TEXT')
     // Project membership; written only by setThreadProject and deleteProject.
     this.ensureColumn('threads', 'project_id', 'TEXT')
+    // Model process profile identity a thread is pinned to (model-profiles.mts).
+    this.ensureColumn('threads', 'model_profile_fingerprint', 'TEXT')
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_threads_project ON threads(project_id)')
     this.ensurePinnedSection()
     this.migrateLegacyPinState()
@@ -287,13 +289,13 @@ export class SessionStore {
       .prepare(`
         INSERT INTO threads (
           id, session_id, forked_from_id, is_pinned, section_id, section_entered_at, section_position,
-          preview, name, archived, cwd, model, reasoning_effort, model_provider, claude_session_id,
+          preview, name, archived, cwd, model, model_profile_fingerprint, reasoning_effort, model_provider, claude_session_id,
           source, created_at, updated_at, status_json,
           approval_policy, sandbox_mode, permission_profile_id, ephemeral, thread_source, agent_role, agent_nickname,
           base_instructions, developer_instructions, personality, runtime_backend, codex_session_id
         ) VALUES (
           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         ON CONFLICT(id) DO UPDATE SET
           session_id=excluded.session_id,
@@ -307,6 +309,7 @@ export class SessionStore {
           archived=excluded.archived,
           cwd=excluded.cwd,
           model=excluded.model,
+          model_profile_fingerprint=excluded.model_profile_fingerprint,
           reasoning_effort=excluded.reasoning_effort,
           model_provider=excluded.model_provider,
           claude_session_id=excluded.claude_session_id,
@@ -339,6 +342,7 @@ export class SessionStore {
         thread.archived ? 1 : 0,
         thread.cwd,
         thread.model,
+        thread.modelProfileFingerprint ?? null,
         thread.reasoningEffort,
         thread.modelProvider,
         thread.claudeSessionId,
@@ -1460,6 +1464,8 @@ export class SessionStore {
       archived: Number(row.archived) === 1,
       cwd: String(row.cwd),
       model: String(row.model),
+      modelProfileFingerprint:
+        row.model_profile_fingerprint == null ? null : String(row.model_profile_fingerprint),
       reasoningEffort: row.reasoning_effort == null ? null : String(row.reasoning_effort),
       modelProvider: String(row.model_provider),
       claudeSessionId: row.claude_session_id == null ? null : String(row.claude_session_id),

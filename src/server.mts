@@ -42,6 +42,11 @@ import {
   readMcpConfig,
   readMcpResource,
 } from './mcp.mjs'
+import {
+  assertModelProfileTransition,
+  modelProfileFingerprint,
+  resolveClaudeModelProfile,
+} from './model-profiles.mjs'
 import { projectInstructions } from './project-instructions.mjs'
 import { projectProviderLoopConfig } from './provider-loop-config.mjs'
 import {
@@ -194,6 +199,7 @@ import {
   platformOs,
   resolveClaudeEffort,
   resolveClaudeModel,
+  resolveClaudeSummaryModelIdentity,
   sleep,
   textFromInput,
   threadVisualizationDir,
@@ -394,11 +400,47 @@ function turnItemsView(value: unknown): TurnItemsView {
   return 'summary'
 }
 
+// The model process profile fingerprint a thread on `model` pins (see
+// model-profiles.mts): null for Codex threads and when no profiles exist.
+function profileFingerprintForModel(
+  model: string,
+  runtimeBackend: ThreadRecord['runtimeBackend'],
+): string | null {
+  if (runtimeBackend === 'codex') return null
+  return modelProfileFingerprint(model)
+}
+
 // The Claude model a helper thread runs on in place of a Codex model: the
-// summary model.
+// summary profile when model profiles are configured, else the summary model.
 // App rule: helper-thread-model
 function claudeHelperModel(model: string): string {
-  return resolveClaudeModel(model, 'summary') ?? model
+  const summary = resolveClaudeSummaryModelIdentity(model)
+  return summary.modelProfileId ?? summary.model ?? model
+}
+
+// A Claude thread's session lives in its model process profile (executable,
+// provider, CLAUDE_CONFIG_DIR). Refuse to continue it once that profile is
+// gone or its configuration changed, instead of resuming somewhere else.
+function assertThreadModelProfileBinding(thread: ThreadRecord): void {
+  if (thread.runtimeBackend !== 'claude') return
+  const pinned = thread.modelProfileFingerprint ?? null
+  const currentFingerprint = modelProfileFingerprint(thread.model)
+  if (currentFingerprint === null) {
+    if (pinned !== null) {
+      throw new Error('model process profiles are no longer configured; start a new thread')
+    }
+    return
+  }
+  if (pinned === null) {
+    throw new Error(
+      `thread ${thread.id} predates model process profile identity pinning; start a new thread`,
+    )
+  }
+  if (currentFingerprint !== pinned) {
+    throw new Error(
+      `model process profile configuration changed for ${thread.model}; start a new thread`,
+    )
+  }
 }
 
 // A Codex model with Codex routing off has nowhere to run.
@@ -1047,12 +1089,22 @@ export class CodexClaudeAppServer {
     // Any other thread on a Codex model has nowhere to run, and the picker
     // offers none: refuse it before a worktree is made for it.
     if (codexRoutingDisabled && isCodexOpenAiModel(model)) throw codexRoutingDisabledError(model)
+    const selectedProviderLoop = resolveProviderLoopSelection(this.providerLoopSelectionInput())
+    // Pick the runtime backend from the chosen model — picking gpt-* in
+    // the App's model dropdown flips the new thread to runtimeBackend
+    // 'codex' so turns get forwarded to `codex exec`. Default 'claude'.
+    const runtimeBackend: ThreadRecord['runtimeBackend'] =
+      selectedProviderLoop.runtimeType === 'codex-proxy' || isCodexOpenAiModel(model)
+        ? 'codex'
+        : 'claude'
+    // Resolved before any side effect so a misconfigured model process profile
+    // fails the request without leaving a worktree behind.
+    const profileFingerprint = profileFingerprintForModel(model, runtimeBackend)
     const requestedCwd = stringOr(params.cwd, process.cwd())
     const cwd = maybeCreateThreadWorktree(id, requestedCwd).cwd
     const reasoningEffort = reasoningEffortFromParams(params, this.configReasoningEffort)
     const permissionProfileId = permissionProfileIdFromParams(params)
     const permissionProfile = permissionProfilePolicy(permissionProfileId)
-    const selectedProviderLoop = resolveProviderLoopSelection(this.providerLoopSelectionInput())
     const thread: ThreadRecord = {
       id,
       sessionId: id,
@@ -1066,6 +1118,7 @@ export class CodexClaudeAppServer {
       archived: false,
       cwd,
       model,
+      modelProfileFingerprint: profileFingerprint,
       reasoningEffort,
       modelProvider: 'claude-code',
       claudeSessionId: null,
@@ -1097,13 +1150,7 @@ export class CodexClaudeAppServer {
         typeof params.developerInstructions === 'string' ? params.developerInstructions : null,
       ),
       personality: normalizePersonality(params.personality),
-      // Pick the runtime backend from the chosen model — picking gpt-* in
-      // the App's model dropdown flips the new thread to runtimeBackend
-      // 'codex' so turns get forwarded to `codex exec`. Default 'claude'.
-      runtimeBackend:
-        selectedProviderLoop.runtimeType === 'codex-proxy' || isCodexOpenAiModel(model)
-          ? 'codex'
-          : 'claude',
+      runtimeBackend,
       codexSessionId: null,
       projectId,
     }
@@ -1126,6 +1173,7 @@ export class CodexClaudeAppServer {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
     if (!thread) throw new Error('unknown thread: ' + threadId)
+    this.checkModelProfileBinding(thread)
     if (typeof params.cwd === 'string' && params.cwd.length > 0) thread.cwd = params.cwd
     const rawModel = modelFromParams(params, null)
     const model = rawModel ? normalizeSelectableModelId(rawModel, thread.model) : null
@@ -1139,7 +1187,21 @@ export class CodexClaudeAppServer {
       // still rebind same-backend models (e.g. sonnet → opus).
       const newBackend = isCodexOpenAiModel(model) ? 'codex' : 'claude'
       if (newBackend === thread.runtimeBackend) {
-        thread.model = model
+        // A Claude conversation also stays on its model process profile; the
+        // picker's choice is ignored rather than failing the resume.
+        try {
+          if (newBackend === 'claude' && this.threadHasConversation(thread))
+            assertModelProfileTransition(thread.model, model)
+          thread.modelProfileFingerprint = profileFingerprintForModel(model, newBackend)
+          thread.model = model
+        } catch (error) {
+          debugLog('thread.resume.modelProfileMismatch', {
+            threadId,
+            oldModel: thread.model,
+            newModel: model,
+            message: error instanceof Error ? error.message : String(error),
+          })
+        }
       } else {
         debugLog('thread.resume.modelBackendMismatch', {
           threadId,
@@ -1192,18 +1254,20 @@ export class CodexClaudeAppServer {
     const parentId = stringOr(params.threadId, '')
     const parent = this.store.getThread(parentId)
     if (!parent) throw new Error(`unknown thread: ${parentId}`)
+    this.checkModelProfileBinding(parent)
     const now = nowSeconds()
     const id = newThreadId()
     const requestedModel = modelFromParams(params, parent.model)
     // The App describes a thread in an ephemeral fork named for its own
-    // summary model. With Codex routing off, the fork of a Claude thread stays
-    // on its model.
+    // summary model. A thread on a model process profile cannot leave it, so
+    // that fork stays on the profile, and so does its summary turn. With Codex
+    // routing off, the fork of any Claude thread stays on its model.
     // App rule: helper-thread-model
     const forkModel =
       params.ephemeral === true &&
       parent.runtimeBackend === 'claude' &&
       isCodexOpenAiModel(requestedModel) &&
-      this.codexRoutingDisabled()
+      (resolveClaudeModelProfile(parent.model) || this.codexRoutingDisabled())
         ? parent.model
         : requestedModel
     // Fork: model may flip backend (forking from claude-thread with a
@@ -1211,6 +1275,12 @@ export class CodexClaudeAppServer {
     const runtimeBackend: ThreadRecord['runtimeBackend'] = isCodexOpenAiModel(forkModel)
       ? 'codex'
       : 'claude'
+    // The fork carries the parent's conversation, which lives in the
+    // parent's model process profile.
+    if (parent.runtimeBackend === 'claude' || runtimeBackend === 'claude') {
+      assertModelProfileTransition(parent.model, forkModel)
+    }
+    const profileFingerprint = profileFingerprintForModel(forkModel, runtimeBackend)
     const requestedCwd = stringOr(params.cwd, parent.cwd)
     const cwd = maybeCreateThreadWorktree(id, requestedCwd).cwd
     const forkPoint = runtimeBackend === 'claude' ? this.forkPointOf(parent) : null
@@ -1226,6 +1296,7 @@ export class CodexClaudeAppServer {
       archived: false,
       cwd,
       model: forkModel,
+      modelProfileFingerprint: profileFingerprint,
       reasoningEffort: reasoningEffortFromParams(params, parent.reasoningEffort),
       claudeSessionId: forkPoint?.sessionId ?? parent.claudeSessionId,
       createdAt: now,
@@ -2701,6 +2772,8 @@ export class CodexClaudeAppServer {
       const backend = isCodexOpenAiModel(model) ? 'codex' : 'claude'
       if (backend !== thread.runtimeBackend)
         throw new Error(`a running ${thread.runtimeBackend} turn cannot switch to ${model}`)
+      // The running turn's process belongs to its model process profile.
+      if (backend === 'claude') assertModelProfileTransition(thread.model, model)
       const resolved = backend === 'codex' ? model : resolveClaudeModel(model)
       if (resolved) settings.model = resolved
     }
@@ -2766,6 +2839,7 @@ export class CodexClaudeAppServer {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
     if (!thread) throw new Error(`unknown thread: ${threadId}`)
+    this.checkModelProfileBinding(thread)
     this.subscribe(threadId, peer)
     const turnId = newId()
     const review = reviewLabel(params.target)
@@ -2835,6 +2909,7 @@ export class CodexClaudeAppServer {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
     if (!thread) throw new Error(`unknown thread: ${threadId}`)
+    this.checkModelProfileBinding(thread)
     const turnId = newId()
     const compactItem: ThreadItem = { type: 'contextCompaction', id: newId() }
     const turn: TurnRecord = {
@@ -2957,6 +3032,12 @@ export class CodexClaudeAppServer {
     ].join('\n')
 
     let collected = ''
+    // A thread on a model process profile summarizes in that profile's
+    // process; any other thread on the summary model (or its profile).
+    const summaryModel = resolveClaudeSummaryModelIdentity(
+      thread.model,
+      thread.modelProfileFingerprint ?? null,
+    )
     await this.runtime.runTurn(
       {
         threadId: thread.id,
@@ -2965,7 +3046,9 @@ export class CodexClaudeAppServer {
         prompt: compactPrompt,
         cwd: thread.cwd,
         runtimeType: null,
-        model: resolveClaudeModel(thread.model, 'summary'),
+        model: summaryModel.model,
+        modelProfileId: summaryModel.modelProfileId,
+        modelProfileFingerprint: summaryModel.modelProfileFingerprint,
         effort: resolveClaudeEffort(thread.reasoningEffort ?? null),
         claudeSessionId: null,
         forkSession: false,
@@ -3019,6 +3102,7 @@ export class CodexClaudeAppServer {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
     if (!thread) throw new Error(`unknown thread: ${threadId}`)
+    this.checkModelProfileBinding(thread)
     // Follow-up turns the adapter starts itself have no requesting peer.
     if (peer !== DETACHED_PEER) this.subscribe(threadId, peer)
 
@@ -3604,11 +3688,36 @@ export class CodexClaudeAppServer {
       })
     }
 
-    const rawTurnModel = stringOr(params.model, thread.model)
+    const summaryTurn = params.outputSchema != null
     const isCodexThread = thread.runtimeBackend === 'codex' && process.env.CLAUDE_CODEX_MOCK !== '1'
+    // A thread on a model process profile runs every turn in that profile:
+    // its summary turns too, whatever summary model the App names, and a
+    // helper thread's turns, whatever Codex model they name. Any other
+    // thread's summary turns use the summary model (or the summary profile).
+    const threadModelProfile = isCodexThread ? null : resolveClaudeModelProfile(thread.model)
+    const rawTurnModel = threadModelProfile ? thread.model : stringOr(params.model, thread.model)
+    const summaryModelIdentity =
+      summaryTurn && !isCodexThread
+        ? resolveClaudeSummaryModelIdentity(
+            rawTurnModel,
+            threadModelProfile ? (thread.modelProfileFingerprint ?? null) : null,
+          )
+        : null
+    const modelProfileId = isCodexThread
+      ? null
+      : summaryModelIdentity
+        ? summaryModelIdentity.modelProfileId
+        : (threadModelProfile?.id ?? null)
+    const modelProfileFingerprint = isCodexThread
+      ? null
+      : summaryModelIdentity
+        ? summaryModelIdentity.modelProfileFingerprint
+        : (thread.modelProfileFingerprint ?? null)
     const resolvedModel = isCodexThread
       ? rawTurnModel
-      : resolveClaudeModel(rawTurnModel, params.outputSchema == null ? 'normal' : 'summary')
+      : summaryModelIdentity
+        ? summaryModelIdentity.model
+        : resolveClaudeModel(rawTurnModel, 'normal')
     const resolvedEffort = resolveClaudeEffort(
       typeof params.effort === 'string'
         ? params.effort
@@ -3627,6 +3736,8 @@ export class CodexClaudeAppServer {
       envDefaultModel: process.env.CLAUDE_CODEX_DEFAULT_MODEL ?? null,
       envDefaultEffort:
         process.env.CLAUDE_CODEX_DEFAULT_EFFORT ?? process.env.CLAUDE_CODEX_EFFORT ?? null,
+      modelProfileId,
+      modelProfileFingerprint,
       resolvedModel,
       resolvedEffort,
     })
@@ -3704,6 +3815,8 @@ export class CodexClaudeAppServer {
         cwd: turnCwd,
         runtimeType: isCodexThread ? 'codex-proxy' : null,
         model: resolvedModel,
+        modelProfileId,
+        modelProfileFingerprint,
         effort: resolvedEffort,
         claudeSessionId: isCodexThread ? thread.codexSessionId : thread.claudeSessionId,
         forkSession,
@@ -3836,7 +3949,10 @@ export class CodexClaudeAppServer {
               name: null,
               archived: false,
               cwd: thread.cwd,
-              model: subagentModel,
+              // The subagent runs inside the parent's model process profile,
+              // so its record carries that profile rather than Task's alias.
+              model: thread.modelProfileFingerprint ? thread.model : subagentModel,
+              modelProfileFingerprint: thread.modelProfileFingerprint ?? null,
               reasoningEffort: thread.reasoningEffort,
               modelProvider: thread.modelProvider,
               claudeSessionId: null,
@@ -6081,7 +6197,11 @@ export class CodexClaudeAppServer {
   // no conversation yet has nothing to lose, so its model still picks its
   // backend: the App starts a new chat's thread before the user picks a model.
   // App rule: prewarmed-threads
+  // With model process profiles configured, a Claude conversation likewise
+  // stays on its profile, since its session lives in that profile's process
+  // and config dir; a thread with no conversation yet can take any profile.
   private setThreadModel(thread: ThreadRecord, model: string): void {
+    let runtimeBackend = thread.runtimeBackend
     if (this.crossesRuntimeBackend(thread, model)) {
       const codexModel = isCodexOpenAiModel(model)
       if (this.threadHasConversation(thread)) {
@@ -6090,9 +6210,37 @@ export class CodexClaudeAppServer {
         )
       }
       if (codexModel && this.codexRoutingDisabled()) throw codexRoutingDisabledError(model)
-      thread.runtimeBackend = codexModel ? 'codex' : 'claude'
+      runtimeBackend = codexModel ? 'codex' : 'claude'
+    } else if (runtimeBackend === 'claude' && this.threadHasConversation(thread)) {
+      assertModelProfileTransition(thread.model, model)
     }
+    const profileFingerprint = profileFingerprintForModel(model, runtimeBackend)
+    thread.runtimeBackend = runtimeBackend
     thread.model = model
+    thread.modelProfileFingerprint = profileFingerprint
+  }
+
+  // A Claude thread's conversation lives in its model process profile: it
+  // continues only while that profile is configured as it was (see
+  // assertThreadModelProfileBinding). A thread with no conversation yet has
+  // nothing to lose and takes the profile's current configuration.
+  private checkModelProfileBinding(thread: ThreadRecord): void {
+    if (thread.runtimeBackend !== 'claude') return
+    if (this.threadHasConversation(thread)) {
+      assertThreadModelProfileBinding(thread)
+      return
+    }
+    let fingerprint: string | null
+    try {
+      fingerprint = profileFingerprintForModel(thread.model, 'claude')
+    } catch {
+      // Its model is no profile now: a model change can still pin one, and
+      // a turn on this model fails naming it.
+      fingerprint = null
+    }
+    if (fingerprint === (thread.modelProfileFingerprint ?? null)) return
+    thread.modelProfileFingerprint = fingerprint
+    this.store.upsertThread(thread)
   }
 
   private providerLoopSelectionInput(): ProviderLoopSelectionInput {

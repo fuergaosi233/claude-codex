@@ -85,6 +85,131 @@ Claude Code, so an alias for a full model id gets that model's efforts. The
 Codex App hides `max` until it is turned on under Settings > Agent > Model
 features > Available reasoning efforts.
 
+## Model process profiles
+
+Every Claude thread normally runs the same Claude Code: the one the SDK ships
+(or `CLAUDE_CODEX_CLI`), with the adapter's environment. A profiles file gives
+each model in the picker a Claude Code process of its own instead: its own
+executable, provider environment and Claude config folder
+(`CLAUDE_CONFIG_DIR`, where its sessions live). That way one App can offer
+models from several Claude-compatible providers or accounts you hold. Without a
+profiles file nothing changes.
+
+```bash
+export CLAUDE_CODEX_MODEL_PROFILES_FILE="$HOME/.claude-codex/models.json"
+# Or the same JSON inline; set only one of the two.
+# export CLAUDE_CODEX_MODEL_PROFILES='[{"id":"sonnet"},{"id":"opus"}]'
+```
+
+```json
+{
+  "defaultModel": "main-model",
+  "models": [
+    {
+      "id": "main-model",
+      "sdkModel": "sonnet",
+      "displayName": "Main model",
+      "env": { "CLAUDE_CONFIG_DIR": "${HOME}/.claude-codex/profiles/main-model" }
+    },
+    {
+      "id": "second-model",
+      "sdkModel": "vendor/model-1",
+      "displayName": "Second model",
+      "description": "Served by a second provider",
+      "executable": "${HOME}/bin/claude",
+      "envFile": "second-model.env",
+      "env": {
+        "CLAUDE_CONFIG_DIR": "${HOME}/.claude-codex/profiles/second-model",
+        "ANTHROPIC_AUTH_TOKEN": "${SECOND_PROVIDER_TOKEN}"
+      }
+    }
+  ]
+}
+```
+
+The file holds either an object with a `models` array (and optionally
+`defaultModel`) or just the array. Each profile has:
+
+| Field | Meaning |
+| --- | --- |
+| `id` | The model id the picker shows and threads store. Letters, digits, `.`, `_` and `-` (starting with a letter or digit), at most 128 characters, unique. |
+| `sdkModel` | The model Claude Code runs; defaults to `id`. |
+| `displayName` / `description` | The picker's label and description. |
+| `isDefault` | Marks the default model, as the top-level `defaultModel` does. There is one default: without either, the first profile. |
+| `executable` | Path of the Claude Code to start. Without it the SDK's own Claude Code runs; `CLAUDE_CODEX_CLI` does not apply to profiles. |
+| `envFile` | A file of `KEY=value` lines (`export` and quotes allowed, `#` comments) applied to the process environment. |
+| `env` | Variables set on the process after the env file. |
+| `inheritEnv` | Adapter variables the process inherits. By default `HOME`, `PATH`, `SHELL`, `USER`, `LOGNAME`, the locale, terminal, color and temp-folder variables, the `XDG_*` folders, `SSH_AUTH_SOCK` and `GIT_CONFIG_GLOBAL` / `GIT_CONFIG_SYSTEM`; `["*"]` inherits all of them and cannot be combined with names. |
+
+`${VAR}` in `executable`, `envFile`, the env file and `env` reads the adapter's
+environment; a missing variable is an error. `executable` and `envFile` may
+also start with `~/`, and a relative path is taken from the profiles file's
+folder (the adapter's working folder for inline profiles). A key in `env` that looks like a secret (its name contains `TOKEN`,
+`KEY`, `SECRET`, `PASSWORD` or `AUTH`) must be a single `${VAR}` reference, so
+the file itself never holds a credential.
+
+The process starts from the inherited variables without the adapter's provider
+settings (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`,
+`ANTHROPIC_MODEL`, the `ANTHROPIC_DEFAULT_*_MODEL` variables,
+`CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_SUBAGENT_MODEL`,
+`CLAUDE_CODE_EFFORT_LEVEL` and `CLAUDE_CONFIG_DIR`), even with `["*"]`, and
+without the secret variables the profile reads from; then the env file and
+`env` apply. So each profile sets its own provider and config folder, and the
+adapter's own credentials never reach it. A profile without `CLAUDE_CONFIG_DIR`
+uses Claude Code's default folder.
+
+The profiles file must be a regular file owned by the user running the adapter,
+neither a symbolic link nor writable by group or others. An env file must be a
+regular file owned by that user with mode `0600`, not a symbolic link; the
+adapter opens it without following links and rejects it if it changes while
+being read. A profiles file that breaks these rules, or that cannot be parsed,
+fails the requests that need it with the reason rather than falling back to
+another Claude Code.
+
+### Fingerprints
+
+A Claude thread pins the fingerprint of its profile when it starts: a SHA-256
+over the profile's `id`, `sdkModel`, `executable` and `envFile` paths, sorted
+`inheritEnv`, and the env file and `env` assignments with `${VAR}` expanded.
+The value of a secret-looking key, and any secret-looking variable a value
+reads, counts as a placeholder: rotating a credential keeps the fingerprint, while
+changing the model, endpoint, executable, config folder or any other setting
+changes it. The fingerprint is kept with the thread in the adapter's state
+database.
+
+- Once a thread has a conversation (a turn ran, or it is a fork), its Claude
+  session lives in that profile's process and config folder. If the profile's
+  fingerprint changed, the profiles file is gone, or the thread started before
+  profiles were set up, a turn, resume, fork, compaction or review of it fails
+  and asks for a new thread instead of resuming the session somewhere else.
+- A thread with nothing said yet, such as the one the App opens for a new chat
+  before its first message, takes the profile's current configuration and can
+  still move to any profile.
+- A thread with a conversation stays on its profile: the model menu
+  (`thread/settings/update`, `thread/metadata/update`), `turn/start` and
+  `turn/settings/update` refuse another profile, `thread/resume` ignores one, and
+  a fork stays on its parent's profile, the App's ephemeral description fork
+  included. Subagents run in their parent's process and carry its profile.
+  Its sessions resume only from its profile's config folder, and the workflows
+  it starts are looked up there too.
+- Codex model threads have no profile.
+
+### Profiles and the other model settings
+
+The profiles are the whole Claude part of the picker. `CLAUDE_CODEX_MODELS`,
+`CLAUDE_CODEX_MODEL_ALIASES` and discovered router models are not used, and a
+Claude model id that names no profile is an error rather than a fallback. Codex
+models are listed and routed as before. `CLAUDE_CODEX_DEFAULT_MODEL` still picks
+the model of new threads when it names a profile; the `default` alias is the
+default profile. Each profile offers the reasoning efforts Claude Code reports
+for its `sdkModel`.
+
+A chat's title and summary turns run on its own profile. The App's helper
+threads that name a Codex model, with `CLAUDE_CODEX_DISABLE_CODEX_PROXY=1`, run
+on the profile `CLAUDE_CODEX_SUMMARY_MODEL` names (else
+`CLAUDE_CODEX_TITLE_MODEL`, else the default profile); with profiles set, those
+two variables take a profile id.
+
 ## MCP, tools & directories
 
 ```bash
@@ -154,10 +279,12 @@ export CLAUDE_CODEX_NODE="/absolute/path/to/node"
 | `provider_loop_provider` | Saved config key for provider descriptor selection via `config/value/write`. |
 | `provider_loop_agent_loop` | Saved config key for agent-loop selection via `config/value/write`. |
 | `CLAUDE_CODEX_DEFAULT_MODEL` / `_EFFORT` | Defaults for new threads. |
-| `CLAUDE_CODEX_MODELS` | Codex App model picker list. |
+| `CLAUDE_CODEX_MODELS` | Codex App model picker list. Unused with model process profiles. |
+| `CLAUDE_CODEX_MODEL_PROFILES_FILE` | JSON file of model process profiles: each Claude model in the picker runs its own Claude Code executable, provider environment and config folder, and a thread stays on the profile it started with. Must be owned by the user and not writable by others. See [Model process profiles](#model-process-profiles). |
+| `CLAUDE_CODEX_MODEL_PROFILES` | The same profiles as inline JSON; set only one of the two. |
 | `CLAUDE_CODEX_CODEX_MODELS` | Codex models the picker offers through the bundled `codex` (comma-separated). Without it the list comes from `model_catalog.json` in `CODEX_HOME`. |
-| `CLAUDE_CODEX_DISABLE_CODEX_PROXY` | `1` turns Codex model routing off, unless the Codex proxy is the selected loop: the picker offers only Claude models, a new thread on a Codex model is refused, and the App's title and summary threads run on `CLAUDE_CODEX_SUMMARY_MODEL` (else `CLAUDE_CODEX_TITLE_MODEL`, else haiku). |
-| `CLAUDE_CODEX_MODEL_ALIASES` / `_EFFORT_ALIASES` | Id remapping. |
+| `CLAUDE_CODEX_DISABLE_CODEX_PROXY` | `1` turns Codex model routing off, unless the Codex proxy is the selected loop: the picker offers only Claude models, a new thread on a Codex model is refused, and the App's title and summary threads run on `CLAUDE_CODEX_SUMMARY_MODEL` (else `CLAUDE_CODEX_TITLE_MODEL`, else haiku; with model process profiles, the profile they name, else the default profile). |
+| `CLAUDE_CODEX_MODEL_ALIASES` / `_EFFORT_ALIASES` | Id remapping (model aliases are unused with model process profiles). |
 | `CLAUDE_CODEX_MCP_SERVERS` | MCP server config (JSON or path to a JSON file; a file may wrap the servers in `mcpServers` as `.mcp.json` does). Wins a name over inherited servers. |
 | `CLAUDE_CODEX_CODEX_MCP_SERVERS` | `1` starts the Codex config's `[mcp_servers]` (user `config.toml` and trusted project `.codex/config.toml`) in Claude threads; off otherwise, since the Codex App writes its own desktop servers into that file. See [Inherited configuration](https://github.com/fuergaosi233/claude-codex#inherited-configuration). |
 | `CLAUDE_CODEX_CODEX_NOTIFY` | `1` runs the Codex config's `notify` program when a Claude thread's turn completes; off otherwise, since the Codex App sets `notify` to its own turn-ended program. See [Inherited configuration](https://github.com/fuergaosi233/claude-codex#inherited-configuration). |

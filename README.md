@@ -83,6 +83,22 @@ until the one before has sent its first message, or for at most
 `CLAUDE_CODEX_SDK_LAUNCH_GATE_TIMEOUT_MS` (default 30000) when it stays silent.
 Prompts and steers sent meanwhile wait for their process. It is off by default.
 
+### Model process profiles
+
+By default every Claude thread runs the same Claude Code with the adapter's
+environment. With `CLAUDE_CODEX_MODEL_PROFILES_FILE` pointing at a profiles file
+(or the same JSON inline in `CLAUDE_CODEX_MODEL_PROFILES`), each Claude model in
+the picker runs a Claude Code process of its own instead: its own executable,
+provider environment and Claude config folder, with none of the adapter's
+provider credentials. Secrets stay in the environment or in private env files;
+the profiles file only references them. A chat stays on the profile it started
+on, and asks for a new thread once that profile's configuration changes rather
+than resuming its session somewhere else. Without a profiles file nothing
+changes. See
+[Model process profiles](https://fuergaosi233.github.io/claude-codex/guide/configuration#model-process-profiles)
+for the file format, its safety rules and how it relates to
+`CLAUDE_CODEX_MODELS`.
+
 ### Desktop conversation and visual explanations
 
 The native Claude Agent SDK backend receives presentation guidance modeled on
