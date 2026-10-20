@@ -847,6 +847,27 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    if (/subagent effort check/i.test(context.prompt)) {
+      // An agent asked to run on its own model and effort, and a fork asked
+      // the same: Claude ignores both inputs for a fork.
+      const ownId = `task-own-${Date.now()}`
+      const forkId = `task-fork-${Date.now()}`
+      for (const [toolUseId, input] of [
+        [ownId, { prompt: 'own agent', subagent_type: 'reviewer', model: 'opus', effort: 'max' }],
+        [forkId, { prompt: 'fork agent', subagent_type: 'fork', model: 'haiku', effort: 'low' }],
+      ] as const) {
+        await handlers.onEvent({ type: 'tool_use', toolUseId, toolName: 'Agent', input })
+        await handlers.onEvent({
+          type: 'tool_result',
+          toolUseId,
+          content: `${input.prompt} report`,
+        })
+      }
+      await handlers.onEvent({ type: 'text_delta', delta: 'both agents reported' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'efforts' })
+      return
+    }
+
     if (/subagent check/i.test(context.prompt)) {
       // Drive the subagent suppression contract: a Task tool_use opens the
       // subagent context, internal tool_use/text/tool_result are emitted but

@@ -108,6 +108,7 @@ import {
   simpleDiff,
   stringListFromEnv,
   stringOr,
+  subagentEffortFromInput,
   summarizeInjectedItem,
   summarizeRpcParams,
   threadPermissionProfileId,
@@ -3773,8 +3774,16 @@ export class CodexClaudeAppServer {
             const promptText = String(event.input.prompt ?? event.input.description ?? '')
             const subType =
               typeof event.input.subagent_type === 'string' ? event.input.subagent_type : null
+            // A fork runs on its parent's model and effort; Claude ignores
+            // the Agent tool's model and effort inputs for it.
+            const forkSubagent = subType === 'fork'
             const subagentModel =
-              typeof event.input.model === 'string' ? event.input.model : thread.model
+              !forkSubagent && typeof event.input.model === 'string'
+                ? event.input.model
+                : thread.model
+            const subagentEffort =
+              (forkSubagent ? null : subagentEffortFromInput(event.input.effort)) ??
+              thread.reasoningEffort
             const childThreadId = newThreadId()
             // The id's random tail: its head is a timestamp, shared by agents
             // spawned in the same millisecond.
@@ -3795,7 +3804,7 @@ export class CodexClaudeAppServer {
               archived: false,
               cwd: thread.cwd,
               model: subagentModel,
-              reasoningEffort: thread.reasoningEffort,
+              reasoningEffort: subagentEffort,
               modelProvider: thread.modelProvider,
               claudeSessionId: null,
               source: normalizeSessionSource(thread.source),
@@ -3877,7 +3886,7 @@ export class CodexClaudeAppServer {
             // (strict enum: none|minimal|low|medium|high|xhigh). Same Oops trap as
             // threadSource — an empty string from a sloppy resume crashes the App.
             // Normalize here once and reuse for every stage of the lifecycle.
-            const collabEffort = normalizeReasoningEffortEnum(thread.reasoningEffort)
+            const collabEffort = normalizeReasoningEffortEnum(subagentEffort)
             const spawnBegin: ThreadItem = {
               type: 'collabAgentToolCall',
               id: spawnId,
