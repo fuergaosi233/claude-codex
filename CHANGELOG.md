@@ -333,7 +333,9 @@ versioning or publishing metadata.
   offers to retry; refused sign-ins, `provider_not_allowed`, invalid managed
   settings and local problems are `other`. The adapter sets
   `CLAUDE_CODE_STARTUP_FAILURE_RESULTS=1` so every startup failure is reported
-  this way unless the environment sets it.
+  this way unless the environment sets it. The thread keeps its Claude
+  session: the refused run never loaded it, so the session id on its result
+  is not stored, and the next turn resumes the conversation.
 - The adapter keeps the Claude Code version each session reports (in the
   initialize reply from 2.1.296, in `system/init` from every CLI) and leaves
   off what an older CLI cannot do: live Bash output needs 2.1.287
