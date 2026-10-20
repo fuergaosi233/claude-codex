@@ -7,10 +7,10 @@ versioning or publishing metadata.
 
 ## Unreleased
 
-### Breaking: the `ws://` listener requires auth off loopback
+### `ws://` listener authentication
 
-- `--listen ws://` on a non-loopback address (`0.0.0.0`, `::`, a LAN or
-  public IP) now refuses to start without a capability token, as
+- **Breaking:** `--listen ws://` on a non-loopback address (`0.0.0.0`, `::`,
+  a LAN or public IP) now refuses to start without a capability token, as
   `codex app-server` does. It used to accept any client, which put an agent
   with shell access on the network. Pass `--ws-auth capability-token`
   (`CLAUDE_CODEX_WS_AUTH=capability-token`) to require a token or, when
@@ -19,10 +19,11 @@ versioning or publishing metadata.
   the adapter then warns at startup. Loopback listeners keep working without
   a token, and the Codex App, which uses stdio or the unix socket, is not
   affected.
-- A `ws://` upgrade that carries an `Origin` header is refused (403) unless
-  the origin is in `CLAUDE_CODEX_WS_ALLOWED_ORIGINS` / `--ws-allowed-origins`,
-  on loopback too, so web pages (and DNS rebinding) cannot reach the
-  listener. App-server clients outside a browser send no `Origin`.
+- **Breaking:** a `ws://` upgrade that carries an `Origin` header is refused
+  (403) unless the origin is in `CLAUDE_CODEX_WS_ALLOWED_ORIGINS` /
+  `--ws-allowed-origins`, on loopback too, so web pages (and DNS rebinding)
+  cannot reach the listener. App-server clients outside a browser send no
+  `Origin`.
 - Capability-token auth (`--ws-auth capability-token`, `--ws-token-file`,
   `--ws-token-sha256`, `CLAUDE_CODEX_WS_TOKEN*`) takes the token as
   `Authorization: Bearer`, which `codex --remote-auth-token-env` sends, or as

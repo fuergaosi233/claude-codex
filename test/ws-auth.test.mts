@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict'
 import { type ChildProcess, spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { once } from 'node:events'
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import type { IncomingMessage } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { PassThrough } from 'node:stream'
 import test from 'node:test'
 import WebSocket from 'ws'
 import { startWebSocketTransport } from '../src/transports.mjs'
@@ -13,6 +15,7 @@ import {
   authNotice,
   ensureTokenFile,
   isLoopbackHost,
+  rejectUpgrade,
   resolveWebSocketAuth,
   selectProtocol,
   WS_BEARER_PROTOCOL_PREFIX,
@@ -156,6 +159,36 @@ test('websocket auth rejects conflicting or weak token settings', () => {
   const auth = resolveWebSocketAuth('0.0.0.0', 1, {}, { CLAUDE_CODEX_WS_TOKEN: TOKEN })
   assert.equal(auth.mode, 'capability-token')
   assert.equal(auth.source, 'CLAUDE_CODEX_WS_TOKEN')
+})
+
+test('a SHA-256 digest checks the token it was made from', () => {
+  const auth = resolveWebSocketAuth(
+    '0.0.0.0',
+    1,
+    { tokenSha256: createHash('sha256').update(TOKEN).digest('hex').toUpperCase() },
+    {},
+  )
+  assert.equal(auth.mode, 'capability-token')
+  assert.deepEqual(auth.verify(upgradeRequest({ authorization: `Bearer ${TOKEN}` })), {
+    ok: true,
+  })
+  assert.deepEqual(auth.verify(upgradeRequest({ authorization: `Bearer ${TOKEN}x` })), {
+    ok: false,
+    status: 401,
+    reason: 'invalid token',
+  })
+  assert.throws(
+    () => resolveWebSocketAuth('0.0.0.0', 1, { tokenSha256: 'a'.repeat(63) }, {}),
+    /64 hex characters/,
+  )
+})
+
+test('a refused upgrade survives the client resetting the connection', () => {
+  const socket = new PassThrough()
+  rejectUpgrade(socket, upgradeRequest({}), { status: 401, reason: 'missing token' })
+  // Without a listener of its own, this error would end the process.
+  assert.doesNotThrow(() => socket.emit('error', new Error('read ECONNRESET')))
+  assert.equal(socket.destroyed, true)
 })
 
 test('websocket token file is created once with mode 0600', async () => {

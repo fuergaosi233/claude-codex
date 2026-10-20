@@ -249,6 +249,10 @@ export function rejectUpgrade(
     `Content-Length: ${Buffer.byteLength(body)}`,
   ]
   if (verdict.status === 401) lines.push('WWW-Authenticate: Bearer')
+  // Node hands over an upgrade socket without its own error listener, and ws
+  // adds one only in handleUpgrade, which a refused request never reaches. A
+  // client resetting the connection mid-reply would otherwise end the adapter.
+  socket.on('error', () => socket.destroy())
   socket.once('finish', () => socket.destroy())
   socket.end(`${lines.join('\r\n')}\r\n\r\n${body}`)
 }
