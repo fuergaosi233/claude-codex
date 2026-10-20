@@ -5693,11 +5693,11 @@ export class CodexClaudeAppServer {
     return false
   }
 
-  // The watchdog gave up on a turn whose subagents went quiet. Interrupting
-  // the session would also end the background agents the turn handed off and
-  // every other task still running in it, so a backend that can let go of
-  // the turn alone does that; the interrupt is for a session with nothing
-  // else alive.
+  // The watchdog gave up on a turn whose subagents went quiet. An interrupt
+  // stops it like the user's stop does, which keeps what earlier turns left
+  // running but also ends the background agents this turn handed off, so a
+  // backend that can let go of the turn alone does that while any of them
+  // still run.
   private async releaseStalledTurn(threadId: string, turnId: string): Promise<void> {
     const abandoned =
       (await this.runtime.abandonTurn?.(threadId, turnId).catch(() => false)) === true

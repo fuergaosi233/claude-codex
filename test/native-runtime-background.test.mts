@@ -952,25 +952,18 @@ test('native workflow progress reports the Workflow call it belongs to', async (
   await runtime.stop()
 })
 
-test('native turn the server gives up on stops its own agents and leaves background ones running', async () => {
+test('native turn the server gives up on stops its own agents and leaves the ones it handed off running', async () => {
   await withSettleMs(40, async () => {
     const { runtime, queries } = fakeRuntime()
     const listener = recordingListener()
     runtime.setBackgroundListener(listener)
 
-    const first = runtime.runTurn(context, handlers([]))
-    const query = await waitFor(() => queries[0], 'session')
-    query.push(...launchBackgroundAgent('a1'))
-    await first
-
     const events: RuntimeEvent[] = []
-    const second = runtime.runTurn(
-      { ...context, turnId: 'turn-2', prompt: 'check the build' },
-      handlers(events),
-    )
-    await waitFor(() => query.prompts.length === 2, 'second prompt')
+    const turn = runtime.runTurn(context, handlers(events))
+    const query = await waitFor(() => queries[0], 'session')
     query.push(
       init,
+      ...launchBackgroundAgent('a1').slice(0, 3),
       assistant('m1', [
         { type: 'tool_use', id: 'agent-1', name: 'Agent', input: { prompt: 'check the build' } },
       ]),
@@ -987,9 +980,9 @@ test('native turn the server gives up on stops its own agents and leaves backgro
       () => listener.tasks.some((event) => event.type === 'task_started' && event.taskId === 'f1'),
       'foreground agent',
     )
-    assert.equal(await runtime.abandonTurn('thread', 'turn-2'), true)
-    await second
-    assert.equal(query.interrupts, 0, 'an interrupt would end the background agent too')
+    assert.equal(await runtime.abandonTurn('thread', 'turn-1'), true)
+    await turn
+    assert.equal(query.interrupts, 0, 'an interrupt would end the agent the turn handed off')
     assert.deepEqual(query.stoppedTasks, ['f1'], 'only the agent the turn waited on stops')
     assert.equal(query.closed, false)
     assert.equal(
@@ -1041,15 +1034,77 @@ test('native turn the server gives up on stops its own agents and leaves backgro
   })
 })
 
+test('native turn the server gives up on is left to an interrupt when it handed nothing off', async () => {
+  await withSettleMs(40, async () => {
+    const { runtime, queries } = fakeRuntime()
+    const listener = recordingListener()
+    runtime.setBackgroundListener(listener)
+
+    const first = runtime.runTurn(context, handlers([]))
+    const query = await waitFor(() => queries[0], 'session')
+    query.push(...launchBackgroundAgent('a1'))
+    await first
+
+    const second = runtime.runTurn(
+      { ...context, turnId: 'turn-2', prompt: 'check the build' },
+      handlers([]),
+    )
+    await waitFor(() => query.prompts.length === 2, 'second prompt')
+    query.push(
+      init,
+      assistant('m1', [
+        { type: 'tool_use', id: 'agent-1', name: 'Agent', input: { prompt: 'check the build' } },
+      ]),
+      {
+        type: 'system',
+        subtype: 'task_started',
+        task_id: 'f1',
+        tool_use_id: 'agent-1',
+        task_type: 'local_agent',
+        description: 'check the build',
+      },
+    )
+    await waitFor(
+      () => listener.tasks.some((event) => event.type === 'task_started' && event.taskId === 'f1'),
+      'foreground agent',
+    )
+    // The agent an earlier turn handed off outlives an interrupt, which also
+    // ends the CLI's turn instead of leaving it to run unseen.
+    assert.equal(await runtime.abandonTurn('thread', 'turn-2'), false)
+    assert.deepEqual(query.stoppedTasks, [])
+    await runtime.interrupt('thread')
+    await second
+    assert.equal(query.interrupts, 1)
+    assert.equal(query.closed, false)
+    assert.equal(runtime.hasBackgroundWork(), true)
+    await runtime.stop()
+  })
+})
+
 test('native turn the server gives up on is left to an interrupt when nothing else runs', async () => {
   const { runtime, queries } = fakeRuntime()
   const listener = recordingListener()
   runtime.setBackgroundListener(listener)
-  const turn = runtime.runTurn(context, handlers([]))
+  // The App is slow to take the turn's text, so the session is still busy
+  // routing it when the server gives up.
+  let holding = false
+  let release = (): void => {}
+  const held = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const turn = runtime.runTurn(context, {
+    ...handlers([]),
+    onEvent: async (event) => {
+      if (event.type !== 'text_delta' || event.delta !== 'hold') return
+      holding = true
+      await held
+    },
+  })
   const query = await waitFor(() => queries[0], 'session')
   query.push(
     init,
     assistant('m1', [
+      text('hold'),
       { type: 'tool_use', id: 'agent-1', name: 'Agent', input: { prompt: 'check the build' } },
     ]),
     {
@@ -1061,10 +1116,18 @@ test('native turn the server gives up on is left to an interrupt when nothing el
       description: 'check the build',
     },
   )
-  await waitFor(() => listener.tasks.length === 1, 'foreground agent')
-  assert.equal(await runtime.abandonTurn('thread', 'turn-1'), false)
+  await waitFor(() => holding, 'busy session')
+  // The answer must not wait behind the session: the interrupt the server
+  // falls back to has to reach this turn, not one the user starts meanwhile.
+  const answer = await Promise.race([
+    runtime.abandonTurn('thread', 'turn-1'),
+    sleep(500).then(() => 'waited on the session'),
+  ])
+  assert.equal(answer, false)
   assert.deepEqual(query.stoppedTasks, [])
   assert.equal(query.closed, false)
+  release()
+  await waitFor(() => listener.tasks.length === 1, 'foreground agent')
   await runtime.interrupt('thread')
   await turn
   assert.equal(query.closed, true)

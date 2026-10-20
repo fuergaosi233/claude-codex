@@ -116,6 +116,9 @@ interface PendingTurn {
   workflowTranscriptRoots: string[]
   skippedWorkflowTaskIds: Set<string>
   workflowTasks: Map<string, WorkflowTaskState>
+  // Tasks Claude started while this turn ran. An interrupt of the turn also
+  // ends the background agents among them (see abandonTurn).
+  startedTasks: Set<string>
   // Tool ids whose content_block_start we already saw — used to skip the
   // second delivery via AssistantMessage.content (the SDK ships every
   // ToolUseBlock twice; we keep only the AssistantMessage copy because
@@ -434,22 +437,24 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   }
 
   // The server gave up on a turn whose subagents stopped reporting progress.
-  // Interrupting Claude would also end the background agents the turn handed
-  // off, so while the session holds anything besides the turn's own work the
-  // turn is let go instead: its stuck agents and workflows stop, and what the
-  // CLI still sends for it is dropped like an interrupted turn's tail.
+  // An interrupt ends the CLI's turn and keeps what earlier turns left
+  // running (see interrupt), but it also ends the background agents this
+  // turn handed off. While any of those still run, the turn is let go
+  // instead: its stuck agents and workflows stop, and what the CLI still
+  // sends for it is dropped like an interrupted turn's tail. The choice is
+  // made before queueing behind the session, so the interrupt the server
+  // falls back to still finds this turn and not the user's next one.
   async abandonTurn(threadId: string, turnId: string): Promise<boolean> {
     const live = this.sessions.get(threadId)
     const pending = this.turns.get(turnId)
-    if (!live || live.closed || !pending || pending.session !== live) return false
-    let abandoned = false
+    if (!live || live.closed || !pending || pending.resolved || pending.session !== live)
+      return false
+    const handedOff = this.handedOffTasks(live, pending)
+    debugLog('native.turn.abandon', { threadId, turnId, handedOff })
+    if (handedOff.length === 0) return false
     await this.serialize(live, async () => {
       if (live.closed || pending.resolved) return
-      const own = this.turnTaskIds(live, pending)
-      const others = [...live.liveTasks].some((taskId) => !own.has(taskId))
-      if (!others && !this.holdsCronJobs(live)) return
-      abandoned = true
-      await this.stopSessionTasks(live, own)
+      await this.stopSessionTasks(live, this.turnTaskIds(live, pending))
       await this.stopWorkflowTasks(pending)
       if (live.current === pending) {
         const cancelled = this.cancelSends(live)
@@ -463,8 +468,16 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       this.releaseTurn(pending)
       this.maybeRelease(live)
     })
-    debugLog('native.turn.abandon', { threadId, turnId, abandoned })
-    return abandoned
+    return true
+  }
+
+  // Background tasks the turn started that still run without it waiting on
+  // them.
+  private handedOffTasks(live: LiveSession, pending: PendingTurn): string[] {
+    const own = this.turnTaskIds(live, pending)
+    return [...live.liveTasks].filter(
+      (taskId) => pending.startedTasks.has(taskId) && !own.has(taskId),
+    )
   }
 
   // A workflow belongs to the turn that launched it; the turn waits for it.
@@ -1028,6 +1041,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       workflowTranscriptRoots: defaultWorkflowTranscriptRoots(process.env, context.cwd),
       skippedWorkflowTaskIds: new Set(),
       workflowTasks: new Map(),
+      startedTasks: new Set(),
       toolStartSeen: new Set(),
       structuredBuffer: '',
       pendingUserMessage: null,
@@ -1625,6 +1639,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
 
     if (subtype === 'task_started') {
       session.tasks.set(taskId, { taskType, toolUseId, outputFile: known?.outputFile ?? null })
+      session.current?.startedTasks.add(taskId)
       const backgrounded =
         typeof message.is_backgrounded === 'boolean' ? message.is_backgrounded : null
       if (!session.levelSeen && backgrounded === true && message.ambient !== true)

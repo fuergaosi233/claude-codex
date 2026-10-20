@@ -163,9 +163,10 @@ versioning or publishing metadata.
   starting or finishing all start it over. It used to fail every workflow
   that ran past 30 minutes, however busy, and interrupt the whole Claude
   session, which ended every workflow agent and unrelated background agent
-  with it. When it does give up, the turn's own stuck agents and workflows
-  stop, while background agents it handed off keep running; the session is
-  interrupted only when nothing else runs in it.
+  with it. When it does give up, the turn is stopped as an interrupt would
+  stop it, which keeps background work earlier turns left running; while
+  background agents the turn itself handed off still run, only its own stuck
+  agents and workflows stop and those agents keep going.
 - An interrupt while a session idles no longer leaves its earlier idle timer
   running, which could close the session (and its background agents) on the
   old deadline although they kept reporting progress.

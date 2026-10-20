@@ -731,10 +731,11 @@ export interface ClaudeRuntime {
   ): Promise<boolean | undefined>
   interrupt(threadId: string): Promise<void>
   // Let go of a turn the server gave up on (its subagents stopped reporting
-  // progress) while the session keeps the rest of its work: the turn's own
-  // stuck agents and workflows stop, background tasks it handed off and the
-  // session's other tasks keep running. Resolves false when the session has
-  // nothing else alive, so an interrupt would cost nothing.
+  // progress) without ending the background agents it handed off, which an
+  // interrupt would stop too: the turn's own stuck agents and workflows stop,
+  // and the rest of the session keeps running. Resolves false, without
+  // waiting on the session, when none of those agents still run; an
+  // interrupt then ends no more than the user's stop would.
   abandonTurn?(threadId: string, turnId: string): Promise<boolean>
   stop(): Promise<void>
   // Switch the running turn's model or effort until it ends; the next turn
