@@ -132,6 +132,67 @@ export CLAUDE_CODEX_IDLE_EXIT_MS="15000"
 export CLAUDE_CODEX_NODE="/absolute/path/to/node"
 ```
 
+## WebSocket listener
+
+`--listen ws://host:port` serves the protocol over TCP for clients such as
+`codex --remote`. The Codex App does not use it (it runs the adapter over stdio,
+or over the unix socket behind `app-server proxy`, which file permissions
+protect), so these settings only matter for other clients.
+
+```bash
+# Require a capability token on every connection. Without a token source
+# the adapter creates one in ws-token under the adapter home
+# ($CODEX_HOME/claude-codex-adapter unless CLAUDE_CODEX_HOME is set), mode
+# 0600, and prints the file path, never the token.
+export CLAUDE_CODEX_WS_AUTH="capability-token"
+
+# Token sources (set at most one; any of them turns the token on):
+export CLAUDE_CODEX_WS_TOKEN="<at-least-16-printable-characters>"
+export CLAUDE_CODEX_WS_TOKEN_FILE="/absolute/path/to/token"   # mode 0600
+export CLAUDE_CODEX_WS_TOKEN_SHA256="<hex sha-256 of the token>"
+
+# Origins allowed to connect. Requests with any other Origin header are
+# refused, which keeps web pages away from a loopback listener.
+export CLAUDE_CODEX_WS_ALLOWED_ORIGINS="https://example.com"
+
+# Not recommended: let a listener on a non-loopback address start without a
+# token. Anyone who can reach the address can then run the agent as this user.
+export CLAUDE_CODEX_WS_ALLOW_UNAUTHENTICATED=1
+```
+
+The same settings exist as flags: `--ws-auth capability-token|none`,
+`--ws-token-file`, `--ws-token-sha256`, `--ws-allowed-origins` and
+`--ws-allow-unauthenticated`.
+
+- A client sends the token as `Authorization: Bearer <token>`, which is what
+  `codex --remote ws://… --remote-auth-token-env VAR` does. A browser, which
+  cannot set headers on a WebSocket, offers the subprotocols
+  `claude-codex.v1` and `claude-codex.bearer.<token>`; the adapter answers with
+  `claude-codex.v1` only.
+- On a loopback address (`127.0.0.1`, `::1`, `localhost`) the token is
+  optional unless one of the settings above turns it on, so existing local
+  clients keep working. On any other address (`0.0.0.0`, `::`, a LAN or public
+  IP) the adapter refuses to start without it, as `codex app-server` does:
+
+  ```text
+  refusing to start non-loopback websocket listener ws://0.0.0.0:8788 without auth. Pass --ws-auth capability-token (CLAUDE_CODEX_WS_AUTH=capability-token) to require a token, or --ws-allow-unauthenticated (CLAUDE_CODEX_WS_ALLOW_UNAUTHENTICATED=1) to accept any client that can reach this address.
+  ```
+
+  `--ws-allow-unauthenticated` is the explicit opt-out for a listener that
+  something else protects (a private network, a firewall, an authenticating
+  reverse proxy). The adapter then prints a warning at startup, and the
+  `Origin` check below still applies. It cannot be combined with a token.
+- Any request with an `Origin` header is refused (403) unless the origin is in
+  `CLAUDE_CODEX_WS_ALLOWED_ORIGINS`. App-server clients outside a browser send
+  no Origin.
+- Tokens are compared as SHA-256 digests in constant time and never logged.
+- `ws://` is plain text. Off the local machine, put it behind TLS (a reverse
+  proxy) or reach it through an SSH tunnel to a loopback listener. The Codex
+  CLI sends a `--remote-auth-token-env` token only to a `wss://` or a loopback
+  `ws://` URL.
+- `ws://[::1]:8788` listens on the IPv6 loopback address, and port `0` picks a
+  free port; the `listening on ws://…` line shows the port actually bound.
+
 ## Reference table
 
 | Setting | Purpose |
@@ -164,11 +225,16 @@ export CLAUDE_CODEX_NODE="/absolute/path/to/node"
 | `CLAUDE_CODEX_ENABLE_FILE_CHECKPOINTING` | Enable SDK file checkpointing. |
 | `CLAUDE_CODEX_AUTO_WORKTREE` / `_WORKTREE_ROOT` | Per-thread worktree isolation. |
 | `CLAUDE_CODEX_IDLE_EXIT_MS` | Daemon idle shutdown. |
+| `CLAUDE_CODEX_WS_AUTH` | `capability-token` requires a token on the `ws://` listener; `none` (the default on loopback) does not. See [WebSocket listener](#websocket-listener). |
+| `CLAUDE_CODEX_WS_TOKEN` / `_TOKEN_FILE` / `_TOKEN_SHA256` | The `ws://` listener token, from the variable, a 0600 file (absolute path), or as its SHA-256 digest. Default: `ws-token` in the adapter home, created on first use. |
+| `CLAUDE_CODEX_WS_ALLOWED_ORIGINS` | Comma-separated origins allowed to open a `ws://` connection; requests with any other `Origin` are refused. |
+| `CLAUDE_CODEX_WS_ALLOW_UNAUTHENTICATED` | `1` (or `--ws-allow-unauthenticated`) lets a `ws://` listener on a non-loopback address start without a token, which it otherwise refuses. Not recommended: anyone who can reach the address can run the agent. |
 | `CLAUDE_CODEX_BACKGROUND_IDLE_MS` | How long a Claude session keeps background agents alive without any message (default 2 hours). |
 | `CLAUDE_CODEX_QUIET_BACKGROUND_TURNS` | `0` marks every finished turn unread in the Codex App again. By default a turn that ends while its background agents or workflows still run leaves the chat read and sends no notification (background Bash shells do not count, since one can run for the rest of the chat); see [Background work and the unread dot](/guide/gui#background-work-and-the-unread-dot). |
 | `CLAUDE_CODEX_LIVE_FILE_CHANGES` | `0` shows a file change only once Claude has written the whole call. By default the card of an Edit, Write or MultiEdit call opens as soon as Claude's streamed input names the file and grows while Claude writes the rest, as the Codex App draws a patch Codex is still writing; see [File changes while Claude writes them](/guide/gui#file-changes-while-claude-writes-them). |
 | `CLAUDE_CODEX_SESSION_SETTLE_MS` | How long an idle session waits for Claude to answer a task that just ended, when the CLI does not report session state (default `15000`). |
 | `CLAUDE_CODEX_GOAL_TOOLS` | `0` keeps the goal tools (the `codex_goal` MCP server) away from Claude. |
+| `CLAUDE_CODEX_MEMORIES` | `1` lets the App's Memories settings and `/memories` decide whether Claude threads run with Claude Code's auto-memory; with Memories off in the App, Claude threads then run without it. Off otherwise: the App shows no Memories settings and Claude Code's own settings decide. See [Memories](/guide/gui#memories). |
 | `CLAUDE_CODEX_REAP_ORPHANED_CLI` | `0` stops the adapter from ending Claude CLI processes a previous adapter left running (on by default; never on Windows). |
 | `CLAUDE_CODEX_MOCK` | Run the protocol without Claude credentials. |
 | `CLAUDE_CODEX_STATE_DB_TIMEOUT_MS` | How long a state-database write waits for another connection's lock before it fails (default `5000`). |

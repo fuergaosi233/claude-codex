@@ -7,8 +7,47 @@ versioning or publishing metadata.
 
 ## Unreleased
 
+### `ws://` listener authentication
+
+- **Breaking:** `--listen ws://` on a non-loopback address (`0.0.0.0`, `::`,
+  a LAN or public IP) now refuses to start without a capability token, as
+  `codex app-server` does. It used to accept any client, which put an agent
+  with shell access on the network. Pass `--ws-auth capability-token`
+  (`CLAUDE_CODEX_WS_AUTH=capability-token`) to require a token or, when
+  something else protects the listener, opt out explicitly with
+  `--ws-allow-unauthenticated` (`CLAUDE_CODEX_WS_ALLOW_UNAUTHENTICATED=1`);
+  the adapter then warns at startup. Loopback listeners keep working without
+  a token, and the Codex App, which uses stdio or the unix socket, is not
+  affected.
+- **Breaking:** a `ws://` upgrade that carries an `Origin` header is refused
+  (403) unless the origin is in `CLAUDE_CODEX_WS_ALLOWED_ORIGINS` /
+  `--ws-allowed-origins`, on loopback too, so web pages (and DNS rebinding)
+  cannot reach the listener. App-server clients outside a browser send no
+  `Origin`.
+- Capability-token auth (`--ws-auth capability-token`, `--ws-token-file`,
+  `--ws-token-sha256`, `CLAUDE_CODEX_WS_TOKEN*`) takes the token as
+  `Authorization: Bearer`, which `codex --remote-auth-token-env` sends, or as
+  a `claude-codex.bearer.<token>` subprotocol from a browser. Without a token
+  source the adapter creates a 0600 `ws-token` file in its home and prints
+  only the path.
+- `ws://[::1]:port` listens on the IPv6 loopback address (the brackets used
+  to reach `listen()` and fail), and the `listening on` line shows the bound
+  port, so `ws://127.0.0.1:0` is usable.
+- A refused listener or another bad listener option ends the adapter with
+  exit code 1 and the message alone, without a stack trace.
+
 ### App-server and protocol compatibility
 
+- Opt-in Memories: with `CLAUDE_CODEX_MEMORIES=1`, the App's Memories
+  settings (Settings > Personalization) and `/memories` decide whether Claude
+  threads run with Claude Code's auto-memory, and while Memories is off in the
+  App they run with `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`. Without the switch
+  nothing changes: the App shows no Memories settings and Claude Code's own
+  settings decide.
+- `memory/reset` is refused instead of reporting success, since Claude Code's
+  memory folders are shared with Claude Code outside the App and the adapter
+  deletes nothing, and `memory/status` checks `minConsolidatedThreads` against
+  Codex's bounds (1 to 4096).
 - The model picker reads the Codex model catalog from `CODEX_HOME` instead of
   `~/.codex`, so an App with its own home lists its catalog rather than the
   built-in fallback models.
