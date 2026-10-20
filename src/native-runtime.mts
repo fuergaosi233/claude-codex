@@ -42,6 +42,7 @@ if (!process.env.ANTHROPIC_BETAS) {
 // installed via optionalDependencies.
 
 import type { Query } from '@anthropic-ai/claude-agent-sdk'
+import { autoCompactWindowEnv } from './auto-compact.mjs'
 import { noteClaudeCommands } from './claude-commands.mjs'
 import { noteClaudeModels } from './claude-models.mjs'
 import { removeCliMcpConfig, writeCliMcpConfig } from './cli-mcp-config.mjs'
@@ -688,10 +689,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     // CLI has finished answering everything queued (see maybeRelease).
     // With the memories mapping on, auto-memory runs only for threads the
     // user turned memories on for.
+    // A user who set Codex's compaction limit gets it as the window.
     opts.env = {
       ...process.env,
       CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1',
       ...autoMemoryEnv(context.autoMemory),
+      ...autoCompactWindowEnv(context.autoCompactWindow),
     }
     // A forked thread resumes a transcript that opens with its parent's
     // history. Left alone, the CLI would schedule the parent's session cron
@@ -3286,7 +3289,7 @@ function inheritedAllowedTools(context: RuntimeTurnContext): string[] {
 
 // Options a live CLI process cannot change in place. A turn whose signature
 // differs needs a fresh process (unless background work pins the old one).
-function sessionSignature(context: RuntimeTurnContext): string {
+export function sessionSignature(context: RuntimeTurnContext): string {
   return JSON.stringify([
     context.cwd,
     context.effort ?? null,
@@ -3308,6 +3311,7 @@ function sessionSignature(context: RuntimeTurnContext): string {
     context.planMode === true,
     configuredPermissionMode(),
     context.autoMemory ?? null,
+    context.autoCompactWindow ?? null,
   ])
 }
 

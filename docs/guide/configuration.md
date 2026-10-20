@@ -112,6 +112,42 @@ export CLAUDE_CODEX_ADD_DIRS="/repo/shared,/repo/docs"
 export CLAUDE_CODEX_ENABLE_FILE_CHECKPOINTING=1
 ```
 
+## Context compaction
+
+```toml
+# CODEX_HOME/config.toml: Claude threads compact their conversation at about
+# this many tokens.
+model_auto_compact_token_limit = 300000
+```
+
+Codex's `model_auto_compact_token_limit` needs no switch, since only you set it.
+Claude threads take the first of these that sets it:
+
+1. the `config` a thread is started, resumed or forked with (kept until the
+   adapter restarts, as Codex keeps it; a fork also takes its parent's);
+2. what a client wrote with `config/value/write` or `config/batchWrite`;
+3. the Codex config files: `CODEX_HOME/config.toml`, then the
+   `.codex/config.toml` files of a project Codex trusts, from the repository
+   root down to the thread's folder.
+
+The limit becomes Claude Code's auto-compact window: the CLI starts with
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW` set to it, kept within the 100,000 to
+1,000,000 tokens Claude Code takes. The CLI compacts a little before the
+window fills, as Codex compacts once the limit is reached. The window wins
+over `autoCompactWindow` in Claude Code's own settings, a window saved with
+`/autocompact`, and a `CLAUDE_CODE_AUTO_COMPACT_WINDOW` the adapter was started
+with. A thread whose window changes starts a new Claude session on its next
+turn and resumes the conversation in it. Without the key, nothing is set and
+Claude Code keeps its own window. `config/read` reports the window in effect
+for its `cwd`, or `null`. Values that are not a whole number of tokens count as
+unset; `model_auto_compact_token_limit_scope` and `[profiles]` are not read.
+Codex model threads keep Codex's own handling.
+
+A Claude Code subagent brought in with `CLAUDE_CODEX_CLAUDE_AGENTS=1` keeps its
+`autoCompactWindow` frontmatter, which can only lower the window it runs with.
+Claude Code's idle compaction (`idleCompaction` in its settings) is left as
+Claude Code has it.
+
 ## Worktree isolation
 
 ```bash
@@ -207,6 +243,7 @@ The same settings exist as flags: `--ws-auth capability-token|none`,
 | `CLAUDE_CODEX_AGENT_LOOP` | Agent-loop id (`native-claude-code-sdk` or `codex-jsonl-proxy`) mapped only to existing runtime behavior. |
 | `provider_loop_provider` | Saved config key for provider descriptor selection via `config/value/write`. |
 | `provider_loop_agent_loop` | Saved config key for agent-loop selection via `config/value/write`. |
+| `model_auto_compact_token_limit` | Codex config key (thread `config`, `config/value/write`, user or trusted project `config.toml`): the token count Claude threads compact at, as Claude Code's auto-compact window (100,000 to 1,000,000). Unset leaves Claude Code's own window. See [Context compaction](#context-compaction). |
 | `CLAUDE_CODEX_DEFAULT_MODEL` / `_EFFORT` | Defaults for new threads. |
 | `CLAUDE_CODEX_MODELS` | Codex App model picker list. |
 | `CLAUDE_CODEX_CODEX_MODELS` | Codex models the picker offers through the bundled `codex` (comma-separated). Without it the list comes from `model_catalog.json` in `CODEX_HOME`. |

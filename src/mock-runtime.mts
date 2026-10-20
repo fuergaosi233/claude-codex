@@ -647,6 +647,15 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    if (/compact window check/i.test(context.prompt)) {
+      await handlers.onEvent({
+        type: 'text_delta',
+        delta: `autoCompactWindow=${context.autoCompactWindow ?? 'unset'}`,
+      })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'compact window check' })
+      return
+    }
+
     if (/system prompt check/i.test(context.prompt)) {
       await handlers.onEvent({
         type: 'text_delta',

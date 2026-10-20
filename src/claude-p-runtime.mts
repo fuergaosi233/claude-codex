@@ -2,6 +2,7 @@ import { type ChildProcess, execFileSync, spawn } from 'node:child_process'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { autoCompactWindowEnv } from './auto-compact.mjs'
 import { autoMemoryEnv } from './memories.mjs'
 import type { ClaudeRuntime, RuntimeHandlers, RuntimeTurnContext } from './types.mjs'
 
@@ -41,8 +42,13 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
 
       const args = this.argsForContext(context, inputFile)
       // With the memories mapping on, auto-memory only for threads the user
-      // turned memories on for.
-      const env = { ...process.env, ...autoMemoryEnv(context.autoMemory) }
+      // turned memories on for; Codex's compaction limit, when set, as the
+      // window.
+      const env = {
+        ...process.env,
+        ...autoMemoryEnv(context.autoMemory),
+        ...autoCompactWindowEnv(context.autoCompactWindow),
+      }
       const result = await this.runProcessWithRetry(
         context.threadId,
         args,

@@ -545,6 +545,10 @@ export interface RuntimeTurnContext {
   // false to have the runtime switch auto-memory off. Unset leaves it to
   // Claude Code's own settings.
   autoMemory?: boolean
+  // The auto-compact window, in tokens, of the thread's Claude sessions: set
+  // only when the user set Codex's model_auto_compact_token_limit. Unset
+  // leaves Claude Code's own window.
+  autoCompactWindow?: number | null
   // Tools the client registered on thread/start, one MCP server per
   // namespace. Claude's calls reach RuntimeHandlers.onDynamicToolCall of the
   // turn in flight. Backends without in-process tools ignore it.
