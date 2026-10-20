@@ -139,6 +139,18 @@ versioning or publishing metadata.
   `thread/metadata/update` patches it as Codex does, which the App uses after
   creating a branch, and `getConversationSummary` returns it. Threads also
   carry their `model` and `reasoningEffort`.
+- The context gauge moves while a turn runs, as it does for Codex: each API
+  call of the main loop sends `thread/tokenUsage/updated` as it streams, with
+  that call as `last` and on top of the settled total, once a result has
+  reported the context window for the thread or its model. The turn's result
+  still settles the total, so nothing is counted twice.
+- Notifications a client opts out of in `initialize`
+  (`capabilities.optOutNotificationMethods`) are no longer sent to it. The App
+  opts out of `turn/diff/updated`, so its threads also skip the whole-tree
+  `git diff` after every tool call.
+- `config/read` reports `web_search = "live"` instead of `"disabled"`, matching
+  the web search `modelProvider/capabilities/read` advertises;
+  `CLAUDE_CODEX_WEBSEARCH=0` turns both off.
 
 ### Provider and multi-agent boundaries
 

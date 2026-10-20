@@ -57,6 +57,7 @@ import { recordRunEvent } from './run-registry.mjs'
 import { normalizeRuntimeType } from './runtime-config.mjs'
 import {
   addedFileDiff,
+  addTokenBreakdowns,
   allSelectableModelOptions,
   asRecord,
   buildSystemPromptAddendum,
@@ -374,6 +375,10 @@ interface PeerFeatures {
   supportsCompletedSubagentActivity: boolean
   // clientInfo.name from initialize, which Codex's notify event reports.
   clientName: string | null
+  // capabilities.optOutNotificationMethods from initialize: notifications
+  // Codex never sends to the connection. The App opts out of
+  // turn/diff/updated, among others.
+  optedOutNotifications: ReadonlySet<string>
 }
 
 function turnItemsView(value: unknown): TurnItemsView {
@@ -446,7 +451,14 @@ export class CodexClaudeAppServer {
   // the running turn; the second keeps the call last reported.
   private lastCallUsageByThread = new Map<string, TokenUsageBreakdown>()
   private lastUsageByThread = new Map<string, TokenUsageBreakdown>()
+  // The main loop's API calls since the turn's last result, by message id.
+  // Live updates add them to the settled total until the result replaces
+  // them.
+  private liveCallUsageByThread = new Map<string, Map<string, TokenUsageBreakdown>>()
   private contextWindowByThread = new Map<string, number>()
+  // The window a result last reported for each model, for a thread that has
+  // not had a result of its own yet.
+  private contextWindowByModel = new Map<string, number>()
   private configModel = defaultSelectableModelId()
   private configReasoningEffort =
     normalizeCodexReasoningEffort(process.env.CLAUDE_CODEX_DEFAULT_EFFORT) ?? 'medium'
@@ -602,6 +614,13 @@ export class CodexClaudeAppServer {
             process.env.CLAUDE_CODEX_SUBAGENT_COMPLETED === '1',
           clientName:
             typeof clientInfo.name === 'string' && clientInfo.name ? clientInfo.name : null,
+          optedOutNotifications: new Set(
+            Array.isArray(capabilities.optOutNotificationMethods)
+              ? capabilities.optOutNotificationMethods.filter(
+                  (method): method is string => typeof method === 'string',
+                )
+              : [],
+          ),
         })
         // The App lists config warnings in its settings, which is where an App
         // build nobody checked the App rules against gets reported.
@@ -1739,6 +1758,7 @@ export class CodexClaudeAppServer {
     this.tokenUsageByThread.delete(threadId)
     this.lastCallUsageByThread.delete(threadId)
     this.lastUsageByThread.delete(threadId)
+    this.liveCallUsageByThread.delete(threadId)
     this.contextWindowByThread.delete(threadId)
     this.goalIdleStreaks.delete(threadId)
     this.goalClockByThread.delete(threadId)
@@ -1983,12 +2003,17 @@ export class CodexClaudeAppServer {
   // Charges one main-loop API call as it streams. Its usage only grows, and
   // the turn's result reconciles whatever it charged.
   private recordUsageProgress(
+    peer: RpcPeer,
     threadId: string,
+    turnId: string,
     messageId: string,
     usage: Record<string, unknown>,
   ): void {
     const breakdown = tokenBreakdownFromClaudeUsage(usage)
-    if (breakdown.totalTokens > 0) this.lastCallUsageByThread.set(threadId, breakdown)
+    if (breakdown.totalTokens > 0) {
+      this.lastCallUsageByThread.set(threadId, breakdown)
+      this.publishLiveTokenUsage(peer, threadId, turnId, messageId, breakdown)
+    }
     const counted = breakdown.inputTokens + breakdown.outputTokens
     const progress = this.goalProgressByThread.get(threadId) ?? new Map<string, number>()
     const charged = progress.get(messageId) ?? 0
@@ -1996,6 +2021,52 @@ export class CodexClaudeAppServer {
     progress.set(messageId, counted)
     this.goalProgressByThread.set(threadId, progress)
     this.accrueGoalTokens(threadId, counted - charged, true)
+  }
+
+  // Codex reports token usage after every model request, so the App's context
+  // gauge moves while a turn runs. Each main-loop API call reports here once
+  // its usage grows (the CLI repeats it with every content block), as `last`
+  // and on top of the settled total; the turn's result then settles it.
+  private publishLiveTokenUsage(
+    peer: RpcPeer,
+    threadId: string,
+    turnId: string,
+    messageId: string,
+    breakdown: TokenUsageBreakdown,
+  ): void {
+    const calls = this.liveCallUsageByThread.get(threadId) ?? new Map<string, TokenUsageBreakdown>()
+    const reported = calls.get(messageId)
+    if (reported && reported.totalTokens >= breakdown.totalTokens) return
+    calls.set(messageId, breakdown)
+    this.liveCallUsageByThread.set(threadId, calls)
+    // The App hides its gauge for a null window, so wait for one rather than
+    // blank it.
+    const modelContextWindow = this.contextWindowFor(threadId)
+    if (!modelContextWindow) return
+    const tokenUsage: ThreadTokenUsage = {
+      total: this.liveTokenTotal(threadId),
+      last: breakdown,
+      modelContextWindow,
+    }
+    this.notify(peer, {
+      method: 'thread/tokenUsage/updated',
+      params: { threadId, turnId, tokenUsage },
+    })
+  }
+
+  // What results have settled plus the API calls reported since.
+  private liveTokenTotal(threadId: string): TokenUsageBreakdown {
+    const settled = this.tokenUsageByThread.get(threadId) ?? emptyTokenBreakdown()
+    const live = this.liveCallUsageByThread.get(threadId)?.values() ?? []
+    return addTokenBreakdowns([settled, ...live])
+  }
+
+  // App rule: context-gauge
+  private contextWindowFor(threadId: string): number | null {
+    const known = this.contextWindowByThread.get(threadId)
+    if (known) return known
+    const model = this.store.getThread(threadId)?.model
+    return (model && this.contextWindowByModel.get(model)) || null
   }
 
   // Bookkeeping for a turn that just left the thread: close the goal clock
@@ -4387,6 +4458,10 @@ export class CodexClaudeAppServer {
                 method: 'item/completed',
                 params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
               })
+            // A whole-tree diff after every tool is wasted on a client that
+            // opted out of hearing it; the turn's end still records one.
+            const target = this.peerForParams(peer, { threadId: thread.id })
+            if (this.optedOut(target, 'turn/diff/updated')) return
             const diff = await gitDiff(thread.cwd)
             if (this.stopped || this.store.getTurn(turn.id)?.status !== 'inProgress') return
             if (diff) {
@@ -4438,7 +4513,7 @@ export class CodexClaudeAppServer {
             return
           }
           if (event.type === 'usage_progress') {
-            this.recordUsageProgress(thread.id, event.messageId, event.usage)
+            this.recordUsageProgress(peer, thread.id, turn.id, event.messageId, event.usage)
             return
           }
           if (event.type === 'hook_run') {
@@ -6024,6 +6099,8 @@ export class CodexClaudeAppServer {
         ...this.publicConfigOverrides(),
         model: this.configModel,
         review_model: null,
+        // Codex reports a window here only when config.toml sets one; the App
+        // takes the window from thread/tokenUsage/updated.
         model_context_window: null,
         model_auto_compact_token_limit: null,
         model_provider: 'claude-code',
@@ -6033,7 +6110,12 @@ export class CodexClaudeAppServer {
         sandbox_workspace_write: this.configOverrides.sandbox_workspace_write ?? null,
         forced_chatgpt_workspace_id: null,
         forced_login_method: null,
-        web_search: this.configOverrides.web_search ?? 'disabled',
+        // Claude searches the web live with its WebSearch tool, which
+        // modelProvider/capabilities/read advertises unless
+        // CLAUDE_CODEX_WEBSEARCH=0.
+        web_search:
+          this.configOverrides.web_search ??
+          (process.env.CLAUDE_CODEX_WEBSEARCH === '0' ? 'disabled' : 'live'),
         tools: this.configOverrides.tools ?? null,
         profile: this.configOverrides.profile ?? null,
         profiles: {},
@@ -6222,29 +6304,32 @@ export class CodexClaudeAppServer {
     if (!child) {
       this.goalProgressByThread.delete(threadId)
       this.lastCallUsageByThread.delete(threadId)
+      // The result counts the calls reported live.
+      this.liveCallUsageByThread.delete(threadId)
     }
-    if (source.contextWindow) this.contextWindowByThread.set(threadId, source.contextWindow)
+    if (source.contextWindow) {
+      this.contextWindowByThread.set(threadId, source.contextWindow)
+      const model = this.store.getThread(threadId)?.model
+      if (model) this.contextWindowByModel.set(model, source.contextWindow)
+    }
     if (spent.totalTokens === 0) return
     const prior = this.tokenUsageByThread.get(threadId) ?? emptyTokenBreakdown()
-    const total: TokenUsageBreakdown = {
-      totalTokens: prior.totalTokens + spent.totalTokens,
-      inputTokens: prior.inputTokens + spent.inputTokens,
-      cachedInputTokens: prior.cachedInputTokens + spent.cachedInputTokens,
-      outputTokens: prior.outputTokens + spent.outputTokens,
-      reasoningOutputTokens: prior.reasoningOutputTokens + spent.reasoningOutputTokens,
-    }
-    this.tokenUsageByThread.set(threadId, total)
-    const measured = child ? this.lastUsageByThread.get(threadId) : lastCall
+    this.tokenUsageByThread.set(threadId, addTokenBreakdowns([prior, spent]))
+    // A child that reports while the main loop runs keeps its latest call in
+    // the gauge.
+    const measured = child
+      ? (this.lastCallUsageByThread.get(threadId) ?? this.lastUsageByThread.get(threadId))
+      : lastCall
     if (!child) {
       if (lastCall) this.lastUsageByThread.set(threadId, lastCall)
       else this.lastUsageByThread.delete(threadId)
     }
     const tokenUsage: ThreadTokenUsage = {
-      total,
+      total: this.liveTokenTotal(threadId),
       last: measured ?? (child ? emptyTokenBreakdown() : spent),
       // Only one call's usage measures the context; a whole turn's sum would
       // overfill the App's gauge.
-      modelContextWindow: measured ? (this.contextWindowByThread.get(threadId) ?? null) : null,
+      modelContextWindow: measured ? this.contextWindowFor(threadId) : null,
     }
     this.notify(peer, {
       method: 'thread/tokenUsage/updated',
@@ -7257,6 +7342,7 @@ export class CodexClaudeAppServer {
     // parent state without throwing on a broken pipe.
     if (this.stopped) return
     const target = this.peerForParams(peer, notification.params)
+    if (this.optedOut(target, notification.method)) return
     debugLog('rpc.notify', {
       peerId: target.id,
       originalPeerId: target.id === peer.id ? null : peer.id,
@@ -7276,7 +7362,13 @@ export class CodexClaudeAppServer {
       params: summarizeRpcParams(notification.method, notification.params),
     })
     for (const peer of this.peers.values())
-      peer.send({ jsonrpc: '2.0', method: notification.method, params: notification.params })
+      if (!this.optedOut(peer, notification.method))
+        peer.send({ jsonrpc: '2.0', method: notification.method, params: notification.params })
+  }
+
+  // Whether the client asked in initialize not to hear `method`.
+  private optedOut(peer: RpcPeer, method: string): boolean {
+    return this.peerFeatures.get(peer)?.optedOutNotifications.has(method) === true
   }
 
   private notifyThread(threadId: string, notification: { method: string; params: unknown }): void {
@@ -7397,6 +7489,8 @@ export class CodexClaudeAppServer {
     const turnId = this.activeTurnByThread.get(threadId)
     const existed = this.activeTurnByThread.delete(threadId)
     if (turnId) this.closeStreamingItemsByTurn.delete(turnId)
+    // A turn that ended without a result leaves its live calls unsettled.
+    this.liveCallUsageByThread.delete(threadId)
     let settled: TurnRecord | null = null
     try {
       settled = turnId ? this.store.getTurn(turnId) : null

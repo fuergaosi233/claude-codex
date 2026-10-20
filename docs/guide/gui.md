@@ -74,6 +74,16 @@ upgrade or sign-in prompt.
 Notices the Claude CLI would show an interactive user at once, such as a
 failed compaction, show as warnings, each once a turn.
 
+## The context gauge
+
+The composer's context gauge shows how full Claude's context window is: the
+size of Claude's latest request against the window of the chat's model. It
+moves while a turn runs, after each request Claude makes, as it does for
+Codex chats. Claude reports the window only when a turn ends, so in a chat's
+first turn after the adapter starts, the gauge appears once that turn ends,
+unless another chat on the same model has finished a turn since. Subagents'
+tokens count towards the chat's total but leave the gauge alone.
+
 ## Branches in the sidebar
 
 A chat whose folder is a git repository shows its branch in the sidebar, as

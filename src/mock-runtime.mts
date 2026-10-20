@@ -983,18 +983,20 @@ export class MockRuntime implements ClaudeRuntime {
     }
 
     if (/context usage check/i.test(context.prompt)) {
-      // Two API calls, then the result that sums them, then what a workflow's
-      // agents spent beside the main loop.
+      // Two API calls, the second repeating its usage with each content block
+      // as the CLI does, then the result that sums them, then what a
+      // workflow's agents spent beside the main loop.
       await handlers.onEvent({
         type: 'usage_progress',
         messageId: 'call-1',
         usage: { input_tokens: 100, output_tokens: 20 },
       })
-      await handlers.onEvent({
-        type: 'usage_progress',
-        messageId: 'call-2',
-        usage: { input_tokens: 30, cache_read_input_tokens: 120, output_tokens: 50 },
-      })
+      for (let block = 0; block < 2; block++)
+        await handlers.onEvent({
+          type: 'usage_progress',
+          messageId: 'call-2',
+          usage: { input_tokens: 30, cache_read_input_tokens: 120, output_tokens: 50 },
+        })
       await handlers.onEvent({ type: 'text_delta', delta: 'measured' })
       await handlers.onEvent({
         type: 'usage',

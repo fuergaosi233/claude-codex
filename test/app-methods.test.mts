@@ -915,6 +915,78 @@ test('threads carry the git info of their workspace without listing running git'
   }
 })
 
+test('notifications a client opts out of are not sent, nor the diff after each tool run', async () => {
+  // A git on PATH that logs each run, to count the diffs the server takes.
+  const tools = await mkdtemp(join(tmpdir(), 'claude-codex-git-runs-'))
+  const log = join(tools, 'runs.log')
+  const realGit = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim()
+  await writeFile(
+    join(tools, 'git'),
+    `#!/bin/sh\necho "$*" >> '${log}'\nexec '${realGit}' "$@"\n`,
+    {
+      mode: 0o755,
+    },
+  )
+  const diffRuns = async () =>
+    (await readFile(log, 'utf8').catch(() => ''))
+      .split('\n')
+      .filter((line) => line.startsWith('diff ')).length
+  const env = { PATH: `${tools}${delimiter}${process.env.PATH ?? ''}` }
+  // Like Codex, an opt-out names exact methods; the App opts out of the diff.
+  const run = async (optOutNotificationMethods: string[]) => {
+    let seen = { diffRuns: 0, diffs: [] as string[], accounts: 0, completed: 0 }
+    await withServer(async (server) => {
+      await rm(log, { force: true })
+      const repo = join(server.home, 'repo')
+      execFileSync('git', ['init', '-q', repo])
+      await writeFile(join(repo, 'README.md'), 'first\n')
+      const git = (...args: string[]) =>
+        execFileSync(
+          'git',
+          ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', ...args],
+          { cwd: repo },
+        )
+      git('add', 'README.md')
+      git('-c', 'commit.gpgsign=false', 'commit', '-q', '-m', 'first')
+      await writeFile(join(repo, 'README.md'), 'changed\n')
+
+      await server.request('initialize', {
+        clientInfo: { name: 'test-client', version: '1.0.0' },
+        capabilities: { optOutNotificationMethods },
+      })
+      const threadId = await server.startThread({ cwd: repo })
+      const turnId = await server.runTurn(threadId, 'please use generic tool')
+      seen = {
+        diffRuns: await diffRuns(),
+        diffs: server
+          .notified('turn/diff/updated', 0)
+          .filter((params) => params.turnId === turnId)
+          .map((params) => params.diff),
+        accounts: server.notified('account/updated', 0).length,
+        completed: server.notified('turn/completed', 0).length,
+      }
+    }, env)
+    return seen
+  }
+  try {
+    // One diff after the tool runs and one when the turn ends.
+    const all = await run([])
+    assert.equal(all.diffRuns, 2)
+    assert.equal(all.diffs.length, 2)
+    assert.match(all.diffs[1] ?? '', /\+changed/)
+    assert.equal(all.accounts, 1)
+
+    // Opted out, only the turn's own diff is taken, and nothing named is sent.
+    const optedOut = await run(['turn/diff/updated', 'account/updated', 'no/such/method'])
+    assert.equal(optedOut.diffRuns, 1)
+    assert.deepEqual(optedOut.diffs, [])
+    assert.equal(optedOut.accounts, 0)
+    assert.equal(optedOut.completed, 1)
+  } finally {
+    await rm(tools, { recursive: true, force: true })
+  }
+})
+
 test('rollback and revert rewind Claude to the newest remaining turn', async () => {
   await withServer(async (server) => {
     const threadId = await server.startThread()

@@ -3021,6 +3021,70 @@ test('the context gauge follows the last API call and child tokens add to the to
   }
 })
 
+test('the context gauge moves with each API call once the window is known', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  // [last, total, window] of each token usage update of a turn.
+  const runTurn = async (id: number, threadId: string): Promise<unknown[]> => {
+    proc.stdin.write(
+      json({
+        id,
+        method: 'turn/start',
+        params: { threadId, input: textInput('context usage check') },
+      }),
+    )
+    const turn = await readUntil(
+      reader,
+      (message) => message.method === 'turn/completed' && message.params.threadId === threadId,
+    )
+    return turn
+      .filter((m) => m.method === 'thread/tokenUsage/updated' && m.params.threadId === threadId)
+      .map(({ params: { tokenUsage } }) => [
+        tokenUsage.last.totalTokens,
+        tokenUsage.total.totalTokens,
+        tokenUsage.modelContextWindow,
+      ])
+  }
+  try {
+    const threadId = await startMockThread(reader, proc)
+    // The window comes with the first result, so the first turn moves the
+    // gauge only at its end.
+    assert.deepEqual(await runTurn(2, threadId), [
+      [200, 320, 200_000],
+      [200, 1320, 200_000],
+    ])
+    // Then each call moves it as it streams, once however often it repeats
+    // its usage, on top of the settled total; the result settles the same
+    // total, counting nothing twice, and a child adds to the total only.
+    assert.deepEqual(await runTurn(3, threadId), [
+      [120, 1440, 200_000],
+      [200, 1640, 200_000],
+      [200, 1640, 200_000],
+      [200, 2640, 200_000],
+    ])
+
+    // A new thread on the same model starts with the window it reported.
+    proc.stdin.write(
+      json({
+        id: 4,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false },
+      }),
+    )
+    const other = (await reader.nextResponse(4)).result.thread.id
+    assert.deepEqual(await runTurn(5, other), [
+      [120, 120, 200_000],
+      [200, 320, 200_000],
+      [200, 320, 200_000],
+      [200, 1320, 200_000],
+    ])
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('Claude token usage maps to thread/tokenUsage/updated notifications', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
@@ -3491,20 +3555,37 @@ test('Claude WebSearch tool maps to native Codex webSearch ThreadItem with actio
   }
 })
 
-test('modelProvider/capabilities/read advertises webSearch=true unless CLAUDE_CODEX_WEBSEARCH=0', async () => {
-  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
-  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
-    stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
-  })
-  const reader = new JsonLineReader(proc)
-  try {
-    proc.stdin.write(json({ id: 1, method: 'modelProvider/capabilities/read', params: {} }))
-    const cap = await reader.nextResponse(1)
-    assert.equal(cap.result.webSearch, true)
-  } finally {
-    proc.kill()
-    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+test('capabilities and config/read report live web search unless CLAUDE_CODEX_WEBSEARCH=0', async () => {
+  for (const [setting, webSearch, mode] of [
+    ['', true, 'live'],
+    ['0', false, 'disabled'],
+  ] as const) {
+    const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+    const proc = spawnMockAdapter(home, { CLAUDE_CODEX_WEBSEARCH: setting })
+    const reader = new JsonLineReader(proc)
+    try {
+      proc.stdin.write(json({ id: 1, method: 'modelProvider/capabilities/read', params: {} }))
+      assert.equal((await reader.nextResponse(1)).result.webSearch, webSearch)
+      proc.stdin.write(json({ id: 2, method: 'config/read', params: {} }))
+      const { config } = (await reader.nextResponse(2)).result
+      assert.equal(config.web_search, mode)
+      // Codex reports a context window only when config.toml sets one.
+      assert.equal(config.model_context_window, null)
+      // What the App's settings saved still wins.
+      proc.stdin.write(
+        json({
+          id: 3,
+          method: 'config/value/write',
+          params: { keyPath: 'web_search', value: 'cached' },
+        }),
+      )
+      await reader.nextResponse(3)
+      proc.stdin.write(json({ id: 4, method: 'config/read', params: {} }))
+      assert.equal((await reader.nextResponse(4)).result.config.web_search, 'cached')
+    } finally {
+      proc.kill()
+      await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+    }
   }
 })
 

@@ -223,6 +223,14 @@ export const APP_RULES: readonly AppRule[] = [
       'Start a chat in a git repository on a feature branch and send a message: after an App restart the sidebar still shows the branch, and it follows a branch Claude switches to once the turn ends.',
   },
   {
+    id: 'context-gauge',
+    app: "Fills the composer's context gauge from the thread's latest thread/tokenUsage/updated, as last.totalTokens over modelContextWindow, and hides it when either is null.",
+    adapter:
+      "Reports each main-loop API call as it streams, with that call as last and on top of the settled total, once a result has reported the window for the thread or its model; the turn's result then settles the total. A subagent's tokens add to the total and leave last alone.",
+    verify:
+      'Ask for a task with many tool calls in a chat that has finished a turn: the context gauge moves while Claude works instead of jumping when the turn ends.',
+  },
+  {
     id: 'prewarmed-threads',
     app: 'Starts the thread of a new chat with thread/start before the user sends anything, keeps it out of thread/list and holds back its thread/started until it sends turn/start there, and deletes it with thread/delete once the chat goes unused for 10 minutes. It forgets such threads when the app-server connection drops or the App quits.',
     adapter:

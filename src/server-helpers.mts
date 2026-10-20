@@ -809,6 +809,18 @@ export function emptyTokenBreakdown(): TokenUsageBreakdown {
   }
 }
 
+export function addTokenBreakdowns(breakdowns: Iterable<TokenUsageBreakdown>): TokenUsageBreakdown {
+  const sum = emptyTokenBreakdown()
+  for (const breakdown of breakdowns) {
+    sum.totalTokens += breakdown.totalTokens
+    sum.inputTokens += breakdown.inputTokens
+    sum.cachedInputTokens += breakdown.cachedInputTokens
+    sum.outputTokens += breakdown.outputTokens
+    sum.reasoningOutputTokens += breakdown.reasoningOutputTokens
+  }
+  return sum
+}
+
 // claude-agent-sdk's Task tool appends a fixed metadata trailer to the
 // subagent's tool_result content:
 //   `agentId: <hex> (use SendMessage with to: '<hex>', summary: ... to continue this agent)`

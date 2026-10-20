@@ -19,7 +19,7 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 | Handoffs | Supported | A `turn/start` with `toolOutput` instead of input (a thread handoff, or a message from another thread) prompts Claude with its text and images and is recorded as a `functionCallOutput` item, which the App shows as the user's message. Sent during a turn, it joins that turn. |
 | Goals | Supported | `thread/goal/*` keeps the thread working with hidden continuation turns, counts tokens and time, and stops on budget, usage limits or a turn without progress. Claude gets `get_goal` / `create_goal` / `update_goal` through an in-process MCP server. |
 | Message queue | Supported | `thread/queue/*` holds follow-ups during a turn and sends them in order when the thread goes idle; after an interrupt they wait for `thread/queue/start`. The App uses it from app-server `0.148.0-alpha.14` (see `CLAUDE_CODEX_COMPAT_VERSION`). |
-| Token usage | Supported | SDK ResultMessage usage → TokenUsageBreakdown, pushed as `thread/tokenUsage/updated` (cumulative + last turn). The context gauge follows the main loop's latest API call; subagent and workflow tokens add to the total only. |
+| Token usage | Supported | SDK ResultMessage usage → TokenUsageBreakdown, pushed as `thread/tokenUsage/updated` (cumulative + last turn). The context gauge follows the main loop's latest API call, live while the turn runs once a result has reported the context window for the thread or its model; the turn's result then settles the total. Subagent and workflow tokens add to the total only. |
 
 ## Runtime selection
 
@@ -128,6 +128,15 @@ codex.
 - Lifecycle turn envelopes carry only schema fields — internal api/cost/turn
   metrics are not serialized onto the wire (token metrics flow through
   `thread/tokenUsage/updated`).
+- Notifications a client lists in `initialize`'s
+  `capabilities.optOutNotificationMethods` are not sent to it, as in Codex. For
+  a thread whose client opted out of `turn/diff/updated` (the App does), the
+  adapter also skips the whole-tree `git diff` after each tool call; the turn's
+  end still records one.
+- `config/read` reports `web_search = "live"`, the way Claude's WebSearch tool
+  searches, unless `CLAUDE_CODEX_WEBSEARCH=0` turns the App's search affordance
+  off or the App saved another value. `model_context_window` stays null, as
+  Codex reports it only when `config.toml` sets it.
 - `turn/plan/updated` is reserved for the `update_plan`/TodoWrite checklist tool
   and ships the spec shape `{ explanation, plan: [{ step, status }] }` (status
   ∈ pending/inProgress/completed); the checklist tool is not also surfaced as a
