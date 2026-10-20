@@ -175,8 +175,8 @@ export function firstSentence(text: string): string {
 // to one of the built-in commands above becomes `/name` there and the rest of
 // the message its arguments. Later ones stay inline as `/name`, which the
 // model can still act on. Links to skills under .claude/skills are left alone:
-// the CLI runs without setting sources, so it does not know them as commands
-// and the model reads the linked SKILL.md instead.
+// the CLI runs without setting sources, so it does not know them as commands,
+// and their SKILL.md goes into the prompt instead (see turn-context.mts).
 const SKILL_LINK = /\[\$([^\]\n]+)\]\(([^)\n]+)\)/g
 
 export function skillLinksToCommand(text: string): string {

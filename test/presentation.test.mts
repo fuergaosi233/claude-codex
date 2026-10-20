@@ -4,7 +4,13 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { CodexClaudeAppServer } from '../src/server.mjs'
-import { codexErrorInfo, parseSubagentTrailer, retryTurnError } from '../src/server-helpers.mjs'
+import {
+  codexErrorInfo,
+  parseSubagentTrailer,
+  retryTurnError,
+  turnErrorOf,
+  turnFailure,
+} from '../src/server-helpers.mjs'
 import { SessionStore } from '../src/store.mjs'
 import type {
   ClaudeRuntime,
@@ -437,6 +443,73 @@ test('Claude failures map onto the Codex error codes the App knows', () => {
   )
 })
 
+test('a CLI that refused to start says why, offers a retry only when one can help, and hides its own text', () => {
+  const startup = (startupFailure: string): RuntimeFailure => ({
+    terminalReason: null,
+    category: null,
+    status: null,
+    startupFailure,
+  })
+  const retryable = { httpConnectionFailed: { httpStatusCode: null } }
+  const cases: Array<[string, unknown, RegExp]> = [
+    // Something could not be loaded or checked right now.
+    ['org_config_required_unavailable', retryable, /policy limits.*try again/],
+    ['remote_settings_required_unavailable', retryable, /managed settings.*try again/],
+    ['org_verify_failed', retryable, /verify/],
+    ['worktree_unverified', retryable, /worktree/],
+    // A new sign-in or an administrator: a retry does not help.
+    ['org_config_refused', 'other', /refused.*claude \/login/],
+    ['gateway_signin_required', 'other', /claude \/login/],
+    ['gateway_access_denied', 'other', /administrator/],
+    ['org_pin_api_key_conflict', 'other', /API key/],
+    ['org_pin_mismatch', 'other', /allowed account/],
+    ['provider_not_allowed', 'other', /provider/],
+    ['managed_settings_invalid', 'other', /managed settings/],
+    // Something on this machine to fix first.
+    ['proxy_invalid', 'other', /proxy/],
+    ['temp_dir_unusable', 'other', /temporary directory/],
+    ['cwd_unavailable', 'other', /working directory/],
+    ['shell_tool_missing', 'other', /shell/],
+    ['session_held_by_background', 'other', /background session/],
+    ['worktree_resume_refused', 'other', /resume/],
+    ['cli_version_too_old', 'other', /Update Claude Code/],
+    ['bypass_root', 'other', /root/],
+    // A reason newer than the adapter.
+    ['brand_new_reason', 'other', /^Claude Code refused to start \(brand_new_reason\)\.$/],
+  ]
+  for (const [reason, code, message] of cases) {
+    assert.deepEqual(codexErrorInfo(startup(reason)), code, reason)
+    // A refused start is never a retry the CLI itself makes.
+    assert.deepEqual(codexErrorInfo(startup(reason), true), code, reason)
+    const raw = 'Invalid proxy URL: http://user:secret@proxy.invalid:8080 (sk-ant-api03-key)'
+    const error = turnErrorOf(turnFailure(raw, startup(reason)))
+    assert.match(error.message, message, reason)
+    assert.deepEqual(error.codexErrorInfo, code, reason)
+    assert.equal(error.additionalDetails, `Claude Code startup failure: ${reason}`)
+    assert.doesNotMatch(JSON.stringify(error), /secret|sk-ant|proxy\.invalid/, reason)
+  }
+  // A reason that does not look like one is not repeated.
+  const odd = turnErrorOf(turnFailure('raw', startup('Bearer abc.def')))
+  assert.deepEqual(odd, {
+    message: 'Claude Code refused to start.',
+    codexErrorInfo: 'other',
+    additionalDetails: null,
+  })
+  // Inherited keys are no reasons.
+  assert.equal(turnErrorOf(turnFailure('raw', startup('constructor'))).codexErrorInfo, 'other')
+  // A failure without a startup reason keeps its own message.
+  assert.equal(
+    turnErrorOf(
+      turnFailure('API Error: 500', {
+        terminalReason: 'api_error',
+        category: 'server_error',
+        status: 500,
+      }),
+    ).message,
+    'API Error: 500',
+  )
+})
+
 test('retries show as passing Reconnecting errors in chats, not in helper turns', async () => {
   const retrying: RuntimeEvent[] = [
     {
@@ -479,24 +552,72 @@ test('retries show as passing Reconnecting errors in chats, not in helper turns'
   assert.equal(helper.messages.filter((message) => message.method === 'error').length, 0)
 })
 
-test('plan output retains its native plan item and complete Markdown', async () => {
-  const { turn, messages } = await present(
+test('plan mode: the ExitPlanMode plan is the one plan item, prose stays agent messages', async () => {
+  const plan = '## Plan\n\n1. Inspect\n2. Implement'
+  const { turn, messages, replay } = await present(
     emit([
       { type: 'message_boundary' },
-      { type: 'text_delta', delta: '## Plan\n\n' },
-      { type: 'text_delta', delta: '1. Inspect\n2. Implement' },
+      { type: 'text_delta', delta: 'I looked around.' },
+      { type: 'tool_use', toolUseId: 'exit-1', toolName: 'ExitPlanMode', input: { plan } },
+      { type: 'proposed_plan', toolUseId: 'exit-1', text: plan },
+      { type: 'tool_result', toolUseId: 'exit-1', content: 'delivered', isError: true },
+      { type: 'text_delta', delta: 'Plan ready.' },
+      { type: 'completed', success: true },
+    ]),
+    { planMode: true },
+  )
+  assert.equal(turn.status, 'completed')
+  const shown = turn.items.filter((item) => item.type !== 'userMessage')
+  assert.deepEqual(
+    shown.map((item) => item.type),
+    ['agentMessage', 'plan', 'agentMessage'],
+    'ExitPlanMode is the card, not a tool item',
+  )
+  assert.deepEqual(
+    shown.map((item) => (item as { text: string }).text),
+    ['I looked around.', plan, 'Plan ready.'],
+  )
+  assert.equal(assistantItems(turn.items).at(-1)?.phase, 'final_answer')
+  const planEvents = messages
+    .filter(
+      (message) => message.params?.item?.type === 'plan' || message.method?.startsWith('item/plan'),
+    )
+    .map((message) => [message.method, message.params.item?.text ?? message.params.delta])
+  assert.deepEqual(planEvents, [
+    ['item/started', ''],
+    ['item/plan/delta', plan],
+    ['item/completed', plan],
+  ])
+  assert.deepEqual(
+    replay.items.filter((item: ThreadItem) => item.type === 'plan').map((item: any) => item.text),
+    [plan],
+  )
+})
+
+test('a plan revised in the same turn replaces its card', async () => {
+  const { turn, messages } = await present(
+    emit([
+      { type: 'proposed_plan', toolUseId: 'exit-1', text: '1. First draft' },
+      { type: 'proposed_plan', toolUseId: 'exit-2', text: '1. Final plan' },
       { type: 'completed', success: true },
     ]),
     { planMode: true },
   )
   const plans = turn.items.filter((item) => item.type === 'plan')
-  assert.equal(plans.length, 1)
-  assert.equal(plans[0]?.text, '## Plan\n\n1. Inspect\n2. Implement')
-  assert.equal(assistantItems(turn.items).length, 0)
-  assert.equal(messages.filter((message) => message.method === 'item/completed').length, 1)
+  assert.deepEqual(
+    plans.map((item) => item.text),
+    ['1. Final plan'],
+  )
+  const completedPlans = messages.filter(
+    (message) => message.method === 'item/completed' && message.params.item.type === 'plan',
+  )
+  assert.equal(new Set(completedPlans.map((message) => message.params.item.id)).size, 1)
+  assert.equal(completedPlans.at(-1)?.params.item.text, '1. Final plan')
 })
 
-test('an interrupt completes the message or plan still streaming before the turn', async () => {
+test('an interrupt completes the message still streaming before the turn', async () => {
+  // Plan mode streams prose as an agent message too; only ExitPlanMode
+  // makes a plan item.
   for (const planMode of [false, true]) {
     const { messages, turn, replay } = await present(
       async (handlers, { interrupt }) => {
@@ -506,17 +627,16 @@ test('an interrupt completes the message or plan still streaming before the turn
       { planMode },
     )
     assert.equal(turn.status, 'interrupted')
-    const type = planMode ? 'plan' : 'agentMessage'
     const order = messages
       .filter(
         (message) => message.method === 'item/completed' || message.method === 'turn/completed',
       )
       .map((message) => message.params.item?.type ?? message.method)
-    assert.deepEqual(order, [type, 'turn/completed'])
+    assert.deepEqual(order, ['agentMessage', 'turn/completed'])
     const live = messages.find((message) => message.method === 'item/completed')?.params.item
     assert.equal(live.text, 'Started the workflow.')
     assert.deepEqual(
-      replay.items.find((item: ThreadItem) => item.type === type),
+      replay.items.find((item: ThreadItem) => item.type === 'agentMessage'),
       live,
     )
   }
@@ -644,7 +764,7 @@ test('an image Read asks about and falls back to its Read command', async () => 
           path: '/elsewhere/chart.png',
         },
       ],
-      availableDecisions: ['accept', 'decline', 'cancel'],
+      availableDecisions: ['accept', 'acceptForSession', 'decline', 'cancel'],
     },
   )
   const completed = messages

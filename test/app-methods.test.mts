@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { type ChildProcessWithoutNullStreams, execFileSync, spawn } from 'node:child_process'
 import { once } from 'node:events'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { delimiter, join, resolve } from 'node:path'
 import test from 'node:test'
@@ -607,11 +607,10 @@ test('turn/settings/update switches model and effort for the running turn only',
     await server.waitFor('item/agentMessage/delta', (params) => params.turnId === turn.id, from)
     const update = (settings: Record<string, unknown>) =>
       server.request('turn/settings/update', { threadId, turnId: turn.id, ...settings })
-    // The user already reviews every approval.
     assert.deepEqual(await update({ approvalsReviewer: 'user' }), { status: 'applied' })
     await assert.rejects(
       update({ approvalsReviewer: 'auto_review', summary: 'detailed' }),
-      /a running Claude turn cannot change approvalsReviewer auto_review, summary/,
+      /a running Claude turn cannot change summary/,
     )
     await assert.rejects(update({ effort: 'extreme' }), /unsupported effort: extreme/)
     await assert.rejects(update({ model: 'claude-opus-9' }), /unknown model: claude-opus-9/)
@@ -621,6 +620,11 @@ test('turn/settings/update switches model and effort for the running turn only',
     // 'none' is the effort of a model that takes none, such as Haiku. It
     // leaves the effort as it was.
     assert.deepEqual(await update({ effort: 'none' }), { status: 'applied' })
+    // The App's auto-review preset reaches the running turn, and the thread
+    // keeps it for later turns.
+    assert.deepEqual(await update({ approvalsReviewer: 'guardian_subagent' }), {
+      status: 'applied',
+    })
     await server.request('turn/steer', {
       threadId,
       expectedTurnId: turn.id,
@@ -629,8 +633,10 @@ test('turn/settings/update switches model and effort for the running turn only',
     await server.waitFor('turn/completed', (params) => params.turn.id === turn.id, from)
     assert.match(
       (await server.reply(threadId, turn.id)) ?? '',
-      /released on model=opus effort=high$/,
+      /released on model=opus effort=high autoReview=true$/,
     )
+    const resumed = await server.request('thread/resume', { threadId })
+    assert.equal(resumed.approvalsReviewer, 'auto_review')
   })
 })
 
@@ -1132,6 +1138,130 @@ test("with CLAUDE_CODEX_MEMORIES the App's switches decide which threads get aut
       await assert.rejects(server.request('memory/reset'), /memory\/reset is not supported/)
     },
     { CLAUDE_CODEX_MEMORIES: '1' },
+  )
+})
+
+// A Codex config.toml that sets model_auto_compact_token_limit, and a project
+// it trusts whose own file sets another.
+async function writeAutoCompactConfig(home: string): Promise<string> {
+  const project = join(home, 'project')
+  await mkdir(join(project, '.codex'), { recursive: true })
+  await writeFile(
+    join(home, 'config.toml'),
+    [
+      'model_auto_compact_token_limit = 300_000',
+      '',
+      `[projects.${JSON.stringify(project)}]`,
+      'trust_level = "trusted"',
+      '',
+    ].join('\n'),
+  )
+  await writeFile(
+    join(project, '.codex', 'config.toml'),
+    'model_auto_compact_token_limit = 600000\n',
+  )
+  return project
+}
+
+// The window a thread's Claude session runs with, config/read's report of
+// it, and a config/batchWrite of the key.
+function autoCompactProbes(server: AppServer) {
+  return {
+    window: async (threadId: string) =>
+      server.reply(threadId, await server.runTurn(threadId, 'compact window check')),
+    reported: async (params: Record<string, unknown> = {}) =>
+      (await server.request('config/read', params)).config.model_auto_compact_token_limit,
+    write: (value: unknown) =>
+      server.request('config/batchWrite', {
+        edits: [{ keyPath: 'model_auto_compact_token_limit', value, mergeStrategy: 'upsert' }],
+      }),
+  }
+}
+
+test("Codex's model_auto_compact_token_limit becomes the compaction window of Claude threads", async () => {
+  await withServer(
+    async (server) => {
+      const { window, reported, write } = autoCompactProbes(server)
+
+      // Unset, Claude Code keeps its own window and config/read has none.
+      const thread = await server.startThread()
+      assert.equal(await window(thread), 'autoCompactWindow=unset')
+      assert.equal(await reported(), null)
+
+      // The Codex config files, written for Codex models, are not read
+      // without the switch.
+      const project = await writeAutoCompactConfig(server.home)
+      const inProject = await server.startThread({ cwd: project })
+      assert.equal(await window(thread), 'autoCompactWindow=unset')
+      assert.equal(await window(inProject), 'autoCompactWindow=unset')
+      assert.equal(await reported({ cwd: project }), null)
+
+      // What a client writes sets it. The window stays within the range
+      // Claude Code takes, and config/read reports the one in effect.
+      await write(50_000)
+      assert.equal(await window(thread), 'autoCompactWindow=100000')
+      assert.equal(await window(inProject), 'autoCompactWindow=100000')
+      assert.equal(await reported(), 100_000)
+      await write(250_000)
+      assert.equal(await window(thread), 'autoCompactWindow=250000')
+      // A value that is not a token count counts as unset.
+      await write('lots')
+      assert.equal(await window(thread), 'autoCompactWindow=unset')
+      await write(null)
+      assert.equal(await reported(), null)
+
+      // The config a thread starts or resumes with wins for that thread, and
+      // its forks.
+      await write(250_000)
+      const own = await server.startThread({
+        config: { model_auto_compact_token_limit: 2_000_000 },
+      })
+      assert.equal(await window(own), 'autoCompactWindow=1000000')
+      assert.equal(await window(thread), 'autoCompactWindow=250000')
+      assert.equal(await reported(), 250_000)
+      const { thread: fork } = await server.request('thread/fork', { threadId: own })
+      assert.equal(await window(fork.id), 'autoCompactWindow=1000000')
+      const { thread: retuned } = await server.request('thread/fork', {
+        threadId: own,
+        config: { model_auto_compact_token_limit: 400_000 },
+      })
+      assert.equal(await window(retuned.id), 'autoCompactWindow=400000')
+      await server.request('thread/resume', {
+        threadId: thread,
+        config: { model_auto_compact_token_limit: 150_000 },
+      })
+      assert.equal(await window(thread), 'autoCompactWindow=150000')
+      assert.equal(await window(inProject), 'autoCompactWindow=250000')
+    },
+    { CLAUDE_CODEX_CODEX_AUTO_COMPACT: undefined },
+  )
+})
+
+test('CLAUDE_CODEX_CODEX_AUTO_COMPACT=1 also takes the limit from the Codex config files', async () => {
+  await withServer(
+    async (server) => {
+      const { window, reported, write } = autoCompactProbes(server)
+
+      // The user's file sets it, and a trusted project's file overrides it
+      // for threads in the project.
+      const project = await writeAutoCompactConfig(server.home)
+      const thread = await server.startThread()
+      const inProject = await server.startThread({ cwd: project })
+      assert.equal(await window(thread), 'autoCompactWindow=300000')
+      assert.equal(await reported(), 300_000)
+      assert.equal(await window(inProject), 'autoCompactWindow=600000')
+      assert.equal(await reported({ cwd: project }), 600_000)
+
+      // What a client writes wins over the files, and the files take over
+      // again once it is cleared.
+      await write(150_000)
+      assert.equal(await window(inProject), 'autoCompactWindow=150000')
+      assert.equal(await reported({ cwd: project }), 150_000)
+      await write(null)
+      assert.equal(await window(thread), 'autoCompactWindow=300000')
+      assert.equal(await reported(), 300_000)
+    },
+    { CLAUDE_CODEX_CODEX_AUTO_COMPACT: '1' },
   )
 })
 

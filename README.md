@@ -61,8 +61,9 @@ Codex App ──SSH──▶ login shell ──▶ codex (shim, earlier in PATH)
 
 Agent text and reasoning stream into the conversation, Claude's thinking as the
 reasoning summary the App shows (`CLAUDE_CODEX_REASONING_VISIBLE=0` hides it);
-`Bash` becomes command approvals; `Edit`/`Write`/`MultiEdit` become file-change approvals with live
-diffs. Runtime selection maps only to existing backend paths today: default
+`Bash` and other tools become command approvals; `Edit`/`Write`/`MultiEdit`
+become file-change approvals with live diffs; MCP tool calls get the App's MCP
+tool approval card. Runtime selection maps only to existing backend paths today: default
 in-process Claude Agent SDK, `agent-http`, `agentapi`, `claude-p`, `codex-proxy`,
 and `mock`.
 
@@ -83,6 +84,14 @@ after the adapter or the App restarts, write the user's Claude Code config
 until the one before has sent its first message, or for at most
 `CLAUDE_CODEX_SDK_LAUNCH_GATE_TIMEOUT_MS` (default 30000) when it stays silent.
 Prompts and steers sent meanwhile wait for their process. It is off by default.
+
+That process inherits the adapter's environment, so Claude Code's own variables
+work as they do in a terminal. For example, `CLAUDE_CODE_FORK_SUBAGENT=0` keeps
+Claude from starting fork subagents (`subagent_type: "fork"`), which Claude Code
+offers Agent SDK sessions by default since 2.1.302; a fork shows in the App as a
+subagent with the role `fork`. With model process profiles, a profile passes such
+a variable on only when its `inheritEnv` names it or its `env` sets it. See
+[Claude Code variables](https://fuergaosi233.github.io/claude-codex/guide/configuration#claude-code-variables).
 
 ### Model process profiles
 
@@ -241,8 +250,8 @@ With `CLAUDE_CODEX_CLAUDE_AGENTS=1`, the bridged Claude Code folder also brings
 its subagents: `agents/*.md` in it, then `.claude/agents/*.md` from the git root
 down to the thread's folder, a project agent winning a name over a user agent.
 Their `name`, `description`, `tools`, `disallowedTools`, `model`, `skills`,
-`maxTurns`, `effort`, `memory`, `background`, `initialPrompt` and named
-`mcpServers` carry over; `permissionMode`, `hooks` and inline server definitions
+`maxTurns`, `effort`, `memory`, `background`, `initialPrompt`,
+`autoCompactWindow` and named `mcpServers` carry over; `permissionMode`, `hooks` and inline server definitions
 do not, since the Codex approval policy decides what runs.
 
 With `CLAUDE_CODEX_CLAUDE_PERMISSIONS=1`, its permission rules apply as well.
@@ -264,7 +273,10 @@ Codex approval prompt; the user's rules always count, a project's only once the
 project is trusted (those of a `settings.local.json` the repository supplies
 never), and none in plan mode or a read-only sandbox, where Codex would not let
 those tools run unasked. A user rule's `/path` stays relative to the config
-folder, as in Claude Code. `defaultMode` and `additionalDirectories` are not
+folder, as in Claude Code. A rule saved from an approval card ("Allow similar
+commands", "Always allow"; see [Approvals](docs/guide/gui.md#approvals)) goes
+to the project's `.claude/settings.local.json`, so it counts here once the
+project is trusted. `defaultMode` and `additionalDirectories` are not
 carried over: the Codex approval policy and sandbox decide the mode and the
 folders.
 
@@ -336,6 +348,17 @@ would otherwise be called after every Claude turn. The adapter does not wait for
 the program, ends it after 30 seconds and writes its stderr to the debug log.
 Summaries and other internal turns, and Codex model threads (whose own Codex
 runs it), do not notify; a project's `.codex/config.toml` cannot set it.
+
+`model_auto_compact_token_limit`, set with `config/value/write` or in the config
+a thread starts with, becomes Claude Code's auto-compact window for Claude
+threads (`CLAUDE_CODE_AUTO_COMPACT_WINDOW`, kept within the 100,000 to
+1,000,000 tokens Claude Code takes), winning over the window in Claude Code's
+own settings. With `CLAUDE_CODEX_CODEX_AUTO_COMPACT=1`, the key in
+`CODEX_HOME/config.toml` or a trusted project's `.codex/config.toml` counts
+too. This is off by default because users set that key for Codex models, and
+it would otherwise replace their Claude Code window on every Claude thread.
+Unset, Claude Code keeps its own window. See
+**[Configuration](https://fuergaosi233.github.io/claude-codex/guide/configuration#context-compaction)**.
 
 ### Leader chats
 

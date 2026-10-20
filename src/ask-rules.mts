@@ -112,14 +112,17 @@ function toolsMatch(name: string, tool: string): boolean {
   return agent.has(name) && agent.has(tool)
 }
 
-// mcp__server covers the server's tools, as does mcp__server__*.
+// mcp__server covers the server's tools, as does mcp__server__*, and only
+// that server's: Claude Code matches a rule's server name exactly. A server
+// name may hold `__` itself, so mcp__a__b, server a's tool b, also covers the
+// tools of a server a__b, as Claude Code's ask rules do.
 function mcpRuleCovers(name: string, tool: string): boolean {
   const clean = (text: string) => text.replace(/[^A-Za-z0-9_*-]/g, '_')
   const rule = clean(name)
   const parts = rule.split('__')
   if (parts.length === 2) return tool === rule || tool.startsWith(`${rule}__`)
   if (rule.endsWith('*')) return tool.startsWith(rule.slice(0, -1))
-  return tool === rule
+  return tool === rule || tool.startsWith(`${rule}__`)
 }
 
 // Bash(specifier): `prefix:*`, a pattern with * wildcards, or a command.

@@ -144,6 +144,33 @@ test('native presentation keeps streamed progress and a later unstreamed final a
   )
 })
 
+// Claude Code sends a `ping` every 30 seconds while it streams, and can close
+// a cut-short reply late or not at all; neither changes what the turn shows.
+test('native presentation ignores stream pings and a late or missing message_stop', async () => {
+  const messages: Record<string, unknown>[] = [
+    start('cut'),
+    stream({ type: 'ping' }),
+    delta('text', 'Cut short', 0),
+    assistant('cut', [text('Cut short')]),
+    stream({ type: 'ping' }),
+    start('answer'),
+    // The cut-short reply's, arriving after the next one started.
+    stream({ type: 'message_stop' }),
+    delta('text', 'Done.', 0),
+    stream({ type: 'ping' }),
+    assistant('answer', [text('Done.')]),
+  ]
+  const quiet = messages.filter((message) => {
+    const type = (message.event as Record<string, unknown> | undefined)?.type
+    return type !== 'ping' && type !== 'message_stop'
+  })
+  const shape = (events: RuntimeEvent[]) =>
+    events.map((event) => (event.type === 'text_delta' ? `text:${event.delta}` : event.type))
+  const events = shape(await collect(messages))
+  assert.deepEqual(events, shape(await collect(quiet)))
+  assert.deepEqual(events, ['message_boundary', 'text:Cut short', 'message_boundary', 'text:Done.'])
+})
+
 test('native presentation deduplicates per content block without losing adjacent unstreamed blocks', async () => {
   const events = await collect([
     start('answer'),
@@ -580,6 +607,34 @@ test('a failed native turn says why it failed, and a successful one carries no f
     failure: { terminalReason: 'prompt_too_long', category: null, status: null },
   })
 
+  // A CLI that refused to start names the reason; its stderr stays behind,
+  // and so does the id of a session it never loaded.
+  const refused = await completedEvent([
+    {
+      type: 'result',
+      subtype: 'error_during_execution',
+      is_error: true,
+      duration_ms: 0,
+      num_turns: 0,
+      session_id: 'never-loaded',
+      startup_failure_reason: 'proxy_invalid',
+      errors: ['Invalid proxy URL: http://user:secret@proxy.invalid:8080'],
+    },
+  ])
+  assert.equal(refused.outcome, 'Claude turn failed')
+  assert.deepEqual(refused.completed, {
+    type: 'completed',
+    success: false,
+    result: null,
+    claudeSessionId: null,
+    failure: {
+      terminalReason: null,
+      category: null,
+      status: null,
+      startupFailure: 'proxy_invalid',
+    },
+  })
+
   const succeeded = await completedEvent([
     system('api_retry', {
       attempt: 1,
@@ -743,6 +798,32 @@ test('turn settings switch the running turn in place, and the next turn restores
     ['applyFlagSettings', { effortLevel: null }],
   ])
   assert.equal(session.effort, null)
+
+  // The model switch may have left the CLI in another permission mode, so
+  // the turn's mode goes back with it; without a switch nothing is sent.
+  const modes: string[] = []
+  const planned = {
+    query: {
+      setModel: async () => {},
+      setPermissionMode: async (mode: string) => {
+        modes.push(mode)
+      },
+    },
+    model: 'opus',
+    effort: null,
+    permissionMode: 'plan',
+  }
+  const planTurn: RuntimeTurnContext = {
+    ...context,
+    model: 'sonnet',
+    approvalPolicy: 'on-request',
+    sandboxMode: 'workspace-write',
+    planMode: true,
+  }
+  await apply.call(runtime, planned, planTurn)
+  assert.deepEqual(modes, ['plan'])
+  await apply.call(runtime, planned, planTurn)
+  assert.deepEqual(modes, ['plan'])
 })
 
 test('a file tool call streams its input as throttled progress before the finished call', async () => {

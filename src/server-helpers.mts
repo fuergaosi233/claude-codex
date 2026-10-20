@@ -6,8 +6,11 @@ import type { AppSkill } from './claude-capabilities.mjs'
 import { callMcpTool, readMcpConfig, readMcpResource } from './mcp.mjs'
 import { stripQuietTurnHeartbeat } from './quiet-turns.mjs'
 import type { SessionStore } from './store.mjs'
+import { type AppToolNoteOptions, appToolAvailabilityNote } from './turn-context.mjs'
 import type {
+  ApprovalsReviewer,
   ClaudeRuntime,
+  CollaborationModeKind,
   FileUpdateChange,
   ImageInput,
   JsonRpcId,
@@ -145,8 +148,19 @@ export function normalizeSelectableModelId(value: string, fallback: string): str
   return defaultModel
 }
 
+// Codex: a request's collaborationMode "takes precedence over model,
+// reasoning_effort, and developer instructions". The App relies on it: a
+// turn/start that names a mode sends `model: null, effort: null` and puts the
+// picker's choice in collaborationMode.settings. An empty model or a null
+// effort there means "keep the current one".
+function collaborationSettings(params: Record<string, unknown>): Record<string, unknown> {
+  return asRecord(asRecord(params.collaborationMode).settings)
+}
+
 export function modelFromParams(params: Record<string, unknown>, fallback: string | null): string {
   const config = asRecord(params.config)
+  const modeModel = collaborationSettings(params).model
+  if (typeof modeModel === 'string' && modeModel.length > 0) return modeModel
   if (typeof params.model === 'string' && params.model.length > 0) return params.model
   if (typeof config.model === 'string' && config.model.length > 0) return config.model
   return fallback ?? ''
@@ -157,13 +171,82 @@ export function reasoningEffortFromParams(
   fallback: string | null,
 ): 'low' | 'medium' | 'high' | 'xhigh' | 'max' | null {
   const config = asRecord(params.config)
+  const modeEffort = collaborationSettings(params).reasoning_effort
   const effort =
-    typeof params.effort === 'string'
-      ? params.effort
-      : typeof config.model_reasoning_effort === 'string'
-        ? config.model_reasoning_effort
-        : fallback
+    typeof modeEffort === 'string'
+      ? modeEffort
+      : typeof params.effort === 'string'
+        ? params.effort
+        : typeof config.model_reasoning_effort === 'string'
+          ? config.model_reasoning_effort
+          : fallback
   return normalizeCodexReasoningEffort(effort)
+}
+
+// The model and effort a turn/start's collaborationMode carries, lifted to
+// the top-level `model` / `effort` keys the runtime reads.
+export function collaborationModeSettings(params: Record<string, unknown>): {
+  model?: string
+  effort?: string
+} {
+  const settings = collaborationSettings(params)
+  return {
+    ...(typeof settings.model === 'string' && settings.model.length > 0
+      ? { model: settings.model }
+      : {}),
+    ...(typeof settings.reasoning_effort === 'string' ? { effort: settings.reasoning_effort } : {}),
+  }
+}
+
+// The mode a request's `collaborationMode` names, or null when it names none
+// (the thread then keeps its stored mode).
+export function collaborationModeFromParams(
+  params: Record<string, unknown>,
+): CollaborationModeKind | null {
+  const mode = asRecord(params.collaborationMode).mode
+  return mode === 'plan' || mode === 'default' ? mode : null
+}
+
+// The reviewer a request's `approvalsReviewer` names, or null when it names
+// none. Codex still accepts the older name of auto_review.
+export function approvalsReviewerFromParams(
+  params: Record<string, unknown>,
+): ApprovalsReviewer | null {
+  const reviewer = params.approvalsReviewer
+  if (reviewer === 'auto_review' || reviewer === 'guardian_subagent') return 'auto_review'
+  return reviewer === 'user' ? 'user' : null
+}
+
+// Codex `GuardianApprovalReviewAction` for the item of a reviewed call: what
+// the App's review card says was asked. Other items have no such action.
+export function autoReviewAction(item: ThreadItem, cwd: string): Record<string, unknown> | null {
+  if (item.type === 'commandExecution')
+    return { type: 'command', source: 'shell', command: item.command, cwd: item.cwd }
+  if (item.type === 'fileChange')
+    return { type: 'applyPatch', cwd, files: item.changes.map((change) => change.path) }
+  if (item.type === 'mcpToolCall')
+    return {
+      type: 'mcpToolCall',
+      server: item.server,
+      toolName: item.tool,
+      connectorId: null,
+      connectorName: null,
+      toolTitle: null,
+    }
+  return null
+}
+
+// Codex `CollaborationMode` for a thread, as thread/settings/updated and
+// thread/resume report it. The App adopts it as the composer's mode.
+export function collaborationModeEnvelope(thread: ThreadRecord): Record<string, unknown> {
+  return {
+    mode: thread.collaborationMode ?? 'default',
+    settings: {
+      model: thread.model,
+      reasoning_effort: thread.reasoningEffort,
+      developer_instructions: thread.developerInstructions,
+    },
+  }
 }
 
 export function numberOr(value: unknown, fallback: number): number {
@@ -538,18 +621,139 @@ export interface CodexTurnError {
   additionalDetails: string | null
 }
 
+// Why Claude Code refused to start (the SDK's SDKStartupFailureReason), told
+// as what fixes it. Only these messages are shown: the CLI's own text can
+// carry a proxy URL with its credentials. `retry` marks the failures a retry
+// can fix, where something could not be loaded or checked right now; the
+// others need a new sign-in, an administrator or a change on this machine.
+const STARTUP_FAILURES: Record<string, { retry: boolean; message: string }> = {
+  org_config_required_unavailable: {
+    retry: true,
+    message:
+      'Claude Code could not load the policy limits and settings your organization requires before a session starts. Check the network or proxy, then try again.',
+  },
+  remote_settings_required_unavailable: {
+    retry: true,
+    message:
+      'Claude Code could not load the managed settings your organization requires. Check the network or proxy, then try again.',
+  },
+  org_verify_failed: {
+    retry: true,
+    message:
+      "Claude Code could not verify your sign-in's organization. Check the network, then try again; if it keeps failing, sign in to Claude Code again.",
+  },
+  worktree_unverified: {
+    retry: true,
+    message: "Claude Code could not verify this session's worktree right now. Try again.",
+  },
+  org_config_refused: {
+    retry: false,
+    message:
+      "Anthropic refused your organization's policy limits and settings for this sign-in. Sign in to Claude Code again (claude /login), or ask an administrator to allow Claude Code for this account.",
+  },
+  gateway_signin_required: {
+    retry: false,
+    message: 'The Claude gateway ended this sign-in. Sign in to Claude Code again (claude /login).',
+  },
+  gateway_access_denied: {
+    retry: false,
+    message:
+      'The Claude gateway refused managed settings for this account. Ask an administrator for access.',
+  },
+  org_pin_api_key_conflict: {
+    retry: false,
+    message:
+      "Your organization's managed settings require a Claude sign-in, but an Anthropic API key or auth token is configured. Remove it from the adapter's environment and sign in to Claude Code (claude /login).",
+  },
+  org_pin_mismatch: {
+    retry: false,
+    message:
+      'This Claude sign-in belongs to an organization your managed settings do not allow. Sign in to Claude Code with an allowed account (claude /login).',
+  },
+  provider_not_allowed: {
+    retry: false,
+    message:
+      "Your organization's managed settings do not allow the API provider this session is set up for. Switch to an allowed provider.",
+  },
+  managed_settings_invalid: {
+    retry: false,
+    message:
+      'Claude Code could not use your managed settings: they cannot be read, name no organization, or leave no allowed model. Ask an administrator to fix them.',
+  },
+  proxy_invalid: {
+    retry: false,
+    message:
+      "A proxy setting in Claude Code's environment or settings is not a complete URL. Fix it, then try again.",
+  },
+  temp_dir_unusable: {
+    retry: false,
+    message:
+      "Claude Code's temporary directory is unsafe or could not be created. Check the system temporary directory and its permissions.",
+  },
+  cwd_unavailable: {
+    retry: false,
+    message:
+      "This thread's working directory was deleted, moved or cannot be read. Restore it, or start the thread in a folder that exists.",
+  },
+  shell_tool_missing: {
+    retry: false,
+    message:
+      'Claude Code found no shell to run commands with. Install Git for Windows (Git Bash), or turn on the PowerShell tool.',
+  },
+  session_held_by_background: {
+    retry: false,
+    message:
+      'This conversation is running as a Claude Code background session. Stop that session, then try again.',
+  },
+  worktree_resume_refused: {
+    retry: false,
+    message:
+      'Claude Code refused to resume this session: its worktree failed a safety check, or the resume started inside the worktree.',
+  },
+  cli_version_too_old: {
+    retry: false,
+    message:
+      'This Claude Code version is older than the minimum Anthropic requires. Update Claude Code.',
+  },
+  bypass_root: {
+    retry: false,
+    message:
+      'Full access (bypass permissions) cannot run as root. Run the adapter as another user, or choose another approval mode.',
+  },
+}
+
+function startupFailure(reason: string): { retry: boolean; message: string } {
+  const known = Object.hasOwn(STARTUP_FAILURES, reason) ? STARTUP_FAILURES[reason] : undefined
+  if (known) return known
+  const name = startupReasonName(reason)
+  return { retry: false, message: `Claude Code refused to start${name ? ` (${name})` : ''}.` }
+}
+
+// A reason is named only when it looks like one, as a reason newer than the
+// table above still would.
+function startupReasonName(reason: string): string | null {
+  return /^[a-z][a-z0-9_]{0,63}$/.test(reason) ? reason : null
+}
+
 // The Codex error code for a Claude failure. `retrying` describes a request
 // Claude will send again: Codex reports every such retry as a disconnected
 // stream with the HTTP status, except an overloaded API, which the App shows
 // as "Server is busy". Codes the App answers with ChatGPT account flows are
 // never used: usageLimitExceeded opens a plan upgrade card and cyberPolicy a
 // safety notice, and an authentication failure stays 'other' rather than
-// 'unauthorized'.
+// 'unauthorized'. A CLI that refused to start for a reason a retry can fix
+// is a failed connection, which the App offers to retry; any other refusal
+// is 'other', which it does not.
 // App rule: error-codes
 export function codexErrorInfo(
   failure: RuntimeFailure | null | undefined,
   retrying = false,
 ): CodexErrorInfo {
+  if (failure?.startupFailure) {
+    return startupFailure(failure.startupFailure).retry
+      ? { httpConnectionFailed: { httpStatusCode: null } }
+      : 'other'
+  }
   const terminalReason = failure?.terminalReason ?? null
   const category = failure?.category ?? null
   const status = failure?.status ?? null
@@ -595,10 +799,19 @@ export function retryTurnError(event: Extract<RuntimeEvent, { type: 'retrying' }
 }
 
 // An Error for a failed turn that carries its Codex error code to failTurn.
+// A CLI that refused to start is told by why, never by its own text.
 export function turnFailure(message: string, failure: RuntimeFailure | null | undefined): Error {
-  return Object.assign(new Error(message), {
+  const reason = failure?.startupFailure
+  if (!reason) {
+    return Object.assign(new Error(message), {
+      codexErrorInfo: codexErrorInfo(failure),
+      additionalDetails: apiErrorDetails(failure),
+    })
+  }
+  const name = startupReasonName(reason)
+  return Object.assign(new Error(startupFailure(reason).message), {
     codexErrorInfo: codexErrorInfo(failure),
-    additionalDetails: apiErrorDetails(failure),
+    additionalDetails: name ? `Claude Code startup failure: ${name}` : null,
   })
 }
 
@@ -739,6 +952,8 @@ export function buildSystemPromptAddendum(input: {
   visualizationDir?: string | null
   // AGENTS.md and the Claude Code files the CLI does not read itself.
   projectInstructions?: string | null
+  // The App tools the thread has by another route.
+  appTools?: AppToolNoteOptions
 }): string | null {
   const sections: string[] = []
   if (input.desktopPresentation) sections.push(desktopPresentationPrompt)
@@ -750,6 +965,9 @@ export function buildSystemPromptAddendum(input: {
   if (base) sections.push(`# Project instructions\n${base}`)
   const dev = (input.developerInstructions ?? '').trim()
   if (dev) sections.push(`# Developer instructions\n${dev}`)
+  // App rule: app-tool-availability
+  const tools = input.desktopPresentation ? appToolAvailabilityNote(dev, input.appTools) : null
+  if (tools) sections.push(tools)
   const cue = personalityPromptCue(input.personality)
   if (cue) sections.push(cue)
   return sections.length > 0 ? sections.join('\n\n') : null
@@ -1068,6 +1286,59 @@ export function normalizeDecision(response: unknown): PermissionDecision['decisi
     return 'acceptForSession'
   }
   return 'decline'
+}
+
+// Whether the App answered with "Allow similar commands" for the prefix the
+// card showed: an acceptWithExecpolicyAmendment decision carrying it.
+export function acceptsAmendment(response: unknown, prefix: string[] | null): boolean {
+  if (!prefix) return false
+  const choice = asRecord(asRecord(response).decision).acceptWithExecpolicyAmendment
+  const words = asRecord(choice).execpolicy_amendment
+  return (
+    Array.isArray(words) &&
+    words.length === prefix.length &&
+    words.every((word, index) => word === prefix[index])
+  )
+}
+
+// What an approval "for this session" covers: a shell command by its exact
+// text, an MCP tool as a whole (as Codex keys it by server and tool), any
+// other tool by its exact input.
+export function approvalSessionKey(toolName: string, input: Record<string, unknown>): string {
+  if (toolName === 'Bash') return JSON.stringify(['command', String(input.command ?? '')])
+  if (toolName.startsWith('mcp__')) return JSON.stringify(['mcp', toolName])
+  return JSON.stringify(['tool', toolName, input])
+}
+
+const APPROVAL_SUMMARY_KEYS = [
+  'url',
+  'file_path',
+  'notebook_path',
+  'path',
+  'skill',
+  'pattern',
+  'query',
+  'description',
+  'prompt',
+  'command',
+]
+
+// The line a command approval card shows for a tool that is not a shell
+// command (WebFetch, NotebookEdit, Skill, ...): the tool's name and the
+// input that says what it will touch.
+export function toolApprovalCommand(toolName: string, input: Record<string, unknown>): string {
+  const key = APPROVAL_SUMMARY_KEYS.find(
+    (name) => typeof input[name] === 'string' && (input[name] as string).trim(),
+  )
+  let detail = key ? String(input[key]) : ''
+  if (!detail && Object.keys(input).length > 0) {
+    try {
+      detail = JSON.stringify(input)
+    } catch {}
+  }
+  detail = detail.replace(/\s+/g, ' ').trim()
+  if (detail.length > 200) detail = `${detail.slice(0, 199)}…`
+  return detail ? `${toolName} ${detail}` : toolName
 }
 
 export function fileChangeFromTool(

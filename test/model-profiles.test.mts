@@ -928,6 +928,21 @@ test('a profile that inherits everything gets no provider setting or other crede
   }
 })
 
+test("a profile passes the adapter's Claude Code switches on only when it inherits or sets them", () => {
+  const env = (profile: Record<string, unknown>) => ({
+    HOME: tmpdir(),
+    PATH: '/usr/bin',
+    CLAUDE_CODE_FORK_SUBAGENT: '0',
+    CLAUDE_CODEX_MODEL_PROFILES: JSON.stringify([{ id: 'main-model', ...profile }]),
+  })
+  const fork = (profile: Record<string, unknown>) =>
+    resolveClaudeModelProcess('main-model', env(profile))?.env.CLAUDE_CODE_FORK_SUBAGENT
+  assert.equal(fork({}), undefined)
+  assert.equal(fork({ inheritEnv: ['PATH', 'CLAUDE_CODE_FORK_SUBAGENT'] }), '0')
+  assert.equal(fork({ inheritEnv: ['*'] }), '0')
+  assert.equal(fork({ env: { CLAUDE_CODE_FORK_SUBAGENT: '1' } }), '1')
+})
+
 test('the fork of a Codex thread may take a profile', async () => {
   const harness = await profileServer(TWO_PROFILES)
   const { call } = harness

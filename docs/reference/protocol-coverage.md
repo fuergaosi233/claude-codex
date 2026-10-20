@@ -25,10 +25,14 @@ Implemented as real remote/runtime behavior:
   allowed tools, add dirs, file checkpointing.
 - **Turn input** — user input, and the `toolOutput` of a thread handoff as a
   `functionCallOutput` item.
-- **Approval bridge** — `Bash`, and `Read` / `Grep` / `Glob` / `LS` →
-  command approval with Codex command actions; `Edit` / `Write` / `MultiEdit`
-  → file-change approval with diffs; MCP elicitation → the App's form or link
-  prompt.
+- **Approval bridge** — `Bash`, `Read` / `Grep` / `Glob` / `LS` (with Codex
+  command actions) and other tools → command approval; `Edit` / `Write` /
+  `MultiEdit` → file-change approval with diffs; MCP tool calls → the App's MCP
+  tool approval card; declined calls end `declined`, and cancel interrupts the
+  turn; MCP elicitation → the App's form or link prompt. The auto-review
+  reviewer (`approvalsReviewer`, kept per thread) → Claude Code's auto mode,
+  with `item/autoApprovalReview/completed` for a call its classifier denies, or
+  a `configWarning` and `user` echoed back where auto mode is unavailable.
 - **Streaming** — turn started/completed, thread status changes, agent text
   deltas, reasoning deltas, command output deltas, file patches (updated while
   Claude is still writing the call), file exploration as commands with Codex

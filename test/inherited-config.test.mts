@@ -1177,6 +1177,7 @@ disallowedTools: Bash
 effort: high
 memory: user
 maxTurns: "3"
+autoCompactWindow: 150000
 skills: docs
 ---
 Write docs.
@@ -1189,7 +1190,8 @@ Write docs.
     )
     await write(
       join(repo, '.claude', 'agents', 'reviewer.md'),
-      '---\nname: reviewer\ndescription: Repo reviewer\ntools: Read, Grep\n---\nRepo rules.\n',
+      // A window that is not a whole number of tokens is left out.
+      '---\nname: reviewer\ndescription: Repo reviewer\ntools: Read, Grep\nautoCompactWindow: 200k\n---\nRepo rules.\n',
     )
     await write(
       join(cwd, '.claude', 'agents', 'reviewer.md'),
@@ -1197,7 +1199,7 @@ Write docs.
     )
     await write(
       join(repo, '.claude', 'agents', 'tester.md'),
-      '---\nname: tester\ndescription: Runs tests\nbackground: true\n---\nTest.\n',
+      '---\nname: tester\ndescription: Runs tests\nbackground: true\nautoCompactWindow: "120000"\n---\nTest.\n',
     )
 
     const atRoot = Object.fromEntries(
@@ -1211,6 +1213,8 @@ Write docs.
       disallowedTools: ['Bash'],
       skills: ['docs'],
       maxTurns: 3,
+      // Claude Code compacts the subagent's conversation at this many tokens.
+      autoCompactWindow: 150000,
       memory: 'user',
       effort: 'high',
     })
@@ -1223,6 +1227,7 @@ Write docs.
       description: 'Runs tests',
       prompt: 'Test.',
       background: true,
+      autoCompactWindow: 120000,
     })
     // The closest folder wins.
     const inApp = claudeAgents(cwd, configDir).find((agent) => agent.name === 'reviewer')

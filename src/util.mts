@@ -202,6 +202,33 @@ export function codexCliVersion(): string {
   return `codex-cli ${codexCompatVersion()}${suffix ? ` (${suffix})` : ''}`
 }
 
+// The first Claude Code versions with a feature the adapter uses only when the
+// session's CLI has it: the get_task_output request behind live Bash output,
+// and the Agent tool's effort parameter.
+export const CLAUDE_CODE_TASK_OUTPUT_VERSION = '2.1.287'
+export const CLAUDE_CODE_AGENT_EFFORT_VERSION = '2.1.292'
+
+// Whether a Claude Code version, as system/init or the initialize reply
+// report it ("2.1.304"), is at least `minimum`. A version that is unknown or
+// cannot be read counts as new enough: a feature is never turned off only
+// because the version could not be read.
+export function claudeCodeAtLeast(version: string | null | undefined, minimum: string): boolean {
+  const have = versionParts(version)
+  const need = versionParts(minimum)
+  if (!have || !need) return true
+  for (let index = 0; index < 3; index += 1) {
+    const ours = have[index] ?? 0
+    const wanted = need[index] ?? 0
+    if (ours !== wanted) return ours > wanted
+  }
+  return true
+}
+
+function versionParts(value: string | null | undefined): number[] | null {
+  const match = /^\s*v?(\d+)\.(\d+)\.(\d+)/.exec(value ?? '')
+  return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : null
+}
+
 export function codexUserAgent(clientName: string, clientVersion: string): string {
   const name = clientName.trim() || 'codex-app'
   const version = clientVersion.trim() || 'unknown'
@@ -222,11 +249,19 @@ export function textFromInput(input: unknown): string {
       if (value.type === 'mention') return `@${value.path ?? value.name ?? ''}`
       if (value.type === 'localImage') return `[local image: ${value.path ?? ''}]`
       if (value.type === 'image') return `[image]`
-      if (value.type === 'skill') return `/${value.name ?? 'skill'}`
+      if (value.type === 'skill') return skillInputText(value)
       return ''
     })
     .filter(Boolean)
     .join('\n')
+}
+
+// A skill input item reads like the link the composer writes for a picked
+// skill, so both reach Claude the same way (see turn-context.mts).
+// App rule: skill-injection
+function skillInputText(item: { name?: string; path?: string }): string {
+  const name = item.name || 'skill'
+  return item.path ? `[$${name}](${item.path})` : `/${name}`
 }
 
 export function turnToolOutputFromParams(value: unknown): TurnToolOutput | null {
@@ -282,7 +317,7 @@ export function extractImageInputs(input: unknown): ImageExtractResult {
     const item = raw as { type?: string; text?: string; path?: string; name?: string; url?: string }
     if (item.type === 'text' && typeof item.text === 'string') texts.push(item.text)
     else if (item.type === 'mention') texts.push(`@${item.path ?? item.name ?? ''}`)
-    else if (item.type === 'skill') texts.push(`/${item.name ?? 'skill'}`)
+    else if (item.type === 'skill') texts.push(skillInputText(item))
     else if (item.type === 'localImage' && typeof item.path === 'string') {
       const img = readLocalImage(item.path)
       if (img) images.push(img)

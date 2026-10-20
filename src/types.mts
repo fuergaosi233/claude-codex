@@ -45,6 +45,14 @@ export interface RpcPeer {
   close(): void
 }
 
+// Codex `ModeKind`: the collaboration modes the App's composer offers.
+export type CollaborationModeKind = 'plan' | 'default'
+
+// Codex `ApprovalsReviewer`: who answers a thread's approvals. 'auto_review'
+// (older Apps send 'guardian_subagent') lets an automatic reviewer decide
+// them; a Claude thread runs it as Claude Code's 'auto' permission mode.
+export type ApprovalsReviewer = 'user' | 'auto_review'
+
 export interface ThreadRecord {
   id: string
   sessionId: string
@@ -98,6 +106,13 @@ export interface ThreadRecord {
   // Keep it alongside the normalized policies so the profile survives resume
   // and the settings UI can round-trip its selection.
   permissionProfileId?: string | null
+  // The App's collaboration mode (the /plan toggle), as last sent on
+  // turn/start or thread/settings/update. Null until the App names one; a
+  // turn that names none runs in the stored mode.
+  collaborationMode?: CollaborationModeKind | null
+  // Who answers the thread's approvals, as the App last chose it and the
+  // thread can run it. Null until the App names one, which means 'user'.
+  approvalsReviewer?: ApprovalsReviewer | null
   // Codex App marks transient title-generation / consolidation threads as
   // ephemeral — these should not appear in the user-facing thread list.
   ephemeral: boolean
@@ -551,10 +566,15 @@ export interface RuntimeTurnContext {
   // Folders outside the workspace Claude may read without asking, such as
   // the Codex App skills the prompt lists. Writes still follow the policy.
   readableRoots?: string[]
-  // Drive Claude SDK permission_mode='plan' for this turn — Claude generates
-  // a plan but does not execute tools. Set when the App requests `planMode`
-  // on turn/start (or when CLAUDE_CODEX_PERMISSION_MODE=plan globally).
+  // Drive Claude SDK permission_mode='plan' for this turn — Claude explores
+  // read-only and proposes a plan through ExitPlanMode. Set when the thread's
+  // collaboration mode is 'plan' (or the legacy `planMode` flag is on).
   planMode: boolean
+  // The thread chose the App's automatic reviewer: run the session in Claude
+  // Code's 'auto' permission mode, where Claude's classifier answers the asks
+  // the approval policy would bring to the user. A backend that cannot
+  // reports auto_review_unavailable and leaves the approvals with the user.
+  autoReview?: boolean
   // Multimodal input attached to the turn. localImage gets read + base64
   // encoded; image (URL) is passed through as-is. Sidecar reshapes the
   // Claude SDK query into a multimodal user message when this is non-empty.
@@ -572,6 +592,10 @@ export interface RuntimeTurnContext {
   // false to have the runtime switch auto-memory off. Unset leaves it to
   // Claude Code's own settings.
   autoMemory?: boolean
+  // The auto-compact window, in tokens, of the thread's Claude sessions: set
+  // only when the user set Codex's model_auto_compact_token_limit. Unset
+  // leaves Claude Code's own window.
+  autoCompactWindow?: number | null
   // Tools the client registered on thread/start, one MCP server per
   // namespace. Claude's calls reach RuntimeHandlers.onDynamicToolCall of the
   // turn in flight. Backends without in-process tools ignore it.
@@ -651,7 +675,17 @@ export type RuntimeEvent =
   | { type: 'message_boundary' }
   | { type: 'text_delta'; delta: string }
   | { type: 'reasoning_delta'; delta: string }
-  | { type: 'tool_use'; toolUseId: string; toolName: string; input: Record<string, unknown> }
+  | {
+      type: 'tool_use'
+      toolUseId: string
+      toolName: string
+      input: Record<string, unknown>
+      // A subagent's own call: the task id of the agent that made it, which
+      // stays the same when the agent is resumed. Only Agent calls of a
+      // subagent reach the server; absent for the main loop and on CLIs
+      // that do not report it.
+      agentId?: string
+    }
   // The input of a file tool call (Edit, Write, MultiEdit) as far as the
   // model has written it; the finished call follows as `tool_use`.
   | {
@@ -676,7 +710,39 @@ export type RuntimeEvent =
       toolUseId: string
       toolName: string
       input: Record<string, unknown>
+      // Why Claude asks (a matched rule, a hook, a path outside the
+      // workspace), shown on the approval card.
+      reason?: string | null
+      // Claude's own one-line prompt for the request ("Claude wants to read
+      // foo.txt"), used when it gives no reason.
+      title?: string | null
+      // The path outside the allowed folders that made Claude ask.
+      blockedPath?: string | null
+      // The MCP server an mcp__ tool belongs to.
+      mcpServer?: string | null
+      // Claude offers no "always allow" for this call, so the card offers no
+      // session approval either.
+      suppressSessionApproval?: boolean
+      // Claude Code says the user has to answer this call themselves (the
+      // card is the tool's own interface, or the ask only shows locally): only
+      // the user may answer it, never a policy or an earlier session approval.
+      requiresUser?: boolean
+      // The permission changes Claude offers with this approval, the "don't
+      // ask again" choices of its own prompt (see permission-suggestions.mts).
+      suggestions?: ClaudePermissionUpdate[]
     }
+  // Claude refused a tool call without asking (a deny rule, a hook, the
+  // permission mode). `autoReview` is set when Claude's auto-mode classifier
+  // refused it, with the classifier's reason.
+  | {
+      type: 'tool_denied'
+      toolUseId: string
+      toolName?: string
+      autoReview?: { rationale: string | null }
+    }
+  // The thread asked for automatic review, but this session cannot run it:
+  // the approvals stay with the user. `reason` says why.
+  | { type: 'auto_review_unavailable'; reason: string }
   | {
       type: 'user_input_request'
       requestId: string
@@ -694,6 +760,9 @@ export type RuntimeEvent =
       preTokens: number | null
       postTokens: number | null
     }
+  // A plan-mode turn's finished plan: the text Claude handed to ExitPlanMode.
+  // The App shows it as the turn's plan card and offers to implement it.
+  | { type: 'proposed_plan'; toolUseId: string; text: string }
   // A result's usage. `child` marks tokens a subagent or workflow spent:
   // they add to the thread's total, not to its context window.
   | {
@@ -767,6 +836,9 @@ export interface RuntimeFailure {
   category: string | null
   // The HTTP status of the API error that ended the turn.
   status: number | null
+  // Why Claude Code refused to start, when it said so: the SDK's
+  // startup_failure_reason ('org_config_refused', 'proxy_invalid', ...).
+  startupFailure?: string | null
 }
 
 // Codex's request_user_input primitive — surfaces Claude's AskUserQuestion as a
@@ -830,6 +902,21 @@ export interface ThreadTokenUsage {
 export interface PermissionDecision {
   decision: 'accept' | 'acceptForSession' | 'decline' | 'cancel'
   updatedInput?: Record<string, unknown>
+  // What Claude Code applies as it runs the call: the rule the user chose to
+  // save, or what "for this session" adds for the session.
+  updatedPermissions?: ClaudePermissionUpdate[]
+}
+
+// A change to Claude Code's permission settings (the Agent SDK's
+// PermissionUpdate): rules to add for a tool, folders to add, or a mode, for
+// the session or one of its settings files.
+export interface ClaudePermissionUpdate {
+  type: string
+  destination: string
+  behavior?: string
+  rules?: { toolName: string; ruleContent?: string }[]
+  directories?: string[]
+  mode?: string
 }
 
 export interface RuntimeHandlers {
@@ -881,6 +968,9 @@ export type RuntimeTaskEvent =
       subagentType: string | null
       prompt: string | null
       backgrounded: boolean | null
+      // The task id of the subagent whose agent launched this task. Absent
+      // when the main loop launched it, and on CLIs that do not report it.
+      parentTaskId?: string
     }
   | {
       type: 'task_progress'
@@ -937,10 +1027,12 @@ export interface RuntimeSteerOptions {
   onAccepted?: () => void
 }
 
-// turn/settings/update: model and effort for the rest of a running turn.
+// turn/settings/update: model, effort and reviewer for the rest of a running
+// turn. `autoReview` as in RuntimeTurnContext.
 export interface RuntimeTurnSettings {
   model?: string
   effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+  autoReview?: boolean
 }
 
 // A background task of a live session: a backgrounded Bash shell
@@ -949,6 +1041,15 @@ export interface RuntimeLiveTask {
   taskId: string
   taskType: string | null
   toolUseId: string | null
+}
+
+// An MCP server as a live Claude session sees it: its connection state
+// (connected, failed, needs-auth, pending or disabled) and, once connected,
+// the name and version the server gave.
+export interface RuntimeMcpServerStatus {
+  name: string
+  status: string
+  serverInfo: { name: string; version: string } | null
 }
 
 export interface ClaudeRuntime {
@@ -984,6 +1085,9 @@ export interface ClaudeRuntime {
   stopTask?(threadId: string, taskId: string): Promise<boolean>
   // Background tasks still running in the thread's live session.
   liveTasks?(threadId: string): RuntimeLiveTask[]
+  // The Claude Code version the thread's live session runs, null until its
+  // CLI reported one.
+  cliVersion?(threadId: string): string | null
   // True while a session outlives its turns: background tasks are running or
   // Claude may still answer one that just reported back.
   hasBackgroundWork?(): boolean
@@ -1003,4 +1107,7 @@ export interface ClaudeRuntime {
   // that failed or wait for a sign-in; a session opened later reads the
   // config itself. Never rejects.
   reloadMcpServers?(): Promise<void>
+  // The MCP servers of the thread's live session, as Claude Code sees them;
+  // null when no live session can say. Never rejects.
+  mcpServerStatuses?(threadId: string): Promise<RuntimeMcpServerStatus[] | null>
 }

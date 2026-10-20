@@ -42,10 +42,17 @@ class FakeQuery implements AsyncIterable<Record<string, unknown>> {
   interrupts = 0
   stoppedTasks: string[] = []
   closed = false
-  // What mcpServerStatus answers; null makes it fail.
-  mcpStatuses: { name: string; status: string }[] | null = []
+  // What mcpServerStatus answers; null makes it fail, and 'hang' never
+  // answers, as a wedged session does.
+  mcpStatuses: Record<string, unknown>[] | null | 'hang' = []
   reconnects: string[] = []
   failingReconnects = new Set<string>()
+  // The permission modes the runtime switched to, each with the number of
+  // prompts sent by then; the models the CLI lists, and a mode it refuses.
+  modes: { mode: string; prompts: number }[] = []
+  models: Record<string, unknown>[] = []
+  refuseMode: string | null = null
+  modeDelayMs = 0
   private queue: Record<string, unknown>[] = []
   private wake: (() => void) | null = null
 
@@ -68,7 +75,8 @@ class FakeQuery implements AsyncIterable<Record<string, unknown>> {
     this.stoppedTasks.push(taskId)
   }
 
-  async mcpServerStatus(): Promise<{ name: string; status: string }[]> {
+  async mcpServerStatus(): Promise<Record<string, unknown>[]> {
+    if (this.mcpStatuses === 'hang') return new Promise(() => {})
     if (!this.mcpStatuses) throw new Error('control request failed')
     return this.mcpStatuses
   }
@@ -80,7 +88,15 @@ class FakeQuery implements AsyncIterable<Record<string, unknown>> {
 
   async setModel(): Promise<void> {}
 
-  async setPermissionMode(): Promise<void> {}
+  async setPermissionMode(mode: string): Promise<void> {
+    if (this.modeDelayMs > 0) await sleep(this.modeDelayMs)
+    this.modes.push({ mode, prompts: this.prompts.length })
+    if (mode === this.refuseMode) throw new Error(`${mode} mode is disabled`)
+  }
+
+  async supportedModels(): Promise<Record<string, unknown>[]> {
+    return this.models
+  }
 
   close(): void {
     this.closed = true
@@ -128,15 +144,18 @@ interface RecordingListener extends RuntimeBackgroundListener {
   released: { threadId: string; liveTaskIds: string[] }[]
 }
 
+// `setup` configures each session before the runtime sees it.
 function fakeRuntime<Q extends FakeQuery = FakeQuery>(
   create: (prompt: AsyncIterable<Record<string, unknown>>) => Q = (prompt) =>
     new FakeQuery(prompt) as Q,
+  setup: (query: Q) => void = () => {},
 ): { runtime: NativeClaudeRuntime; queries: Q[] } {
   const runtime = new NativeClaudeRuntime()
   const queries: Q[] = []
   Reflect.set(runtime, 'sdk', {
     query: ({ prompt }: { prompt: AsyncIterable<Record<string, unknown>> }) => {
       const query = create(prompt)
+      setup(query)
       queries.push(query)
       return query
     },
@@ -552,6 +571,74 @@ test('native background level replaces task edges and reports tasks still alive 
   await runtime.stop()
 })
 
+test('native drops the task frames of a run that a resume replaced', async () => {
+  await withSettleMs(40, async () => {
+    const { runtime, queries } = fakeRuntime()
+    const listener = recordingListener()
+    runtime.setBackgroundListener(listener)
+
+    const first = runtime.runTurn(context, handlers([]))
+    const query = await waitFor(() => queries[0], 'session')
+    query.push(
+      ...launchBackgroundAgent('a6').map((message) =>
+        message.type === 'system' ? { ...message, run_id: 'run-1' } : message,
+      ),
+    )
+    await first
+
+    const frame = (subtype: string, fields: Record<string, unknown>) => ({
+      type: 'system',
+      subtype,
+      task_id: 'a6',
+      ...fields,
+    })
+    // SendMessage resumed the agent: same task, a new run. The old run's
+    // notification arrives after that and must not end the new one.
+    query.push(
+      frame('task_started', {
+        run_id: 'run-2',
+        tool_use_id: 'send-use',
+        task_type: 'local_agent',
+        description: 'investigate',
+        is_backgrounded: true,
+      }),
+      frame('task_notification', { run_id: 'run-1', status: 'completed', summary: 'old run' }),
+      frame('task_progress', { run_id: 'run-1', description: 'old run' }),
+      frame('task_progress', { run_id: 'run-2', description: 'new run' }),
+      // A CLI that predates run ids sends none: such frames always count.
+      frame('task_progress', { description: 'no run' }),
+    )
+    await waitFor(
+      () => listener.tasks.filter((event) => event.type === 'task_progress').length === 2,
+      'progress of the current run',
+    )
+    assert.equal(runtime.hasBackgroundWork(), true, 'the old notification ended nothing')
+    query.push(
+      frame('task_notification', { run_id: 'run-2', status: 'failed', summary: 'new run' }),
+    )
+    await waitFor(
+      () => listener.tasks.some((event) => event.type === 'task_notification'),
+      'notification of the current run',
+    )
+    assert.deepEqual(
+      listener.tasks.map((event) =>
+        event.type === 'task_progress' || event.type === 'task_notification'
+          ? `${event.type}:${event.type === 'task_progress' ? event.description : event.summary}`
+          : event.type,
+      ),
+      [
+        'task_started',
+        'task_started',
+        'task_progress:new run',
+        'task_progress:no run',
+        'task_notification:new run',
+      ],
+    )
+    await waitFor(() => listener.released.length === 1, 'session release')
+    await runtime.stop()
+  })
+})
+
 test('native runtime without a background listener keeps closing the session per turn', async () => {
   const { runtime, queries } = fakeRuntime()
   const first = runtime.runTurn(context, handlers([]))
@@ -598,6 +685,51 @@ test('native MCP reload retries only the servers an open session could not reach
   await waitFor(() => listener.released.length === 1, 'session release')
   await runtime.reloadMcpServers()
   assert.deepEqual(query.reconnects, ['docs', 'search'])
+  await runtime.stop()
+})
+
+test('native MCP statuses are what the open session says of its servers', async () => {
+  const { runtime, queries } = fakeRuntime()
+  const listener = recordingListener()
+  runtime.setBackgroundListener(listener)
+  // No session yet: nothing to say.
+  assert.equal(await runtime.mcpServerStatuses('thread'), null)
+
+  const first = runtime.runTurn(context, handlers([]))
+  const query = await waitFor(() => queries[0], 'session')
+  query.push(...launchBackgroundAgent('a8'))
+  await first
+
+  query.mcpStatuses = [
+    { name: 'github', status: 'connected', serverInfo: { name: 'GitHub', version: '1.2.0' } },
+    { name: 'docs', status: 'needs-auth', error: 'sign in first' },
+    // Entries without a name or a state are left out.
+    { status: 'connected' },
+    { name: 'odd' },
+  ]
+  assert.deepEqual(await runtime.mcpServerStatuses('thread'), [
+    { name: 'github', status: 'connected', serverInfo: { name: 'GitHub', version: '1.2.0' } },
+    { name: 'docs', status: 'needs-auth', serverInfo: null },
+  ])
+  assert.equal(await runtime.mcpServerStatuses('other-thread'), null)
+
+  // A session that cannot answer says nothing.
+  query.mcpStatuses = null
+  assert.equal(await runtime.mcpServerStatuses('thread'), null)
+
+  // Nor does a wedged one, in time for the App, which waits five seconds for
+  // the whole list.
+  query.mcpStatuses = 'hang'
+  const asked = Date.now()
+  assert.equal(await runtime.mcpServerStatuses('thread'), null)
+  const waited = Date.now() - asked
+  assert.ok(waited >= 1_500 && waited < 4_000, `waited ${waited} ms`)
+
+  // Nor does one that has ended.
+  query.mcpStatuses = [{ name: 'github', status: 'connected' }]
+  query.close()
+  await waitFor(() => listener.released.length === 1, 'session release')
+  assert.equal(await runtime.mcpServerStatuses('thread'), null)
   await runtime.stop()
 })
 
@@ -784,6 +916,206 @@ test('native steer is accepted once the CLI starts consuming it', async () => {
   assert.equal(accepted, 1)
   assert.equal(await runtime.steer('thread', 'late'), false, 'no turn left to steer')
   await runtime.stop()
+})
+
+// A turn on a thread whose approvals the automatic reviewer answers.
+const autoReviewContext: RuntimeTurnContext = {
+  ...context,
+  prompt: 'tidy the build',
+  model: 'sonnet',
+  approvalPolicy: 'on-request',
+  sandboxMode: 'workspace-write',
+  autoReview: true,
+}
+
+function finishTurn(query: FakeQuery): void {
+  query.push(assistant('done', [text('done')]), {
+    type: 'result',
+    subtype: 'success',
+    result: 'done',
+  })
+}
+
+test('native auto review switches the session to auto mode before Claude reads the prompt', async () => {
+  const { runtime, queries } = fakeRuntime(undefined, (query) => {
+    query.models = [{ value: 'sonnet', displayName: 'Sonnet', supportsAutoMode: true }]
+    query.modeDelayMs = 20
+  })
+  const events: RuntimeEvent[] = []
+  const turn = runtime.runTurn(autoReviewContext, handlers(events))
+  const query = await waitFor(() => queries[0], 'session')
+  // A steer sent meanwhile waits for the prompt.
+  assert.equal(await runtime.steer('thread', 'also this'), true)
+  await waitFor(() => query.prompts.length === 2, 'prompt and steer')
+  assert.deepEqual(query.modes, [{ mode: 'auto', prompts: 0 }])
+  assert.match(JSON.stringify(query.prompts[0]), /tidy the build/)
+  assert.match(JSON.stringify(query.prompts[1]), /also this/)
+
+  // The App hands approvals back to the user mid-turn.
+  assert.equal(await runtime.updateTurnSettings('thread', 'turn-1', { autoReview: false }), true)
+  assert.deepEqual(
+    query.modes.map((entry) => entry.mode),
+    ['auto', 'default'],
+  )
+  finishTurn(query)
+  await turn
+  assert.equal(
+    events.some((event) => event.type === 'auto_review_unavailable'),
+    false,
+  )
+  await runtime.stop()
+})
+
+test('native auto review keeps the user as reviewer where auto mode is unavailable', async () => {
+  const cases: {
+    label: string
+    setup: (query: FakeQuery) => void
+    context: Partial<RuntimeTurnContext>
+    reason: string
+    modes: string[]
+  }[] = [
+    {
+      label: 'model without auto mode',
+      setup: (query) => {
+        query.models = [
+          {
+            value: 'haiku',
+            resolvedModel: 'claude-haiku-5',
+            displayName: 'Haiku',
+            supportsAutoMode: false,
+          },
+        ]
+      },
+      context: { model: 'claude-haiku-5' },
+      reason: 'Haiku does not support auto mode',
+      modes: [],
+    },
+    {
+      label: 'CLI refusing the switch',
+      setup: (query) => {
+        query.refuseMode = 'auto'
+      },
+      context: {},
+      reason: 'Claude Code refused auto mode: auto mode is disabled',
+      modes: ['auto'],
+    },
+    {
+      label: 'read-only sandbox',
+      setup: () => {},
+      context: { sandboxMode: 'read-only' },
+      reason: 'A read-only sandbox keeps every approval with the user',
+      modes: [],
+    },
+  ]
+  for (const entry of cases) {
+    const { runtime, queries } = fakeRuntime(undefined, entry.setup)
+    const events: RuntimeEvent[] = []
+    const turn = runtime.runTurn({ ...autoReviewContext, ...entry.context }, handlers(events))
+    const query = await waitFor(() => queries[0], `${entry.label} session`)
+    await waitFor(() => query.prompts.length === 1, `${entry.label} prompt`)
+    finishTurn(query)
+    await turn
+    assert.deepEqual(
+      events.filter((event) => event.type === 'auto_review_unavailable'),
+      [{ type: 'auto_review_unavailable', reason: entry.reason }],
+      entry.label,
+    )
+    assert.deepEqual(
+      query.modes.map((switched) => switched.mode),
+      entry.modes,
+      entry.label,
+    )
+    await runtime.stop()
+  }
+
+  // Full access answers every call already: nothing to switch, nothing to say.
+  const { runtime, queries } = fakeRuntime()
+  const events: RuntimeEvent[] = []
+  const turn = runtime.runTurn(
+    { ...autoReviewContext, approvalPolicy: 'never', sandboxMode: 'danger-full-access' },
+    handlers(events),
+  )
+  const query = await waitFor(() => queries[0], 'full access session')
+  await waitFor(() => query.prompts.length === 1, 'full access prompt')
+  finishTurn(query)
+  await turn
+  assert.deepEqual(query.modes, [])
+  assert.equal(
+    events.some((event) => event.type === 'auto_review_unavailable'),
+    false,
+  )
+  await runtime.stop()
+})
+
+test('native model switch mid-turn sends the permission mode again for the new model', async () => {
+  // A Plan turn stays in plan mode, whatever the CLI did with the switch.
+  {
+    const { runtime, queries } = fakeRuntime()
+    const turn = runtime.runTurn(
+      { ...autoReviewContext, autoReview: false, planMode: true },
+      handlers([]),
+    )
+    const query = await waitFor(() => queries[0], 'plan session')
+    await waitFor(() => query.prompts.length === 1, 'plan prompt')
+    assert.equal(query.modes.length, 0, 'the session opens in plan mode')
+    assert.equal(await runtime.updateTurnSettings('thread', 'turn-1', { model: 'opus' }), true)
+    assert.deepEqual(
+      query.modes.map((entry) => entry.mode),
+      ['plan'],
+    )
+    finishTurn(query)
+    await turn
+    await runtime.stop()
+  }
+
+  // Auto review asks again whether the new model has auto mode: one without
+  // it hands the approvals back to the user.
+  {
+    const { runtime, queries } = fakeRuntime(undefined, (query) => {
+      query.models = [
+        { value: 'sonnet', displayName: 'Sonnet', supportsAutoMode: true },
+        { value: 'haiku', displayName: 'Haiku', supportsAutoMode: false },
+      ]
+    })
+    const events: RuntimeEvent[] = []
+    const turn = runtime.runTurn(autoReviewContext, handlers(events))
+    const query = await waitFor(() => queries[0], 'auto session')
+    await waitFor(() => query.prompts.length === 1, 'auto prompt')
+    assert.equal(await runtime.updateTurnSettings('thread', 'turn-1', { model: 'haiku' }), true)
+    assert.deepEqual(
+      query.modes.map((entry) => entry.mode),
+      ['auto', 'default'],
+    )
+    assert.deepEqual(
+      events.filter((event) => event.type === 'auto_review_unavailable'),
+      [{ type: 'auto_review_unavailable', reason: 'Haiku does not support auto mode' }],
+    )
+    finishTurn(query)
+    await turn
+    await runtime.stop()
+  }
+
+  // A reviewer handed back mid-turn stays handed back through a later switch.
+  {
+    const { runtime, queries } = fakeRuntime(undefined, (query) => {
+      query.models = [
+        { value: 'sonnet', displayName: 'Sonnet', supportsAutoMode: true },
+        { value: 'opus', displayName: 'Opus', supportsAutoMode: true },
+      ]
+    })
+    const turn = runtime.runTurn(autoReviewContext, handlers([]))
+    const query = await waitFor(() => queries[0], 'handed back session')
+    await waitFor(() => query.prompts.length === 1, 'handed back prompt')
+    assert.equal(await runtime.updateTurnSettings('thread', 'turn-1', { autoReview: false }), true)
+    assert.equal(await runtime.updateTurnSettings('thread', 'turn-1', { model: 'opus' }), true)
+    assert.deepEqual(
+      query.modes.map((entry) => entry.mode),
+      ['auto', 'default', 'default'],
+    )
+    finishTurn(query)
+    await turn
+    await runtime.stop()
+  }
 })
 
 test('native drops the turn Claude starts only to acknowledge a task the user stopped', async () => {
@@ -1423,6 +1755,51 @@ test('the main loop keeps its own tools and text beside an Agent call; only suba
   )
 })
 
+test("a subagent's own Agent call names the agent that made it, when the CLI does", async () => {
+  const { runtime, queries } = fakeRuntime()
+  const events: RuntimeEvent[] = []
+  const turn = runtime.runTurn(context, handlers(events))
+  const query = await waitFor(() => queries[0], 'session')
+  const agentCall = (id: string) => ({ type: 'tool_use', id, name: 'Agent', input: { prompt: id } })
+  const nested = (id: string, fields: Record<string, unknown>) => ({
+    type: 'assistant',
+    parent_tool_use_id: 'agent-1',
+    message: { id: `sub-${id}`, content: [agentCall(id)] },
+    ...fields,
+  })
+  const result = (id: string, parent: string | null) => ({
+    type: 'user',
+    parent_tool_use_id: parent,
+    message: { content: [{ type: 'tool_result', tool_use_id: id, content: `${id} report` }] },
+  })
+  query.push(
+    // The main loop's frames carry no agent id, and one there is ignored.
+    { ...assistant('m1', [agentCall('agent-1')]), parent_tool_use_id: null, agent_id: 'stray' },
+    nested('agent-2', { agent_id: 'task-1' }),
+    // An older CLI names no agent.
+    nested('agent-3', {}),
+    result('agent-2', 'agent-1'),
+    result('agent-3', 'agent-1'),
+    result('agent-1', null),
+    assistant('m2', [text('done')]),
+    { type: 'result', subtype: 'success', result: 'done' },
+  )
+  await turn
+
+  assert.deepEqual(
+    events.flatMap((event) =>
+      event.type === 'tool_use'
+        ? [[event.toolUseId, event.agentId ?? null, 'agentId' in event]]
+        : [],
+    ),
+    [
+      ['agent-1', null, false],
+      ['agent-2', 'task-1', true],
+      ['agent-3', null, false],
+    ],
+  )
+})
+
 test('the result reports the context window of the model behind the main loop', async () => {
   const { runtime, queries } = fakeRuntime()
   const events: RuntimeEvent[] = []
@@ -1843,6 +2220,74 @@ test('native without get_task_output shows Bash output only with the result', as
       events.filter((event) => event.type === 'tool_output_delta'),
       [],
     )
+    await runtime.stop()
+  })
+})
+
+test('native reads Bash output only from a CLI that can answer get_task_output, or one whose version is unknown', async () => {
+  await withCommandOutputPollMs(5, async () => {
+    for (const [version, streams] of [
+      ['2.1.286', false],
+      ['2.1.287', true],
+      [undefined, true],
+      ['not a version', true],
+    ] as const) {
+      const { runtime, queries } = fakeRuntime((prompt) => new ShellQuery(prompt))
+      const events: RuntimeEvent[] = []
+      const turn = runtime.runTurn(context, handlers(events))
+      const query = await waitFor(() => queries[0], 'session')
+      query.outputs.set('t1', 'compiling\n')
+      query.push(
+        {
+          type: 'system',
+          subtype: 'init',
+          session_id: 'session',
+          ...(version === undefined ? {} : { claude_code_version: version }),
+        },
+        assistant('m1', [bash('bash-a', 'make')]),
+        bashTask('t1', 'bash-a', false),
+      )
+      if (streams) await waitFor(() => outputDeltas(events, 'bash-a').length, 'output')
+      else await sleep(40)
+      const label = `CLI ${version ?? 'without a version'}`
+      assert.equal(runtime.cliVersion('thread'), version ?? null, label)
+      query.push(toolResult('bash-a', 'compiling\n'), assistant('m2', [text('done')]), {
+        type: 'result',
+        subtype: 'success',
+        result: 'done',
+      })
+      await turn
+      assert.equal(query.reads > 0, streams, label)
+      assert.equal(outputDeltas(events, 'bash-a').length > 0, streams, label)
+      await runtime.stop()
+    }
+  })
+})
+
+test('native takes the CLI version from the initialize reply before the first turn starts', async () => {
+  await withCommandOutputPollMs(5, async () => {
+    class InitializedQuery extends ShellQuery {
+      async initializationResult(): Promise<unknown> {
+        return { commands: [], claude_code_version: '2.1.250' }
+      }
+    }
+    const { runtime, queries } = fakeRuntime((prompt) => new InitializedQuery(prompt))
+    const events: RuntimeEvent[] = []
+    const turn = runtime.runTurn(context, handlers(events))
+    const query = await waitFor(() => queries[0], 'session')
+    await waitFor(() => runtime.cliVersion('thread'), 'version')
+    query.outputs.set('t1', 'compiling\n')
+    query.push(assistant('m1', [bash('bash-a', 'make')]), bashTask('t1', 'bash-a', false))
+    await sleep(40)
+    assert.equal(runtime.cliVersion('thread'), '2.1.250')
+    query.push(toolResult('bash-a', 'compiling\n'), assistant('m2', [text('done')]), {
+      type: 'result',
+      subtype: 'success',
+      result: 'done',
+    })
+    await turn
+    assert.equal(query.reads, 0)
+    assert.deepEqual(outputDeltas(events, 'bash-a'), [])
     await runtime.stop()
   })
 })

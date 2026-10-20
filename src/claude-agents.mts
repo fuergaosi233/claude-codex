@@ -71,6 +71,14 @@ function agentFrom(source: string, text: string): ClaudeAgent | null {
   if (skills && skills.length > 0) definition.skills = skills
   const maxTurns = Number(data.maxTurns)
   if (Number.isInteger(maxTurns) && maxTurns > 0) definition.maxTurns = maxTurns
+  // The token count at which the subagent compacts its own conversation; it
+  // only ever lowers the window the subagent would inherit.
+  const autoCompactWindow =
+    typeof data.autoCompactWindow === 'number' || typeof data.autoCompactWindow === 'string'
+      ? Number(data.autoCompactWindow)
+      : Number.NaN
+  if (Number.isSafeInteger(autoCompactWindow) && autoCompactWindow > 0)
+    definition.autoCompactWindow = autoCompactWindow
   if (data.background === true || data.background === 'true') definition.background = true
   if (typeof data.memory === 'string' && MEMORY_SCOPES.includes(data.memory))
     definition.memory = data.memory

@@ -130,6 +130,10 @@ test('other ask rules: whole tools, domains, MCP servers and subagents', () => {
   assert.equal(covers('mcp__docs__write', 'mcp__docs__read'), false)
   assert.equal(covers('mcp__docs__read', 'mcp__docs__read'), true)
   assert.equal(covers('mcp__docs', 'mcp__docsearch__read'), false)
+  assert.equal(covers('mcp__docs__*', 'mcp__docsearch__read'), false)
+  // A server whose name holds `__`: a rule naming it covers its tools.
+  assert.equal(covers('mcp__docs__v2', 'mcp__docs__v2__read'), true)
+  assert.equal(covers('mcp__docs__v2', 'mcp__docs__v2read'), false)
   assert.equal(covers('Agent(reviewer)', 'Task', { subagent_type: 'reviewer' }), true)
   assert.equal(covers('Task(reviewer)', 'Agent', { subagent_type: 'other' }), false)
   assert.equal(covers('Agent', 'Agent', { subagent_type: 'other' }), true)

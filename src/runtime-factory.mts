@@ -13,6 +13,7 @@ import type {
   RuntimeBackgroundListener,
   RuntimeHandlers,
   RuntimeLiveTask,
+  RuntimeMcpServerStatus,
   RuntimeSteerOptions,
   RuntimeTurnContext,
   RuntimeTurnSettings,
@@ -73,9 +74,19 @@ class SelectableRuntime implements ClaudeRuntime {
       model: context.model,
       effort: context.effort,
     })
+    // Only an Agent SDK session has Claude Code's auto mode.
+    // App rule: auto-review
+    let turnContext = context
+    if (context.autoReview && !runsAutoReview(requestedType)) {
+      await handlers.onEvent({
+        type: 'auto_review_unavailable',
+        reason: `The ${requestedType} runtime has no auto mode`,
+      })
+      turnContext = { ...context, autoReview: false }
+    }
     this.activeRuntimeByThread.set(context.threadId, runtime)
     try {
-      await runtime.runTurn(context, handlers)
+      await runtime.runTurn(turnContext, handlers)
     } finally {
       if (this.activeRuntimeByThread.get(context.threadId) === runtime) {
         this.activeRuntimeByThread.delete(context.threadId)
@@ -99,6 +110,10 @@ class SelectableRuntime implements ClaudeRuntime {
   ): Promise<boolean> {
     const runtime = this.activeRuntimeByThread.get(threadId)
     if (!runtime) return false
+    // A backend without auto mode leaves the reviewer change to its next
+    // turn, which reports it unavailable.
+    if (!runtime.updateTurnSettings && settings.model == null && settings.effort == null)
+      return true
     if (!runtime.updateTurnSettings)
       throw new Error('this backend cannot change the settings of a running turn')
     return runtime.updateTurnSettings(threadId, turnId, settings)
@@ -148,6 +163,16 @@ class SelectableRuntime implements ClaudeRuntime {
     return this.activeRuntimeByThread.get(threadId)?.filtersNestedEvents?.(threadId) === true
   }
 
+  cliVersion(threadId: string): string | null {
+    const active = this.activeRuntimeByThread.get(threadId)
+    if (active) return active.cliVersion?.(threadId) ?? null
+    for (const runtime of this.runtimes.values()) {
+      const version = runtime.cliVersion?.(threadId)
+      if (version) return version
+    }
+    return null
+  }
+
   hasPendingContinuation(threadId: string): boolean {
     return [...this.runtimes.values()].some(
       (runtime) => runtime.hasPendingContinuation?.(threadId) === true,
@@ -170,6 +195,15 @@ class SelectableRuntime implements ClaudeRuntime {
     )
   }
 
+  // The first backend whose live session for the thread can say.
+  async mcpServerStatuses(threadId: string): Promise<RuntimeMcpServerStatus[] | null> {
+    for (const runtime of this.runtimes.values()) {
+      const statuses = await runtime.mcpServerStatuses?.(threadId)
+      if (statuses) return statuses
+    }
+    return null
+  }
+
   private runtimeFor(type: RuntimeBackendType): ClaudeRuntime {
     const existing = this.runtimes.get(type)
     if (existing) return existing
@@ -181,6 +215,10 @@ class SelectableRuntime implements ClaudeRuntime {
 }
 
 function runsModelProfiles(type: RuntimeBackendType): boolean {
+  return type === 'agent-sdk-sidecar' || type === 'mock'
+}
+
+function runsAutoReview(type: RuntimeBackendType): boolean {
   return type === 'agent-sdk-sidecar' || type === 'mock'
 }
 

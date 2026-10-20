@@ -12,7 +12,9 @@ Once the shim and exports are installed and the adapter is built:
      live diff that grows while Claude writes it.
    - Files Claude reads, searches and lists fold into **Explored** rows; see
      [How tool calls show](#how-tool-calls-show).
-3. Approve actions in the Codex App UI as usual.
+   - Other tools surface as command approvals naming the tool and what it
+     touches, and MCP tools as the App's **MCP tool approval** card.
+3. Approve actions in the Codex App UI as usual (see [Approvals](#approvals)).
 4. Disconnecting closes the proxy. Once no turn is active, the daemon idles out
    and the in-process Claude runtime is reclaimed.
 
@@ -44,8 +46,9 @@ Available reasoning efforts. See [Models & effort](/guide/configuration#models-e
 
 **Claude Opus Plan / Sonnet Execute** keeps the `opus-plan` option ID and maps to Claude
 Code's `opusplan` hybrid mode: Opus during planning, Sonnet during execution.
-Selecting it does not itself enable plan mode, so an ordinary conversation may
-correctly run on Sonnet. Choose **Claude Opus** to use Opus throughout. See the
+Selecting it does not itself enable plan mode (see [Plan mode](#plan-mode)), so
+an ordinary conversation may correctly run on Sonnet. Choose **Claude Opus** to
+use Opus throughout. See the
 [Claude Code model configuration](https://code.claude.com/docs/en/model-config#opusplan-model-setting).
 
 A new chat runs on whichever model is picked before its first message. After
@@ -97,6 +100,19 @@ error. An overloaded API shows as **Server is busy**. The adapter never sends
 the codes the App answers with ChatGPT account flows, so a Claude
 authentication or billing failure shows its message instead of a ChatGPT plan
 upgrade or sign-in prompt.
+
+When the Claude CLI refuses to start a session, the turn fails with a message
+the adapter writes for the reason Claude Code gave, saying what fixes it, and
+the reason's name under it (for example `Claude Code startup failure:
+org_config_refused`). A failure a retry can fix, such as organization settings
+that could not be loaded, is a failed connection, which the App offers to
+retry. A refused sign-in, a provider or account the organization does not
+allow, invalid managed settings or a problem on this machine (a broken proxy
+setting, a missing working directory, an outdated CLI) is a plain error. The
+CLI's own output is never shown, since it can contain a proxy URL with its
+credentials. The adapter asks the CLI to report every startup failure this
+way by setting `CLAUDE_CODE_STARTUP_FAILURE_RESULTS=1`; a value in the
+adapter's environment takes its place.
 
 Notices the Claude CLI would show an interactive user at once, such as a
 failed compaction, go out as `warning` notifications, each once a turn. The
@@ -150,10 +166,111 @@ Claude's tool calls show as the items Codex uses for its own:
 When Claude Code asks before a Read, Grep, Glob or LS call, for a file outside
 the workspace for example, the App asks on the command card with the command
 the item shows. The card names a command's reads and searches only when one of
-them is the whole command, so it always shows everything that runs, and only a
-Bash command can be allowed for the rest of the session.
+them is the whole command, so it always shows everything that runs. See
+[Approvals](#approvals) for what the card's choices cover.
 
 Chats from before this version keep showing their earlier items.
+
+## Plan mode
+
+`/plan` and the composer's **Plan** toggle work in Claude chats as they do in
+Codex chats. A turn sent in Plan mode runs in Claude Code's plan mode: Claude
+explores read-only, may ask you questions, and hands its finished plan over,
+which the App shows as a plan card. When the turn ends the App asks
+**Implement this plan?**: accepting switches the chat back to Default and sends
+the plan as a new turn, in which Claude carries it out; writing feedback instead
+keeps Plan mode on for a revised plan. In Plan mode a tool call that would need
+your approval (a command, an edit) is refused rather than asked about.
+
+A chat keeps its mode after a restart. A fork starts in Default, as a Codex
+fork does; when you fork a chat from the App, the App keeps the mode it showed
+and sends it with the fork's messages.
+
+## Approvals
+
+Outside Full access, Claude asks before it runs a command, edits a file, or
+uses another tool its permission mode does not already allow, and the App
+shows the approval card a Codex chat would:
+
+- **Commands** (`Bash`) and other Claude tools ask as command approvals. A tool
+  that is not a shell command shows its name and what it touches, such as
+  `WebFetch https://example.com`. The card carries Claude's reason for asking
+  when it gives one.
+- **Edits** (`Edit`, `Write`, `MultiEdit`) ask as file-change approvals with the
+  diff.
+- **MCP tools** ask with the App's MCP tool approval card: "Allow the *server*
+  MCP server to run tool *name*?", with the call's arguments.
+
+**Allow for this session** approves the same command, the same tool call, or
+for an MCP tool every call of that tool, for the rest of the thread while the
+adapter runs. For an edit it approves only that edit. With
+`CLAUDE_CODEX_SESSION_SUGGESTIONS=1` it also adds what Claude Code offers for
+the session with the call, such as a rule for every fetch from the same domain
+or the folder outside the workspace that the call reads or writes in; that can
+cover more than a Codex session approval does, so it is off by default. It
+never switches the thread's permission mode, and it saves nothing.
+
+Claude Code sometimes offers to remember an approval: the "don't ask again"
+choice of its own prompt. The card then offers to save a rule:
+
+- **Allow similar commands**, on a command card, appears when Claude offers a
+  single rule for a shell command. The card shows the command prefix that the
+  rule covers, such as `npm test` for `Bash(npm test *)`.
+- **Always allow**, on an MCP tool card, saves a rule for that tool of that
+  server, `mcp__<server>__<tool>`. Claude Code matches a rule's server name
+  exactly, so the rule covers no other server whose name starts the same way.
+
+Claude Code writes the rule itself, always to the project's uncommitted
+`.claude/settings.local.json`. It never writes to your user settings or to the
+checked-in `.claude/settings.json`. From then on, calls the rule covers run
+without asking, in this chat and in later ones. To be asked again, remove the
+rule from that file. Nothing is saved unless you pick one of these two choices:
+**Allow** and **Allow for this session** save nothing. A card offers neither
+choice for a compound command line, for a call Claude offers no "always allow"
+for, or for a call that only you may answer.
+
+**Decline** refuses the call: its card shows as declined, and Claude is told and
+goes on. **Cancel** refuses it and stops the turn, as the Stop button does. A
+call Claude refuses on its own (a deny rule, its permission mode) also shows as
+declined, with a warning saying why.
+
+### Auto-review
+
+Picking the App's **auto-review** permissions preset in a Claude chat runs the
+chat in Claude Code's auto permission mode, where a classifier decides the
+calls that would otherwise ask you. The chat keeps the
+choice for its later messages, after a restart and in its forks, until you pick
+another preset. A call the classifier blocks shows as declined with a review
+card giving its reason, and Claude is told and goes on; the card's "approve
+anyway" has nothing to override in a Claude chat.
+
+Auto mode needs a model that supports it, a sandbox that allows writes and a
+Claude Code that accepts it. Where it is unavailable (a model without it, a
+read-only sandbox, `CLAUDE_CODEX_PERMISSION_MODE` set to another mode), the
+chat keeps asking you as before: the picker goes back to the default and a
+warning under Settings > Agent > Configuration says why. Plan mode and Full
+access work as they did. Some calls Claude Code says only you may answer ask
+you in every mode, Full access included, and "Allow for this session" covers
+only that call.
+
+## Skills and the App's tools
+
+Skills you pick with `$` or `/` in the composer work as they do in Codex chats.
+Claude Code's built-in commands (`/simplify`, `/code-review`, …) run as slash
+commands. For any other skill, the adapter adds its `SKILL.md` to what Claude
+reads for that message, so Claude follows it without first looking for the
+file. That covers the skills in your Claude Code and project `.claude/skills`
+folders and the App's own skills Claude can run, up to 64 KiB per skill;
+Claude reads any other skill file itself. Your message shows only the chip.
+
+Context the App attaches to a message without showing it, such as the follow-up
+after you connect a suggested plugin, reaches Claude after the message, marked
+as data rather than instructions when the App does not vouch for it.
+
+The App's instructions to the model describe tools only Codex chats have:
+starting and messaging other threads, worktrees, automations and the sidebar.
+Claude chats are told which of these they lack, so instead of searching for
+them Claude asks you to use the App for such steps.
 
 ## Inline visualizations
 
