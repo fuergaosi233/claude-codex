@@ -302,6 +302,8 @@ interface PendingServerRequest {
   readonly request: WireMessage
   // Ids of the peers the request was sent to, which a replay skips.
   readonly targets: Set<string>
+  // Withdrawn through its abort signal, rather than when its turn ends.
+  readonly cancellable: boolean
   resolve(value: unknown): void
   reject(error: Error): void
 }
@@ -1842,6 +1844,10 @@ export class CodexClaudeAppServer {
     const subscribers = this.subscribersByThread.get(threadId)
     if (!subscribers?.delete(peer.id)) return { status: 'notSubscribed' }
     if (subscribers.size === 0) this.subscribersByThread.delete(threadId)
+    // The peer drops the thread's request cards with it, so a later
+    // thread/resume shows its pending requests again.
+    for (const pending of this.pendingServerRequests.values())
+      if (pending.threadId === threadId) pending.targets.delete(peer.id)
     // The thread's other followers keep it open; only this peer hears it close.
     this.sendNotification(peer, { method: 'thread/closed', params: { threadId } })
     return { status: 'unsubscribed' }
@@ -7558,6 +7564,7 @@ export class CodexClaudeAppServer {
         turnId: nullIfEmpty(stringOr(fields.turnId, '')),
         request,
         targets: new Set(targets.map((target) => target.id)),
+        cancellable: signal != null,
         resolve: (value) => {
           signal?.removeEventListener('abort', onAbort)
           resolve(value)
@@ -7607,6 +7614,19 @@ export class CodexClaudeAppServer {
     }
   }
 
+  // A turn's approvals and questions end with it, as Codex's app-server drops
+  // a thread's pending requests when its turn completes: an answer that comes
+  // later is ignored instead of reporting the idle thread active again.
+  // Requests with an abort signal are withdrawn through it.
+  private dropPendingServerRequests(threadId: string, turnId: string): void {
+    for (const [id, pending] of this.pendingServerRequests.entries()) {
+      if (pending.cancellable || pending.threadId !== threadId || pending.turnId !== turnId)
+        continue
+      this.pendingServerRequests.delete(id)
+      debugLog('rpc.serverRequest.dropped', { threadId, turnId, id, method: pending.method })
+    }
+  }
+
   private completeActiveTurns(status: 'interrupted' | 'failed', error: unknown): void {
     for (const [threadId, turnId] of this.activeTurnByThread.entries()) {
       const turn = this.store.getTurn(turnId)
@@ -7645,7 +7665,10 @@ export class CodexClaudeAppServer {
   private clearActiveTurn(threadId: string): void {
     const turnId = this.activeTurnByThread.get(threadId)
     const existed = this.activeTurnByThread.delete(threadId)
-    if (turnId) this.closeStreamingItemsByTurn.delete(turnId)
+    if (turnId) {
+      this.closeStreamingItemsByTurn.delete(turnId)
+      this.dropPendingServerRequests(threadId, turnId)
+    }
     let settled: TurnRecord | null = null
     try {
       settled = turnId ? this.store.getTurn(turnId) : null

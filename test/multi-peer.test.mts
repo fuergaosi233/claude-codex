@@ -125,11 +125,13 @@ test('a pending approval reaches a peer that opens the thread later', {
 test('an approval left by an interrupted turn is not shown to a later follower', {
   timeout: 20_000,
 }, async () => {
-  await withServer(async (connect) => {
+  await withServer(async (connect, debugLog) => {
     const app = connect('app')
     const threadId = await startThread(app)
     await app.request('turn/start', { threadId, input: textInput('please run approval bash') })
-    await app.until((message) => message.method === 'item/commandExecution/requestApproval')
+    const request = (
+      await app.until((message) => message.method === 'item/commandExecution/requestApproval')
+    ).at(-1)
     await app.request('turn/interrupt', { threadId })
     await app.until((message) => message.method === 'turn/completed')
 
@@ -139,6 +141,48 @@ test('an approval left by an interrupted turn is not shown to a later follower',
       late.received.some((message) => message.method === 'item/commandExecution/requestApproval'),
       false,
       'the turn that asked has ended',
+    )
+
+    // The request ended with its turn: an answer now is ignored, and the idle
+    // thread is not reported active again.
+    const before = app.received.length
+    await app.respond(request.id, { decision: 'accept' })
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 50))
+    assert.deepEqual(ignoredResponses(debugLog), [['app', request.id, 'notPending']])
+    assert.deepEqual(
+      app.received.slice(before).map((message) => message.method),
+      [],
+      'nothing follows a late answer',
+    )
+  })
+})
+
+test('a client that closes a thread and opens it again gets its pending approval again', {
+  timeout: 20_000,
+}, async () => {
+  await withServer(async (connect) => {
+    const app = connect('app')
+    const threadId = await startThread(app)
+    await app.request('turn/start', { threadId, input: textInput('please run approval bash') })
+    const isApproval = (message: any) => message.method === 'item/commandExecution/requestApproval'
+    const request = (await app.until(isApproval)).at(-1)
+
+    // Closing the chat takes its approval card down; opening it shows the card again.
+    await app.request('thread/unsubscribe', { threadId })
+    await app.until((message) => message.method === 'thread/closed')
+    await app.request('thread/resume', { threadId })
+    const replayed = (await app.until(isApproval)).at(-1)
+    assert.equal(replayed.id, request.id)
+
+    await app.respond(replayed.id, { decision: 'accept' })
+    const seen = await app.until((message) => message.method === 'turn/completed')
+    assert.ok(
+      seen.some(
+        (message) =>
+          message.method === 'item/commandExecution/outputDelta' &&
+          /mock approval/.test(message.params.delta),
+      ),
+      'the accepted command ran',
     )
   })
 })
@@ -171,15 +215,7 @@ test('any client may answer a pending approval; a later answer is ignored', {
 
     // An answer after the first is dropped, and the debug log says so.
     await app.respond(request.id, { decision: 'decline' })
-    const ignored = readFileSync(debugLog, 'utf8')
-      .split('\n')
-      .filter(Boolean)
-      .map((line) => JSON.parse(line))
-      .filter((entry) => entry.event === 'rpc.responseFromClient.ignored')
-    assert.deepEqual(
-      ignored.map((entry) => [entry.peerId, entry.id, entry.reason]),
-      [['app', request.id, 'notPending']],
-    )
+    assert.deepEqual(ignoredResponses(debugLog), [['app', request.id, 'notPending']])
   })
 })
 
@@ -469,6 +505,16 @@ function agentText(messages: any[]): string {
     .filter((message) => message.method === 'item/agentMessage/delta')
     .map((message) => message.params.delta)
     .join('')
+}
+
+// [peer, request id, reason] for each client answer the debug log says was ignored.
+function ignoredResponses(debugLog: string): string[][] {
+  return readFileSync(debugLog, 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+    .filter((entry) => entry.event === 'rpc.responseFromClient.ignored')
+    .map((entry) => [entry.peerId, entry.id, entry.reason])
 }
 
 function userMessages(messages: any[]): any[] {
