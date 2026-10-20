@@ -36,9 +36,9 @@ import { debugLog } from './util.mjs'
 // prints JSON that does not parse, the CLI gets what exit 2 would give it,
 // with a reason that names the hook and what went wrong. Async hooks and
 // Stop and SubagentStop hooks ignore it. The SDK takes no onFailure for a
-// callback, so the adapter applies it, and the callback gets a second more
-// than the command, so that the command's own timeout, which blocks, comes
-// before the CLI's, which does not.
+// callback, so the adapter applies it, and the callback gets a few seconds
+// more than the command, so that the command's own timeout, which blocks,
+// comes before the CLI's, which does not.
 //
 // Two events never reach a callback. The CLI runs SessionStart hooks for a
 // new, resumed or forked session while it loads, before it reads the SDK's
@@ -98,6 +98,10 @@ const TOOL_EVENTS = new Set(['PreToolUse', 'PostToolUse', 'PostToolUseFailure'])
 const DRAIN_MS = 250
 // How often a killed hook is killed again until it is gone.
 const KILL_RETRY_MS = 100
+// How much longer the CLI waits for a hook that blocks on failure than its
+// command may run: room to kill it, drain its output and answer, even when
+// the adapter is busy, before the CLI gives up and lets the action go ahead.
+const FAILURE_GRACE_SEC = 5
 const OUTPUT_LIMIT = 1024 * 1024
 const OUTPUT_KEYS = [
   'continue',
@@ -346,11 +350,11 @@ export function claudeHookSession(
       if (spec.if && !conditionMet(spec.if, input, options.projectDir)) return {}
       return run(spec, input, signal)
     }
-    // A second more for a hook that blocks on failure: its own timeout
-    // blocks, the CLI's would let the action go ahead.
+    // More time for a hook that blocks on failure: its own timeout blocks,
+    // the CLI's would let the action go ahead.
     const matcher: HookMatcher = {
       hooks: [callback],
-      timeout: spec.timeoutSec + (blocksOnFailure(spec) ? 1 : 0),
+      timeout: spec.timeoutSec + (blocksOnFailure(spec) ? FAILURE_GRACE_SEC : 0),
     }
     if (spec.matcher) matcher.matcher = spec.matcher
     add(spec.event, matcher)

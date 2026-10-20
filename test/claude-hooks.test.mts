@@ -462,8 +462,8 @@ test('a hook command that blocks on failure blocks when it times out, cannot sta
         'deny',
       )
       assert.match(String(denial(closed.output)), pattern)
-      // The command's own timeout comes first.
-      assert.equal(closed.timeout, timeoutSec + 1)
+      // The command's own timeout comes first, with room to answer.
+      assert.equal(closed.timeout, timeoutSec + 5)
     }
     // A hook that does its job is not a failure.
     assert.deepEqual((await outcome(spec({ command: 'true', onFailure: 'block' }))).output, {})
@@ -565,18 +565,22 @@ test('a hook is done when its own process exits, and what it started keeps runni
 test('a hook the CLI gives up on is stopped', async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'claude-hooks-abort-')))
   try {
-    const { hooks } = claudeHookSession([spec({ command: 'sleep 5' })], {
-      projectDir: root,
-      approvals: true,
-    })
-    const callback = hooks.PreToolUse?.[0]?.hooks[0]
-    assert.ok(callback)
-    const controller = new AbortController()
-    const started = Date.now()
-    const pending = callback({}, undefined, { signal: controller.signal })
-    setTimeout(() => controller.abort(), 100)
-    assert.deepEqual(await pending, {})
-    assert.ok(Date.now() - started < 3000)
+    // Killed because the CLI gave up, not failed: even a hook that blocks on
+    // failure answers nothing.
+    for (const onFailure of ['continue', 'block'] as const) {
+      const { hooks } = claudeHookSession([spec({ command: 'sleep 5', onFailure })], {
+        projectDir: root,
+        approvals: true,
+      })
+      const callback = hooks.PreToolUse?.[0]?.hooks[0]
+      assert.ok(callback)
+      const controller = new AbortController()
+      const started = Date.now()
+      const pending = callback({}, undefined, { signal: controller.signal })
+      setTimeout(() => controller.abort(), 100)
+      assert.deepEqual(await pending, {}, onFailure)
+      assert.ok(Date.now() - started < 3000, onFailure)
+    }
   } finally {
     await rm(root, { recursive: true, force: true })
   }
