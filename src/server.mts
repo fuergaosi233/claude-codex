@@ -16,6 +16,7 @@ import {
   listClaudeSkills,
 } from './claude-capabilities.mjs'
 import { onClaudeCommandsChanged, skillLinksToCommand } from './claude-commands.mjs'
+import { configRequirements } from './cli-probes.mjs'
 import { runCodexNotify } from './codex-notify.mjs'
 import {
   continuePrompt,
@@ -788,7 +789,7 @@ export class CodexClaudeAppServer {
       case 'config/read':
         return this.configRead()
       case 'configRequirements/read':
-        return { requirements: null }
+        return configRequirements()
       case 'model/list':
         return this.modelList()
       case 'modelProvider/capabilities/read':

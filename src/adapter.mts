@@ -3,6 +3,7 @@ import { chmodSync, existsSync, readFileSync, unlinkSync, writeFileSync } from '
 import { dirname } from 'node:path'
 import { sweepCliMcpConfigs } from './cli-mcp-config.mjs'
 import { reapOrphanedCliChildren } from './cli-orphans.mjs'
+import { daemonProbe, startupConfigProbe } from './cli-probes.mjs'
 import { inheritedHooksWarning } from './inherited-config.mjs'
 import { createRuntime } from './runtime-factory.mjs'
 import { CodexClaudeAppServer } from './server.mjs'
@@ -58,6 +59,16 @@ async function main(): Promise<void> {
   const args = process.argv.slice(2)
   if (args[0] !== 'app-server') {
     usage(1)
+    return
+  }
+
+  // One-shot probes, answered before the state database opens and before
+  // startup recovery, so a probe cannot disturb a server already running.
+  const probe = startupConfigProbe(args) ?? (await daemonProbe(args))
+  if (probe) {
+    process.stdout.write(probe.stdout)
+    process.stderr.write(probe.stderr)
+    process.exitCode = probe.code
     return
   }
 
@@ -260,6 +271,8 @@ function usage(code: number): never {
   claude-codex-adapter app-server --listen unix://
   claude-codex-adapter app-server --listen ws://127.0.0.1:8788
   claude-codex-adapter app-server proxy [--sock PATH]
+  claude-codex-adapter app-server --print-startup-config [--startup-client-info JSON]
+  claude-codex-adapter app-server daemon version
 `
   ;(code === 0 ? process.stdout : process.stderr).write(text)
   process.exit(code)

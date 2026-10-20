@@ -59,6 +59,13 @@ versioning or publishing metadata.
   Each turn records the process that wrote it, by pid and start time, and
   startup recovery fails only the turns of processes that are gone; turns
   written before this change are recovered as before.
+- `app-server --print-startup-config` (codex 0.164) prints its one JSON line
+  (`appServerVersion` and `configRequirements`) and exits, and
+  `app-server daemon version` reports the unix daemon listening on the control
+  socket, or fails when none is. Both answer before the state database opens;
+  they used to start a full stdio server, with its startup recovery and
+  cleanup, and never print their answer. The `codex` shim answers the plain
+  forms itself, without starting node.
 - The App's "/" popup offers Claude Code's built-in skills (`/simplify`,
   `/code-review`, …) from the list the CLI reports, and a picked one runs as
   the CLI's slash command.

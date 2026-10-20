@@ -3,7 +3,8 @@
 Implemented as real remote/runtime behavior:
 
 - **Transports** — stdio, WebSocket, Unix-socket daemon, and `app-server proxy`
-  raw stdio forwarding.
+  raw stdio forwarding. The one-shot `app-server --print-startup-config` and
+  `app-server daemon version` probes answer without opening the state database.
 - **Thread lifecycle** — start, resume, fork, list, read, turns list, name,
   archive/unarchive, unsubscribe, interrupt, delete, and rollback/revert that
   rewind Claude's session to the kept turns.

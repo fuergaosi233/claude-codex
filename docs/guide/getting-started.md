@@ -64,3 +64,21 @@ node dist/src/adapter.mjs app-server proxy
 node dist/src/adapter.mjs app-server --listen stdio://
 node dist/src/adapter.mjs app-server --listen ws://127.0.0.1:8788
 ```
+
+Two one-shot probes answer and exit without opening the state database, so
+they never disturb a server already running on the same `CODEX_HOME`:
+
+```bash
+# One JSON line: {"appServerVersion": ..., "configRequirements": ...}
+node dist/src/adapter.mjs app-server --print-startup-config
+# The unix daemon on <CODEX_HOME>/app-server-control/app-server-control.sock,
+# or exit 1 when none is running there
+node dist/src/adapter.mjs app-server daemon version
+```
+
+`--startup-sign-out` and `--startup-client-info <json>` are accepted with
+`--print-startup-config` and change nothing: Claude threads have no ChatGPT
+account to sign out of. `scripts/codex-shim` answers `--print-startup-config`
+(without a client info) and a `daemon version` with no socket to check by
+itself, without starting node, and passes both to the real `codex` in native
+Codex mode.

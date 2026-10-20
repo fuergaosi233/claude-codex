@@ -20,6 +20,7 @@ line a rule touches.
 | --- | --- | --- |
 | `client-info` | identifies itself in `initialize` as `clientInfo.name` `codex_desktop`, with its build as the version | `check:app-upgrade` finds the name |
 | `feature-gates` | turns features on by the app-server version in the `initialize` userAgent, and rejects one below its minimum | `check:app-upgrade` lists the gates |
+| `daemon-version` | with `CODEX_APP_SERVER_USE_LOCAL_DAEMON=1`, runs `codex app-server daemon version` and connects to the server on `<CODEX_HOME>/app-server-control/app-server-control.sock` when it reports a version, or starts its own over stdio when the probe fails | the bundle still runs the probe and reads that socket |
 | `config-warnings` | lists `configWarning` notifications under Settings > Agent > Configuration | an unlisted build shows the warning there |
 | `bedrock-account` | filters the model picker through its OpenAI allowlist unless `account/read` returns a Bedrock account | the picker lists the Claude models |
 | `bedrock-auth-status` | reads its feature flags in the main process only when `getAuthStatus` names the auth method it derives from `account/read`; otherwise a thread it resumes on its own never becomes ready | a message queued during a turn is sent when the turn ends; a new chat gets a title |
