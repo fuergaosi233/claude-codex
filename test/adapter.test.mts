@@ -3498,6 +3498,8 @@ test('turn/steer reaches a turn Claude compacted on its own, not a compaction or
       }),
     )
     const rejected = await reader.nextResponse(6)
+    // Codex's invalid-request code, which the App matches with the turn kind.
+    assert.equal(rejected.error.code, -32600)
     assert.equal(rejected.error.message, 'cannot steer a compact turn')
     assert.deepEqual(rejected.error.data, {
       message: 'cannot steer a compact turn',
@@ -3533,6 +3535,7 @@ test('turn/steer reaches a turn Claude compacted on its own, not a compaction or
       }),
     )
     const reviewSteer = await reader.nextResponse(9)
+    assert.equal(reviewSteer.error.code, -32600)
     assert.equal(reviewSteer.error.message, 'cannot steer a review turn')
     assert.equal(reviewSteer.error.data.codexErrorInfo.activeTurnNotSteerable.turnKind, 'review')
     proc.stdin.write(

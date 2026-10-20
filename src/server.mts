@@ -576,7 +576,7 @@ export class CodexClaudeAppServer {
         stack: error instanceof Error ? error.stack : null,
       })
       this.sendResponse(peer, request.id, undefined, {
-        code: -32000,
+        code: error instanceof RpcError ? error.code : -32000,
         message: error instanceof Error ? error.message : String(error),
         ...(error instanceof RpcError ? { data: error.data } : {}),
       })
@@ -6086,16 +6086,23 @@ export class CodexClaudeAppServer {
     if (expectedTurnId && expectedTurnId !== activeTurnId)
       throw new Error(`expected active turn id \`${expectedTurnId}\` but found \`${activeTurnId}\``)
     // Like Codex, a review or a compaction the user started takes no input
-    // until it ends; a turn Claude compacted on its own still does.
+    // until it ends; a turn Claude compacted on its own still does. The
+    // refusal is Codex's invalid-request error (-32600) with the turn kind in
+    // `data`, which App builds that queue a message sent during a compaction
+    // match on.
     const turnKind = this.unsteerableTurns.get(activeTurnId)
     if (turnKind) {
       const message = `cannot steer a ${turnKind} turn`
-      throw new RpcError(message, {
+      throw new RpcError(
         message,
-        codexErrorInfo: { activeTurnNotSteerable: { turnKind } },
-        additionalDetails: null,
-        misalignment: null,
-      })
+        {
+          message,
+          codexErrorInfo: { activeTurnNotSteerable: { turnKind } },
+          additionalDetails: null,
+          misalignment: null,
+        },
+        -32600,
+      )
     }
     const input = turnInput(params)
     const { textPrompt, images } = extractImageInputs(input)
