@@ -48,6 +48,11 @@ export interface RpcPeer {
 // Codex `ModeKind`: the collaboration modes the App's composer offers.
 export type CollaborationModeKind = 'plan' | 'default'
 
+// Codex `ApprovalsReviewer`: who answers a thread's approvals. 'auto_review'
+// (older Apps send 'guardian_subagent') lets an automatic reviewer decide
+// them; a Claude thread runs it as Claude Code's 'auto' permission mode.
+export type ApprovalsReviewer = 'user' | 'auto_review'
+
 export interface ThreadRecord {
   id: string
   sessionId: string
@@ -102,6 +107,9 @@ export interface ThreadRecord {
   // turn/start or thread/settings/update. Null until the App names one; a
   // turn that names none runs in the stored mode.
   collaborationMode?: CollaborationModeKind | null
+  // Who answers the thread's approvals, as the App last chose it and the
+  // thread can run it. Null until the App names one, which means 'user'.
+  approvalsReviewer?: ApprovalsReviewer | null
   // Codex App marks transient title-generation / consolidation threads as
   // ephemeral — these should not appear in the user-facing thread list.
   ephemeral: boolean
@@ -444,6 +452,11 @@ export interface RuntimeTurnContext {
   // read-only and proposes a plan through ExitPlanMode. Set when the thread's
   // collaboration mode is 'plan' (or the legacy `planMode` flag is on).
   planMode: boolean
+  // The thread chose the App's automatic reviewer: run the session in Claude
+  // Code's 'auto' permission mode, where Claude's classifier answers the asks
+  // the approval policy would bring to the user. A backend that cannot
+  // reports auto_review_unavailable and leaves the approvals with the user.
+  autoReview?: boolean
   // Multimodal input attached to the turn. localImage gets read + base64
   // encoded; image (URL) is passed through as-is. Sidecar reshapes the
   // Claude SDK query into a multimodal user message when this is non-empty.
@@ -521,10 +534,23 @@ export type RuntimeEvent =
       // Claude offers no "always allow" for this call, so the card offers no
       // session approval either.
       suppressSessionApproval?: boolean
+      // Claude Code says the user has to answer this call themselves (the
+      // card is the tool's own interface, or the ask only shows locally): only
+      // the user may answer it, never a policy or an earlier session approval.
+      requiresUser?: boolean
     }
   // Claude refused a tool call without asking (a deny rule, a hook, the
-  // permission mode).
-  | { type: 'tool_denied'; toolUseId: string }
+  // permission mode). `autoReview` is set when Claude's auto-mode classifier
+  // refused it, with the classifier's reason.
+  | {
+      type: 'tool_denied'
+      toolUseId: string
+      toolName?: string
+      autoReview?: { rationale: string | null }
+    }
+  // The thread asked for automatic review, but this session cannot run it:
+  // the approvals stay with the user. `reason` says why.
+  | { type: 'auto_review_unavailable'; reason: string }
   | {
       type: 'user_input_request'
       requestId: string
@@ -726,10 +752,12 @@ export interface RuntimeSteerOptions {
   onAccepted?: () => void
 }
 
-// turn/settings/update: model and effort for the rest of a running turn.
+// turn/settings/update: model, effort and reviewer for the rest of a running
+// turn. `autoReview` as in RuntimeTurnContext.
 export interface RuntimeTurnSettings {
   model?: string
   effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+  autoReview?: boolean
 }
 
 // A background task of a live session: a backgrounded Bash shell

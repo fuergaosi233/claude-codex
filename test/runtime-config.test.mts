@@ -2013,6 +2013,137 @@ test('native SDK auto-denials decline the call and say why', async () => {
   ])
 })
 
+test('native SDK classifier denials become a denied auto review of the call', async () => {
+  const runtime = new NativeClaudeRuntime()
+  const events: any[] = []
+  const pending = { handlers: { onEvent: async (event: unknown) => events.push(event) } }
+  const handleSystem = Reflect.get(runtime, 'handleSystem')
+
+  await handleSystem.call(runtime, pending, {
+    subtype: 'permission_denied',
+    tool_name: 'Bash',
+    tool_use_id: 'tool-1',
+    decision_reason_type: 'classifier',
+    decision_reason: ' Deleting the build directory was not requested. ',
+    message: 'Permission to use Bash has been denied.',
+  })
+  await handleSystem.call(runtime, pending, {
+    subtype: 'permission_denied',
+    tool_name: 'Bash',
+    tool_use_id: 'tool-2',
+    decision_reason_type: 'classifier',
+    message: 'Permission to use Bash has been denied.',
+  })
+
+  // No notice: the review card says why.
+  assert.deepEqual(events, [
+    {
+      type: 'tool_denied',
+      toolUseId: 'tool-1',
+      toolName: 'Bash',
+      autoReview: { rationale: 'Deleting the build directory was not requested.' },
+    },
+    {
+      type: 'tool_denied',
+      toolUseId: 'tool-2',
+      toolName: 'Bash',
+      autoReview: { rationale: 'Permission to use Bash has been denied.' },
+    },
+  ])
+})
+
+test('native SDK sessions always launch in an explicit permission mode', () => {
+  const previous = process.env.CLAUDE_CODEX_PERMISSION_MODE
+  delete process.env.CLAUDE_CODEX_PERMISSION_MODE
+  const runtime = new NativeClaudeRuntime()
+  const buildOptions = Reflect.get(runtime, 'buildOptions')
+  const launch = (overrides: Partial<RuntimeTurnContext>): unknown =>
+    buildOptions.call(runtime, {}, nativeTurnContext(overrides), new AbortController(), () => null)
+      .permissionMode
+  try {
+    assert.equal(launch({}), 'default')
+    assert.equal(launch({ approvalPolicy: 'untrusted', sandboxMode: 'read-only' }), 'default')
+    assert.equal(
+      launch({ approvalPolicy: 'on-request', sandboxMode: 'workspace-write' }),
+      'default',
+    )
+    assert.equal(
+      launch({ approvalPolicy: 'on-failure', sandboxMode: 'workspace-write' }),
+      'acceptEdits',
+    )
+    assert.equal(launch({ approvalPolicy: 'never', sandboxMode: 'danger-full-access' }), 'default')
+    assert.equal(launch({ planMode: true, approvalPolicy: 'never' }), 'plan')
+    // Auto review switches to auto mode after launch, once the session knows
+    // its model supports it.
+    assert.equal(
+      launch({ approvalPolicy: 'on-request', sandboxMode: 'workspace-write', autoReview: true }),
+      'default',
+    )
+    process.env.CLAUDE_CODEX_PERMISSION_MODE = 'auto'
+    assert.equal(launch({ approvalPolicy: 'on-request' }), 'auto')
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_CODEX_PERMISSION_MODE
+    else process.env.CLAUDE_CODEX_PERMISSION_MODE = previous
+  }
+})
+
+test('native SDK asks only the user may answer reach the App in every mode', async () => {
+  const runtime = new NativeClaudeRuntime()
+  const makeCanUseTool = Reflect.get(runtime, 'makeCanUseTool')
+  const requests: any[] = []
+  const signal = new AbortController().signal
+  const plain = { toolUseID: 'tool', signal }
+  const userOnly = { toolUseID: 'tool', signal, requiresUserInteraction: true }
+  const ask = (context: RuntimeTurnContext) =>
+    makeCanUseTool.call(runtime, () => ({
+      current: {
+        context,
+        resolved: false,
+        handlers: {
+          onPermissionRequest: async (event: unknown) => {
+            requests.push(event)
+            return { decision: 'accept' }
+          },
+        },
+      },
+      lastContext: context,
+    }))
+
+  // Full access answers any other call itself.
+  const fullAccess = nativeTurnContext({
+    approvalPolicy: 'never',
+    sandboxMode: 'danger-full-access',
+  })
+  assert.deepEqual(await ask(fullAccess)('Bash', { command: 'true' }, plain), { behavior: 'allow' })
+  assert.equal(requests.length, 0)
+  assert.deepEqual(await ask(fullAccess)('Bash', { command: 'git push' }, userOnly), {
+    behavior: 'allow',
+    updatedInput: { command: 'git push' },
+  })
+  assert.equal(requests.length, 1)
+  assert.equal(requests[0].requiresUser, true)
+
+  // A read of a readable root needs no approval, unless only the user may
+  // answer it.
+  const readable = nativeTurnContext({
+    approvalPolicy: 'on-request',
+    sandboxMode: 'workspace-write',
+    readableRoots: [process.cwd()],
+  })
+  const file = { file_path: join(process.cwd(), 'package.json') }
+  assert.deepEqual(await ask(readable)('Read', file, plain), { behavior: 'allow' })
+  assert.equal(requests.length, 1)
+  await ask(readable)('Read', file, userOnly)
+  assert.equal(requests.length, 2)
+  assert.equal(requests[1].requiresUser, true)
+
+  // Between turns no standing policy answers it.
+  const between = makeCanUseTool.call(runtime, () => ({ current: null, lastContext: fullAccess }))
+  assert.deepEqual(await between('Bash', { command: 'true' }, plain), { behavior: 'allow' })
+  assert.equal((await between('Bash', { command: 'git push' }, userOnly)).behavior, 'deny')
+  assert.equal(requests.length, 2)
+})
+
 test('native SDK permission request between turns falls back to the standing policy', async () => {
   const runtime = new NativeClaudeRuntime()
   const makeCanUseTool = Reflect.get(runtime, 'makeCanUseTool')

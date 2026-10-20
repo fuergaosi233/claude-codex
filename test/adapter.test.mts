@@ -6527,6 +6527,225 @@ test('a call Claude refuses without asking ends declined', async () => {
   }
 })
 
+// Requests and turns against one mock adapter, keeping what arrives meanwhile.
+function autoReviewClient(reader: JsonLineReader, proc: ChildProcessWithoutNullStreams) {
+  let nextId = 1
+  const request = async (method: string, params: Record<string, unknown>) => {
+    const id = nextId++
+    proc.stdin.write(json({ id, method, params }))
+    const seen: any[] = []
+    const response = await awaitMessage(
+      reader,
+      (message) => message.id === id && message.method == null,
+      seen,
+    )
+    return { result: response.result, seen }
+  }
+  const turn = async (threadId: string, text: string, params: Record<string, unknown> = {}) => {
+    const { seen } = await request('turn/start', { threadId, input: textInput(text), ...params })
+    if (!seen.some((message) => message.method === 'turn/completed'))
+      await awaitMessage(reader, (message) => message.method === 'turn/completed', seen)
+    return { reply: completedAgentMessages(seen, threadId).at(-1)?.text, seen }
+  }
+  return { request, turn }
+}
+
+test('the auto-review preset runs a thread under auto review and the thread keeps it', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  const { request, turn } = autoReviewClient(reader, proc)
+  const workspace = { cwd: process.cwd(), persistExtendedHistory: false, permissions: ':workspace' }
+  try {
+    // Nothing changes for a thread that does not ask for it.
+    const plain = await request('thread/start', workspace)
+    assert.equal(plain.result.approvalsReviewer, 'user')
+    assert.equal(
+      (await turn(plain.result.thread.id, 'auto review check')).reply,
+      'autoReview=false',
+    )
+
+    // The App's preset names the reviewer guardian_subagent.
+    const started = await request('thread/start', {
+      ...workspace,
+      approvalsReviewer: 'guardian_subagent',
+    })
+    const threadId = started.result.thread.id
+    assert.equal(started.result.approvalsReviewer, 'auto_review')
+    assert.equal((await turn(threadId, 'auto review check')).reply, 'autoReview=true')
+
+    const toUser = await request('thread/settings/update', { threadId, approvalsReviewer: 'user' })
+    assert.deepEqual(toUser.result, {})
+    const echoed = toUser.seen.find((message) => message.method === 'thread/settings/updated')
+    assert.equal(echoed?.params.threadSettings.approvalsReviewer, 'user')
+    assert.equal((await turn(threadId, 'auto review check')).reply, 'autoReview=false')
+
+    // turn/start sets it for its own turn and the ones after.
+    const set = await turn(threadId, 'auto review check', { approvalsReviewer: 'auto_review' })
+    assert.equal(set.reply, 'autoReview=true')
+    assert.equal((await turn(threadId, 'auto review check')).reply, 'autoReview=true')
+
+    const resumed = await request('thread/resume', { threadId })
+    assert.equal(resumed.result.approvalsReviewer, 'auto_review')
+    const forked = await request('thread/fork', { threadId, persistExtendedHistory: false })
+    assert.equal(forked.result.approvalsReviewer, 'auto_review')
+    assert.equal(
+      (await turn(forked.result.thread.id, 'auto review check')).reply,
+      'autoReview=true',
+    )
+  } finally {
+    await stopProcess(proc)
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('a thread whose session has no auto mode keeps the user as reviewer and says why', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  const { request, turn } = autoReviewClient(reader, proc)
+  try {
+    const started = await request('thread/start', {
+      cwd: process.cwd(),
+      persistExtendedHistory: false,
+      permissions: ':workspace',
+      approvalsReviewer: 'auto_review',
+    })
+    const threadId = started.result.thread.id
+    const { seen } = await turn(threadId, 'auto review unsupported')
+    assert.deepEqual(
+      seen.filter((message) => message.method === 'configWarning').map((message) => message.params),
+      [
+        {
+          summary: 'Auto-review is not available on this Claude thread; you will review approvals.',
+          details: 'mock model does not support auto mode.',
+        },
+      ],
+    )
+    const echoed = seen.find((message) => message.method === 'thread/settings/updated')
+    assert.equal(echoed?.params.threadId, threadId)
+    assert.equal(echoed?.params.threadSettings.approvalsReviewer, 'user')
+
+    const resumed = await request('thread/resume', { threadId })
+    assert.equal(resumed.result.approvalsReviewer, 'user')
+    const next = await turn(threadId, 'auto review unsupported')
+    assert.equal(next.reply, 'autoReview=false')
+    assert.equal(
+      next.seen.some((message) => message.method === 'configWarning'),
+      false,
+    )
+  } finally {
+    await stopProcess(proc)
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('an auto-mode classifier denial is a denied review of the declined command', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  const { request, turn } = autoReviewClient(reader, proc)
+  try {
+    const started = await request('thread/start', {
+      cwd: process.cwd(),
+      persistExtendedHistory: false,
+      permissions: ':workspace',
+      approvalsReviewer: 'auto_review',
+    })
+    const threadId = started.result.thread.id
+    const { seen } = await turn(threadId, 'auto review denied')
+    const done = seen.find((message) => message.method === 'turn/completed')
+    assert.equal(done.params.turn.status, 'completed')
+    assert.equal(
+      seen.some((message) => /requestApproval$/.test(String(message.method ?? ''))),
+      false,
+    )
+    const ended = seen.find(
+      (message) =>
+        message.method === 'item/completed' && message.params.item.type === 'commandExecution',
+    )
+    const command = ended?.params.item
+    assert.equal(command?.command, 'rm -rf build')
+    assert.equal(command?.status, 'declined')
+
+    const reviewed = seen.find((message) => message.method === 'item/autoApprovalReview/completed')
+    assert.ok(reviewed, 'the denial is a review of the call')
+    assert.ok(seen.indexOf(reviewed) < seen.indexOf(ended), 'the review comes first')
+    const { reviewId, startedAtMs, completedAtMs, ...review } = reviewed.params
+    assert.equal(typeof reviewId, 'string')
+    assert.ok(startedAtMs <= completedAtMs)
+    assert.deepEqual(review, {
+      threadId,
+      turnId: done.params.turn.id,
+      targetItemId: command.id,
+      decisionSource: 'agent',
+      review: {
+        status: 'denied',
+        riskLevel: null,
+        userAuthorization: null,
+        rationale: 'Deleting the build directory was not requested.',
+      },
+      action: { type: 'command', source: 'shell', command: 'rm -rf build', cwd: command.cwd },
+    })
+    assert.equal(
+      seen.some((message) => message.method === 'warning'),
+      false,
+    )
+
+    // "Approve anyway" has nothing to record on a Claude thread.
+    const approved = await request('thread/approveGuardianDeniedAction', {
+      threadId,
+      event: { type: 'denied' },
+    })
+    assert.deepEqual(approved.result, {})
+  } finally {
+    await stopProcess(proc)
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('a call only the user may answer asks even with full access, for that call only', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  const { request } = autoReviewClient(reader, proc)
+  try {
+    const started = await request('thread/start', {
+      cwd: process.cwd(),
+      persistExtendedHistory: false,
+      approvalPolicy: 'never',
+      sandbox: 'danger-full-access',
+      approvalsReviewer: 'auto_review',
+    })
+    const threadId = started.result.thread.id
+    sendTurn(proc, 100, threadId, 'auto review escalated')
+    const asked = await awaitMessage(
+      reader,
+      (message) => message.method === 'item/commandExecution/requestApproval',
+    )
+    assert.equal(asked.params.command, 'git push')
+    assert.deepEqual(asked.params.availableDecisions, ['accept', 'decline', 'cancel'])
+    proc.stdin.write(json({ id: asked.id, result: { decision: 'acceptForSession' } }))
+    const first: any[] = []
+    await awaitMessage(reader, (message) => message.method === 'turn/completed', first)
+    assert.equal(completedItem(first, asked.params.itemId)?.status, 'completed')
+
+    // Nothing was remembered: the next one asks again.
+    sendTurn(proc, 101, threadId, 'auto review escalated')
+    const again = await awaitMessage(
+      reader,
+      (message) => message.method === 'item/commandExecution/requestApproval',
+    )
+    proc.stdin.write(json({ id: again.id, result: { decision: 'decline' } }))
+    const second: any[] = []
+    await awaitMessage(reader, (message) => message.method === 'turn/completed', second)
+    assert.equal(completedItem(second, again.params.itemId)?.status, 'declined')
+  } finally {
+    await stopProcess(proc)
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('generic Claude tools complete as Codex mcpToolCall items', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {

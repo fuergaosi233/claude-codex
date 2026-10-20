@@ -204,10 +204,61 @@ export class MockRuntime implements ClaudeRuntime {
       await handlers.onEvent({
         type: 'text_delta',
         delta: settings
-          ? ` released on model=${settings.model ?? 'unchanged'} effort=${settings.effort ?? 'unchanged'}`
+          ? ` released on model=${settings.model ?? 'unchanged'} effort=${settings.effort ?? 'unchanged'}${
+              settings.autoReview != null ? ` autoReview=${settings.autoReview}` : ''
+            }`
           : ' released',
       })
       await handlers.onEvent({ type: 'completed', success: true, result: 'released' })
+      return
+    }
+
+    // Auto review: "check" echoes whether the turn runs it, "unsupported"
+    // has the session refuse it, "denied" has the classifier refuse a command
+    // and "escalated" asks the user about a call that needs them whatever the
+    // mode.
+    const autoReview = /auto review (check|unsupported|denied|escalated)/i.exec(context.prompt)
+    if (autoReview) {
+      const kind = (autoReview[1] ?? '').toLowerCase()
+      if (kind === 'unsupported' && context.autoReview) {
+        await handlers.onEvent({
+          type: 'auto_review_unavailable',
+          reason: 'mock model does not support auto mode',
+        })
+      }
+      if (kind === 'denied' || kind === 'escalated') {
+        const toolUseId = `tool-${Date.now()}`
+        const input = { command: kind === 'denied' ? 'rm -rf build' : 'git push' }
+        await handlers.onEvent({ type: 'tool_use', toolUseId, toolName: 'Bash', input })
+        let allowed = false
+        if (kind === 'denied') {
+          await handlers.onEvent({
+            type: 'tool_denied',
+            toolUseId,
+            toolName: 'Bash',
+            autoReview: { rationale: 'Deleting the build directory was not requested.' },
+          })
+        } else {
+          const decision = await handlers.onPermissionRequest({
+            type: 'permission_request',
+            requestId: `perm-${toolUseId}`,
+            toolUseId,
+            toolName: 'Bash',
+            input,
+            requiresUser: true,
+          })
+          allowed = decision.decision === 'accept' || decision.decision === 'acceptForSession'
+        }
+        await handlers.onEvent({
+          type: 'tool_result',
+          toolUseId,
+          content: allowed ? 'pushed' : 'Permission to use Bash has been denied.',
+          isError: !allowed,
+        })
+      }
+      const text = `autoReview=${context.autoReview === true}`
+      await handlers.onEvent({ type: 'text_delta', delta: text })
+      await handlers.onEvent({ type: 'completed', success: true, result: text })
       return
     }
 

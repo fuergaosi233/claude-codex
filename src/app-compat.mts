@@ -262,6 +262,14 @@ export const APP_RULES: readonly AppRule[] = [
     verify:
       'Decline a command approval in a Claude chat: the command shows as declined, not failed, and Claude goes on; cancel one: the turn stops.',
   },
+  {
+    id: 'auto-review',
+    app: 'Its auto-review permissions preset sends approvalsReviewer guardian_subagent (auto_review in newer builds) on thread/settings/update and turn/start, and on turn/settings/update while a turn runs. Its picker follows the approvalsReviewer of thread responses and thread/settings/updated, and it draws item/autoApprovalReview/completed as a review card on the item named by targetItemId.',
+    adapter:
+      "Stores the reviewer per thread and runs a Claude thread that asks for auto_review in Claude Code's auto permission mode, when its model supports it. Otherwise approvals stay with the user: it stores and echoes 'user' and sends a configWarning saying why. A call the auto-mode classifier denies ends declined, with a denied review naming the classifier's reason; a call Claude Code says only the user may answer always asks, in every mode.",
+    verify:
+      'Pick auto-review in a Claude chat on a model with auto mode and have Claude delete a build folder: the picker stays on auto-review, and a blocked call shows as declined with the review reason. On a model without auto mode the picker returns to the default with a config warning, and approval cards show as before.',
+  },
 ]
 
 // The methods the App starts calling, or sends new parameters to, once the

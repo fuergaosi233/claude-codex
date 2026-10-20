@@ -180,6 +180,8 @@ export class SessionStore {
     this.ensureColumn('threads', 'permission_profile_id', 'TEXT')
     // The App's collaboration mode ('plan' / 'default'); NULL until named.
     this.ensureColumn('threads', 'collaboration_mode', 'TEXT')
+    // The App's approvals reviewer ('user' / 'auto_review'); NULL until named.
+    this.ensureColumn('threads', 'approvals_reviewer', 'TEXT')
     this.ensureColumn('threads', 'ephemeral', 'INTEGER NOT NULL DEFAULT 0')
     this.ensureColumn('threads', 'thread_source', 'TEXT')
     this.ensureColumn('threads', 'agent_role', 'TEXT')
@@ -293,10 +295,10 @@ export class SessionStore {
           source, created_at, updated_at, status_json,
           approval_policy, sandbox_mode, permission_profile_id, ephemeral, thread_source, agent_role, agent_nickname,
           base_instructions, developer_instructions, personality, runtime_backend, codex_session_id,
-          collaboration_mode
+          collaboration_mode, approvals_reviewer
         ) VALUES (
           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         ON CONFLICT(id) DO UPDATE SET
           session_id=excluded.session_id,
@@ -328,7 +330,8 @@ export class SessionStore {
           personality=excluded.personality,
           runtime_backend=excluded.runtime_backend,
           codex_session_id=excluded.codex_session_id,
-          collaboration_mode=excluded.collaboration_mode
+          collaboration_mode=excluded.collaboration_mode,
+          approvals_reviewer=excluded.approvals_reviewer
       `)
       .run(
         thread.id,
@@ -363,6 +366,7 @@ export class SessionStore {
         thread.runtimeBackend,
         thread.codexSessionId,
         thread.collaborationMode ?? null,
+        thread.approvalsReviewer ?? null,
       )
   }
 
@@ -1479,6 +1483,10 @@ export class SessionStore {
       collaborationMode:
         row.collaboration_mode === 'plan' || row.collaboration_mode === 'default'
           ? row.collaboration_mode
+          : null,
+      approvalsReviewer:
+        row.approvals_reviewer === 'user' || row.approvals_reviewer === 'auto_review'
+          ? row.approvals_reviewer
           : null,
       ephemeral: Number(row.ephemeral ?? 0) === 1,
       threadSource: row.thread_source == null ? null : String(row.thread_source),

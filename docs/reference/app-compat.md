@@ -51,6 +51,7 @@ line a rule touches.
 | `command-approval-card` | draws a command approval from its params alone, but a file change approval only for a `fileChange` item with the request's `itemId` | a WebFetch approval in a Claude chat names the tool and the URL |
 | `mcp-tool-approval` | draws an `mcpServer/elicitation/request` with `_meta.codex_approval_kind` `mcp_tool_call` as a tool approval card, and answers "Allow for this session" with `_meta.persist` `session` | an MCP tool call asks to allow the server to run the tool; after "Allow for this session" the next call does not ask |
 | `declined-tool-items` | shows a `commandExecution` or `fileChange` item with status `declined` as declined, without output or an exit code | a declined command shows as declined and Claude goes on; a cancelled one stops the turn |
+| `auto-review` | sends its auto-review preset as `approvalsReviewer` `guardian_subagent` (`auto_review` in newer builds), sets its picker from the `approvalsReviewer` of thread responses and `thread/settings/updated`, and draws `item/autoApprovalReview/completed` as a review card on the item named by `targetItemId` | on a model with auto mode the picker stays on auto-review and a call Claude's classifier blocks shows as declined with its reason; on one without, the picker goes back to the default with a config warning |
 
 The full text of each rule, including the adapter side, is in
 `src/app-compat.mts`.
@@ -142,7 +143,7 @@ answers in a particular way:
 | Gate | With it on, the App… | The adapter… |
 | --- | --- | --- |
 | `turnToolOutput` | sends a thread handoff or a message from another thread as `turn/start` with empty `input` and the text in `toolOutput` | prompts Claude with it and records a `functionCallOutput` item (rule `tool-output-turns`) |
-| `turnApprovalsReviewer` | follows a permission change during a turn with `turn/settings/update` carrying the new `approvalsReviewer` | accepts `user`, the only reviewer it has; any other is rejected, which the App only logs |
+| `turnApprovalsReviewer` | follows a permission change during a turn with `turn/settings/update` carrying the new `approvalsReviewer` | switches the running session into or out of Claude Code's auto mode, and keeps the reviewer for the thread's later turns (rule `auto-review`) |
 | `threadTimeline` | can read history with `thread/timeline/list`, newest page first | pages from the newest entry back |
 | `mcpServerStatusByName` | passes `serverName` to `mcpServerStatus/list` | lists only that server |
 | `mcpResourceReadOriginCallId` | checks `originCallId` on a resource read from a hosted app | answers `null`; Claude's MCP servers are not hosted apps |

@@ -71,6 +71,25 @@ goes on. **Cancel** refuses it and stops the turn, as the Stop button does. A
 call Claude refuses on its own (a deny rule, its permission mode) also shows as
 declined, with a warning saying why.
 
+### Auto-review
+
+Picking the App's **auto-review** permissions preset in a Claude chat runs the
+chat in Claude Code's auto permission mode, where a classifier decides the
+calls that would otherwise ask you. The chat keeps the
+choice for its later messages, after a restart and in its forks, until you pick
+another preset. A call the classifier blocks shows as declined with a review
+card giving its reason, and Claude is told and goes on; the card's "approve
+anyway" has nothing to override in a Claude chat.
+
+Auto mode needs a model that supports it, a sandbox that allows writes and a
+Claude Code that accepts it. Where it is unavailable (a model without it, a
+read-only sandbox, `CLAUDE_CODEX_PERMISSION_MODE` set to another mode), the
+chat keeps asking you as before: the picker goes back to the default and a
+warning under Settings > Agent > Configuration says why. Plan mode and Full
+access work as they did. Some calls Claude Code says only you may answer ask
+you in every mode, Full access included, and "Allow for this session" covers
+only that call.
+
 ## Skills and the App's tools
 
 Skills you pick with `$` or `/` in the composer work as they do in Codex chats.

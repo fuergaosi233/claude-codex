@@ -59,7 +59,9 @@ import {
   addedFileDiff,
   allSelectableModelOptions,
   approvalSessionKey,
+  approvalsReviewerFromParams,
   asRecord,
+  autoReviewAction,
   buildSystemPromptAddendum,
   coerceStructuredValue,
   collaborationModeEnvelope,
@@ -742,13 +744,12 @@ export class CodexClaudeAppServer {
       case 'thread/shellCommand':
         return this.threadShellCommand(peer, asRecord(params))
       case 'thread/approveGuardianDeniedAction': {
-        // Codex App's "Guardian" is an OpenAI-side pre-tool safety classifier
-        // that can deny a tool call before it reaches the runtime. Claude
-        // Code has no equivalent — every denial in our pipeline already
-        // routes through the canUseTool round-trip, which the user resolves
-        // directly via the standard approval modal. There is no separate
-        // guardian-denied action to retry. We log the event (for parity
-        // debugging) and ack with the schema-correct {} response.
+        // The App offers this on an auto-review denial card ("approve
+        // anyway"). On a Codex thread it records a one-off approval for the
+        // next retry. Claude Code's auto-mode classifier takes no such
+        // override (the model sees the denial and decides what to do next),
+        // so there is nothing to record. Log the event and ack with the
+        // schema's {}.
         const evt = asRecord(params).event
         debugLog('thread.approveGuardianDeniedAction', {
           threadId: stringOr(asRecord(params).threadId, ''),
@@ -1068,6 +1069,9 @@ export class CodexClaudeAppServer {
         normalizeSandboxMode(params.sandbox) ??
         'danger-full-access',
       permissionProfileId: permissionProfile?.id ?? null,
+      // Helper threads never ask the user anything.
+      // App rule: auto-review
+      approvalsReviewer: isTitleOrHelper ? null : approvalsReviewerFromParams(params),
       ephemeral: isTitleOrHelper,
       threadSource: normalizeThreadSource(params.threadSource),
       agentRole: nullIfEmpty(typeof params.agentRole === 'string' ? params.agentRole : null),
@@ -1157,6 +1161,8 @@ export class CodexClaudeAppServer {
       thread.personality = normalizePersonality(params.personality)
     thread.collaborationMode =
       collaborationModeFromParams(params) ?? thread.collaborationMode ?? null
+    thread.approvalsReviewer =
+      approvalsReviewerFromParams(params) ?? thread.approvalsReviewer ?? null
     this.store.upsertThread(thread)
     recordRunEvent('thread.resumed', {
       threadId,
@@ -1237,8 +1243,12 @@ export class CodexClaudeAppServer {
       // The App forks a thread to describe it and asks for an ephemeral fork;
       // like any helper thread, it stays out of the thread list.
       ephemeral: params.ephemeral === true || parent.ephemeral,
-      // A helper fork never inherits the Plan toggle.
+      // A helper fork never inherits the Plan toggle or the reviewer.
       collaborationMode: params.ephemeral === true ? null : (parent.collaborationMode ?? null),
+      approvalsReviewer:
+        params.ephemeral === true
+          ? null
+          : (approvalsReviewerFromParams(params) ?? parent.approvalsReviewer ?? null),
       threadSource:
         typeof params.threadSource === 'string'
           ? normalizeThreadSource(params.threadSource)
@@ -2235,12 +2245,15 @@ export class CodexClaudeAppServer {
   // last user turn used, minus its input. Queued messages never carry a
   // collaboration mode (the App keeps those in the window queue), and these
   // turns stay out of plan mode without changing the thread's stored mode.
+  // They run on the thread's stored reviewer, which may have fallen back to
+  // the user since that turn asked for automatic review.
   private followUpParams(threadId: string): Record<string, unknown> {
     const {
       input: _input,
       clientUserMessageId: _clientId,
       outputSchema: _schema,
       collaborationMode: _mode,
+      approvalsReviewer: _reviewer,
       ...rest
     } = this.lastTurnParamsByThread.get(threadId) ?? {}
     return { ...rest, threadId, planMode: false }
@@ -2383,8 +2396,15 @@ export class CodexClaudeAppServer {
     const sandboxMode = sandboxFromTurnParams(params)
     if (sandboxMode && !permissionProfile) thread.sandboxMode = sandboxMode
     if (typeof params.cwd === 'string' && params.cwd.length > 0) thread.cwd = params.cwd
+    // App rule: auto-review
+    thread.approvalsReviewer =
+      approvalsReviewerFromParams(params) ?? thread.approvalsReviewer ?? null
     this.store.upsertThread(thread)
+    this.notifyThreadSettings(peer, thread)
+    return {}
+  }
 
+  private notifyThreadSettings(peer: RpcPeer, thread: ThreadRecord): void {
     const activePermissionProfileId = threadPermissionProfileId(
       thread.permissionProfileId,
       thread.approvalPolicy,
@@ -2393,11 +2413,13 @@ export class CodexClaudeAppServer {
     this.notify(peer, {
       method: 'thread/settings/updated',
       params: {
-        threadId,
+        threadId: thread.id,
         threadSettings: {
           cwd: thread.cwd,
           approvalPolicy: thread.approvalPolicy ?? 'on-request',
-          approvalsReviewer: 'user',
+          // The reviewer actually in effect: the App's picker follows it.
+          // App rule: auto-review
+          approvalsReviewer: thread.approvalsReviewer ?? 'user',
           sandboxPolicy: sandboxEnvelope(thread.sandboxMode, thread.cwd),
           activePermissionProfile: activePermissionProfileId
             ? { id: activePermissionProfileId, extends: null }
@@ -2415,7 +2437,27 @@ export class CodexClaudeAppServer {
         },
       },
     })
-    return {}
+  }
+
+  // The thread asked for automatic review and its session cannot run it. Its
+  // approvals stay with the user: store and echo that, so the App's picker
+  // shows what is in effect, and say why in the App's config warnings.
+  // App rule: auto-review
+  private autoReviewUnavailable(peer: RpcPeer, threadId: string, reason: string): void {
+    debugLog('thread.autoReview.unavailable', { threadId, reason })
+    const thread = this.store.getThread(threadId)
+    if (thread?.approvalsReviewer === 'auto_review') {
+      thread.approvalsReviewer = 'user'
+      this.store.upsertThread(thread)
+      this.notifyThreadSettings(peer, thread)
+    }
+    this.notify(peer, {
+      method: 'configWarning',
+      params: {
+        summary: 'Auto-review is not available on this Claude thread; you will review approvals.',
+        details: /[.!?]$/.test(reason) ? reason : `${reason}.`,
+      },
+    })
   }
 
   private threadRollback(params: Record<string, unknown>): unknown {
@@ -2668,9 +2710,9 @@ export class CodexClaudeAppServer {
 
   // Codex can change a running turn's model, effort or reviewer; null leaves a
   // setting as it is, and the next turn takes its settings from turn/start
-  // again. Claude switches model and effort in place. The user reviews every
-  // approval, so the only reviewer is 'user'; a reasoning summary and a
-  // service tier have no Claude counterpart.
+  // again. Claude switches model, effort and auto mode in place (a session
+  // that cannot run auto mode says so and keeps the user as reviewer); a
+  // reasoning summary and a service tier have no Claude counterpart.
   private async turnSettingsUpdate(params: Record<string, unknown>): Promise<unknown> {
     const threadId = stringOr(params.threadId, '')
     const turnId = stringOr(params.turnId, '')
@@ -2678,11 +2720,12 @@ export class CodexClaudeAppServer {
     if (!thread || this.activeTurnByThread.get(threadId) !== turnId)
       return { status: 'targetUnavailable' }
     const unsupported = ['summary', 'serviceTier'].filter((key) => params[key] != null)
-    if (params.approvalsReviewer != null && params.approvalsReviewer !== 'user')
-      unsupported.unshift(`approvalsReviewer ${String(params.approvalsReviewer)}`)
     if (unsupported.length > 0)
       throw new Error(`a running Claude turn cannot change ${unsupported.join(', ')}`)
     const settings: RuntimeTurnSettings = {}
+    // App rule: auto-review
+    const reviewer = approvalsReviewerFromParams(params)
+    if (reviewer) settings.autoReview = reviewer === 'auto_review'
     if (params.model != null) {
       // Unlike turn/start, an unknown model fails instead of falling back.
       const requested = stringOr(params.model, '')
@@ -2701,7 +2744,13 @@ export class CodexClaudeAppServer {
       if (!effort) throw new Error(`unsupported effort: ${String(params.effort)}`)
       settings.effort = effort
     }
-    if (settings.model == null && settings.effort == null) return { status: 'applied' }
+    if (reviewer && reviewer !== (thread.approvalsReviewer ?? 'user')) {
+      // Like turn/start, the reviewer holds for the thread's later turns.
+      thread.approvalsReviewer = reviewer
+      this.store.upsertThread(thread)
+    }
+    if (settings.model == null && settings.effort == null && settings.autoReview == null)
+      return { status: 'applied' }
     if (!this.runtime.updateTurnSettings)
       throw new Error('this runtime cannot change the settings of a running turn')
     const applied = await this.runtime.updateTurnSettings(threadId, turnId, settings)
@@ -3102,6 +3151,10 @@ export class CodexClaudeAppServer {
       const requestedSandbox = sandboxFromTurnParams(params)
       if (requestedSandbox) thread.sandboxMode = requestedSandbox
     }
+    // Like Codex, a reviewer named on turn/start holds for later turns too.
+    // App rule: auto-review
+    const reviewer = approvalsReviewerFromParams(params)
+    if (reviewer) thread.approvalsReviewer = reviewer
     this.store.upsertThread(thread)
     if (!hiddenPrompt && !resumed && !thread.preview && prompt) {
       thread.preview = prompt.slice(0, 200)
@@ -3562,6 +3615,46 @@ export class CodexClaudeAppServer {
         params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
       })
     }
+    // App rule: auto-review
+    // Claude's auto-mode classifier denied a call. Like Codex's automatic
+    // reviewer, that is a denied review of the call's item, which then ends
+    // declined. A call with no item here (a subagent's) gets a warning.
+    const reportAutoReviewDenial = (
+      toolUseId: string,
+      toolName: string,
+      rationale: string | null,
+    ): void => {
+      const itemId = itemIds.get(toolUseId)
+      const item = itemId
+        ? this.store.getTurn(turn.id)?.items.find((candidate) => candidate.id === itemId)
+        : undefined
+      const action = item ? autoReviewAction(item, stringOr(params.cwd, thread.cwd)) : null
+      if (!itemId || !action) {
+        const message = rationale
+          ? `Permission denied for ${toolName}: ${rationale}`
+          : `Permission denied for ${toolName}`
+        if (noticesSeen.has(message)) return
+        noticesSeen.add(message)
+        this.notify(peer, { method: 'warning', params: { threadId: thread.id, message } })
+        return
+      }
+      const completedAtMs = nowMillis()
+      this.notify(peer, {
+        method: 'item/autoApprovalReview/completed',
+        params: {
+          threadId: thread.id,
+          turnId: turn.id,
+          startedAtMs: itemStartedAtMs.get(itemId) ?? completedAtMs,
+          completedAtMs,
+          reviewId: newId(),
+          targetItemId: itemId,
+          decisionSource: 'agent',
+          review: { status: 'denied', riskLevel: null, userAuthorization: null, rationale },
+          action,
+        },
+      })
+      declineToolItem(toolUseId)
+    }
 
     // Allow per-turn override of policy (Codex App may attach updated values
     // when the user toggles Full access mid-conversation), then fall back to
@@ -3775,6 +3868,8 @@ export class CodexClaudeAppServer {
           ...(appSkills.visualizationDir ? [appSkills.visualizationDir] : []),
         ],
         planMode,
+        // App rule: auto-review
+        autoReview: thread.approvalsReviewer === 'auto_review',
         imageInputs: Array.isArray(params._imageInputs)
           ? (params._imageInputs as ImageInput[])
           : [],
@@ -4441,7 +4536,18 @@ export class CodexClaudeAppServer {
             return
           }
           if (event.type === 'tool_denied') {
-            declineToolItem(event.toolUseId)
+            if (event.autoReview)
+              reportAutoReviewDenial(
+                event.toolUseId,
+                event.toolName ?? 'tool',
+                event.autoReview.rationale,
+              )
+            else declineToolItem(event.toolUseId)
+            return
+          }
+          if (event.type === 'auto_review_unavailable') {
+            this.autoReviewUnavailable(peer, thread.id, event.reason)
+            thread.approvalsReviewer = 'user'
             return
           }
           if (event.type === 'notice') {
@@ -5754,8 +5860,14 @@ export class CodexClaudeAppServer {
     // sidecar already drops can_use_tool in those modes, but in case some
     // future SDK path still emits permission_request, this prevents the
     // adapter from sitting on "Awaiting approval" forever.
+    // A call Claude Code says the user has to answer themselves is the
+    // exception, in every mode: only the user answers it, and only for this
+    // call.
+    // App rule: auto-review
+    const userOnly = event.requiresUser === true
     const thread = this.store.getThread(threadId)
     if (
+      !userOnly &&
       thread &&
       (thread.approvalPolicy === 'never' || thread.sandboxMode === 'danger-full-access')
     ) {
@@ -5768,7 +5880,9 @@ export class CodexClaudeAppServer {
       return this.requestMcpToolApproval(peer, threadId, turnId, event, server, mcpTool[2] ?? '')
     }
     const sessionKey = approvalSessionKey(event.toolName, event.input)
-    if (this.sessionApprovals.get(threadId)?.has(sessionKey)) return { decision: 'accept' }
+    if (!userOnly && this.sessionApprovals.get(threadId)?.has(sessionKey))
+      return { decision: 'accept' }
+    const allowSession = !event.suppressSessionApproval && !userOnly
 
     this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: ['waitingOnApproval'] })
     const requestId = newId()
@@ -5810,9 +5924,9 @@ export class CodexClaudeAppServer {
           additionalPermissions: null,
           proposedExecpolicyAmendment: null,
           proposedNetworkPolicyAmendments: null,
-          availableDecisions: event.suppressSessionApproval
-            ? ['accept', 'decline', 'cancel']
-            : ['accept', 'acceptForSession', 'decline', 'cancel'],
+          availableDecisions: allowSession
+            ? ['accept', 'acceptForSession', 'decline', 'cancel']
+            : ['accept', 'decline', 'cancel'],
         }
 
     let response: unknown
@@ -5823,7 +5937,8 @@ export class CodexClaudeAppServer {
       this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
     }
     const decision = normalizeDecision(response)
-    if (decision === 'acceptForSession' && !isFileChange && !event.suppressSessionApproval)
+    if (decision === 'acceptForSession' && userOnly) return { decision: 'accept' }
+    if (decision === 'acceptForSession' && !isFileChange && allowSession)
       this.rememberSessionApproval(threadId, sessionKey)
     return { decision }
   }
@@ -5846,8 +5961,11 @@ export class CodexClaudeAppServer {
     tool: string,
   ): Promise<PermissionDecision> {
     const sessionKey = JSON.stringify(['mcp', event.toolName])
-    if (this.sessionApprovals.get(threadId)?.has(sessionKey)) return { decision: 'accept' }
-    const allowSession = !event.suppressSessionApproval
+    // App rule: auto-review
+    const userOnly = event.requiresUser === true
+    if (!userOnly && this.sessionApprovals.get(threadId)?.has(sessionKey))
+      return { decision: 'accept' }
+    const allowSession = !event.suppressSessionApproval && !userOnly
     const reason = event.reason || event.title || null
     let response: Record<string, unknown>
     try {
@@ -7210,7 +7328,8 @@ export class CodexClaudeAppServer {
       instructionSources:
         thread.runtimeBackend === 'codex' ? [] : projectInstructions(thread.cwd).sources,
       approvalPolicy: thread.approvalPolicy ?? 'never',
-      approvalsReviewer: 'user',
+      // App rule: auto-review
+      approvalsReviewer: thread.approvalsReviewer ?? 'user',
       sandbox: sandboxEnvelope(thread.sandboxMode, thread.cwd),
       permissionProfile: null,
       activePermissionProfile: activePermissionProfileId

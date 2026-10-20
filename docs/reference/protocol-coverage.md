@@ -19,7 +19,11 @@ Implemented as real remote/runtime behavior:
 - **Approval bridge** — `Bash` and other tools → command approval; `Edit` /
   `Write` / `MultiEdit` → file-change approval with diffs; MCP tool calls → the
   App's MCP tool approval card; declined calls end `declined`, and cancel
-  interrupts the turn; MCP elicitation → the App's form or link prompt.
+  interrupts the turn; MCP elicitation → the App's form or link prompt. The
+  auto-review reviewer (`approvalsReviewer`, kept per thread) → Claude Code's
+  auto mode, with `item/autoApprovalReview/completed` for a call its
+  classifier denies, or a `configWarning` and `user` echoed back where auto
+  mode is unavailable.
 - **Streaming** — turn started/completed, thread status changes, agent text
   deltas, reasoning deltas, command output deltas, file patches, generic tool
   item completion, hook runs, model reroutes, and aggregated git diff updates.

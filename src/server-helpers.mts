@@ -8,6 +8,7 @@ import { stripQuietTurnHeartbeat } from './quiet-turns.mjs'
 import type { SessionStore } from './store.mjs'
 import { appToolAvailabilityNote } from './turn-context.mjs'
 import type {
+  ApprovalsReviewer,
   ClaudeRuntime,
   CollaborationModeKind,
   FileUpdateChange,
@@ -203,6 +204,35 @@ export function collaborationModeFromParams(
 ): CollaborationModeKind | null {
   const mode = asRecord(params.collaborationMode).mode
   return mode === 'plan' || mode === 'default' ? mode : null
+}
+
+// The reviewer a request's `approvalsReviewer` names, or null when it names
+// none. Codex still accepts the older name of auto_review.
+export function approvalsReviewerFromParams(
+  params: Record<string, unknown>,
+): ApprovalsReviewer | null {
+  const reviewer = params.approvalsReviewer
+  if (reviewer === 'auto_review' || reviewer === 'guardian_subagent') return 'auto_review'
+  return reviewer === 'user' ? 'user' : null
+}
+
+// Codex `GuardianApprovalReviewAction` for the item of a reviewed call: what
+// the App's review card says was asked. Other items have no such action.
+export function autoReviewAction(item: ThreadItem, cwd: string): Record<string, unknown> | null {
+  if (item.type === 'commandExecution')
+    return { type: 'command', source: 'shell', command: item.command, cwd: item.cwd }
+  if (item.type === 'fileChange')
+    return { type: 'applyPatch', cwd, files: item.changes.map((change) => change.path) }
+  if (item.type === 'mcpToolCall')
+    return {
+      type: 'mcpToolCall',
+      server: item.server,
+      toolName: item.tool,
+      connectorId: null,
+      connectorName: null,
+      toolTitle: null,
+    }
+  return null
 }
 
 // Codex `CollaborationMode` for a thread, as thread/settings/updated and

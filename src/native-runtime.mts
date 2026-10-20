@@ -221,6 +221,9 @@ interface LiveSession {
   // Serializes message routing with turn attachment so a turn never misses
   // or reorders the messages that precede it.
   chain: Promise<void>
+  // Settles once the first prompt is sent, when the session has to switch
+  // permission modes first; a steer must not overtake it.
+  firstPrompt: Promise<void> | null
   closed: boolean
 }
 
@@ -332,6 +335,10 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }
     if (!pending) return false
     const session = pending.session
+    if (session.firstPrompt) {
+      await session.firstPrompt
+      if (session.closed) return false
+    }
     const uuid = this.send(session, this.buildUserMessage(prompt, options.imageInputs ?? []))
     if (!uuid) return false
     // Accepted once the CLI starts consuming it (command_lifecycle `started`)
@@ -370,6 +377,13 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         'effort change',
       )
     }
+    // App rule: auto-review
+    if (settings.autoReview != null)
+      await this.applyPermissionMode(
+        session,
+        { ...pending.context, autoReview: settings.autoReview },
+        pending.handlers,
+      )
     return true
   }
 
@@ -632,7 +646,10 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     // mode supersedes everything. Relay rejects the SDK's dangerous bypass
     // flag outside a recognized container sandbox, so App-level Full Access
     // stays in default mode and auto-allows through canUseTool below. An
-    // explicit env override can still opt into bypassPermissions.
+    // explicit env override can still opt into bypassPermissions. The mode is
+    // always named: newer Claude Code releases changed the default for SDK
+    // sessions that name none. Auto review switches to 'auto' after launch,
+    // once the model is known to support it.
     const mode = derivePermissionMode(context.approvalPolicy, context.sandboxMode, context.planMode)
     opts.permissionMode = mode
     if (mode === 'bypassPermissions') opts.allowDangerouslySkipPermissions = true
@@ -691,6 +708,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         blockedPath?: string
         mcpServer?: { name: string; source: string }
         suppressAlwaysAllowRule?: boolean
+        requiresUserInteraction?: boolean
       },
     ): Promise<
       | { behavior: 'allow'; updatedInput?: unknown }
@@ -698,6 +716,11 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     > => {
       if (toolName.startsWith(`mcp__${GOAL_MCP_SERVER}__`)) return { behavior: 'allow' }
       const toolUseId = options.toolUseID || `tool-${newId()}`
+      // Claude Code says the user has to answer this ask themselves (the card
+      // is the tool's own interface, or its disclosure only shows locally): no
+      // policy of the thread answers it, in any mode, auto review included.
+      // App rule: auto-review
+      const userOnly = options.requiresUserInteraction === true
       const session = sessionRef()
       const pending = session?.current
       if (!session || !pending || pending.resolved) {
@@ -705,6 +728,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         // an approval in, so only the thread's standing policy can answer.
         if (
           session &&
+          !userOnly &&
           toolName !== 'AskUserQuestion' &&
           !plans(session.lastContext) &&
           autoAllowsTools(session.lastContext)
@@ -747,13 +771,15 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         }
       }
 
-      if (plans(context)) return this.planModeDecision(toolName, input, toolUseId, pending)
+      if (plans(context))
+        return this.planModeDecision(toolName, input, toolUseId, pending, userOnly)
 
       // Auto-allow when the App has selected Full Access / bypassPermissions —
       // matches the previous behaviour of skipping the canUseTool round-trip
       // entirely for those modes.
-      if (autoAllow) return { behavior: 'allow' }
-      if (readsWithin(toolName, input, context.readableRoots)) return { behavior: 'allow' }
+      if (!userOnly && autoAllow) return { behavior: 'allow' }
+      if (!userOnly && readsWithin(toolName, input, context.readableRoots))
+        return { behavior: 'allow' }
 
       const requestId = `${context.threadId}:${context.turnId}:${toolName}:${toolUseId}`
       // Subagent-aware approval suppression: when Claude is mid-subagent we
@@ -774,6 +800,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
             blockedPath: options.blockedPath || null,
             mcpServer: options.mcpServer?.name || null,
             ...(options.suppressAlwaysAllowRule ? { suppressSessionApproval: true } : {}),
+            ...(userOnly ? { requiresUser: true } : {}),
           }),
         ).then((d) => {
           // The handler may resolve synchronously via the App's permission
@@ -800,12 +827,14 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   // App asks the user whether to implement it once the turn completes, so
   // the call is refused without an interrupt to let the turn end normally.
   // Anything else that needs an approval is refused, as it was before plan
-  // mode had this callback; a read of a readable root needs none.
+  // mode had this callback; a read of a readable root needs none, unless only
+  // the user may answer it.
   private async planModeDecision(
     toolName: string,
     input: Record<string, unknown>,
     toolUseId: string,
     pending: PendingTurn,
+    userOnly: boolean,
   ): Promise<{ behavior: 'allow' } | { behavior: 'deny'; message: string }> {
     if (toolName === 'ExitPlanMode') {
       const plan = typeof input.plan === 'string' ? input.plan.trim() : ''
@@ -813,7 +842,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       await pending.handlers.onEvent({ type: 'proposed_plan', toolUseId, text: plan })
       return { behavior: 'deny', message: PLAN_DELIVERED_MESSAGE }
     }
-    if (readsWithin(toolName, input, pending.context.readableRoots)) return { behavior: 'allow' }
+    if (!userOnly && readsWithin(toolName, input, pending.context.readableRoots))
+      return { behavior: 'allow' }
     return {
       behavior: 'deny',
       message: `${toolName} is not available in plan mode. Explore with read-only tools, then present the plan with ExitPlanMode; the user decides whether to implement it.`,
@@ -902,10 +932,16 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         settleTimer: null,
         idleTimer: null,
         chain: Promise.resolve(),
+        firstPrompt: null,
         closed: false,
       }
       session = opened
-      this.send(opened, this.buildPromptMessage(context))
+      // A thread that asked for auto review gets Claude Code's auto mode, or
+      // hears why not, before Claude reads the prompt. The session launches
+      // in the policy's mode and switches once it knows its models.
+      // App rule: auto-review
+      const settlesMode = autoModeFor(context) !== 'skip'
+      if (!settlesMode) this.send(opened, this.buildPromptMessage(context))
       const pending = this.createPendingTurn(opened, context, handlers, false, resolve, reject)
       opened.current = pending
       this.turns.set(context.turnId, pending)
@@ -914,6 +950,20 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         if (previous && previous !== opened) this.closeSession(previous)
         this.sessions.set(context.threadId, opened)
       }
+      if (settlesMode)
+        opened.firstPrompt = this.serialize(opened, async () => {
+          try {
+            await this.applyPermissionMode(opened, context, handlers)
+          } finally {
+            if (!opened.closed) this.send(opened, this.buildPromptMessage(context))
+            opened.firstPrompt = null
+          }
+        }).catch((error: unknown) => {
+          debugLog('native.session.auto_mode_failed', {
+            threadId: context.threadId,
+            error: error instanceof Error ? error.message : String(error),
+          })
+        })
       // Run the receive loop in the background. runTurn() resolves when this
       // turn's result arrives; the loop itself runs for the session.
       void this.consumeSession(opened)
@@ -971,7 +1021,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         this.turns.set(context.turnId, pending)
         session.input.beginTurn()
         if (!autonomous) {
-          await this.applySessionSettings(session, context)
+          await this.applySessionSettings(session, context, handlers)
           this.send(session, this.buildPromptMessage(context))
         }
         // Replay what Claude already produced on its own. Anything after the
@@ -1035,10 +1085,10 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   private async applySessionSettings(
     session: LiveSession,
     context: RuntimeTurnContext,
+    handlers: RuntimeHandlers,
   ): Promise<void> {
     const query = session.query as Query & {
       setModel?: (model?: string) => Promise<void>
-      setPermissionMode?: (mode: string) => Promise<void>
       applyFlagSettings?: (settings: { effortLevel?: string | null }) => Promise<void>
     }
     if (context.model && context.model !== session.model && query.setModel) {
@@ -1059,6 +1109,33 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         SESSION_CONTROL_TIMEOUT_MS,
       )
     }
+    await this.applyPermissionMode(session, context, handlers)
+  }
+
+  // Puts the session in the permission mode the turn asks for: Claude Code's
+  // auto mode for a thread whose reviewer is auto_review, when the session
+  // can run it (otherwise the turn hears why and the user keeps reviewing),
+  // else the mode the approval policy maps to.
+  // App rule: auto-review
+  private async applyPermissionMode(
+    session: LiveSession,
+    context: RuntimeTurnContext,
+    handlers: RuntimeHandlers,
+  ): Promise<void> {
+    const auto = autoModeFor(context)
+    if (auto !== 'skip') {
+      const reason =
+        auto !== 'enter'
+          ? auto.reason
+          : session.permissionMode === 'auto'
+            ? null
+            : await this.switchToAutoMode(session, context.model)
+      if (!reason) return
+      await handlers.onEvent({ type: 'auto_review_unavailable', reason })
+    }
+    const query = session.query as Query & {
+      setPermissionMode?: (mode: string) => Promise<void>
+    }
     const mode = derivePermissionMode(context.approvalPolicy, context.sandboxMode, context.planMode)
     if (
       mode !== session.permissionMode &&
@@ -1072,6 +1149,50 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         SESSION_CONTROL_TIMEOUT_MS,
       )
     }
+  }
+
+  // Switches the session to Claude Code's auto mode, unless the model it runs
+  // says it has none or the CLI refuses. Returns why it did not, or null.
+  private async switchToAutoMode(
+    session: LiveSession,
+    model: string | null,
+  ): Promise<string | null> {
+    const query = session.query as Query & {
+      setPermissionMode?: (mode: string) => Promise<void>
+      supportedModels?: () => Promise<unknown>
+    }
+    if (!query.setPermissionMode) return 'This Claude Code cannot switch permission modes'
+    if (query.supportedModels) {
+      let models: unknown = null
+      await settlesWithin(
+        query.supportedModels().then(
+          (list) => {
+            models = list
+          },
+          () => {},
+        ),
+        SESSION_CONTROL_TIMEOUT_MS,
+      )
+      const info = modelInfoFor(models, model)
+      if (info?.supportsAutoMode === false)
+        return `${stringOrNull(info.displayName) ?? model ?? 'The default model'} does not support auto mode`
+    }
+    let failure: unknown = null
+    const settled = await settlesWithin(
+      query.setPermissionMode('auto').catch((error: unknown) => {
+        failure = error
+      }),
+      SESSION_CONTROL_TIMEOUT_MS,
+    )
+    if (failure != null)
+      return `Claude Code refused auto mode: ${failure instanceof Error ? failure.message : String(failure)}`
+    if (!settled) {
+      // It may still take effect: the caller puts the policy's mode back.
+      session.permissionMode = 'unconfirmed'
+      return 'Claude Code did not confirm auto mode in time'
+    }
+    session.permissionMode = 'auto'
+    return null
   }
 
   private serialize(session: LiveSession, task: () => Promise<void> | void): Promise<void> {
@@ -1792,8 +1913,20 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       // happened.
       const toolName = String(message.tool_name ?? 'tool')
       const toolUseId = stringOrNull(message.tool_use_id)
-      if (toolUseId) await pending.handlers.onEvent({ type: 'tool_denied', toolUseId })
       const reason = stringOrNull(message.decision_reason)?.trim()
+      // The auto-mode classifier's verdict is the review the App shows on the
+      // call's item; the server warns when it has no item for the call.
+      // App rule: auto-review
+      if (message.decision_reason_type === 'classifier' && toolUseId) {
+        await pending.handlers.onEvent({
+          type: 'tool_denied',
+          toolUseId,
+          toolName,
+          autoReview: { rationale: reason || stringOrNull(message.message)?.trim() || null },
+        })
+        return
+      }
+      if (toolUseId) await pending.handlers.onEvent({ type: 'tool_denied', toolUseId })
       await pending.handlers.onEvent({
         type: 'notice',
         level: 'warning',
@@ -2826,6 +2959,38 @@ function autoAllowsTools(context: RuntimeTurnContext): boolean {
       (context.approvalPolicy === 'never' || context.sandboxMode === 'danger-full-access')) ||
     mode === 'dontAsk'
   )
+}
+
+// Whether a turn whose thread asks for auto review should switch Claude Code
+// to auto mode. Plan mode, a never-ask policy and an env pin to auto already
+// settle every call without the user, so they skip quietly; a read-only
+// sandbox or an env pin to another mode keeps the user as the reviewer and
+// says why.
+// App rule: auto-review
+function autoModeFor(context: RuntimeTurnContext): 'enter' | 'skip' | { reason: string } {
+  if (context.autoReview !== true || plans(context) || autoAllowsTools(context)) return 'skip'
+  const pinned = configuredPermissionMode()
+  if (pinned === 'auto') return 'skip'
+  if (pinned) return { reason: `CLAUDE_CODEX_PERMISSION_MODE pins Claude Code to ${pinned} mode` }
+  if (context.sandboxMode === 'read-only') {
+    return { reason: 'A read-only sandbox keeps every approval with the user' }
+  }
+  return 'enter'
+}
+
+// The entry for `model` in Claude Code's model list; a thread on no explicit
+// model runs the list's default entry.
+function modelInfoFor(models: unknown, model: string | null): Record<string, unknown> | null {
+  if (!Array.isArray(models)) return null
+  const wanted = (model ?? 'default').toLowerCase()
+  for (const entry of models) {
+    const info = recordOrNull(entry)
+    if (!info) continue
+    const value = stringOrNull(info.value)?.toLowerCase()
+    const resolved = stringOrNull(info.resolvedModel)?.toLowerCase()
+    if (value === wanted || resolved === wanted) return info
+  }
+  return null
 }
 
 // A Read of a file inside one of `roots`, after resolving symlinks.
