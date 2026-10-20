@@ -149,7 +149,8 @@ versioning or publishing metadata.
 - Every turn carries `rootTurnId`, new in that protocol: the root a
   `turn/start` names for work it starts on behalf of another turn, else the
   turn's own id. A subagent's turn takes the root of the turn that spawned it,
-  and input that joins a running turn keeps that turn's root, as in Codex.
+  and input that joins a running turn keeps that turn's root, as in Codex; a
+  queued message or goal turn the adapter starts afterwards is its own root.
 - CI checks the Rust protocol fixtures against `@openai/codex@0.163.0`, and
   the `turn/started` and `turn/completed` fixtures must carry exactly the
   fields of the generated `Turn`.

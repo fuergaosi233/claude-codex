@@ -766,6 +766,36 @@ test('a turn reports the rootTurnId turn/start names, else its own id', async ()
     assert.equal(joined.turn.id, held.id)
     assert.equal(joined.turn.rootTurnId, held.id)
     await server.waitFor('turn/completed', (params) => params.turn.id === held.id, from)
+
+    // A message queued behind work started for another turn is the user's
+    // own turn, its own root.
+    from = server.mark()
+    const { turn: linkedHeld } = await server.request('turn/start', {
+      threadId,
+      input: [{ type: 'text', text: 'hold this turn until released', text_elements: [] }],
+      rootTurnId: 'root-of-the-chain',
+    })
+    await server.waitFor(
+      'item/agentMessage/delta',
+      (params) => params.turnId === linkedHeld.id,
+      from,
+    )
+    await server.request('thread/queue/add', {
+      threadId,
+      input: [{ type: 'text', text: 'queued', text_elements: [] }],
+    })
+    await server.request('turn/steer', {
+      threadId,
+      expectedTurnId: linkedHeld.id,
+      input: [{ type: 'text', text: 'release', text_elements: [] }],
+    })
+    const queued = await server.waitFor(
+      'turn/started',
+      (params) => params.threadId === threadId && params.turn.id !== linkedHeld.id,
+      from,
+    )
+    assert.equal(queued.turn.rootTurnId, queued.turn.id)
+    await server.waitFor('turn/completed', (params) => params.turn.id === queued.turn.id, from)
   })
 })
 

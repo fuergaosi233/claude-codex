@@ -2276,12 +2276,15 @@ export class CodexClaudeAppServer {
 
   // Settings for a turn the adapter starts on the user's behalf: whatever the
   // last user turn used, minus its input. Queued messages never carry a
-  // collaboration mode (the App keeps those in the window queue).
+  // collaboration mode (the App keeps those in the window queue). Nor the
+  // lineage of a turn started for another turn: such a turn is its own root.
   private followUpParams(threadId: string): Record<string, unknown> {
     const {
       input: _input,
       clientUserMessageId: _clientId,
       outputSchema: _schema,
+      parentTurnId: _parent,
+      rootTurnId: _root,
       ...rest
     } = this.lastTurnParamsByThread.get(threadId) ?? {}
     return { ...rest, threadId, planMode: false }
