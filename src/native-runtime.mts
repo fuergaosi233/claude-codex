@@ -280,6 +280,9 @@ const SESSION_SETTLE_MS = 15_000
 // How long an idle session keeps background tasks alive without any message.
 const BACKGROUND_IDLE_MS = 2 * 60 * 60 * 1000
 const SESSION_CONTROL_TIMEOUT_MS = 5_000
+// How long mcpServerStatus/list waits for a session to say how its MCP
+// servers are; the App waits five seconds for a thread's list.
+const MCP_STATUS_TIMEOUT_MS = 2_000
 // How long a new turn waits for an interrupted session to drain before it
 // gives up on the sink and goes ahead.
 const SINK_DRAIN_TIMEOUT_MS = 30_000
@@ -546,7 +549,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         },
         () => {},
       ),
-      SESSION_CONTROL_TIMEOUT_MS,
+      MCP_STATUS_TIMEOUT_MS,
     )
     return statuses
   }

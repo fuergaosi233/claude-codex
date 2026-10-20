@@ -75,16 +75,24 @@ export function readMcpConfig(scope: McpConfigScope = {}): McpConfigSnapshot {
 
 // Cache enumerated server statuses briefly: the App's MCP panel can poll
 // mcpServerStatus/list, and each miss spawns one child process per server.
-let statusCache: { key: string; at: number; data: Array<Record<string, unknown>> } | null = null
+// Lists asked for while the servers are being asked share that look.
+interface StatusLook {
+  readonly key: string
+  // When the look ended; until then it is as fresh as a look can be.
+  at: number
+  readonly data: Promise<Array<Record<string, unknown>>>
+}
+let statusCache: StatusLook | null = null
 const STATUS_CACHE_MS = 10_000
 
 // mcpServerStatus/list with real tools/resources enumerated from each server.
 // Falls back to the conformant empty shape per server on any error/timeout so a
 // single unreachable server never fails the whole list. session is what the
-// thread's live Claude session says of its servers, when it has one.
+// thread's live Claude session says of its servers, when it has one; it is
+// asked while the servers are.
 export async function listMcpServerStatuses(
   scope: McpConfigScope = {},
-  session: readonly RuntimeMcpServerStatus[] | null = null,
+  session: Promise<readonly RuntimeMcpServerStatus[] | null> = Promise.resolve(null),
 ): Promise<Array<Record<string, unknown>>> {
   const snapshot = readMcpConfig(scope)
   const names = serverNames(snapshot.sdkValue)
@@ -93,18 +101,28 @@ export async function listMcpServerStatuses(
     snapshot.sdkValue ?? null,
     plugins.map((server) => [server.pluginId, server.name, server.cwd]),
   ])
-  let data =
-    statusCache && statusCache.key === key && Date.now() - statusCache.at < STATUS_CACHE_MS
-      ? statusCache.data
-      : null
-  if (!data) {
-    data = await Promise.all([
-      ...names.map((name) => enumerateServerStatus(name, snapshot.sdkValue)),
-      ...plugins.map((server) => pluginServerStatus(server)),
-    ])
-    statusCache = { key, at: Date.now(), data }
+  let look = statusCache
+  if (!look || look.key !== key || Date.now() - look.at >= STATUS_CACHE_MS) {
+    const fresh: StatusLook = {
+      key,
+      at: Number.POSITIVE_INFINITY,
+      data: Promise.all([
+        ...names.map((name) => enumerateServerStatus(name, snapshot.sdkValue)),
+        ...plugins.map((server) => pluginServerStatus(server)),
+      ]),
+    }
+    fresh.data.then(
+      () => {
+        fresh.at = Date.now()
+      },
+      () => {
+        if (statusCache === fresh) statusCache = null
+      },
+    )
+    statusCache = look = fresh
   }
-  return session ? data.map((status) => withSessionStatus(status, session)) : data
+  const [data, seen] = await Promise.all([look.data, session])
+  return seen ? data.map((status) => withSessionStatus(status, seen)) : data
 }
 
 // Codex's McpServerConnectionStatus for each state Claude Code gives an MCP
@@ -424,6 +442,18 @@ const INITIALIZE_PARAMS = {
   clientInfo: { name: 'claude-codex-adapter', version: '0.1.0' },
 }
 
+// How much of a stdio server's stderr, or of an HTTP server's error body, an
+// error carries.
+const ERROR_DETAIL_LIMIT = 2000
+
+// How long a connection to a server the adapter reaches itself may take,
+// all its requests included: CLAUDE_CODEX_MCP_TIMEOUT_MS, 20 seconds by
+// default. A server that takes longer is let go, a stdio one ended.
+function mcpTimeoutMs(): number {
+  const value = Number(process.env.CLAUDE_CODEX_MCP_TIMEOUT_MS)
+  return Number.isFinite(value) && value > 0 ? value : 20_000
+}
+
 async function connectMcp(
   serverName: string,
   config: Record<string, unknown>,
@@ -480,7 +510,8 @@ async function connectStdio(
   child.stdin.on('error', () => undefined)
   child.stderr.setEncoding('utf8')
   child.stderr.on('data', (chunk) => {
-    stderr += String(chunk)
+    // The end of it is what explains an exit, and all an error carries.
+    stderr = (stderr + String(chunk)).slice(-ERROR_DETAIL_LIMIT)
   })
   child.stdout.setEncoding('utf8')
   child.stdout.on('data', (chunk) => {
@@ -515,7 +546,7 @@ async function connectStdio(
   const timeout = setTimeout(() => {
     end(new Error(`MCP request timed out${stderrNote(stderr)}`))
     child.kill()
-  }, 20_000)
+  }, mcpTimeoutMs())
   const close = () => {
     clearTimeout(timeout)
     end(new Error('MCP connection closed'))
@@ -534,42 +565,103 @@ async function connectStdio(
   }
 }
 
+// A streamable HTTP server, spoken to as the MCP spec has clients do it: each
+// request takes a JSON reply or an event stream, and carries the session id
+// the server gave on initialize, a session that ends with the connection.
+// All requests share one deadline, as a stdio server's do.
 async function connectHttp(config: Record<string, unknown>): Promise<McpConnection> {
   const url = stringOr(config.url, '')
   if (!url) throw new Error('HTTP MCP server has no url')
-  const headers = {
+  // fetch refuses a url with credentials, and its error repeats the url.
+  let target: URL
+  try {
+    target = new URL(url)
+  } catch {
+    throw new Error('HTTP MCP server url is not a valid url')
+  }
+  if (target.username || target.password) {
+    throw new Error('HTTP MCP server url has credentials in it, which fetch refuses')
+  }
+  const signal = AbortSignal.timeout(mcpTimeoutMs())
+  const headers: Record<string, string> = {
     'content-type': 'application/json',
-    accept: 'application/json',
+    accept: 'application/json, text/event-stream',
     ...stringRecord(config.headers),
   }
   let nextId = 1
   const request = async (method: string, params: unknown): Promise<unknown> => {
-    const body = { jsonrpc: '2.0', id: nextId++, method, params }
-    const record = asRecord(await fetchJsonRpc(url, headers, body))
+    const id = nextId++
+    const reply = await postJsonRpc(url, headers, { jsonrpc: '2.0', id, method, params }, signal)
+    if (method === 'initialize' && reply.sessionId) headers['mcp-session-id'] = reply.sessionId
+    const record = asRecord(jsonRpcReply(reply, id))
     if (record.error) throw new Error(JSON.stringify(record.error))
     return record.result
   }
   const initialized = asRecord(await request('initialize', INITIALIZE_PARAMS))
-  return { initialized, request, close: () => {} }
+  const notice = { jsonrpc: '2.0', method: 'notifications/initialized', params: {} }
+  await postJsonRpc(url, headers, notice, signal).catch(() => undefined)
+  const close = () => {
+    if (!headers['mcp-session-id']) return
+    // The server can let go of the session; one that does not end sessions
+    // this way answers 405.
+    fetch(url, { method: 'DELETE', headers, signal })
+      .then((response) => response.arrayBuffer())
+      .catch(() => undefined)
+  }
+  return { initialized, request, close }
 }
 
-async function fetchJsonRpc(
+// One JSON-RPC message posted to an HTTP server, and what came back. Errors
+// leave out what fetch says, which can repeat the url or a header value.
+async function postJsonRpc(
   url: string,
   headers: Record<string, string>,
-  body: Record<string, unknown>,
-): Promise<unknown> {
-  const response = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) })
-  const text = await response.text()
+  message: Record<string, unknown>,
+  signal: AbortSignal,
+): Promise<{ text: string; stream: boolean; sessionId: string | null }> {
+  let response: Response
+  let text: string
+  try {
+    response = await fetch(url, { method: 'POST', headers, body: JSON.stringify(message), signal })
+    text = await response.text()
+  } catch (error) {
+    if (signal.aborted) throw new Error('MCP request timed out')
+    const cause = error instanceof Error ? error.cause : undefined
+    throw new Error(
+      `HTTP MCP request failed${cause instanceof Error ? `: ${cause.message}` : ' to send'}`,
+    )
+  }
+  const detail = text.trim().slice(0, ERROR_DETAIL_LIMIT)
   if (response.status === 401 || response.status === 403) {
-    throw new OutOfReach(`HTTP MCP request failed ${response.status}: ${text}`)
+    throw new OutOfReach(`HTTP MCP request failed ${response.status}: ${detail}`)
   }
-  if (!response.ok) throw new Error(`HTTP MCP request failed ${response.status}: ${text}`)
-  const trimmed = text.trim()
-  if (trimmed.startsWith('event:') || trimmed.startsWith('data:')) {
-    const dataLine = trimmed.split('\n').find((line) => line.startsWith('data:'))
-    return JSON.parse((dataLine ?? '').slice('data:'.length).trim())
+  if (!response.ok) throw new Error(`HTTP MCP request failed ${response.status}: ${detail}`)
+  return {
+    text,
+    stream: (response.headers.get('content-type') ?? '').includes('text/event-stream'),
+    sessionId: response.headers.get('mcp-session-id'),
   }
-  return JSON.parse(trimmed)
+}
+
+// The reply to request id: the JSON body, or, from an event stream, the
+// event that answers it, which notifications can come before.
+function jsonRpcReply(reply: { text: string; stream: boolean }, id: number): unknown {
+  const trimmed = reply.text.trim()
+  if (!reply.stream && !/^(event|data|id):/.test(trimmed)) return JSON.parse(trimmed)
+  let last: unknown = null
+  for (const event of trimmed.split(/\r?\n\r?\n/)) {
+    const data = event
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith('data:'))
+      .map((line) => line.slice('data:'.length).trim())
+      .join('\n')
+    if (!data) continue
+    const message = asRecord(JSON.parse(data))
+    if (String(message.id) === String(id)) return message
+    if ('result' in message || 'error' in message) last = message
+  }
+  if (last == null) throw new Error('HTTP MCP server sent no reply')
+  return last
 }
 
 // What a stdio server wrote to stderr, to go with an error.

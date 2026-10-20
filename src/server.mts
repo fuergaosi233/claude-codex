@@ -975,12 +975,11 @@ export class CodexClaudeAppServer {
         // serverName limits discovery to one server. With a Claude thread
         // whose session is live, runtimeStatus is that session's view.
         const serverName = nullIfEmpty(stringOr(asRecord(params).serverName, ''))
-        return this.mcpSessionStatuses(params)
-          .then((session) => listMcpServerStatuses(this.mcpScope(params), session))
-          .then((data) => ({
-            data: serverName == null ? data : data.filter((server) => server.name === serverName),
-            nextCursor: null,
-          }))
+        const session = this.mcpSessionStatuses(params).catch(() => null)
+        return listMcpServerStatuses(this.mcpScope(params), session).then((data) => ({
+          data: serverName == null ? data : data.filter((server) => server.name === serverName),
+          nextCursor: null,
+        }))
       }
       case 'mcpServer/resource/read':
         // originCallId comes back only when a hosted app scoped the read;

@@ -42,8 +42,9 @@ class FakeQuery implements AsyncIterable<Record<string, unknown>> {
   interrupts = 0
   stoppedTasks: string[] = []
   closed = false
-  // What mcpServerStatus answers; null makes it fail.
-  mcpStatuses: Record<string, unknown>[] | null = []
+  // What mcpServerStatus answers; null makes it fail, and 'hang' never
+  // answers, as a wedged session does.
+  mcpStatuses: Record<string, unknown>[] | null | 'hang' = []
   reconnects: string[] = []
   failingReconnects = new Set<string>()
   private queue: Record<string, unknown>[] = []
@@ -69,6 +70,7 @@ class FakeQuery implements AsyncIterable<Record<string, unknown>> {
   }
 
   async mcpServerStatus(): Promise<Record<string, unknown>[]> {
+    if (this.mcpStatuses === 'hang') return new Promise(() => {})
     if (!this.mcpStatuses) throw new Error('control request failed')
     return this.mcpStatuses
   }
@@ -629,6 +631,14 @@ test('native MCP statuses are what the open session says of its servers', async 
   // A session that cannot answer says nothing.
   query.mcpStatuses = null
   assert.equal(await runtime.mcpServerStatuses('thread'), null)
+
+  // Nor does a wedged one, in time for the App, which waits five seconds for
+  // the whole list.
+  query.mcpStatuses = 'hang'
+  const asked = Date.now()
+  assert.equal(await runtime.mcpServerStatuses('thread'), null)
+  const waited = Date.now() - asked
+  assert.ok(waited >= 1_500 && waited < 4_000, `waited ${waited} ms`)
 
   // Nor does one that has ended.
   query.mcpStatuses = [{ name: 'github', status: 'connected' }]

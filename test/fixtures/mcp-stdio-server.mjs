@@ -1,8 +1,15 @@
 #!/usr/bin/env node
+import { appendFileSync, writeSync } from 'node:fs'
 import readline from 'node:readline'
 
-// MCP_FIXTURE_EXIT exits before answering anything, as a broken server does.
-if (process.env.MCP_FIXTURE_EXIT) process.exit(Number(process.env.MCP_FIXTURE_EXIT))
+// MCP_FIXTURE_STARTS names a file that gets a line each time the server starts.
+if (process.env.MCP_FIXTURE_STARTS) appendFileSync(process.env.MCP_FIXTURE_STARTS, 'start\n')
+// MCP_FIXTURE_EXIT exits before answering anything, as a broken server does,
+// after writing MCP_FIXTURE_STDERR to stderr.
+if (process.env.MCP_FIXTURE_EXIT) {
+  if (process.env.MCP_FIXTURE_STDERR) writeSync(2, process.env.MCP_FIXTURE_STDERR)
+  process.exit(Number(process.env.MCP_FIXTURE_EXIT))
+}
 const rl = readline.createInterface({ input: process.stdin })
 // The tool call waiting for the client to answer the server's ping.
 let pingCall = null

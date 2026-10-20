@@ -228,7 +228,11 @@ versioning or publishing metadata.
   With a `threadId` whose Claude session is open, `runtimeStatus` is the
   state that session reports for each server; otherwise it is `null`, as
   Codex answers without a thread. The App uses these to show server names and
-  logos and a tool discovery error, and to retry a plugin's servers.
+  logos and a tool discovery error, and to retry a plugin's servers. Lists
+  asked for at once share one look at the servers; HTTP servers are spoken to
+  as streamable HTTP (event-stream replies, sessions) and, like stdio ones,
+  given up on after 20 seconds (`CLAUDE_CODEX_MCP_TIMEOUT_MS`). An error
+  carries only the end of a server's stderr and never a url's credentials.
 - Codex's `model_auto_compact_token_limit` now sets the compaction window of
   Claude threads: from the config a thread starts, resumes or forks with, or
   `config/value/write`, it reaches the Claude CLI as
