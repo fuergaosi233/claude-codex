@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { setTimeout as delay } from 'node:timers/promises'
 import { NativeClaudeRuntime } from '../src/native-runtime.mjs'
+import { TOOL_INPUT_PREVIEW_INTERVAL_MS } from '../src/tool-input-preview.mjs'
 import type { RuntimeEvent, RuntimeTurnContext, RuntimeTurnSettings } from '../src/types.mjs'
 
 const context: RuntimeTurnContext = {
@@ -32,7 +34,11 @@ async function collect(
   const runtime = new NativeClaudeRuntime()
   Reflect.set(runtime, 'sdk', {
     query: async function* () {
-      yield* messages
+      for (const message of messages) {
+        // `{ wait: ms }` lets time pass between two messages.
+        if (typeof message.wait === 'number') await delay(message.wait)
+        else yield message
+      }
       yield { type: 'result', subtype: 'success', result: 'done' }
     },
   })
@@ -72,6 +78,32 @@ function assistant(id: string, content: Record<string, unknown>[]) {
 
 function text(value: string) {
   return { type: 'text', text: value }
+}
+
+function toolStart(index: number, id: string, name: string, parent: string | null = null) {
+  return stream(
+    {
+      type: 'content_block_start',
+      index,
+      content_block: { type: 'tool_use', id, name, input: {} },
+    },
+    parent,
+  )
+}
+
+function inputDelta(index: number, json: string, parent: string | null = null) {
+  return stream(
+    { type: 'content_block_delta', index, delta: { type: 'input_json_delta', partial_json: json } },
+    parent,
+  )
+}
+
+function blockStop(index: number) {
+  return stream({ type: 'content_block_stop', index })
+}
+
+function toolUse(id: string, name: string, input: Record<string, unknown>) {
+  return { type: 'tool_use', id, name, input }
 }
 
 test('native presentation keeps streamed progress and a later unstreamed final answer', async () => {
@@ -524,4 +556,136 @@ test('turn settings switch the running turn in place, and the next turn restores
     ['applyFlagSettings', { effortLevel: null }],
   ])
   assert.equal(session.effort, null)
+})
+
+test('a file tool call streams its input as throttled progress before the finished call', async () => {
+  const input = { file_path: '/tmp/notes.md', content: '# Notes\n\nFirst line\u00e9\n' }
+  const events = await collect([
+    start('edit'),
+    delta('text', 'Writing it.', 0),
+    blockStop(0),
+    assistant('edit', [text('Writing it.')]),
+    toolStart(1, 'write', 'Write'),
+    // The path is still being written: no file to show yet.
+    inputDelta(1, '{"file_path": "/tmp/no'),
+    inputDelta(1, 'tes.md", "content": "# No'),
+    inputDelta(1, 'tes\\n\\nFirst'),
+    { wait: TOOL_INPUT_PREVIEW_INTERVAL_MS + 20 },
+    inputDelta(1, ' line\\u00'),
+    inputDelta(1, 'e9\\n"}'),
+    blockStop(1),
+    assistant('edit', [toolUse('write', 'Write', input)]),
+  ])
+  const progress = (content: string) => ({
+    type: 'tool_input_progress',
+    toolUseId: 'write',
+    toolName: 'Write',
+    input: { file_path: '/tmp/notes.md', content },
+  })
+  assert.deepEqual(events, [
+    { type: 'message_boundary' },
+    { type: 'text_delta', delta: 'Writing it.' },
+    progress('# No'),
+    // The cut escape is left out until it is complete.
+    progress('# Notes\n\nFirst line'),
+    { type: 'tool_use', toolUseId: 'write', toolName: 'Write', input },
+  ])
+})
+
+test('subagent and non-file tool input does not stream', async () => {
+  const events = await collect([
+    start('main'),
+    toolStart(0, 'bash', 'Bash'),
+    inputDelta(0, '{"command": "ls", "file_path": "/tmp/a.txt"}'),
+    blockStop(0),
+    assistant('main', [toolUse('bash', 'Bash', { command: 'ls', file_path: '/tmp/a.txt' })]),
+    toolStart(1, 'write', 'Write'),
+    // A subagent streams beside the main loop, numbering its own blocks.
+    stream({ type: 'message_start', message: { id: 'child' } }, 'agent'),
+    toolStart(1, 'child-edit', 'Edit', 'agent'),
+    inputDelta(1, '{"file_path": "/tmp/child.txt", "old_string": "x', 'agent'),
+    inputDelta(1, '{"file_path": "/tmp/b.txt"}'),
+    blockStop(1),
+    {
+      ...assistant('child', [toolUse('child-edit', 'Edit', { file_path: '/tmp/child.txt' })]),
+      parent_tool_use_id: 'agent',
+    },
+    assistant('main', [toolUse('write', 'Write', { file_path: '/tmp/b.txt', content: '' })]),
+  ])
+  assert.deepEqual(events, [
+    { type: 'message_boundary' },
+    {
+      type: 'tool_use',
+      toolUseId: 'bash',
+      toolName: 'Bash',
+      input: { command: 'ls', file_path: '/tmp/a.txt' },
+    },
+    {
+      type: 'tool_input_progress',
+      toolUseId: 'write',
+      toolName: 'Write',
+      input: { file_path: '/tmp/b.txt' },
+    },
+    {
+      type: 'tool_use',
+      toolUseId: 'write',
+      toolName: 'Write',
+      input: { file_path: '/tmp/b.txt', content: '' },
+    },
+  ])
+})
+
+test('a new model response drops the input of a call it did not finish', async () => {
+  const input = { file_path: '/tmp/a.txt', content: 'xyz' }
+  const events = await collect([
+    start('first'),
+    toolStart(0, 'lost', 'Write'),
+    inputDelta(0, '{"file_path": "/tmp/a.txt", "content": "x'),
+    // The stream broke off and Claude asked again.
+    start('retry'),
+    inputDelta(0, 'yz"}'),
+    toolStart(0, 'write', 'Write'),
+    inputDelta(0, '{"file_path": "/tmp/a.txt"'),
+    blockStop(0),
+    assistant('retry', [toolUse('write', 'Write', input)]),
+  ])
+  assert.deepEqual(events, [
+    { type: 'message_boundary' },
+    {
+      type: 'tool_input_progress',
+      toolUseId: 'lost',
+      toolName: 'Write',
+      input: { file_path: '/tmp/a.txt', content: 'x' },
+    },
+    { type: 'message_boundary' },
+    {
+      type: 'tool_input_progress',
+      toolUseId: 'write',
+      toolName: 'Write',
+      input: { file_path: '/tmp/a.txt' },
+    },
+    { type: 'tool_use', toolUseId: 'write', toolName: 'Write', input },
+  ])
+})
+
+test('CLAUDE_CODEX_LIVE_FILE_CHANGES=0 shows a file tool call only once it is finished', async () => {
+  const previous = process.env.CLAUDE_CODEX_LIVE_FILE_CHANGES
+  process.env.CLAUDE_CODEX_LIVE_FILE_CHANGES = '0'
+  try {
+    const input = { file_path: '/tmp/a.txt', content: 'xyz' }
+    const events = await collect([
+      start('edit'),
+      toolStart(0, 'write', 'Write'),
+      inputDelta(0, JSON.stringify(input)),
+      blockStop(0),
+      assistant('edit', [toolUse('write', 'Write', input)]),
+    ])
+    assert.deepEqual(
+      events.map((event) => event.type),
+      ['message_boundary', 'tool_use'],
+    )
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_CODEX_LIVE_FILE_CHANGES
+    else process.env.CLAUDE_CODEX_LIVE_FILE_CHANGES = previous
+  }
 })

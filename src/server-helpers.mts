@@ -257,6 +257,9 @@ export function reviewLabel(target: unknown): string {
   return 'uncommitted changes'
 }
 
+// Codex's exitedReviewMode text when the reviewer gave no answer.
+export const REVIEW_FALLBACK = 'Reviewer failed to output a response.'
+
 export function reviewPrompt(target: unknown): string {
   const label = reviewLabel(target)
   return [

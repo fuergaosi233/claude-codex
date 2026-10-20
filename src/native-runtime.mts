@@ -55,6 +55,7 @@ import {
 import { echoedUuids, TurnInput, type TurnInputMessage } from './native-turn-input.mjs'
 import { sdkHooks } from './sdk-hooks.mjs'
 import { readTaskResult } from './task-output.mjs'
+import { ToolInputPreviews } from './tool-input-preview.mjs'
 import type {
   ClaudeRuntime,
   ElicitationResponse,
@@ -63,6 +64,7 @@ import type {
   HookRunStatus,
   ImageInput,
   PermissionDecision,
+  RecalledMemory,
   RuntimeBackgroundListener,
   RuntimeHandlers,
   RuntimeLiveTask,
@@ -122,6 +124,9 @@ interface PendingTurn {
   // ToolUseBlock twice; we keep only the AssistantMessage copy because
   // content_block_start arrives with empty input).
   toolStartSeen: Set<string>
+  // The streamed input of the current response's file tool calls, null when
+  // CLAUDE_CODEX_LIVE_FILE_CHANGES=0 turns the live preview off.
+  toolInputPreviews: ToolInputPreviews | null
   // Buffer + tool ids for StructuredOutput coercion: when the SDK ships a
   // synthetic StructuredOutput tool_use we want to suppress the streamed
   // text and emit only the final coerced JSON.
@@ -492,6 +497,15 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     return !truthyEnv(process.env.DISABLE_COMPACT)
   }
 
+  // Each turn hands Claude Code the MCP config as it is then, so only the
+  // sessions still open hold an older one. Those retry the servers that failed
+  // or wait for a sign-in, which picks up a sign-in made since. A connected
+  // server is left alone: no call to it is cut off.
+  async reloadMcpServers(): Promise<void> {
+    const open = [...this.sessions.values()].filter((live) => !live.closed)
+    await Promise.all(open.map((live) => this.retryMcpServers(live)))
+  }
+
   async stop(): Promise<void> {
     for (const pending of this.turns.values()) {
       await this.stopWorkflowTasks(pending)
@@ -520,6 +534,45 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   }
 
   // ── private ──
+
+  private async retryMcpServers(live: LiveSession): Promise<void> {
+    const query = live.query as Query & {
+      mcpServerStatus?: () => Promise<Array<{ name: string; status: string }>>
+      reconnectMcpServer?: (serverName: string) => Promise<void>
+    }
+    if (typeof query.mcpServerStatus !== 'function') return
+    if (typeof query.reconnectMcpServer !== 'function') return
+    let statuses: Array<{ name: string; status: string }> = []
+    await settlesWithin(
+      query.mcpServerStatus().then(
+        (found) => {
+          statuses = Array.isArray(found) ? found : []
+        },
+        () => {},
+      ),
+      SESSION_CONTROL_TIMEOUT_MS,
+    )
+    const retry = statuses.filter(
+      (server) => server.status === 'failed' || server.status === 'needs-auth',
+    )
+    for (const server of retry) {
+      if (live.closed) return
+      let failure: string | null = null
+      const settled = await settlesWithin(
+        query.reconnectMcpServer(server.name).catch((error: unknown) => {
+          failure = error instanceof Error ? error.message : String(error)
+        }),
+        SESSION_CONTROL_TIMEOUT_MS,
+      )
+      debugLog('native.mcp.reconnect', {
+        threadId: live.threadId,
+        server: server.name,
+        status: server.status,
+        settled,
+        failure,
+      })
+    }
+  }
 
   private async loadSdk(): Promise<ClaudeSdk> {
     if (this.sdk) return this.sdk
@@ -980,6 +1033,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       skippedWorkflowTaskIds: new Set(),
       workflowTasks: new Map(),
       toolStartSeen: new Set(),
+      toolInputPreviews:
+        process.env.CLAUDE_CODEX_LIVE_FILE_CHANGES === '0' ? null : new ToolInputPreviews(),
       structuredBuffer: '',
       pendingUserMessage: null,
       deferredResult: null,
@@ -1789,6 +1844,11 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       })
       return
     }
+    if (subtype === 'memory_recall') {
+      const memories = recalledMemories(message.memories)
+      if (memories.length > 0) await pending.handlers.onEvent({ type: 'memory_recall', memories })
+      return
+    }
     if (subtype === 'task_started' && isWorkflowBackgroundTask(message)) {
       const taskId = String(message.task_id ?? '')
       if (!taskId) return
@@ -2018,14 +2078,30 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         // full block lands later inside the AssistantMessage. Without this
         // we'd emit one orphan inProgress item per tool and a real one.
         if (id) pending.toolStartSeen.add(id)
+        // A file tool's input is followed as it streams, so the App can draw
+        // the change while Claude is still writing it.
+        if (typeof event.index === 'number') {
+          pending.toolInputPreviews?.start(event.index, id, String(block.name ?? ''))
+        }
       }
+      return
+    }
+    if (eventType === 'content_block_stop') {
+      if (typeof event.index === 'number') pending.toolInputPreviews?.stop(event.index)
       return
     }
     if (eventType === 'content_block_delta') {
       const delta = event.delta as Record<string, unknown> | undefined
       if (!delta) return
       const deltaType = String(delta.type ?? '')
-      if (deltaType === 'text_delta') {
+      if (deltaType === 'input_json_delta') {
+        if (typeof event.index !== 'number') return
+        const preview = pending.toolInputPreviews?.push(
+          event.index,
+          String(delta.partial_json ?? ''),
+        )
+        if (preview) await pending.handlers.onEvent({ type: 'tool_input_progress', ...preview })
+      } else if (deltaType === 'text_delta') {
         const text = String(delta.text ?? '')
         if (!text) return
         this.recordStreamedBlock(pending, event.index, 'text', text)
@@ -2053,6 +2129,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (messageId ? messageId === pending.assistantMessageId : !streamStart) return
     pending.assistantMessageId = messageId
     pending.streamedBlocks = new Map()
+    pending.toolInputPreviews?.clear()
     if (!pending.context?.outputFormat) {
       await pending.handlers.onEvent({ type: 'message_boundary' })
     }
@@ -2586,6 +2663,24 @@ function hookRunOutcome(message: Record<string, unknown>): {
     return { status: 'blocked', entries }
   }
   return { status: 'completed', entries }
+}
+
+// memory_recall's memories: a file path with its text left out, or the text
+// itself under a `<synthesis:DIR>` marker or a URL.
+function recalledMemories(value: unknown): RecalledMemory[] {
+  if (!Array.isArray(value)) return []
+  return value.flatMap((raw) => {
+    const memory = recordOrNull(raw)
+    const path = stringOrNull(memory?.path)
+    if (!memory || !path) return []
+    return [
+      {
+        path,
+        scope: stringOrNull(memory.scope),
+        content: typeof memory.content === 'string' ? memory.content : null,
+      },
+    ]
+  })
 }
 
 function parseHookOutput(value: unknown): Record<string, unknown> {

@@ -83,6 +83,20 @@ export async function listMcpServerStatuses(
   return data
 }
 
+// config/mcpServer/reload: the next mcpServerStatus/list asks the servers
+// again instead of answering from the cache.
+export function resetMcpStatusCache(): void {
+  statusCache = null
+}
+
+// mcpServer/oauth/login: Claude Code signs in to an MCP server itself, and the
+// Agent SDK has no call that starts that sign-in, so there is no authorization
+// URL to give the App.
+export function mcpOauthUnavailable(name: string): string {
+  const server = name ? `"${name}"` : 'the server'
+  return `Claude Code signs in to MCP servers itself, and the adapter cannot start that sign-in. Sign in to ${server} with /mcp in a Claude Code session that has it configured.`
+}
+
 async function enumerateServerStatus(
   name: string,
   scope: McpConfigScope,

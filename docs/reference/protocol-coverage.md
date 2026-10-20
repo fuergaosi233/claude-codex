@@ -20,8 +20,9 @@ Implemented as real remote/runtime behavior:
   `MultiEdit` → file-change approval with diffs; MCP elicitation → the App's
   form or link prompt.
 - **Streaming** — turn started/completed, thread status changes, agent text
-  deltas, reasoning deltas, command output deltas, file patches, generic tool
-  item completion, hook runs, model reroutes, and aggregated git diff updates.
+  deltas, reasoning deltas, command output deltas, file patches (updated while
+  Claude is still writing the call), generic tool item completion, hook runs,
+  model reroutes, and aggregated git diff updates.
 - **Remote utilities** — file read/write/list/metadata/copy/remove/watch,
   command exec with stdin/terminate, process spawn/stdin/kill, fuzzy file
   search, direct MCP stdio/HTTP tool and resource calls.

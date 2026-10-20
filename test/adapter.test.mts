@@ -19,6 +19,7 @@ import test from 'node:test'
 import WebSocket from 'ws'
 import type { ProviderLoopConfigProjectionResult } from '../src/provider-loop-config.mjs'
 import { QUIET_TURN_HEARTBEAT } from '../src/quiet-turns.mjs'
+import { fileChangeFromTool } from '../src/server-helpers.mjs'
 import { SessionStore } from '../src/store.mjs'
 
 const adapter = resolve('dist/src/adapter.mjs')
@@ -521,6 +522,141 @@ test('mcpServerStatus/list and startup notifications use conformant Codex v2 sha
     assert.deepEqual(entry.resourceTemplates, [])
     assert.ok(['unsupported', 'notLoggedIn', 'bearerToken', 'oAuth'].includes(entry.authStatus))
     assert.ok(!('status' in entry), 'McpServerStatus has no startup status field')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('MCP sign-in says where to sign in, and a reload reaches the runtime and the App', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      CODEX_HOME: home,
+      CLAUDE_CODEX_MOCK: '1',
+      NODE_NO_WARNINGS: '1',
+      CLAUDE_CODEX_MCP_SERVERS: JSON.stringify({
+        github: { type: 'http', url: 'https://mcp.example.com/github' },
+      }),
+    },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    // The Agent SDK cannot start Claude Code's sign-in, so the App gets an
+    // error naming where to sign in instead of a link that leads nowhere.
+    proc.stdin.write(json({ id: 1, method: 'mcpServer/oauth/login', params: { name: 'github' } }))
+    const login = await reader.nextResponse(1)
+    assert.equal(login.result, undefined)
+    assert.equal(
+      login.error.message,
+      'Claude Code signs in to MCP servers itself, and the adapter cannot start that sign-in. Sign in to "github" with /mcp in a Claude Code session that has it configured.',
+    )
+
+    proc.stdin.write(json({ id: 2, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const threadId = (await reader.nextResponse(2)).result.thread.id
+    // The mock runtime answers with how many reloads have reached it.
+    const reloadsSeen = async (id: number): Promise<string> => {
+      proc.stdin.write(
+        json({
+          id,
+          method: 'turn/start',
+          params: {
+            threadId,
+            input: [{ type: 'text', text: 'mcp reload check', text_elements: [] }],
+          },
+        }),
+      )
+      let text = ''
+      for (let i = 0; i < 200; i += 1) {
+        const message = await reader.next()
+        if (message.method === 'item/agentMessage/delta') text += message.params.delta
+        if (message.method === 'turn/completed') break
+      }
+      return text
+    }
+    assert.equal(await reloadsSeen(3), '0 MCP reloads')
+
+    proc.stdin.write(json({ id: 4, method: 'config/mcpServer/reload', params: {} }))
+    const statuses: any[] = []
+    let reloaded: any = null
+    for (let i = 0; i < 50 && !reloaded; i += 1) {
+      const message = await reader.next()
+      if (message.method === 'mcpServer/startupStatus/updated') statuses.push(message.params)
+      if (message.id === 4 && message.method == null) reloaded = message
+    }
+    assert.deepEqual(reloaded.result, {})
+    assert.deepEqual(statuses, [{ name: 'github', status: 'ready', error: null }])
+    assert.equal(await reloadsSeen(5), '1 MCP reloads')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('memories Claude recalls are cited on the answer of the turn', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const memory = join(home, 'short-answers.md')
+  await writeFile(
+    memory,
+    '---\nname: Short answers\ndescription: The user wants short answers\ntype: feedback\n---\n\nKeep replies brief.\n',
+  )
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const threadId = (await reader.nextResponse(1)).result.thread.id
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: `memory recall check ${memory}`, text_elements: [] }],
+        },
+      }),
+    )
+    const messages: any[] = []
+    for (let i = 0; i < 200; i += 1) {
+      const message = await reader.next()
+      if (message.method === 'item/completed' && message.params.item.type === 'agentMessage')
+        messages.push(message.params.item)
+      if (message.method === 'turn/completed') break
+    }
+    // Recalled twice, cited once; the summary Claude was given is cited by
+    // its first line, and only the answer carries the citation.
+    const citation = {
+      entries: [
+        { path: memory, lineStart: 1, lineEnd: 7, note: 'The user wants short answers' },
+        {
+          path: '<synthesis:/memories>',
+          lineStart: 1,
+          lineEnd: 2,
+          note: 'The team ships on Fridays.',
+        },
+      ],
+      threadIds: [],
+    }
+    assert.deepEqual(
+      messages.map((item) => [item.text, item.phase, item.memoryCitation]),
+      [
+        ['Checking what I remember.', 'commentary', null],
+        ['You prefer short answers.', 'final_answer', citation],
+      ],
+    )
+
+    proc.stdin.write(
+      json({ id: 3, method: 'thread/read', params: { threadId, includeTurns: true } }),
+    )
+    const read = await reader.nextResponse(3)
+    const answer = read.result.thread.turns[0].items.findLast(
+      (item: any) => item.type === 'agentMessage',
+    )
+    assert.deepEqual(answer.memoryCitation, citation)
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -2929,20 +3065,157 @@ test('review/start and thread/compact/start emit real turn items', async () => {
 
     let reviewText = ''
     let reviewWarning: any = null
-    let sawEnteredReviewMode = false
+    // Like Codex, the entered marker completes as the review starts, and the
+    // exited one, holding the review, closes the turn: here the fallback
+    // text, as the reviewer gave no answer.
+    const markers: string[] = []
+    let exited: any = null
     for (let i = 0; i < 500; i += 1) {
       const message = await reader.next()
-      if (message.method === 'item/started' && message.params.item.type === 'enteredReviewMode')
-        sawEnteredReviewMode = true
+      const item = message.params?.item
+      if (/^item\/(started|completed)$/.test(message.method) && /ReviewMode$/.test(item.type))
+        markers.push(`${message.method} ${item.type}`)
+      if (message.method === 'item/completed' && item.type === 'exitedReviewMode') exited = item
       if (message.method === 'item/agentMessage/delta') reviewText += message.params.delta
       if (message.method === 'warning') reviewWarning = message.params
       if (message.method === 'turn/completed') break
     }
-    assert.equal(sawEnteredReviewMode, true)
+    assert.deepEqual(markers, [
+      'item/started enteredReviewMode',
+      'item/completed enteredReviewMode',
+      'item/started exitedReviewMode',
+      'item/completed exitedReviewMode',
+    ])
+    assert.equal(exited.review, 'Reviewer failed to output a response.')
     assert.equal(reviewText, '')
     assert.deepEqual(reviewWarning, { threadId, message: 'mock rate limit notice' })
+
+    // A review that answers ends with that answer as its review.
+    proc.stdin.write(
+      json({
+        id: 4,
+        method: 'review/start',
+        params: {
+          threadId,
+          delivery: 'inline',
+          target: { type: 'custom', instructions: 'thinking check' },
+        },
+      }),
+    )
+    const answered = await reader.nextResponse(4)
+    let completedTurn: any = null
+    for (let i = 0; i < 500 && !completedTurn; i += 1) {
+      const message = await reader.next()
+      if (message.method === 'turn/completed') completedTurn = message.params.turn
+    }
+    assert.equal(completedTurn.id, answered.result.turn.id)
+    assert.equal(completedTurn.status, 'completed')
+    proc.stdin.write(
+      json({ id: 5, method: 'thread/read', params: { threadId, includeTurns: true } }),
+    )
+    const read = await reader.nextResponse(5)
+    const reviewTurn = read.result.thread.turns.find((turn: any) => turn.id === completedTurn.id)
+    assert.deepEqual(
+      reviewTurn.items.map((item: any) => item.type),
+      ['userMessage', 'enteredReviewMode', 'reasoning', 'agentMessage', 'exitedReviewMode'],
+    )
+    assert.equal(reviewTurn.items.at(-1).review, 'done')
   } finally {
     proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('a review cut off by an interrupt or by the adapter stopping still exits review mode', {
+  timeout: 30_000,
+}, async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const launch = () => {
+    const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+    })
+    t.signal.addEventListener('abort', () => proc.kill('SIGKILL'))
+    return { proc, reader: new JsonLineReader(proc) }
+  }
+  const first = launch()
+  let second: ReturnType<typeof launch> | null = null
+  try {
+    const { proc, reader } = first
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false },
+      }),
+    )
+    const threadId = (await reader.nextResponse(1)).result.thread.id
+    // A review Claude is still answering when it is cut off.
+    const heldReview = async (id: number): Promise<string> => {
+      proc.stdin.write(
+        json({
+          id,
+          method: 'review/start',
+          params: {
+            threadId,
+            delivery: 'inline',
+            target: { type: 'custom', instructions: 'hold this turn until released' },
+          },
+        }),
+      )
+      const turnId = (await reader.nextResponse(id)).result.turn.id
+      await nextNotification(reader, 'item/agentMessage/delta')
+      return turnId
+    }
+
+    // Interrupted: the exited marker, holding the fallback rather than the
+    // unfinished text, goes out before the turn ends.
+    const interruptedId = await heldReview(2)
+    proc.stdin.write(
+      json({ id: 3, method: 'turn/interrupt', params: { threadId, turnId: interruptedId } }),
+    )
+    const markers: string[] = []
+    let exited: any = null
+    let completed: any = null
+    for (let i = 0; i < 500 && !completed; i += 1) {
+      const message = await reader.next()
+      const item = message.params?.item
+      if (/^item\/(started|completed)$/.test(message.method) && /ReviewMode$/.test(item.type)) {
+        markers.push(`${message.method} ${item.type}`)
+        exited = item
+      }
+      if (message.method === 'turn/completed') completed = message.params.turn
+    }
+    assert.deepEqual(markers, ['item/started exitedReviewMode', 'item/completed exitedReviewMode'])
+    assert.equal(exited.review, 'Reviewer failed to output a response.')
+    assert.equal(completed.id, interruptedId)
+    assert.equal(completed.status, 'interrupted')
+
+    // Stopped: the adapter records the marker as it ends the turn, so the
+    // thread reads the same after a restart.
+    const stoppedId = await heldReview(4)
+    proc.kill('SIGTERM')
+    assert.equal(await waitForExit(proc, 20_000), 0)
+    second = launch()
+    second.proc.stdin.write(
+      json({ id: 1, method: 'thread/read', params: { threadId, includeTurns: true } }),
+    )
+    const read = await second.reader.nextResponse(1)
+    const turns = read.result.thread.turns
+    for (const turnId of [interruptedId, stoppedId]) {
+      const turn = turns.find((candidate: any) => candidate.id === turnId)
+      assert.equal(turn.status, 'interrupted')
+      const reviewItems = turn.items.filter((item: any) => /ReviewMode$/.test(item.type))
+      assert.deepEqual(
+        reviewItems.map((item: any) => item.type),
+        ['enteredReviewMode', 'exitedReviewMode'],
+      )
+      assert.equal(turn.items.at(-1).type, 'exitedReviewMode')
+      assert.equal(turn.items.at(-1).review, 'Reviewer failed to output a response.')
+    }
+  } finally {
+    first.proc.kill()
+    second?.proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
@@ -7545,6 +7818,168 @@ test('file change approval emits patch and git diff updates', { timeout: 15_000 
     assert.match(diff, /changed by mock runtime/)
   } finally {
     await stopProcess(proc)
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+// Runs a `live patch check` turn, accepting its file change, and returns what
+// the App saw: every notification, and the changes of the item the approval
+// was asked for as they stood when it was asked.
+async function runLivePatchTurn(prompt: string): Promise<{
+  home: string
+  threadId: string
+  messages: any[]
+  approved: { itemId: string; changes: unknown } | null
+  stored: any[]
+}> {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(
+      json({ id: 1, method: 'thread/start', params: { cwd: home, permissions: ':workspace' } }),
+    )
+    const threadId = (await reader.nextResponse(1)).result.thread.id
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: [{ type: 'text', text: prompt, text_elements: [] }] },
+      }),
+    )
+    const messages: any[] = []
+    const changes = new Map<string, unknown>()
+    let approved: { itemId: string; changes: unknown } | null = null
+    for (let i = 0; i < 200; i += 1) {
+      const message = await reader.next()
+      messages.push(message)
+      if (message.method === 'item/started' && message.params.item.type === 'fileChange')
+        changes.set(message.params.item.id, message.params.item.changes)
+      if (message.method === 'item/fileChange/patchUpdated')
+        changes.set(message.params.itemId, message.params.changes)
+      if (message.method === 'item/fileChange/requestApproval') {
+        approved = { itemId: message.params.itemId, changes: changes.get(message.params.itemId) }
+        proc.stdin.write(json({ id: message.id, result: { decision: 'accept' } }))
+      }
+      // A subagent's turn completes in its own thread.
+      if (message.method === 'turn/completed' && message.params.threadId === threadId) break
+    }
+    proc.stdin.write(
+      json({ id: 3, method: 'thread/read', params: { threadId, includeTurns: true } }),
+    )
+    const read = await reader.nextResponse(3)
+    return { home, threadId, messages, approved, stored: read.result.thread.turns.at(-1).items }
+  } finally {
+    await stopProcess(proc)
+  }
+}
+
+function fileChangeItems(messages: any[], method: string): any[] {
+  return messages
+    .filter((message) => message.method === method && message.params.item?.type === 'fileChange')
+    .map((message) => message.params.item)
+}
+
+for (const variant of ['', 'approval first']) {
+  test(`a file change shows while Claude writes it${variant ? ` (${variant})` : ''}`, async () => {
+    const { home, messages, approved, stored } = await runLivePatchTurn(
+      `live patch check ${variant}`,
+    )
+    try {
+      const path = join(home, 'live.txt')
+      const final = fileChangeFromTool('Write', { file_path: path, content: 'one\ntwo\nthree\n' })
+      const started = fileChangeItems(messages, 'item/started')
+      assert.equal(started.length, 1, 'one card, not a second one for the finished call')
+      const [item] = started
+      // The card opens with the file and nothing written yet.
+      assert.deepEqual(item.changes, fileChangeFromTool('Write', { file_path: path }))
+      assert.equal(item.status, 'inProgress')
+      // The commentary before the call is complete by then.
+      const agentDone = messages.findIndex(
+        (message) =>
+          message.method === 'item/completed' && message.params.item.type === 'agentMessage',
+      )
+      const cardStart = messages.findIndex(
+        (message) => message.method === 'item/started' && message.params.item.id === item.id,
+      )
+      assert.ok(agentDone >= 0 && agentDone < cardStart)
+      const patches = messages
+        .filter((message) => message.method === 'item/fileChange/patchUpdated')
+        .map((message) => {
+          assert.equal(message.params.itemId, item.id)
+          return message.params.changes
+        })
+      assert.deepEqual(patches, [
+        fileChangeFromTool('Write', { file_path: path }),
+        fileChangeFromTool('Write', { file_path: path, content: 'one\ntw' }),
+        final,
+      ])
+      // The approval, the completed card and history hold the finished call.
+      assert.deepEqual(approved, { itemId: item.id, changes: final })
+      const completed = fileChangeItems(messages, 'item/completed')
+      assert.equal(completed.length, 1)
+      assert.equal(completed[0].id, item.id)
+      assert.equal(completed[0].status, 'completed')
+      assert.deepEqual(completed[0].changes, final)
+      const kept = stored.filter((entry) => entry.type === 'fileChange')
+      assert.deepEqual(
+        kept.map((entry) => [entry.id, entry.status, entry.changes]),
+        [[item.id, 'completed', final]],
+      )
+      assert.equal(await readFile(path, 'utf8'), 'one\ntwo\nthree\n')
+    } finally {
+      await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+    }
+  })
+}
+
+test('a file change Claude never finished fails when the next response starts', async () => {
+  const { home, messages, stored } = await runLivePatchTurn('live patch check abandoned')
+  try {
+    const started = fileChangeItems(messages, 'item/started')
+    const completed = fileChangeItems(messages, 'item/completed')
+    assert.equal(started.length, 2)
+    const [lost, live] = started
+    assert.deepEqual(
+      completed.map((entry) => [entry.id, entry.status]),
+      [
+        [lost.id, 'failed'],
+        [live.id, 'completed'],
+      ],
+    )
+    // The lost card failed before the next one opened.
+    const lostDone = messages.findIndex(
+      (message) => message.method === 'item/completed' && message.params.item.id === lost.id,
+    )
+    const liveStart = messages.findIndex(
+      (message) => message.method === 'item/started' && message.params.item.id === live.id,
+    )
+    assert.ok(lostDone >= 0 && lostDone < liveStart)
+    assert.deepEqual(
+      stored.filter((entry) => entry.type === 'fileChange').map((entry) => entry.status),
+      ['failed', 'completed'],
+    )
+  } finally {
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test("a subagent's streamed file change stays out of the parent's timeline", async () => {
+  const { home, messages } = await runLivePatchTurn('live patch check nested')
+  try {
+    const started = fileChangeItems(messages, 'item/started')
+    assert.deepEqual(
+      started.map((item) => item.changes[0].path),
+      [join(home, 'live.txt')],
+    )
+    assert.equal(
+      messages.some((message) => JSON.stringify(message).includes('nested.txt')),
+      false,
+    )
+  } finally {
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })

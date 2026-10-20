@@ -33,6 +33,8 @@ export class MockRuntime implements ClaudeRuntime {
   private nestedFiltered = new Set<string>()
   // resetSession calls per thread, echoed by the rewind check scenario.
   private resets = new Map<string, number>()
+  // reloadMcpServers calls, echoed by the mcp reload check scenario.
+  private mcpReloads = 0
   // Background Bash shells by task id.
   private shells = new Map<string, { threadId: string; toolUseId: string }>()
   // Background workflows: task id to thread id.
@@ -181,6 +183,40 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    if (/mcp reload check/i.test(context.prompt)) {
+      const text = `${this.mcpReloads} MCP reloads`
+      await handlers.onEvent({ type: 'text_delta', delta: text })
+      await handlers.onEvent({ type: 'completed', success: true, result: text })
+      return
+    }
+
+    // "memory recall check <file>": Claude recalls that memory file twice and
+    // a synthesized summary, remarks on it, then answers.
+    const recall = /memory recall check (\S+)/i.exec(context.prompt)
+    if (recall) {
+      const path = recall[1] ?? ''
+      await handlers.onEvent({
+        type: 'memory_recall',
+        memories: [
+          { path, scope: 'personal', content: null },
+          {
+            path: '<synthesis:/memories>',
+            scope: 'team',
+            content: 'The team ships on Fridays.\nReleases need a changelog.',
+          },
+        ],
+      })
+      await handlers.onEvent({ type: 'text_delta', delta: 'Checking what I remember.' })
+      await handlers.onEvent({ type: 'message_boundary' })
+      await handlers.onEvent({
+        type: 'memory_recall',
+        memories: [{ path, scope: 'personal', content: null }],
+      })
+      await handlers.onEvent({ type: 'text_delta', delta: 'You prefer short answers.' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'memory recall check' })
+      return
+    }
+
     if (/fork check/i.test(context.prompt)) {
       const text =
         context.forkedAt != null
@@ -280,6 +316,60 @@ export class MockRuntime implements ClaudeRuntime {
         },
       })
       await handlers.onEvent({ type: 'completed', success: true, result: 'goal continuation' })
+      return
+    }
+
+    // A Write whose input streams in before the finished call, as the native
+    // runtime reports it. With "approval first" the permission request
+    // overtakes the finished call; with "abandoned" a first response breaks
+    // off in the middle of a call and Claude asks again; with "nested" a
+    // subagent streams a call of its own.
+    if (/live patch check/i.test(context.prompt)) {
+      const path = join(context.cwd, 'live.txt')
+      const content = 'one\ntwo\nthree\n'
+      const toolUseId = `tool-live-${Date.now()}`
+      const progress = (id: string, input: Record<string, unknown>) =>
+        handlers.onEvent({ type: 'tool_input_progress', toolUseId: id, toolName: 'Write', input })
+      if (/abandoned/i.test(context.prompt)) {
+        await progress(`${toolUseId}-lost`, { file_path: path, content: 'on' })
+        await handlers.onEvent({ type: 'message_boundary' })
+      }
+      if (/nested/i.test(context.prompt)) {
+        const taskId = `task-live-${Date.now()}`
+        await handlers.onEvent({
+          type: 'tool_use',
+          toolUseId: taskId,
+          toolName: 'Task',
+          input: { description: 'writes a file', prompt: 'write the other file' },
+        })
+        await progress(`${toolUseId}-nested`, { file_path: join(context.cwd, 'nested.txt') })
+        await handlers.onEvent({ type: 'tool_result', toolUseId: taskId, content: 'nested done' })
+      }
+      await handlers.onEvent({ type: 'text_delta', delta: 'writing live.txt' })
+      await progress(toolUseId, { file_path: path })
+      await progress(toolUseId, { file_path: path, content: 'one\ntw' })
+      const input = { file_path: path, content }
+      const approvalFirst = /approval first/i.test(context.prompt)
+      if (!approvalFirst)
+        await handlers.onEvent({ type: 'tool_use', toolUseId, toolName: 'Write', input })
+      const decision = await handlers.onPermissionRequest({
+        type: 'permission_request',
+        requestId: `perm-${toolUseId}`,
+        toolUseId,
+        toolName: 'Write',
+        input,
+      })
+      if (approvalFirst)
+        await handlers.onEvent({ type: 'tool_use', toolUseId, toolName: 'Write', input })
+      const accepted = decision.decision === 'accept' || decision.decision === 'acceptForSession'
+      if (accepted) await writeFile(path, content)
+      await handlers.onEvent({
+        type: 'tool_result',
+        toolUseId,
+        content: accepted ? 'wrote live.txt' : 'declined',
+        isError: !accepted,
+      })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'wrote live.txt' })
       return
     }
 
@@ -1196,6 +1286,10 @@ export class MockRuntime implements ClaudeRuntime {
 
   compactsSessions(): boolean {
     return true
+  }
+
+  async reloadMcpServers(): Promise<void> {
+    this.mcpReloads += 1
   }
 
   private scheduleBackgroundReport(

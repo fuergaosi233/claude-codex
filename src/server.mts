@@ -46,9 +46,12 @@ import {
   callMcpTool,
   listMcpServerStatuses,
   type McpConfigScope,
+  mcpOauthUnavailable,
   readMcpConfig,
   readMcpResource,
+  resetMcpStatusCache,
 } from './mcp.mjs'
+import { memoryCitation } from './memory-citations.mjs'
 import { projectInstructions } from './project-instructions.mjs'
 import { projectProviderLoopConfig } from './provider-loop-config.mjs'
 import {
@@ -112,6 +115,7 @@ import {
   projectMetadata,
   projectName,
   projectRoots,
+  REVIEW_FALLBACK,
   readConfigReasoningEffort,
   reasoningEffortFromParams,
   reviewLabel,
@@ -158,6 +162,7 @@ import type {
   PermissionDecision,
   ProjectRecord,
   QueuedSubmission,
+  RecalledMemory,
   RpcPeer,
   RuntimeEvent,
   RuntimeLiveTask,
@@ -884,11 +889,25 @@ export class CodexClaudeAppServer {
       case 'app/list':
         return { data: [], nextCursor: null }
       case 'mcpServer/oauth/login':
-        return {
-          authorizationUrl: `https://localhost.invalid/claude-codex/mcp-oauth/${encodeURIComponent(stringOr(asRecord(params).name, 'server'))}`,
+        // The Agent SDK has no call that starts an MCP server's OAuth flow, so
+        // there is no authorization URL to hand the App. Say where to sign in
+        // instead of returning a link that leads nowhere.
+        throw new Error(mcpOauthUnavailable(stringOr(asRecord(params).name, '')))
+      case 'config/mcpServer/reload': {
+        // Every turn hands Claude Code the MCP config as it is then. What a
+        // reload adds: the server list is read afresh, sessions kept open by
+        // background work retry the servers that failed or wait for a
+        // sign-in, and every App window hears the servers configured now.
+        resetMcpStatusCache()
+        void this.runtime.reloadMcpServers?.()
+        for (const status of readMcpConfig().startupStatuses) {
+          this.notifyAll({
+            method: 'mcpServer/startupStatus/updated',
+            params: { name: status.name, status: status.status, error: status.error ?? null },
+          })
         }
-      case 'config/mcpServer/reload':
         return {}
+      }
       // Event streams feed MCP app widgets. This server forwards no MCP
       // events, so a subscription stays silent until the App stops it.
       case 'mcpServer/event/stream/start':
@@ -2878,6 +2897,11 @@ export class CodexClaudeAppServer {
         method: 'item/started',
         params: { threadId, turnId, item: entered, startedAtMs: nowMillis() },
       })
+      // The marker is complete once the review is under way, as in Codex.
+      this.notify(peer, {
+        method: 'item/completed',
+        params: { threadId, turnId, item: entered, completedAtMs: nowMillis() },
+      })
       void this.runRuntimeTurn(peer, thread, turn, prompt, {
         model: thread.model,
         effort: thread.reasoningEffort,
@@ -3772,6 +3796,8 @@ export class CodexClaudeAppServer {
     // (interrupt, error, watchdog) drops the late result, so these are closed
     // as failed before the turn completes.
     const openToolItems = new Set<string>()
+    // What Claude's auto-memory recalled for the turn's prompts.
+    const recalledMemories: RecalledMemory[] = []
     // Mutable holder rather than `let collectedMetrics`: TS's control-flow
     // analysis doesn't see writes from inside the onEvent callback, so a bare
     // `let` would still be inferred as `null` outside the closure.
@@ -3853,12 +3879,19 @@ export class CodexClaudeAppServer {
     }
     const completeAgentItem = (phase: 'commentary' | 'final_answer'): void => {
       if (!agentItemId) return
+      // The answer cites the memories Claude recalled during the turn.
+      const citation = phase === 'final_answer' ? memoryCitation(recalledMemories) : null
       // Visualize lines get their marks here and not in the deltas: the App
       // shows the completed text in place of what streamed.
       // App rule: visualize-line
       const updated = this.store.updateItem(turn.id, agentItemId, (item) =>
         item.type === 'agentMessage'
-          ? { ...item, phase, text: markVisualizeLines(item.text) }
+          ? {
+              ...item,
+              phase,
+              text: markVisualizeLines(item.text),
+              ...(citation ? { memoryCitation: citation } : {}),
+            }
           : item,
       )
       const item = updated?.items.find((item) => item.id === agentItemId)
@@ -3882,24 +3915,26 @@ export class CodexClaudeAppServer {
         })
       planItemId = null
     }
-    const completeOpenToolItems = (message: string): void => {
-      for (const itemId of openToolItems) {
-        const started = itemStartedAtMs.get(itemId)
-        const durationMs = started == null ? null : Math.max(0, nowMillis() - started)
-        const updated = this.store.updateItem(turn.id, itemId, (item) => {
-          if (item.type === 'commandExecution') return { ...item, status: 'failed', durationMs }
-          if (item.type === 'fileChange') return { ...item, status: 'failed' }
-          if (item.type === 'mcpToolCall')
-            return { ...item, status: 'failed', error: { message }, durationMs }
-          return item
+    const failToolItem = (itemId: string, message: string): void => {
+      openToolItems.delete(itemId)
+      const started = itemStartedAtMs.get(itemId)
+      const durationMs = started == null ? null : Math.max(0, nowMillis() - started)
+      const updated = this.store.updateItem(turn.id, itemId, (item) => {
+        if (item.type === 'commandExecution') return { ...item, status: 'failed', durationMs }
+        if (item.type === 'fileChange') return { ...item, status: 'failed' }
+        if (item.type === 'mcpToolCall')
+          return { ...item, status: 'failed', error: { message }, durationMs }
+        return item
+      })
+      const item = updated?.items.find((candidate) => candidate.id === itemId)
+      if (item)
+        this.notify(peer, {
+          method: 'item/completed',
+          params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
         })
-        const item = updated?.items.find((candidate) => candidate.id === itemId)
-        if (item)
-          this.notify(peer, {
-            method: 'item/completed',
-            params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
-          })
-      }
+    }
+    const completeOpenToolItems = (message: string): void => {
+      for (const itemId of openToolItems) failToolItem(itemId, message)
       openToolItems.clear()
     }
     // Claude compacting the conversation within the turn, on its own when
@@ -3925,6 +3960,48 @@ export class CodexClaudeAppServer {
         method: 'item/completed',
         params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
       })
+    }
+    // File tool calls drawn from Claude's streamed input whose finished call
+    // has not arrived yet. Codex streams its own apply_patch input the same
+    // way: the card opens with the first part of the change and grows through
+    // item/fileChange/patchUpdated while the model writes the rest.
+    const previewToolUseIds = new Set<string>()
+    const patchFileChange = (
+      toolUseId: string,
+      toolName: string,
+      input: Record<string, unknown>,
+    ): void => {
+      const itemId = itemIds.get(toolUseId)
+      if (!itemId) return
+      const changes = fileChangeFromTool(toolName, input)
+      this.store.updateItem(turn.id, itemId, (item) =>
+        item.type === 'fileChange' ? { ...item, changes } : item,
+      )
+      this.notify(peer, {
+        method: 'item/fileChange/patchUpdated',
+        params: { threadId: thread.id, turnId: turn.id, itemId, changes },
+      })
+    }
+    // The finished call replaces what streamed, so the card, the approval and
+    // the completed item show exactly the change Claude makes.
+    const finishPreview = (
+      toolUseId: string,
+      toolName: string,
+      input: Record<string, unknown>,
+    ): boolean => {
+      if (!previewToolUseIds.delete(toolUseId)) return false
+      patchFileChange(toolUseId, toolName, input)
+      return true
+    }
+    // A model response that ended without finishing a call (its stream broke
+    // and Claude asked again) leaves a card no result will close.
+    const abandonPreviews = (): void => {
+      for (const toolUseId of previewToolUseIds) {
+        const itemId = itemIds.get(toolUseId)
+        if (itemId && openToolItems.has(itemId))
+          failToolItem(itemId, 'Claude did not finish this call.')
+      }
+      previewToolUseIds.clear()
     }
 
     // A turn Claude starts on its own inherits the last user turn's policy,
@@ -4023,7 +4100,8 @@ export class CodexClaudeAppServer {
             if (
               event.type === 'text_delta' ||
               event.type === 'reasoning_delta' ||
-              event.type === 'message_boundary'
+              event.type === 'message_boundary' ||
+              event.type === 'tool_input_progress'
             )
               return
             if (event.type === 'tool_use' && !isSubagentToolName(event.toolName)) return
@@ -4038,9 +4116,43 @@ export class CodexClaudeAppServer {
           }
           if (event.type === 'message_boundary') {
             completeMessage()
+            abandonPreviews()
             return
           }
-          if (event.type === 'tool_use' && !itemIds.has(event.toolUseId)) completeMessage()
+          if (
+            (event.type === 'tool_use' || event.type === 'tool_input_progress') &&
+            !itemIds.has(event.toolUseId)
+          )
+            completeMessage()
+          if (event.type === 'tool_input_progress') {
+            // App rule: file-change-preview
+            if (itemIds.has(event.toolUseId)) {
+              if (previewToolUseIds.has(event.toolUseId))
+                patchFileChange(event.toolUseId, event.toolName, event.input)
+              return
+            }
+            const item = this.toolUseToItem({ ...event, type: 'tool_use' }, thread.cwd)
+            if (item.type !== 'fileChange') return
+            previewToolUseIds.add(event.toolUseId)
+            itemIds.set(event.toolUseId, item.id)
+            itemStartedAtMs.set(item.id, nowMillis())
+            openToolItems.add(item.id)
+            this.store.appendItem(turn.id, item)
+            this.notify(peer, {
+              method: 'item/started',
+              params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: nowMillis() },
+            })
+            this.notify(peer, {
+              method: 'item/fileChange/patchUpdated',
+              params: {
+                threadId: thread.id,
+                turnId: turn.id,
+                itemId: item.id,
+                changes: item.changes,
+              },
+            })
+            return
+          }
           if (
             event.type === 'tool_use' &&
             ((event.toolName === 'SendMessage' &&
@@ -4533,6 +4645,9 @@ export class CodexClaudeAppServer {
             // anything slips through we'd otherwise create a husk
             // commandExecution item that never closes (the second emit
             // overwrites itemIds[] so the husk never sees its tool_result).
+            // A file change already drawn from the streamed input keeps its
+            // card and takes the finished input.
+            if (finishPreview(event.toolUseId, event.toolName, event.input)) return
             if (itemIds.has(event.toolUseId)) return
             // Claude's TodoWrite is the equivalent of Codex's `update_plan`
             // todo/checklist tool, which the real app-server maps to a
@@ -4674,6 +4789,10 @@ export class CodexClaudeAppServer {
             this.recordCompactedContext(peer, thread.id, turn.id, event.postTokens, true)
             return
           }
+          if (event.type === 'memory_recall') {
+            recalledMemories.push(...event.memories)
+            return
+          }
           if (event.type === 'notice') {
             debugLog('turn.runtime.notice', { threadId: thread.id, turnId: turn.id, ...event })
             // Runtime status is not assistant prose. Keep genuine warnings
@@ -4803,6 +4922,9 @@ export class CodexClaudeAppServer {
         onPermissionRequest: async (event) => {
           if (!turnIsActive()) return { decision: 'cancel' }
           completeMessage()
+          // The request can overtake the finished call; the approval must
+          // show the whole change, not the part that streamed.
+          finishPreview(event.toolUseId, event.toolName, event.input)
           let itemId = itemIds.get(event.toolUseId)
           if (!itemId) {
             const item = this.toolUseToItem(
@@ -5014,6 +5136,7 @@ export class CodexClaudeAppServer {
     this.quietTurnIfWorkRuns(peer, thread, turn.id, params, agentItemId)
     completeMessage('final_answer')
     completePlanItem()
+    this.exitReviewMode(peer, thread.id, turn.id)
     const completed: TurnRecord = this.store.completeTurn(turn.id, 'completed') ?? turn
     recordRunEvent('turn.completed', {
       threadId: thread.id,
@@ -6159,6 +6282,7 @@ export class CodexClaudeAppServer {
           )
           this.subagentStateByTurn.delete(turnId)
         }
+        this.exitReviewMode(peer, threadId, turnId)
         const completed =
           this.store.completeTurn(turnId, 'interrupted', { message: 'interrupted' }) ?? turn
         this.notify(peer, {
@@ -7663,6 +7787,8 @@ export class CodexClaudeAppServer {
     for (const [threadId, turnId] of this.activeTurnByThread.entries()) {
       const turn = this.store.getTurn(turnId)
       if (turn?.status === 'inProgress') {
+        // A review the stop cuts off still closes in the thread's history.
+        this.exitReviewMode(null, threadId, turnId)
         this.store.completeTurn(turnId, status, error)
       }
       this.store.updateThreadStatus(threadId, { type: 'idle' })
@@ -7736,12 +7862,50 @@ export class CodexClaudeAppServer {
     return { cwd: thread && thread.runtimeBackend !== 'codex' ? thread.cwd : null }
   }
 
+  // Codex ends a review turn with an exitedReviewMode item holding the review,
+  // or a fallback text when the reviewer gave no answer (an interrupted or
+  // failed review). Before the turn completes, as there. Without a peer the
+  // item is only recorded: the adapter is stopping and tells no client. A
+  // store that refuses the item must not keep the turn from ending.
+  private exitReviewMode(peer: RpcPeer | null, threadId: string, turnId: string): void {
+    let item: ThreadItem
+    try {
+      const turn = this.store.getTurn(turnId)
+      if (turn?.status !== 'inProgress') return
+      if (!turn.items.some((item) => item.type === 'enteredReviewMode')) return
+      if (turn.items.some((item) => item.type === 'exitedReviewMode')) return
+      const answer = turn.items.findLast(
+        (item) => item.type === 'agentMessage' && item.phase === 'final_answer',
+      )
+      const text = answer?.type === 'agentMessage' ? answer.text.trim() : ''
+      item = { type: 'exitedReviewMode', id: newId(), review: text || REVIEW_FALLBACK }
+      this.store.appendItem(turnId, item)
+    } catch (error) {
+      debugLog('review.exit_failed', {
+        threadId,
+        turnId,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      return
+    }
+    if (!peer) return
+    this.notify(peer, {
+      method: 'item/started',
+      params: { threadId, turnId, item, startedAtMs: nowMillis() },
+    })
+    this.notify(peer, {
+      method: 'item/completed',
+      params: { threadId, turnId, item, completedAtMs: nowMillis() },
+    })
+  }
+
   // Ends a turn whose runtime run failed. The client leaves its running state
   // only on turn/completed, so that goes out even when the store refuses the
   // write too; the usual cause is another connection holding the state
   // database past its busy timeout. Returns false for a turn that had already
   // ended, e.g. through turn/interrupt.
   private failTurn(peer: RpcPeer, threadId: string, turn: TurnRecord, error: Error): boolean {
+    this.exitReviewMode(peer, threadId, turn.id)
     const completed = this.endTurn(turn, 'failed', { message: error.message })
     if (!completed) {
       // Its end was recorded, but whatever ended it never let go of the

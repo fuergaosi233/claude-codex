@@ -233,6 +233,29 @@ export interface TurnToolOutput {
   output: string | Array<Record<string, unknown>>
 }
 
+// Codex v2 MemoryCitation: the memories an answer drew on. The App lists each
+// entry's note under the answer; threadIds names Codex rollouts.
+export interface MemoryCitation {
+  entries: MemoryCitationEntry[]
+  threadIds: string[]
+}
+
+export interface MemoryCitationEntry {
+  path: string
+  lineStart: number
+  lineEnd: number
+  note: string
+}
+
+// A memory Claude's auto-memory put into its context. `path` is the memory
+// file, or a `<synthesis:DIR>` marker or a URL for a memory that is not a
+// local file; `content` is the memory's text when Claude reported it.
+export interface RecalledMemory {
+  path: string
+  scope: string | null
+  content: string | null
+}
+
 export type ThreadItem =
   // clientId echoes turn/start's or turn/steer's clientUserMessageId so the
   // App can reconcile its optimistic copy of the message.
@@ -240,7 +263,13 @@ export type ThreadItem =
   // A codex_app tool result that turn/start carried in place of user input,
   // such as a thread handoff. The App shows it as the turn's user message.
   | ({ type: 'functionCallOutput'; id: string } & TurnToolOutput)
-  | { type: 'agentMessage'; id: string; text: string; phase: string | null; memoryCitation: null }
+  | {
+      type: 'agentMessage'
+      id: string
+      text: string
+      phase: string | null
+      memoryCitation: MemoryCitation | null
+    }
   | { type: 'plan'; id: string; text: string }
   | { type: 'reasoning'; id: string; summary: string[]; content: string[] }
   | { type: 'enteredReviewMode'; id: string; review: string }
@@ -494,6 +523,14 @@ export type RuntimeEvent =
   | { type: 'text_delta'; delta: string }
   | { type: 'reasoning_delta'; delta: string }
   | { type: 'tool_use'; toolUseId: string; toolName: string; input: Record<string, unknown> }
+  // The input of a file tool call (Edit, Write, MultiEdit) as far as the
+  // model has written it; the finished call follows as `tool_use`.
+  | {
+      type: 'tool_input_progress'
+      toolUseId: string
+      toolName: string
+      input: Record<string, unknown>
+    }
   | { type: 'tool_output_delta'; toolUseId: string; delta: string }
   | {
       type: 'tool_result'
@@ -564,6 +601,8 @@ export type RuntimeEvent =
       category: string | null
       message: string
     }
+  // Claude's auto-memory recalled these memories for the prompt.
+  | { type: 'memory_recall'; memories: RecalledMemory[] }
   | { type: 'completed'; claudeSessionId?: string | null; result?: string | null; success: boolean }
   | { type: 'error'; message: string }
 
@@ -774,4 +813,8 @@ export interface ClaudeRuntime {
   // True when a turn whose prompt is `/compact` compacts the Claude session
   // it resumes, reporting it with compaction_started / compaction_completed.
   compactsSessions?(): boolean
+  // The MCP config was reloaded. Sessions still open retry their MCP servers
+  // that failed or wait for a sign-in; a session opened later reads the
+  // config itself. Never rejects.
+  reloadMcpServers?(): Promise<void>
 }

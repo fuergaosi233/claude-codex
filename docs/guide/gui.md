@@ -9,7 +9,7 @@ Once the shim and exports are installed and the adapter is built:
    - Agent text and reasoning stream into the conversation.
    - `Bash` calls surface as Codex **command approvals**.
    - `Edit` / `Write` / `MultiEdit` surface as **file-change approvals** with a
-     live diff.
+     live diff that grows while Claude writes it.
 3. Approve actions in the Codex App UI as usual.
 4. Disconnecting closes the proxy. Once no turn is active, the daemon idles out
    and the in-process Claude runtime is reclaimed.
@@ -101,6 +101,22 @@ use it.
 
 The prompt asks Claude to save fragments in the thread's visualization folder,
 which meets the location rule. A fragment that breaks a rule does not render.
+
+## File changes while Claude writes them
+
+With the default native Claude Agent SDK backend, a file change shows up before
+Claude has finished writing it. The card of an `Edit`, `Write` or `MultiEdit`
+call opens as soon as the input Claude streams names the file, and grows about
+twice a second while Claude writes the rest, the way the Codex App draws a
+patch Codex is still writing. How smoothly it grows depends on how the API in
+use streams a tool's input; one that sends the input at once shows the card
+when the call is complete.
+
+Once the call is complete, the card holds the finished change, and so does the
+approval when the thread asks for one. When a response breaks off in the
+middle of a call and Claude asks again, the unfinished card shows as failed and
+the new call gets a card of its own. Set `CLAUDE_CODEX_LIVE_FILE_CHANGES=0` to
+show a change only once Claude has written the whole call.
 
 ## Background work and the unread dot
 
