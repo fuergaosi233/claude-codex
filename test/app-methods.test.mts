@@ -13,10 +13,12 @@ import { setTimeout as delay } from 'node:timers/promises'
 const adapter = resolve('dist/src/adapter.mjs')
 
 class RpcError extends Error {
+  readonly code: number
   readonly data: unknown
 
-  constructor(message: string, data: unknown) {
+  constructor(code: number, message: string, data: unknown) {
     super(message)
+    this.code = code
     this.data = data
   }
 }
@@ -32,11 +34,19 @@ class AppServer {
   private nextId = 1
   private buffer = ''
 
-  constructor(home: string) {
+  // env adds to or, with undefined values, removes from the adapter's
+  // environment.
+  constructor(home: string, env: NodeJS.ProcessEnv = {}) {
     this.home = home
     this.proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+      env: {
+        ...process.env,
+        CODEX_HOME: home,
+        CLAUDE_CODEX_MOCK: '1',
+        NODE_NO_WARNINGS: '1',
+        ...env,
+      },
     })
     this.proc.stderr.resume()
     this.proc.stdout.setEncoding('utf8')
@@ -120,14 +130,19 @@ class AppServer {
       const pending = this.pending.get(message.id)
       if (!pending) continue
       this.pending.delete(message.id)
-      if (message.error) pending.reject(new RpcError(message.error.message, message.error.data))
-      else pending.resolve(message.result)
+      if (message.error) {
+        const { code, message: text, data } = message.error
+        pending.reject(new RpcError(code, text, data))
+      } else pending.resolve(message.result)
     }
   }
 }
 
-async function withServer(run: (server: AppServer) => Promise<void>): Promise<void> {
-  const server = new AppServer(await mkdtemp(join(tmpdir(), 'claude-codex-app-methods-')))
+async function withServer(
+  run: (server: AppServer) => Promise<void>,
+  env: NodeJS.ProcessEnv = {},
+): Promise<void> {
+  const server = new AppServer(await mkdtemp(join(tmpdir(), 'claude-codex-app-methods-')), env)
   try {
     await run(server)
   } finally {
@@ -433,6 +448,77 @@ test('thread attachments are kept per type and key, with notifications', async (
   })
 })
 
+test('attachment owners list the threads holding a worktree, by thread id', async () => {
+  await withServer(async (server) => {
+    const worktree = { attachmentType: 'worktree', identityKey: '/repo/wt-1' }
+    const attach = (threadId: string, attachment: Record<string, string>) =>
+      server.request('thread/attachment/add', { threadId, ...attachment, payload: {} })
+    const holders = [await server.startThread(), await server.startThread()]
+    const other = await server.startThread()
+    for (const threadId of holders) await attach(threadId, worktree)
+    await attach(other, { attachmentType: 'worktree', identityKey: '/repo/wt-2' })
+    await attach(other, { attachmentType: 'pullRequest', identityKey: '/repo/wt-1' })
+    const [first, second] = [...holders].sort()
+    await server.request('thread/archive', { threadId: second })
+
+    const owners = (params: Record<string, unknown>) =>
+      server.request('thread/attachmentOwner/list', { ...worktree, ...params })
+    assert.deepEqual(await owners({}), {
+      data: [
+        { threadId: first, archived: false },
+        { threadId: second, archived: true },
+      ],
+      nextCursor: null,
+    })
+    assert.deepEqual(await owners({ archived: false }), {
+      data: [{ threadId: first, archived: false }],
+      nextCursor: null,
+    })
+    assert.deepEqual(await owners({ archived: true }), {
+      data: [{ threadId: second, archived: true }],
+      nextCursor: null,
+    })
+
+    // The App pages with the cursor until it is null and stops on a cursor
+    // it saw before.
+    const page = await owners({ limit: 1 })
+    assert.deepEqual(page, { data: [{ threadId: first, archived: false }], nextCursor: '1' })
+    assert.deepEqual(await owners({ limit: 1, cursor: page.nextCursor }), {
+      data: [{ threadId: second, archived: true }],
+      nextCursor: null,
+    })
+    assert.deepEqual(await owners({ cursor: '2' }), { data: [], nextCursor: null })
+
+    // A fork holds what its parent held, as in Codex, so it is an owner too;
+    // an ephemeral fork holds nothing.
+    const { thread: fork } = await server.request('thread/fork', { threadId: first })
+    await server.request('thread/fork', { threadId: first, ephemeral: true })
+    assert.deepEqual(
+      (await owners({ archived: false })).data,
+      [first, fork.id].sort().map((threadId) => ({ threadId, archived: false })),
+    )
+    const held = async (threadId: string | undefined) =>
+      (await server.request('thread/attachment/list', { threadId })).data
+    const [original] = await held(first)
+    const [copy] = await held(fork.id)
+    assert.notEqual(copy.id, original.id)
+    assert.deepEqual({ ...copy, id: original.id }, original)
+
+    assert.deepEqual(
+      await server.request('thread/attachmentOwner/list', {
+        attachmentType: 'worktree',
+        identityKey: '/repo/none',
+        archived: false,
+        limit: 100,
+      }),
+      { data: [], nextCursor: null },
+    )
+    await assert.rejects(owners({ attachmentType: ' ' }), /attachmentType must not be empty/)
+    await assert.rejects(owners({ identityKey: '' }), /identityKey must not be empty/)
+    await assert.rejects(owners({ cursor: 'x' }), /invalid attachment owner cursor/)
+  })
+})
+
 test('background shells are listed and stopped as background terminals', async () => {
   await withServer(async (server) => {
     const threadId = await server.startThread()
@@ -457,6 +543,41 @@ test('background shells are listed and stopped as background terminals', async (
     assert.deepEqual(await server.request('thread/backgroundTerminals/terminate', terminate), {
       terminated: false,
     })
+  })
+})
+
+test("a background shell's output streams into its command item after the turn ended", async () => {
+  await withServer(async (server) => {
+    const threadId = await server.startThread()
+    const from = server.mark()
+    const turnId = await server.runTurn(threadId, 'background shell check with output')
+    const completed = server
+      .notified('item/completed', from)
+      .find((params) => params.item.type === 'commandExecution')
+    assert.ok(completed)
+    const itemId = completed.item.id
+    const delta = await server.waitFor(
+      'item/commandExecution/outputDelta',
+      (params) => params.itemId === itemId && params.delta.includes('ready'),
+      from,
+    )
+    assert.deepEqual(delta, { threadId, turnId, itemId, delta: '\nready on :3000\n' })
+    const at = (method: string, match: (params: any) => boolean) =>
+      server.notifications.findIndex((entry) => entry.method === method && match(entry.params))
+    assert.ok(
+      at('item/commandExecution/outputDelta', (params) => params.delta.includes('ready')) >
+        at('turn/completed', (params) => params.turn.id === turnId),
+    )
+
+    const { thread } = await server.request('thread/read', { threadId, includeTurns: true })
+    const item = thread.turns
+      .find((turn: any) => turn.id === turnId)
+      .items.find((entry: any) => entry.id === itemId)
+    assert.equal(item.status, 'completed')
+    assert.match(
+      item.aggregatedOutput,
+      /^Command running in background with ID: \S+\nready on :3000\n$/,
+    )
   })
 })
 
@@ -485,6 +606,9 @@ test('turn/settings/update switches model and effort for the running turn only',
     assert.deepEqual(await update({ model: 'Opus', effort: 'high' }), {
       status: 'applied',
     })
+    // 'none' is the effort of a model that takes none, such as Haiku. It
+    // leaves the effort as it was.
+    assert.deepEqual(await update({ effort: 'none' }), { status: 'applied' })
     await server.request('turn/steer', {
       threadId,
       expectedTurnId: turn.id,
@@ -610,13 +734,175 @@ test('toolOutput sent while a turn runs joins that turn as its input', async () 
   })
 })
 
+test('a turn reports the rootTurnId turn/start names, else its own id', async () => {
+  await withServer(async (server) => {
+    const threadId = await server.startThread()
+
+    // A turn the user starts is its own root, in every turn payload.
+    let from = server.mark()
+    const { turn: own } = await server.startTurn(threadId, 'first')
+    assert.equal(own.rootTurnId, own.id)
+    assert.equal(
+      (await server.waitFor('turn/started', (params) => params.turn.id === own.id, from)).turn
+        .rootTurnId,
+      own.id,
+    )
+    assert.equal(
+      (await server.waitFor('turn/completed', (params) => params.turn.id === own.id, from)).turn
+        .rootTurnId,
+      own.id,
+    )
+
+    // Work started for another turn reports that turn's root, and so does
+    // the agent it spawns.
+    from = server.mark()
+    const { turn: linked } = await server.request('turn/start', {
+      threadId,
+      input: [{ type: 'text', text: 'subagent check', text_elements: [] }],
+      parentTurnId: 'turn-in-another-thread',
+      rootTurnId: 'root-of-the-chain',
+    })
+    assert.equal(linked.rootTurnId, 'root-of-the-chain')
+    const completed = await server.waitFor(
+      'turn/completed',
+      (params) => params.turn.id === linked.id,
+      from,
+    )
+    assert.equal(completed.turn.rootTurnId, 'root-of-the-chain')
+    const child = server
+      .notified('turn/started', from)
+      .find((params) => params.threadId !== threadId)
+    assert.equal(child.turn.rootTurnId, 'root-of-the-chain')
+    const { thread: childThread } = await server.request('thread/read', {
+      threadId: child.threadId,
+      includeTurns: true,
+    })
+    assert.deepEqual(
+      childThread.turns.map((turn: any) => turn.rootTurnId),
+      ['root-of-the-chain'],
+    )
+
+    // History keeps it, in full and in summary.
+    const { thread } = await server.request('thread/read', { threadId, includeTurns: true })
+    assert.deepEqual(
+      thread.turns.map((turn: any) => turn.rootTurnId),
+      [own.id, 'root-of-the-chain'],
+    )
+    const summary = await server.request('thread/turns/list', { threadId, itemsView: 'summary' })
+    assert.deepEqual(
+      summary.data.map((turn: any) => turn.rootTurnId),
+      ['root-of-the-chain', own.id],
+    )
+
+    // A blank root names nothing.
+    const { turn: blank } = await server.request('turn/start', {
+      threadId,
+      input: [{ type: 'text', text: 'third', text_elements: [] }],
+      rootTurnId: ' ',
+    })
+    assert.equal(blank.rootTurnId, blank.id)
+    await server.waitFor('turn/completed', (params) => params.turn.id === blank.id, from)
+
+    // Input that joins a running turn keeps that turn's root, as in Codex.
+    from = server.mark()
+    const { turn: held } = await server.startTurn(threadId, 'hold this turn until released')
+    await server.waitFor('item/agentMessage/delta', (params) => params.turnId === held.id, from)
+    const joined = await server.request('turn/start', {
+      threadId,
+      input: [{ type: 'text', text: 'release', text_elements: [] }],
+      rootTurnId: 'root-of-the-chain',
+    })
+    assert.equal(joined.turn.id, held.id)
+    assert.equal(joined.turn.rootTurnId, held.id)
+    await server.waitFor('turn/completed', (params) => params.turn.id === held.id, from)
+
+    // A message queued behind work started for another turn is the user's
+    // own turn, its own root.
+    from = server.mark()
+    const { turn: linkedHeld } = await server.request('turn/start', {
+      threadId,
+      input: [{ type: 'text', text: 'hold this turn until released', text_elements: [] }],
+      rootTurnId: 'root-of-the-chain',
+    })
+    await server.waitFor(
+      'item/agentMessage/delta',
+      (params) => params.turnId === linkedHeld.id,
+      from,
+    )
+    await server.request('thread/queue/add', {
+      threadId,
+      input: [{ type: 'text', text: 'queued', text_elements: [] }],
+    })
+    await server.request('turn/steer', {
+      threadId,
+      expectedTurnId: linkedHeld.id,
+      input: [{ type: 'text', text: 'release', text_elements: [] }],
+    })
+    const queued = await server.waitFor(
+      'turn/started',
+      (params) => params.threadId === threadId && params.turn.id !== linkedHeld.id,
+      from,
+    )
+    assert.equal(queued.turn.rootTurnId, queued.turn.id)
+    await server.waitFor('turn/completed', (params) => params.turn.id === queued.turn.id, from)
+  })
+})
+
+test('Claude threads report the claude-code model provider', async () => {
+  await withServer(async (server) => {
+    // The App runs composer predictions (a thread/fork with
+    // experimentalPredictionMode) only for threads whose modelProvider is
+    // openai, so a Claude thread must never claim it.
+    const started = await server.request('thread/start', { cwd: server.home })
+    assert.equal(started.modelProvider, 'claude-code')
+    assert.equal(started.thread.modelProvider, 'claude-code')
+    const threadId = started.thread.id
+    await server.runTurn(threadId, 'first')
+
+    const resumed = await server.request('thread/resume', { threadId })
+    assert.equal(resumed.modelProvider, 'claude-code')
+    assert.equal(resumed.thread.modelProvider, 'claude-code')
+    const { thread } = await server.request('thread/read', { threadId })
+    assert.equal(thread.modelProvider, 'claude-code')
+    const forked = await server.request('thread/fork', { threadId })
+    assert.equal(forked.modelProvider, 'claude-code')
+    assert.equal(forked.thread.modelProvider, 'claude-code')
+  })
+})
+
 test('host methods answer truthfully: empty, disabled or unavailable', async () => {
   await withServer(async (server) => {
-    await assert.rejects(server.request('x/y'), /method not implemented: x\/y/)
+    // The App treats -32601 as "not supported here" and falls back quietly;
+    // these three are Codex methods its App builds do not use.
+    for (const method of [
+      'x/y',
+      'thread/items/read',
+      'thread/prediction/request',
+      'thread/readState/update',
+    ]) {
+      await assert.rejects(server.request(method), (error: unknown) => {
+        assert.ok(error instanceof RpcError)
+        assert.equal(error.code, -32601)
+        assert.equal(error.message, `method not found: ${method}`)
+        assert.equal(error.data, undefined)
+        return true
+      })
+    }
     await assert.rejects(server.request('userVerification/enroll'), (error: unknown) => {
       assert.ok(error instanceof RpcError)
+      assert.equal(error.code, -32000)
       assert.deepEqual(error.data, { type: 'unavailable', reason: 'providerUnavailable' })
       return true
+    })
+    await assert.rejects(server.request('remoteControl/enable'), (error: unknown) => {
+      assert.ok(error instanceof RpcError)
+      assert.equal(error.code, -32000)
+      assert.equal(error.data, undefined)
+      return true
+    })
+    assert.deepEqual(await server.request('account/bedrock/checkGovCloudRequirements', {}), {
+      isGovCloud: false,
+      shouldWarn: false,
     })
     assert.deepEqual(await server.request('app/read', { appIds: ['calendar'] }), {
       apps: [],
@@ -655,6 +941,186 @@ test('host methods answer truthfully: empty, disabled or unavailable', async () 
       { title: null, itemType: 'SKILLS', cwd: null, source: '/a2', target: '/b' },
     ])
   })
+})
+
+test('without CLAUDE_CODEX_MEMORIES the memories settings stay hidden and inert', async () => {
+  await withServer(
+    async (server) => {
+      const autoMemory = async (threadId: string) =>
+        server.reply(threadId, await server.runTurn(threadId, 'auto memory check'))
+      const unlisted = async (params: Record<string, unknown> = {}) =>
+        assert.deepEqual(await server.request('experimentalFeature/list', params), {
+          data: [],
+          nextCursor: null,
+        })
+
+      // No feature is listed, so the App hides its Memories settings, and
+      // turns leave auto-memory to Claude Code's own settings.
+      await unlisted()
+      const thread = await server.startThread({
+        config: { 'memories.generate_memories': true, 'memories.use_memories': true },
+      })
+      assert.equal(await autoMemory(thread), 'autoMemory=unset')
+
+      // Neither the connection's enablement nor the config turns it on.
+      assert.deepEqual(
+        await server.request('experimentalFeature/enablement/set', {
+          enablement: { memories: true },
+        }),
+        { enablement: { memories: true } },
+      )
+      await server.request('config/batchWrite', {
+        edits: [
+          { keyPath: 'features.memories', value: true, mergeStrategy: 'upsert' },
+          { keyPath: 'memories.generate_memories', value: true, mergeStrategy: 'upsert' },
+        ],
+      })
+      await unlisted({ threadId: thread })
+      const { config } = await server.request('config/read', {})
+      assert.equal('memories' in config, false)
+      assert.deepEqual(
+        await server.request('thread/memoryMode/set', { threadId: thread, mode: 'enabled' }),
+        {},
+      )
+      assert.deepEqual(
+        await server.request('thread/memoryMode/set', { threadId: 'missing', mode: 'polluted' }),
+        {},
+      )
+      assert.equal(await autoMemory(thread), 'autoMemory=unset')
+      const { thread: fork } = await server.request('thread/fork', { threadId: thread })
+      assert.equal(await autoMemory(fork.id), 'autoMemory=unset')
+
+      // memory/reset and memory/status answer as they do with the switch.
+      await assert.rejects(
+        server.request('memory/status', { minConsolidatedThreads: 4097 }),
+        /minConsolidatedThreads must be between 1 and 4096/,
+      )
+      await assert.rejects(server.request('memory/reset'), /memory\/reset is not supported/)
+    },
+    { CLAUDE_CODEX_MEMORIES: undefined },
+  )
+})
+
+test("with CLAUDE_CODEX_MEMORIES the App's switches decide which threads get auto-memory", async () => {
+  await withServer(
+    async (server) => {
+      const memories = async (params: Record<string, unknown> = {}) => {
+        const list = await server.request('experimentalFeature/list', params)
+        assert.equal(list.nextCursor, null)
+        assert.deepEqual(
+          list.data.map((feature: any) => feature.name),
+          ['memories'],
+        )
+        return list.data[0]
+      }
+      const autoMemory = async (threadId: string) =>
+        server.reply(threadId, await server.runTurn(threadId, 'auto memory check'))
+      const write = (edits: Array<[string, unknown]>) =>
+        server.request('config/batchWrite', {
+          edits: edits.map(([keyPath, value]) => ({ keyPath, value, mergeStrategy: 'upsert' })),
+        })
+
+      // Off until the user turns it on, as in Codex.
+      const feature = await memories()
+      assert.equal(feature.stage, 'beta')
+      assert.equal(feature.enabled, false)
+      assert.equal(feature.defaultEnabled, false)
+      assert.deepEqual(await server.request('experimentalFeature/list', { cursor: '1' }), {
+        data: [],
+        nextCursor: null,
+      })
+      await assert.rejects(
+        server.request('experimentalFeature/list', { cursor: '2' }),
+        /cursor 2 exceeds total feature flags 1/,
+      )
+      await assert.rejects(
+        server.request('experimentalFeature/list', { cursor: 'next' }),
+        /invalid cursor: next/,
+      )
+      await assert.rejects(
+        server.request('experimentalFeature/list', { threadId: 'missing' }),
+        /thread not found: missing/,
+      )
+      const first = await server.startThread()
+      assert.equal(await autoMemory(first), 'autoMemory=false')
+      assert.equal((await memories({ threadId: first })).enabled, false)
+
+      // The App sets its defaults for the connection; the user's config wins.
+      assert.deepEqual(
+        await server.request('experimentalFeature/enablement/set', {
+          enablement: { memories: true, apps: false },
+        }),
+        { enablement: { memories: true, apps: false } },
+      )
+      assert.equal((await memories()).enabled, true)
+      await write([['features.memories', false]])
+      assert.equal((await memories()).enabled, false)
+      assert.equal(await autoMemory(first), 'autoMemory=false')
+
+      // Settings > Personalization turns it on and reads its switches back.
+      await write([
+        ['features.memories', true],
+        ['memories.generate_memories', true],
+        ['memories.use_memories', true],
+      ])
+      assert.equal((await memories()).enabled, true)
+      const { config } = await server.request('config/read', {})
+      assert.deepEqual(config.memories, { generate_memories: true, use_memories: true })
+      assert.equal(await autoMemory(first), 'autoMemory=true')
+
+      // A chat started with its own switch off, then turned on with /memories.
+      const optedOut = await server.startThread({ config: { 'memories.generate_memories': false } })
+      assert.equal(await autoMemory(optedOut), 'autoMemory=false')
+      assert.deepEqual(
+        await server.request('thread/memoryMode/set', { threadId: optedOut, mode: 'enabled' }),
+        {},
+      )
+      assert.equal(await autoMemory(optedOut), 'autoMemory=true')
+      await server.request('thread/memoryMode/set', { threadId: first, mode: 'disabled' })
+      assert.equal(await autoMemory(first), 'autoMemory=false')
+      await assert.rejects(
+        server.request('thread/memoryMode/set', { threadId: first, mode: 'polluted' }),
+        /invalid memory mode: polluted/,
+      )
+      await assert.rejects(
+        server.request('thread/memoryMode/set', { threadId: 'missing', mode: 'enabled' }),
+        /unknown thread: missing/,
+      )
+
+      // A fork remembers like its parent; the ephemeral one the App describes a
+      // chat with never does.
+      const { thread: fork } = await server.request('thread/fork', { threadId: optedOut })
+      assert.equal(await autoMemory(fork.id), 'autoMemory=true')
+      const { thread: helper } = await server.request('thread/fork', {
+        threadId: optedOut,
+        ephemeral: true,
+        threadSource: 'thread_description',
+      })
+      assert.equal(await autoMemory(helper.id), 'autoMemory=false')
+
+      // Claude Code reads and writes its memory as one switch: a new chat gets
+      // it only while both generating and using memories are on.
+      await write([['memories.use_memories', false]])
+      assert.equal(await autoMemory(await server.startThread()), 'autoMemory=false')
+
+      // Turning the feature off stops it everywhere.
+      await write([['features.memories', false]])
+      assert.equal(await autoMemory(optedOut), 'autoMemory=false')
+
+      // memory/status keeps Codex's bounds and reports nothing consolidated;
+      // memory/reset leaves Claude Code's memory folders alone and says so.
+      assert.deepEqual(await server.request('memory/status', { minConsolidatedThreads: 4096 }), {
+        v2ConsolidatedThreads: 0,
+        v2Ready: false,
+      })
+      await assert.rejects(
+        server.request('memory/status', { minConsolidatedThreads: 0 }),
+        /minConsolidatedThreads must be between 1 and 4096/,
+      )
+      await assert.rejects(server.request('memory/reset'), /memory\/reset is not supported/)
+    },
+    { CLAUDE_CODEX_MEMORIES: '1' },
+  )
 })
 
 test('account/usage/read reports turn history and no token counts', async () => {
@@ -851,6 +1317,162 @@ test('a fork resumes at its fork point, and a full rollback returns there', asyn
       await server.reply(fork.id, again),
       `resumed mock-${parent} at ${forkPoint}-entry after 1 resets`,
     )
+  })
+})
+
+test('a fork from a turn keeps the turns up to it, and Claude resumes there', async () => {
+  await withServer(async (server) => {
+    const parent = await server.startThread()
+    const turns: string[] = []
+    for (const text of ['one', 'two', 'three']) turns.push(await server.runTurn(parent, text))
+
+    // lastTurnId keeps its turn; beforeTurnId stops short of it.
+    const forks: string[] = []
+    for (const cutoff of [{ lastTurnId: turns[0] }, { beforeTurnId: turns[1] }]) {
+      const { thread: fork } = await server.request('thread/fork', { threadId: parent, ...cutoff })
+      assert.deepEqual(ids({ data: fork.turns }), turns.slice(0, 1))
+      const check = await server.runTurn(fork.id, 'rewind check')
+      assert.equal(
+        await server.reply(fork.id, check),
+        `resumed mock-${parent} at ${turns[0]}-entry after 0 resets`,
+      )
+      forks.push(fork.id)
+    }
+
+    // excludeTurns still leaves the turns out of the response.
+    const { thread: bare } = await server.request('thread/fork', {
+      threadId: parent,
+      lastTurnId: turns[1],
+      excludeTurns: true,
+    })
+    assert.deepEqual(bare.turns, [])
+    const bareCheck = await server.runTurn(bare.id, 'rewind check')
+    assert.equal(
+      await server.reply(bare.id, bareCheck),
+      `resumed mock-${parent} at ${turns[1]}-entry after 0 resets`,
+    )
+
+    // A fork of a fork from before its own first turn branches where it did.
+    const [early] = forks
+    const [own] = ids(await server.request('thread/turns/list', { threadId: early }))
+    const { thread: inner } = await server.request('thread/fork', {
+      threadId: early,
+      beforeTurnId: own,
+    })
+    assert.deepEqual(inner.turns, [])
+    const innerCheck = await server.runTurn(inner.id, 'rewind check')
+    assert.equal(
+      await server.reply(inner.id, innerCheck),
+      `resumed mock-${parent} at ${turns[0]}-entry after 0 resets`,
+    )
+
+    // The parent keeps its turns and its whole session.
+    assert.deepEqual(
+      ids(await server.request('thread/turns/list', { threadId: parent, sortDirection: 'asc' })),
+      turns,
+    )
+    const parentCheck = await server.runTurn(parent, 'rewind check')
+    assert.equal(
+      await server.reply(parent, parentCheck),
+      `resumed mock-${parent} at end after 0 resets`,
+    )
+  })
+})
+
+test("a fork before a thread's first turn starts Claude over, and so does its full rollback", async () => {
+  await withServer(async (server) => {
+    const parent = await server.startThread()
+    const first = await server.runTurn(parent, 'one')
+    await server.runTurn(parent, 'two')
+    const { thread: fork } = await server.request('thread/fork', {
+      threadId: parent,
+      beforeTurnId: first,
+    })
+    assert.deepEqual(fork.turns, [])
+
+    const check = await server.runTurn(fork.id, 'rewind check')
+    assert.equal(await server.reply(fork.id, check), 'resumed nothing at end after 0 resets')
+    // Not the parent's session, which remembers the turns the fork left out.
+    await server.request('thread/rollback', { threadId: fork.id, numTurns: 1 })
+    const again = await server.runTurn(fork.id, 'rewind check')
+    assert.equal(await server.reply(fork.id, again), 'resumed nothing at end after 1 resets')
+  })
+})
+
+test('thread/fork rejects a fork point it cannot honor', async () => {
+  await withServer(async (server) => {
+    const parent = await server.startThread()
+    const done = await server.runTurn(parent, 'one')
+    for (const model of [undefined, 'gpt-5.4-mini']) {
+      const fork = (params: Record<string, unknown>) =>
+        server.request('thread/fork', { threadId: parent, model, ...params })
+      await assert.rejects(
+        fork({ lastTurnId: done, beforeTurnId: done }),
+        /`beforeTurnId` cannot be combined with `lastTurnId`/,
+      )
+      await assert.rejects(
+        fork({ lastTurnId: 'nope' }),
+        /lastTurnId 'nope' was not found in the source thread/,
+      )
+      await assert.rejects(
+        fork({ beforeTurnId: 'nope' }),
+        /beforeTurnId 'nope' was not found in the source thread/,
+      )
+    }
+
+    const from = server.mark()
+    const { turn } = await server.startTurn(parent, `busy ${'x'.repeat(300)}`)
+    await assert.rejects(
+      server.request('thread/fork', { threadId: parent, lastTurnId: turn.id }),
+      new RegExp(`lastTurnId '${turn.id}' identifies an in-progress turn`),
+    )
+    // A fork from before the running turn leaves it out.
+    const { thread: fork } = await server.request('thread/fork', {
+      threadId: parent,
+      beforeTurnId: turn.id,
+    })
+    assert.deepEqual(ids({ data: fork.turns }), [done])
+    await server.waitFor('turn/completed', (params) => params.turn.id === turn.id, from)
+    // The rejected forks made no threads.
+    assert.deepEqual(
+      ids(await server.request('thread/list')).toSorted(),
+      [parent, fork.id].toSorted(),
+    )
+  })
+})
+
+test('a fork from turns without checkpoints keeps all of Claude context and warns', async () => {
+  await withServer(async (server) => {
+    const parent = await server.startThread()
+    const turns: string[] = []
+    for (const text of ['no checkpoint one', 'no checkpoint two'])
+      turns.push(await server.runTurn(parent, text))
+
+    let from = server.mark()
+    const { thread: fork } = await server.request('thread/fork', {
+      threadId: parent,
+      lastTurnId: turns[0],
+    })
+    assert.deepEqual(ids({ data: fork.turns }), turns.slice(0, 1))
+    const warnings = server.notified('configWarning', from)
+    assert.equal(warnings.length, 1)
+    assert.match(warnings[0].summary, /remembers the turns after the fork point/)
+    assert.match(warnings[0].details, new RegExp(`${parent}.*${fork.id}`))
+    const check = await server.runTurn(fork.id, 'rewind check')
+    assert.equal(await server.reply(fork.id, check), `resumed mock-${parent} at end after 0 resets`)
+
+    // No warning when the fork leaves nothing out, or Claude has nothing to
+    // forget: a fork onto a Codex model starts its own session.
+    from = server.mark()
+    await server.request('thread/fork', { threadId: parent, lastTurnId: turns[1] })
+    await server.request('thread/fork', { threadId: parent })
+    const { thread: codexFork } = await server.request('thread/fork', {
+      threadId: parent,
+      beforeTurnId: turns[1],
+      model: 'gpt-5.4-mini',
+    })
+    assert.deepEqual(ids({ data: codexFork.turns }), turns.slice(0, 1))
+    assert.deepEqual(server.notified('configWarning', from), [])
   })
 })
 

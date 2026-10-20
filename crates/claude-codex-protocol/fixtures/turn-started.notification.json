@@ -5,6 +5,7 @@
     "threadId": "thread_001",
     "turn": {
       "id": "turn_001",
+      "rootTurnId": "turn_001",
       "items": [],
       "itemsView": "notLoaded",
       "status": "inProgress",

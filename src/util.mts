@@ -162,13 +162,15 @@ export function platformOs(): string {
 }
 
 // Codex app-server protocol version the adapter advertises (codex --version /
-// initialize userAgent). The App turns its feature gates on by this version,
-// so it is the Codex build of the verified App (codexVersion in
-// scripts/app-baseline.json): every gate that build knows is on, and
-// check:app-upgrade checks each against the adapter. Older App builds only
-// check a minimum version. Override per host with CLAUDE_CODEX_COMPAT_VERSION.
+// initialize userAgent). The App turns its feature gates on by this version.
+// This is the Codex build of App 26.1013, the baseline (codexVersion in
+// scripts/app-baseline.json), so every gate that build and App 26.930 know is
+// on; codex 0.163.0 has the same app-server protocol. check:app-upgrade checks
+// each gate it turns on against the adapter. Older App builds only check a
+// minimum version. Keep the default in scripts/codex-shim the same. Override
+// per host with CLAUDE_CODEX_COMPAT_VERSION.
 // App rule: feature-gates
-const DEFAULT_CODEX_COMPAT_VERSION = '0.159.0-alpha.12.1'
+const DEFAULT_CODEX_COMPAT_VERSION = '0.163.0-alpha.10.2'
 
 export function codexCompatVersion(): string {
   return (
@@ -355,11 +357,15 @@ export function modelDisplayName(model: string): string {
   return model
 }
 
+// model/list swaps this placeholder for Claude Code's own description of the
+// model once Claude Code has reported one.
+export const GENERIC_MODEL_DESCRIPTION = 'Claude Code runtime model'
+
 function modelDescription(model: string): string {
   if (model === 'opus-plan' || model === 'claude-opus-plan' || model === 'opusplan') {
     return 'Uses Opus in plan mode and Sonnet for execution; selecting this model does not enable plan mode.'
   }
-  return 'Claude Code runtime model'
+  return GENERIC_MODEL_DESCRIPTION
 }
 
 function scanDiscoveredRouterModels(): Set<string> {
@@ -577,10 +583,19 @@ function withoutSchemaDialect(schema: unknown): unknown {
   return rest
 }
 
+// The efforts a thread or the config can hold. Only Claude models list 'max';
+// 'none' (a model without efforts) keeps whatever was set before.
 export function normalizeCodexReasoningEffort(
   value: string | null | undefined,
-): 'low' | 'medium' | 'high' | 'xhigh' | null {
-  if (value === 'low' || value === 'medium' || value === 'high' || value === 'xhigh') return value
+): 'low' | 'medium' | 'high' | 'xhigh' | 'max' | null {
+  if (
+    value === 'low' ||
+    value === 'medium' ||
+    value === 'high' ||
+    value === 'xhigh' ||
+    value === 'max'
+  )
+    return value
   if (value === 'minimal') return 'low'
   return null
 }

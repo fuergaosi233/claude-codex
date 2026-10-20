@@ -33,10 +33,16 @@ export class MockRuntime implements ClaudeRuntime {
   private nestedFiltered = new Set<string>()
   // resetSession calls per thread, echoed by the rewind check scenario.
   private resets = new Map<string, number>()
+  // reloadMcpServers calls, echoed by the mcp reload check scenario.
+  private mcpReloads = 0
   // Background Bash shells by task id.
   private shells = new Map<string, { threadId: string; toolUseId: string }>()
   // Background workflows: task id to thread id.
   private workflows = new Map<string, string>()
+  // Threads whose next /compact fails, as when Claude cannot compact, or
+  // runs until it is interrupted.
+  private failingCompactions = new Set<string>()
+  private holdingCompactions = new Set<string>()
 
   async runTurn(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void> {
     // A session slow to come up (the CLI's, while an interrupted turn is
@@ -71,16 +77,143 @@ export class MockRuntime implements ClaudeRuntime {
         ? `${context.claudeSessionId}~${context.turnId}`
         : (context.claudeSessionId ?? `mock-${context.threadId}`)
     await handlers.onEvent({ type: 'session', claudeSessionId: sessionId })
-    await handlers.onEvent({
-      type: 'checkpoint',
-      claudeSessionId: sessionId,
-      messageUuid: `${context.turnId}-entry`,
-    })
+    // A turn from before the adapter kept checkpoints left none.
+    if (!/no checkpoint/i.test(context.prompt))
+      await handlers.onEvent({
+        type: 'checkpoint',
+        claudeSessionId: sessionId,
+        messageUuid: `${context.turnId}-entry`,
+      })
+
+    // Claude Code's /compact in the thread's session: the summary replaces
+    // the conversation, reported by the status and compact_boundary messages.
+    if (context.prompt === '/compact') {
+      await handlers.onEvent({ type: 'compaction_started' })
+      if (this.holdingCompactions.delete(context.threadId)) {
+        for (let i = 0; i < 1000 && !this.interrupted.has(context.threadId); i += 1) await sleep(10)
+        await handlers.onEvent({ type: 'completed', success: false, result: 'interrupted' })
+        return
+      }
+      if (this.failingCompactions.delete(context.threadId)) {
+        await handlers.onEvent({
+          type: 'notice',
+          level: 'warning',
+          message: 'Claude could not compact the conversation: mock compaction failure',
+        })
+        await handlers.onEvent({ type: 'completed', success: true, result: '' })
+        return
+      }
+      await handlers.onEvent({
+        type: 'compaction_completed',
+        trigger: 'manual',
+        preTokens: 150_000,
+        postTokens: 12_000,
+      })
+      // The summary's own call; it does not measure the context.
+      await handlers.onEvent({
+        type: 'usage',
+        usage: { input_tokens: 150_000, output_tokens: 3_000 },
+        contextWindow: 200_000,
+      })
+      await handlers.onEvent({
+        type: 'completed',
+        success: true,
+        result: '',
+        claudeSessionId: sessionId,
+      })
+      return
+    }
+    // Not from a summary, whose prompt quotes the thread's earlier turns.
+    if (context.purpose !== 'compact') {
+      if (/next compaction fails/i.test(context.prompt))
+        this.failingCompactions.add(context.threadId)
+      if (/next compaction holds/i.test(context.prompt))
+        this.holdingCompactions.add(context.threadId)
+    }
+
+    // Claude compacting on its own partway through a turn. "boundary only"
+    // leaves out the status message before the boundary; "stalls" never
+    // reaches it, until an interrupt; "then hold" keeps the turn running
+    // afterwards until a steer says "release".
+    if (/auto compaction check/i.test(context.prompt)) {
+      await handlers.onEvent({ type: 'text_delta', delta: 'Reading the files.' })
+      if (!/boundary only/i.test(context.prompt))
+        await handlers.onEvent({ type: 'compaction_started' })
+      if (/stalls/i.test(context.prompt)) {
+        for (let i = 0; i < 1000 && !this.interrupted.has(context.threadId); i += 1) await sleep(10)
+        await handlers.onEvent({ type: 'completed', success: false, result: 'interrupted' })
+        return
+      }
+      await handlers.onEvent({
+        type: 'compaction_completed',
+        trigger: 'auto',
+        preTokens: 180_000,
+        postTokens: 20_000,
+      })
+      let released = false
+      if (/then hold/i.test(context.prompt)) {
+        for (let i = 0; i < 1000 && !released; i += 1) {
+          if (this.interrupted.has(context.threadId)) {
+            await handlers.onEvent({ type: 'completed', success: false, result: 'interrupted' })
+            return
+          }
+          released =
+            this.steered.get(context.threadId)?.some((prompt) => /release/i.test(prompt)) === true
+          if (!released) await sleep(10)
+        }
+        this.steered.delete(context.threadId)
+      }
+      await handlers.onEvent({
+        type: 'text_delta',
+        delta: released ? 'Released after compacting.' : 'Done after compacting.',
+      })
+      await handlers.onEvent({
+        type: 'usage',
+        usage: { input_tokens: 500, output_tokens: 50 },
+        contextWindow: 200_000,
+      })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'compacted' })
+      return
+    }
 
     if (/rewind check/i.test(context.prompt)) {
       const text = `resumed ${context.claudeSessionId ?? 'nothing'} at ${context.resumeSessionAt ?? 'end'} after ${this.resets.get(context.threadId) ?? 0} resets`
       await handlers.onEvent({ type: 'text_delta', delta: text })
       await handlers.onEvent({ type: 'completed', success: true, result: text })
+      return
+    }
+
+    if (/mcp reload check/i.test(context.prompt)) {
+      const text = `${this.mcpReloads} MCP reloads`
+      await handlers.onEvent({ type: 'text_delta', delta: text })
+      await handlers.onEvent({ type: 'completed', success: true, result: text })
+      return
+    }
+
+    // "memory recall check <file>": Claude recalls that memory file twice and
+    // a synthesized summary, remarks on it, then answers.
+    const recall = /memory recall check (\S+)/i.exec(context.prompt)
+    if (recall) {
+      const path = recall[1] ?? ''
+      await handlers.onEvent({
+        type: 'memory_recall',
+        memories: [
+          { path, scope: 'personal', content: null },
+          {
+            path: '<synthesis:/memories>',
+            scope: 'team',
+            content: 'The team ships on Fridays.\nReleases need a changelog.',
+          },
+        ],
+      })
+      await handlers.onEvent({ type: 'text_delta', delta: 'Checking what I remember.' })
+      await handlers.onEvent({ type: 'message_boundary' })
+      await handlers.onEvent({
+        type: 'memory_recall',
+        memories: [{ path, scope: 'personal', content: null }],
+      })
+      await handlers.onEvent({ type: 'text_delta', delta: 'You prefer short answers.' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'memory recall check' })
       return
     }
 
@@ -183,6 +316,96 @@ export class MockRuntime implements ClaudeRuntime {
         },
       })
       await handlers.onEvent({ type: 'completed', success: true, result: 'goal continuation' })
+      return
+    }
+
+    // Leader tools: every `leader <tool> <json input>` line calls that tool,
+    // in order, and the answer lists the results. Answered before the keyword
+    // branches below, which the prompts for the led chats would trip.
+    if (/^leader (tools check|thread_)/m.test(context.prompt)) {
+      const lines: string[] = []
+      if (/^leader tools check$/m.test(context.prompt))
+        lines.push(`leader tools: ${context.leaderTools ? 'on' : 'off'}`)
+      let call = 0
+      for (const [, tool = '', json = '{}'] of context.prompt.matchAll(
+        /^leader (thread_\w+) (.*)$/gm,
+      )) {
+        const toolUseId = `leader-${context.turnId}-${(call += 1)}`
+        const input = JSON.parse(json)
+        await handlers.onEvent({
+          type: 'tool_use',
+          toolUseId,
+          toolName: `mcp__codex_leader__${tool}`,
+          input,
+        })
+        let content: string
+        let isError = false
+        try {
+          content = await callLeaderTool(context, tool, input)
+        } catch (error) {
+          content = error instanceof Error ? error.message : String(error)
+          isError = true
+        }
+        await handlers.onEvent({ type: 'tool_result', toolUseId, content, isError })
+        lines.push(`${tool} => ${isError ? 'error: ' : ''}${content}`)
+      }
+      const text = lines.join('\n')
+      await handlers.onEvent({ type: 'text_delta', delta: text })
+      await handlers.onEvent({ type: 'completed', success: true, result: text })
+      return
+    }
+
+    // A Write whose input streams in before the finished call, as the native
+    // runtime reports it. With "approval first" the permission request
+    // overtakes the finished call; with "abandoned" a first response breaks
+    // off in the middle of a call and Claude asks again; with "nested" a
+    // subagent streams a call of its own.
+    if (/live patch check/i.test(context.prompt)) {
+      const path = join(context.cwd, 'live.txt')
+      const content = 'one\ntwo\nthree\n'
+      const toolUseId = `tool-live-${Date.now()}`
+      const progress = (id: string, input: Record<string, unknown>) =>
+        handlers.onEvent({ type: 'tool_input_progress', toolUseId: id, toolName: 'Write', input })
+      if (/abandoned/i.test(context.prompt)) {
+        await progress(`${toolUseId}-lost`, { file_path: path, content: 'on' })
+        await handlers.onEvent({ type: 'message_boundary' })
+      }
+      if (/nested/i.test(context.prompt)) {
+        const taskId = `task-live-${Date.now()}`
+        await handlers.onEvent({
+          type: 'tool_use',
+          toolUseId: taskId,
+          toolName: 'Task',
+          input: { description: 'writes a file', prompt: 'write the other file' },
+        })
+        await progress(`${toolUseId}-nested`, { file_path: join(context.cwd, 'nested.txt') })
+        await handlers.onEvent({ type: 'tool_result', toolUseId: taskId, content: 'nested done' })
+      }
+      await handlers.onEvent({ type: 'text_delta', delta: 'writing live.txt' })
+      await progress(toolUseId, { file_path: path })
+      await progress(toolUseId, { file_path: path, content: 'one\ntw' })
+      const input = { file_path: path, content }
+      const approvalFirst = /approval first/i.test(context.prompt)
+      if (!approvalFirst)
+        await handlers.onEvent({ type: 'tool_use', toolUseId, toolName: 'Write', input })
+      const decision = await handlers.onPermissionRequest({
+        type: 'permission_request',
+        requestId: `perm-${toolUseId}`,
+        toolUseId,
+        toolName: 'Write',
+        input,
+      })
+      if (approvalFirst)
+        await handlers.onEvent({ type: 'tool_use', toolUseId, toolName: 'Write', input })
+      const accepted = decision.decision === 'accept' || decision.decision === 'acceptForSession'
+      if (accepted) await writeFile(path, content)
+      await handlers.onEvent({
+        type: 'tool_result',
+        toolUseId,
+        content: accepted ? 'wrote live.txt' : 'declined',
+        isError: !accepted,
+      })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'wrote live.txt' })
       return
     }
 
@@ -391,6 +614,15 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    if (/auto memory check/i.test(context.prompt)) {
+      await handlers.onEvent({
+        type: 'text_delta',
+        delta: `autoMemory=${context.autoMemory ?? 'unset'}`,
+      })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'auto memory check' })
+      return
+    }
+
     if (/system prompt check/i.test(context.prompt)) {
       await handlers.onEvent({
         type: 'text_delta',
@@ -441,6 +673,35 @@ export class MockRuntime implements ClaudeRuntime {
         delta: `elicitation=${JSON.stringify(response)}`,
       })
       await handlers.onEvent({ type: 'completed', success: true, result: 'elicitation check' })
+      return
+    }
+
+    // Lists the dynamic tools the turn offers, then calls the first one the
+    // way Claude would.
+    if (/dynamic tool check/i.test(context.prompt)) {
+      const servers = context.dynamicTools ?? []
+      const offered = servers.map(
+        (server) => `${server.server}:${server.tools.map((tool) => tool.name).join(',')}`,
+      )
+      await handlers.onEvent({ type: 'text_delta', delta: `tools=${offered.join(';') || 'none'}` })
+      const server = servers[0]
+      const tool = server?.tools[0]
+      if (server && tool && handlers.onDynamicToolCall) {
+        const response = await handlers.onDynamicToolCall(
+          {
+            callId: `call-${context.turnId}`,
+            namespace: server.namespace,
+            tool: tool.name,
+            arguments: { query: 'mock' },
+          },
+          new AbortController().signal,
+        )
+        await handlers.onEvent({
+          type: 'text_delta',
+          delta: ` dynamic=${JSON.stringify(response)}`,
+        })
+      }
+      await handlers.onEvent({ type: 'completed', success: true, result: 'dynamic tool check' })
       return
     }
 
@@ -693,7 +954,9 @@ export class MockRuntime implements ClaudeRuntime {
 
     if (/background shell check/i.test(context.prompt)) {
       // A Bash call Claude runs in the background: the call returns at once
-      // and the shell stays live until it is stopped.
+      // and the shell stays live until it is stopped. "With output" has it
+      // print a line after the turn ended.
+      const withOutput = /with output/i.test(context.prompt)
       const toolUseId = `shell-${Date.now()}`
       const taskId = `bash-${this.shells.size + 1}`
       await handlers.onEvent({
@@ -710,6 +973,17 @@ export class MockRuntime implements ClaudeRuntime {
       })
       await handlers.onEvent({ type: 'text_delta', delta: 'dev server started' })
       await handlers.onEvent({ type: 'completed', success: true, result: 'started' })
+      if (withOutput) {
+        const { threadId } = context
+        setTimeout(() => {
+          void this.listener?.onTaskEvent(threadId, {
+            type: 'task_output',
+            taskId,
+            toolUseId,
+            delta: '\nready on :3000\n',
+          })
+        }, 50)
+      }
       return
     }
 
@@ -844,6 +1118,29 @@ export class MockRuntime implements ClaudeRuntime {
       await handlers.onEvent({ type: 'tool_result', toolUseId, content: 'review done' })
       await handlers.onEvent({ type: 'text_delta', delta: 'workflow finished' })
       await handlers.onEvent({ type: 'completed', success: true, result: 'workflow finished' })
+      return
+    }
+
+    if (/subagent effort check/i.test(context.prompt)) {
+      // An agent asked to run on its own model and effort, and a fork asked
+      // the same: Claude ignores both inputs for a fork.
+      const ownId = `task-own-${Date.now()}`
+      const forkId = `task-fork-${Date.now()}`
+      const namedForkId = `task-named-fork-${Date.now()}`
+      for (const [toolUseId, input] of [
+        [ownId, { prompt: 'own agent', subagent_type: 'reviewer', model: 'opus', effort: 'max' }],
+        [forkId, { prompt: 'fork agent', subagent_type: 'fork', model: 'haiku', effort: 'low' }],
+        [namedForkId, { prompt: 'named fork', subagent_type: 'Fork', model: 'haiku' }],
+      ] as const) {
+        await handlers.onEvent({ type: 'tool_use', toolUseId, toolName: 'Agent', input })
+        await handlers.onEvent({
+          type: 'tool_result',
+          toolUseId,
+          content: `${input.prompt} report`,
+        })
+      }
+      await handlers.onEvent({ type: 'text_delta', delta: 'both agents reported' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'efforts' })
       return
     }
 
@@ -1097,6 +1394,14 @@ export class MockRuntime implements ClaudeRuntime {
     this.resets.set(threadId, (this.resets.get(threadId) ?? 0) + 1)
   }
 
+  compactsSessions(): boolean {
+    return true
+  }
+
+  async reloadMcpServers(): Promise<void> {
+    this.mcpReloads += 1
+  }
+
   private scheduleBackgroundReport(
     threadId: string,
     taskId: string,
@@ -1150,4 +1455,27 @@ function fileChangeFromPrompt(context: RuntimeTurnContext): {
       /with exactly this content(?: and no extra whitespace)?:\s*([^\n]+)/i,
     )?.[1] ?? 'changed by mock runtime\n'
   return { name, path: join(context.cwd, name), content }
+}
+
+function callLeaderTool(
+  context: RuntimeTurnContext,
+  tool: string,
+  input: Record<string, unknown>,
+): Promise<string> {
+  const leader = context.leaderTools
+  if (!leader) throw new Error('leader tools are off')
+  switch (tool) {
+    case 'thread_list':
+      return leader.list(input as Parameters<typeof leader.list>[0])
+    case 'thread_start':
+      return leader.start(input as Parameters<typeof leader.start>[0])
+    case 'thread_prompt':
+      return leader.prompt(input as Parameters<typeof leader.prompt>[0])
+    case 'thread_wait':
+      return leader.wait(input as Parameters<typeof leader.wait>[0])
+    case 'thread_read':
+      return leader.read(input as Parameters<typeof leader.read>[0])
+    default:
+      throw new Error(`unknown leader tool: ${tool}`)
+  }
 }

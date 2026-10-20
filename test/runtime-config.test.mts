@@ -27,7 +27,7 @@ import { NativeClaudeRuntime, sdkResumeSessionId } from '../src/native-runtime.m
 import { TurnInput } from '../src/native-turn-input.mjs'
 import { resolveRuntimeConfig } from '../src/runtime-config.mjs'
 import { buildSystemPromptAddendum } from '../src/server-helpers.mjs'
-import type { RuntimeTurnContext } from '../src/types.mjs'
+import type { DynamicToolServer, RuntimeTurnContext } from '../src/types.mjs'
 import { parseWorkflowCommand, workflowRuntimePrompt } from '../src/workflow-command.mjs'
 import {
   defaultWorkflowTranscriptRoots,
@@ -148,6 +148,43 @@ test('native SDK runtime maps manual /workflows prompts to the human workflow tr
   )
 })
 
+test('native SDK runtime switches auto-memory off only for threads the memories mapping keeps from it', () => {
+  const runtime = new NativeClaudeRuntime()
+  const buildOptions = Reflect.get(runtime, 'buildOptions')
+  const envFor = (overrides: Partial<RuntimeTurnContext>) => {
+    const context = nativeTurnContext(overrides)
+    const session = { current: { context, handlers: {}, resolved: false }, lastContext: context }
+    return buildOptions.call(runtime, {}, context, new AbortController(), () => session)
+      .env as NodeJS.ProcessEnv
+  }
+  const previous = process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY
+  try {
+    delete process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY
+    // Without the memories mapping (no autoMemory) the launch adds nothing,
+    // and Claude Code's own settings decide.
+    assert.equal(envFor({}).CLAUDE_CODE_DISABLE_AUTO_MEMORY, undefined)
+    assert.equal(envFor({}).CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS, '1')
+    // With it, a thread kept from auto-memory gets the CLI's own switch, not
+    // --settings.
+    assert.equal(envFor({ autoMemory: false }).CLAUDE_CODE_DISABLE_AUTO_MEMORY, '1')
+    assert.equal(envFor({ autoMemory: true }).CLAUDE_CODE_DISABLE_AUTO_MEMORY, undefined)
+
+    // A value the user exported passes through without the mapping. With it,
+    // one that forces auto-memory on does not override a thread without
+    // memories, and one that turns it off still wins.
+    process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = '0'
+    assert.equal(envFor({}).CLAUDE_CODE_DISABLE_AUTO_MEMORY, '0')
+    assert.equal(envFor({ autoMemory: false }).CLAUDE_CODE_DISABLE_AUTO_MEMORY, '1')
+    assert.equal(envFor({ autoMemory: true }).CLAUDE_CODE_DISABLE_AUTO_MEMORY, '0')
+    process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = '1'
+    assert.equal(envFor({}).CLAUDE_CODE_DISABLE_AUTO_MEMORY, '1')
+    assert.equal(envFor({ autoMemory: true }).CLAUDE_CODE_DISABLE_AUTO_MEMORY, '1')
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY
+    else process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = previous
+  }
+})
+
 test('native SDK runtime approves goal tools without shadowing canUseTool', async () => {
   const runtime = new NativeClaudeRuntime()
   Reflect.set(runtime, 'zod', z)
@@ -186,6 +223,252 @@ test('native SDK runtime approves goal tools without shadowing canUseTool', asyn
   const plan = build({ planMode: true })
   assert.equal(plan.canUseTool, undefined)
   assert.ok(plan.allowedTools.includes('mcp__codex_goal'))
+})
+
+test('native SDK runtime offers dynamic tools as MCP servers and routes calls to the turn', async () => {
+  const runtime = new NativeClaudeRuntime()
+  Reflect.set(runtime, 'zod', z)
+  const sdk = {
+    tool: (
+      name: string,
+      description: string,
+      schema: { meta: () => unknown },
+      handler: (args: unknown, extra: unknown) => Promise<unknown>,
+      extras: unknown,
+    ) => ({ name, description, schema, handler, extras }),
+    createSdkMcpServer: (config: Record<string, unknown>) => ({ type: 'sdk', ...config }),
+  }
+  const listSchema = {
+    type: 'object',
+    properties: { query: { type: 'string' } },
+    required: ['query'],
+  }
+  const dynamicTools: DynamicToolServer[] = [
+    {
+      server: 'codex_app',
+      namespace: 'codex_app',
+      description: 'Tools provided by the app.',
+      tools: [
+        {
+          name: 'list_artifacts',
+          description: 'List artifacts.',
+          inputSchema: listSchema,
+          deferLoading: false,
+        },
+        {
+          name: 'restore_worktree',
+          description: 'Restore a worktree.',
+          inputSchema: { type: 'object' },
+          deferLoading: true,
+        },
+      ],
+    },
+    {
+      server: 'dynamic_tools',
+      namespace: null,
+      description: '',
+      tools: [
+        {
+          name: 'echo',
+          description: 'Echo.',
+          inputSchema: { type: 'object' },
+          deferLoading: false,
+        },
+      ],
+    },
+    // A server the adapter already runs keeps its name.
+    {
+      server: 'codex_goal',
+      namespace: 'codex_goal',
+      description: '',
+      tools: [
+        { name: 'shadow', description: '', inputSchema: { type: 'object' }, deferLoading: false },
+      ],
+    },
+  ]
+  const context = nativeTurnContext({
+    approvalPolicy: 'on-request',
+    sandboxMode: 'workspace-write',
+    dynamicTools,
+  })
+  const calls: unknown[] = []
+  const pending = {
+    context,
+    resolved: false,
+    handlers: {
+      onDynamicToolCall: async (request: unknown, signal: AbortSignal) => {
+        calls.push({ request, aborted: signal.aborted })
+        return {
+          contentItems: [
+            { type: 'inputText', text: '2 artifacts' },
+            { type: 'inputImage', imageUrl: 'data:image/png;base64,AAAA' },
+            { type: 'inputImage', imageUrl: 'data:image/svg+xml;base64,AAAA' },
+          ],
+          success: true,
+        }
+      },
+    },
+  }
+  const session: { current: typeof pending | null; lastContext: RuntimeTurnContext } = {
+    current: pending,
+    lastContext: context,
+  }
+  const buildOptions = Reflect.get(runtime, 'buildOptions')
+  const options = buildOptions.call(runtime, sdk, context, new AbortController(), () => session)
+  assert.deepEqual(Object.keys(options.mcpServers), ['codex_app', 'dynamic_tools'])
+  const app = options.mcpServers.codex_app
+  assert.equal(app.name, 'codex_app')
+  assert.equal(app.instructions, 'Tools provided by the app.')
+  assert.equal('instructions' in options.mcpServers.dynamic_tools, false)
+  assert.deepEqual(
+    app.tools.map((tool: any) => [tool.name, tool.description, tool.extras]),
+    [
+      ['list_artifacts', 'List artifacts.', { alwaysLoad: true }],
+      // Deferred tools wait for Claude Code's tool search.
+      ['restore_worktree', 'Restore a worktree.', undefined],
+    ],
+  )
+  // The client's schema is what the server lists.
+  assert.deepEqual(app.tools[0].schema.meta(), listSchema)
+
+  // The tools run without an approval prompt, even where other tools ask.
+  const signal = new AbortController().signal
+  assert.deepEqual(await options.canUseTool('mcp__codex_app__list_artifacts', {}, { signal }), {
+    behavior: 'allow',
+  })
+  assert.deepEqual(await options.canUseTool('mcp__dynamic_tools__echo', {}, { signal }), {
+    behavior: 'allow',
+  })
+
+  // Claude Code's tool use id becomes the call id.
+  const result = await app.tools[0].handler(
+    { query: 'reports' },
+    { signal, _meta: { 'claudecode/toolUseId': 'toolu_1' } },
+  )
+  assert.deepEqual(result, {
+    content: [
+      { type: 'text', text: '2 artifacts' },
+      { type: 'image', data: 'AAAA', mimeType: 'image/png' },
+      { type: 'text', text: '[image omitted]' },
+    ],
+  })
+  await options.mcpServers.dynamic_tools.tools[0].handler({}, { signal })
+  assert.deepEqual(calls[0], {
+    request: {
+      callId: 'toolu_1',
+      namespace: 'codex_app',
+      tool: 'list_artifacts',
+      arguments: { query: 'reports' },
+    },
+    aborted: false,
+  })
+  const loose = (calls[1] as { request: Record<string, unknown> }).request
+  assert.match(String(loose.callId), /^call-/)
+  assert.equal(loose.namespace, null)
+  assert.equal(loose.tool, 'echo')
+
+  // A failed call is an error result; between turns nothing can answer.
+  pending.handlers.onDynamicToolCall = async () => ({
+    contentItems: [{ type: 'inputText', text: 'dynamic tool request failed' }],
+    success: false,
+  })
+  assert.deepEqual(await app.tools[0].handler({ query: 'x' }, { signal }), {
+    content: [{ type: 'text', text: 'dynamic tool request failed' }],
+    isError: true,
+  })
+  session.current = null
+  assert.deepEqual(await app.tools[0].handler({ query: 'x' }, { signal }), {
+    content: [{ type: 'text', text: 'dynamic tools are only available during a turn' }],
+    isError: true,
+  })
+  assert.equal(calls.length, 2)
+
+  // Plan mode offers none of them.
+  const plan = buildOptions.call(
+    runtime,
+    sdk,
+    { ...context, planMode: true },
+    new AbortController(),
+    () => session,
+  )
+  assert.equal(plan.mcpServers, undefined)
+})
+
+test('native SDK runtime serves the leader tools, and only the looking ones in plan mode', async () => {
+  const runtime = new NativeClaudeRuntime()
+  Reflect.set(runtime, 'zod', z)
+  const sdk = {
+    tool: (...args: unknown[]) => args,
+    createSdkMcpServer: (config: Record<string, unknown>) => ({ type: 'sdk', ...config }),
+  }
+  const calls: Array<{ tool: string; input: unknown; signal: unknown }> = []
+  const record =
+    (tool: string) =>
+    async (input: unknown, signal?: AbortSignal): Promise<string> => {
+      calls.push({ tool, input, signal })
+      return `${tool} ok`
+    }
+  const leaderTools = {
+    list: record('list'),
+    start: record('start'),
+    prompt: record('prompt'),
+    wait: record('wait'),
+    read: record('read'),
+  }
+  const buildOptions = Reflect.get(runtime, 'buildOptions')
+  const build = (overrides: Partial<RuntimeTurnContext>) =>
+    buildOptions.call(runtime, sdk, nativeTurnContext(overrides), new AbortController(), () => null)
+
+  assert.equal(build({}).mcpServers, undefined)
+  const options = build({
+    leaderTools,
+    approvalPolicy: 'on-request',
+    sandboxMode: 'workspace-write',
+  })
+  const server = options.mcpServers.codex_leader
+  const tools = new Map<string, any[]>(server.tools.map((tool: any[]) => [tool[0], tool]))
+  assert.deepEqual(
+    [...tools.keys()],
+    ['thread_list', 'thread_start', 'thread_prompt', 'thread_wait', 'thread_read'],
+  )
+  assert.match(tools.get('thread_start')?.[1], /Agent tool/)
+  assert.match(tools.get('thread_start')?.[1], /::created-thread line[^\n]*final response/)
+  assert.deepEqual(
+    [...tools.values()].filter((tool) => tool[4]?.annotations?.readOnlyHint).map((tool) => tool[0]),
+    ['thread_list', 'thread_wait', 'thread_read'],
+  )
+  // The SDK's abort signal reaches the waiting handlers; a thrown error
+  // becomes an error result.
+  const signal = new AbortController().signal
+  const result = await tools.get('thread_wait')?.[3]({ threadIds: ['a'] }, { signal })
+  assert.deepEqual(result, { content: [{ type: 'text', text: 'wait ok' }] })
+  assert.deepEqual(calls.at(-1), { tool: 'wait', input: { threadIds: ['a'] }, signal })
+  leaderTools.read = async () => {
+    throw new Error('unknown thread: gone')
+  }
+  const failed = await build({ leaderTools }).mcpServers.codex_leader.tools[4][3]({
+    threadId: 'gone',
+  })
+  assert.deepEqual(failed, {
+    content: [{ type: 'text', text: 'unknown thread: gone' }],
+    isError: true,
+  })
+  // Allowed without asking, like the goal tools, while other tools still ask.
+  assert.deepEqual(
+    await options.canUseTool('mcp__codex_leader__thread_start', { prompt: 'x' }, { signal }),
+    { behavior: 'allow' },
+  )
+  assert.equal((await options.canUseTool('Bash', { command: 'true' }, { signal })).behavior, 'deny')
+
+  const plan = build({ leaderTools, planMode: true })
+  assert.deepEqual(
+    plan.allowedTools.filter((tool: string) => tool.startsWith('mcp__codex_leader')),
+    [
+      'mcp__codex_leader__thread_list',
+      'mcp__codex_leader__thread_read',
+      'mcp__codex_leader__thread_wait',
+    ],
+  )
 })
 
 test('explicit native SDK bypass includes the required dangerous opt-in flag', () => {
@@ -2243,6 +2526,58 @@ test('claude-p runtime runs each turn in its own cwd', async () => {
     assert.equal(await realpath(argCwdB!), await realpath(cwdB))
     assert.equal(promptB, 'prompt-b')
   } finally {
+    await rm(tmp, { recursive: true, force: true })
+  }
+})
+
+test('claude-p runtime turns auto-memory off only for threads the memories mapping keeps from it', async () => {
+  const tmp = await mkdtemp(join(tmpdir(), 'claude-codex-claude-p-memory-test-'))
+  const command = join(tmp, 'fake-claude-p.mjs')
+  await writeFile(
+    command,
+    [
+      '#!/usr/bin/env node',
+      'const value = process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY ?? "unset";',
+      'console.log(JSON.stringify({ result: value, session_id: null, is_error: false }));',
+    ].join('\n'),
+  )
+  await chmod(command, 0o755)
+  const runtime = new ClaudePTranscriptRuntime({
+    command,
+    extraArgs: [],
+    timeoutMs: 20_000,
+    skipPermissions: false,
+    resume: false,
+  })
+  const run = async (autoMemory: boolean | undefined): Promise<string> => {
+    let text = ''
+    await runtime.runTurn(
+      nativeTurnContext({
+        threadId: `thread-${String(autoMemory)}`,
+        cwd: tmp,
+        ...(autoMemory === undefined ? {} : { autoMemory }),
+      }),
+      {
+        onEvent: (event) => {
+          if (event.type === 'text_delta') text += event.delta
+        },
+        onPermissionRequest: async () => ({ decision: 'accept' }),
+      },
+    )
+    return text
+  }
+  const previous = process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY
+  delete process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY
+  try {
+    // Without the mapping (undefined) the CLI gets nothing extra.
+    assert.deepEqual(await Promise.all([run(undefined), run(false), run(true)]), [
+      'unset',
+      '1',
+      'unset',
+    ])
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY
+    else process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = previous
     await rm(tmp, { recursive: true, force: true })
   }
 })

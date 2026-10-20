@@ -5,9 +5,11 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { rendersCompletedSubagentActivity, unverifiedAppWarning } from './app-compat.mjs'
+import { type InstalledAppPlugin, stopAppPluginServers } from './app-plugin-mcp.mjs'
 import {
   type AppPlugin,
   type AppSkill,
+  appMarketplacePlugin,
   appPluginSkills,
   claudeHookSource,
   claudeRunnableAppPlugin,
@@ -16,7 +18,23 @@ import {
   listClaudeSkills,
 } from './claude-capabilities.mjs'
 import { onClaudeCommandsChanged, skillLinksToCommand } from './claude-commands.mjs'
+import {
+  DEFAULT_EFFORTS,
+  defaultReasoningEffort,
+  reasoningEffortOptions,
+  reportedClaudeModel,
+} from './claude-models.mjs'
 import { runCodexNotify } from './codex-notify.mjs'
+import { appendCommandOutput } from './command-output.mjs'
+import {
+  DYNAMIC_TOOL_CANCELLED,
+  DYNAMIC_TOOL_REQUEST_FAILED,
+  dynamicToolFailure,
+  dynamicToolResponse,
+  dynamicToolServers,
+  dynamicToolsEnabled,
+  parseDynamicTools,
+} from './dynamic-tools.mjs'
 import {
   continuePrompt,
   goalBudgetExhausted,
@@ -27,15 +45,37 @@ import {
   isGoalStatus,
   MODEL_GOAL_STATUSES,
 } from './goal-prompts.mjs'
-import { accountUsage, hostMethod, RpcError } from './host-methods.mjs'
+import {
+  accountUsage,
+  hostMethod,
+  INVALID_REQUEST,
+  methodNotFound,
+  RpcError,
+  SERVER_ERROR,
+} from './host-methods.mjs'
 import { inheritedAgents, inheritedHooks, inheritedPermissionRules } from './inherited-config.mjs'
+import { LeaderThreads } from './leader-tools.mjs'
 import {
   callMcpTool,
   listMcpServerStatuses,
   type McpConfigScope,
+  mcpOauthUnavailable,
   readMcpConfig,
   readMcpResource,
+  resetMcpStatusCache,
+  toolCallMeta,
 } from './mcp.mjs'
+import {
+  experimentalFeatureList,
+  MEMORIES_FEATURE,
+  memoriesConfigTable,
+  memoriesEnabled,
+  memoriesMappingEnabled,
+  memoryStatus,
+  newThreadMemoryMode,
+  parseMemoryMode,
+} from './memories.mjs'
+import { memoryCitation } from './memory-citations.mjs'
 import { projectInstructions } from './project-instructions.mjs'
 import { projectProviderLoopConfig } from './provider-loop-config.mjs'
 import {
@@ -99,6 +139,7 @@ import {
   projectMetadata,
   projectName,
   projectRoots,
+  REVIEW_FALLBACK,
   readConfigReasoningEffort,
   reasoningEffortFromParams,
   reviewLabel,
@@ -108,6 +149,7 @@ import {
   simpleDiff,
   stringListFromEnv,
   stringOr,
+  subagentEffortFromInput,
   summarizeInjectedItem,
   summarizeRpcParams,
   threadPermissionProfileId,
@@ -122,6 +164,7 @@ import {
 import { PINNED_SECTION_ID, type SessionStore, settledTurn } from './store.mjs'
 import {
   findOccurrences,
+  forkTurns,
   offsetCursor,
   pageItems,
   pageLimit,
@@ -131,8 +174,10 @@ import {
   threadSnippet,
 } from './thread-history.mjs'
 import type {
-  ClaudeCheckpoint,
+  ClaudeResumePoint,
   ClaudeRuntime,
+  DynamicToolCallRequest,
+  DynamicToolCallResponse,
   ElicitationRequest,
   ElicitationResponse,
   FileUpdateChange,
@@ -144,12 +189,14 @@ import type {
   PermissionDecision,
   ProjectRecord,
   QueuedSubmission,
+  RecalledMemory,
   RpcPeer,
   RuntimeEvent,
   RuntimeLiveTask,
   RuntimeSteerOptions,
   RuntimeTaskEvent,
   RuntimeTaskUsage,
+  RuntimeTurnContext,
   RuntimeTurnSettings,
   ThreadAttachmentRecord,
   ThreadGoal,
@@ -177,6 +224,7 @@ import {
   defaultAllowedTools,
   ensureParent,
   extractImageInputs,
+  GENERIC_MODEL_DESCRIPTION,
   isCodexOpenAiModel,
   newId,
   newThreadId,
@@ -288,6 +336,8 @@ type SubagentActivityKind = 'started' | 'interacted' | 'interrupted' | 'complete
 const DETACHED_PEER: RpcPeer = { id: 'detached', send: () => {}, close: () => {} }
 
 const MAX_TRACKED_TASK_IDS = 512
+// Command items a background shell's later output may still go to.
+const MAX_TRACKED_COMMAND_ITEMS = 512
 const MAX_QUEUED_ACTIVITY = 64
 
 // A hidden goal continuation that does no tool work ends the run of
@@ -398,11 +448,15 @@ export class CodexClaudeAppServer {
   // Closes the message, reasoning and plan items a turn is still streaming,
   // so an interrupt that ends the turn from outside leaves none open.
   private closeStreamingItemsByTurn = new Map<string, () => void>()
+  // Turns review/start and thread/compact/start run, which take no steering.
+  private unsteerableTurns = new Map<string, 'review' | 'compact'>()
   // Keyed by child thread id. Entries outlive the run so SendMessage can
   // still find (and resume) an agent that already reported back.
   private backgroundSubagents = new Map<string, BackgroundSubagent>()
   // task_started precedes the Agent tool result that backgrounds the task.
   private taskIdByToolUse = new Map<string, string>()
+  // Bash command items by tool use id.
+  private commandItems = new Map<string, { threadId: string; turnId: string; itemId: string }>()
   // SendMessage and TaskStop calls addressed to a known agent, by tool use id.
   private pendingAgentCalls = new Map<
     string,
@@ -434,6 +488,8 @@ export class CodexClaudeAppServer {
   // running turn, before its result settles the turn's usage.
   private goalProgressByThread = new Map<string, Map<string, number>>()
   private goalToolHandlers = new Map<string, GoalToolHandlers>()
+  // Chats a thread started with the leader tools, and the waits on them.
+  private readonly leaderThreads: LeaderThreads
   private elicitationCounts = new Map<string, number>()
   private tokenUsageByThread = new Map<string, TokenUsageBreakdown>()
   // Like Codex's last_token_usage, `last` is one API call: the main loop's
@@ -451,8 +507,14 @@ export class CodexClaudeAppServer {
   // so the user's settings survive a daemon restart instead of resetting on
   // every reconnect.
   private configOverrides: Record<string, unknown> = {}
+  // The memories feature as the App last set it with
+  // experimentalFeature/enablement/set; features.memories in the config wins.
+  private memoriesEnablement: boolean | null = null
   // Codex App plugins whose skills Claude can run, as the App installed them.
   private appPlugins: AppPlugin[] = []
+  // Every App plugin the App installed, by its <plugin>@<marketplace> id, for
+  // the plugin MCP servers the App calls through the host.
+  private installedAppPlugins: InstalledAppPlugin[] = []
   private readonly configPath = join(adapterHome(), 'config.json')
   private idleCheckHandler: (() => void) | null = null
   private stopped = false
@@ -465,6 +527,12 @@ export class CodexClaudeAppServer {
   constructor(store: SessionStore, runtime: ClaudeRuntime) {
     this.store = store
     this.runtime = runtime
+    this.leaderThreads = new LeaderThreads({
+      store,
+      activeTurnId: (threadId) => this.activeTurnByThread.get(threadId) ?? null,
+      startThread: (leader, options) => this.startLeaderThread(leader, options),
+      sendInput: (threadId, text) => this.sendLeaderInput(threadId, text),
+    })
     this.loadPersistedConfig()
     // A CLI reported a different set of built-in commands: the App refetches
     // skills/list, which serves them as skills.
@@ -518,6 +586,7 @@ export class CodexClaudeAppServer {
     if (this.stopped) return
     this.stopped = true
     this.stopCommandsListener()
+    this.leaderThreads.stop()
     try {
       // Child turns are created directly from Task/Workflow events and are not
       // registered in activeTurnByThread. Finalize them before aborting the
@@ -527,6 +596,8 @@ export class CodexClaudeAppServer {
       this.finalizeBackgroundSubagents(null, 'server stopped')
       this.completeActiveTurns('interrupted', { message: 'server stopped' })
     } finally {
+      // The App plugin servers go with the adapter.
+      stopAppPluginServers()
       // A store that can no longer be written must not keep the Claude
       // processes running.
       try {
@@ -573,9 +644,9 @@ export class CodexClaudeAppServer {
         stack: error instanceof Error ? error.stack : null,
       })
       this.sendResponse(peer, request.id, undefined, {
-        code: -32000,
+        code: error instanceof RpcError ? error.code : SERVER_ERROR,
         message: error instanceof Error ? error.message : String(error),
-        ...(error instanceof RpcError ? { data: error.data } : {}),
+        ...(error instanceof RpcError && error.data !== undefined ? { data: error.data } : {}),
       })
     }
   }
@@ -662,6 +733,8 @@ export class CodexClaudeAppServer {
         return this.threadAttachmentList(asRecord(params))
       case 'thread/attachment/remove':
         return this.threadAttachmentRemove(asRecord(params))
+      case 'thread/attachmentOwner/list':
+        return this.threadAttachmentOwnerList(asRecord(params))
       case 'thread/name/set':
         return this.threadNameSet(asRecord(params))
       case 'thread/archive':
@@ -717,15 +790,19 @@ export class CodexClaudeAppServer {
         return this.projectMove(asRecord(params))
       case 'thread/settings/update':
         return this.threadSettingsUpdate(peer, asRecord(params))
-      // Intentional no-ops: Claude Code has no equivalent concept, so the
-      // adapter acknowledges the call without side effects rather than failing
-      // the RPC (which would break the Codex App connection).
       case 'thread/memoryMode/set':
+        return this.threadMemoryModeSet(asRecord(params))
+      // Claude Code keeps its auto-memory in per-project folders that Claude
+      // Code in a terminal shares, so deleting them here would take memories
+      // the App never made. The App reports the failure.
+      // App rule: memories-settings
       case 'memory/reset':
-        return {}
-      // Claude Code keeps no Codex memories, so none were ever consolidated.
+        throw new Error(
+          "memory/reset is not supported: Claude Code keeps its memories in its own per-project folders, shared with Claude Code outside the App. Review or delete them with Claude Code's /memory command.",
+        )
+      // Claude Code never consolidates chats into Codex memories.
       case 'memory/status':
-        return { v2ConsolidatedThreads: 0, v2Ready: false }
+        return memoryStatus(asRecord(params))
       case 'thread/unarchive':
         return this.historyForPeer(peer, this.threadArchive(asRecord(params), false))
       case 'thread/compact/start':
@@ -801,11 +878,11 @@ export class CodexClaudeAppServer {
           webSearch: process.env.CLAUDE_CODEX_WEBSEARCH !== '0',
         }
       case 'experimentalFeature/list':
-        return { data: [], nextCursor: null }
+        return this.experimentalFeatureList(asRecord(params))
       case 'permissionProfile/list':
         return permissionProfileList(asRecord(params))
       case 'experimentalFeature/enablement/set':
-        return { enablement: asRecord(asRecord(params).enablement) }
+        return this.experimentalFeatureEnablementSet(asRecord(params))
       case 'collaborationMode/list':
         return method === 'collaborationMode/list' ? { data: [] } : {}
       case 'mock/experimentalMethod':
@@ -847,8 +924,8 @@ export class CodexClaudeAppServer {
         return { effectiveEnabled: asRecord(params).enabled === true }
       case 'plugin/share/list':
         return { data: [] }
-      // Stub the three RPC methods Codex App may call but our dispatcher
-      // previously threw "method not implemented" on. Stubs return the
+      // Stub the three RPC methods Codex App may call that our dispatcher
+      // would otherwise answer as unknown. Stubs return the
       // schema-correct empty shape so the App's call sites don't surface an
       // RPC error toast.
       case 'plugin/share/checkout':
@@ -864,11 +941,25 @@ export class CodexClaudeAppServer {
       case 'app/list':
         return { data: [], nextCursor: null }
       case 'mcpServer/oauth/login':
-        return {
-          authorizationUrl: `https://localhost.invalid/claude-codex/mcp-oauth/${encodeURIComponent(stringOr(asRecord(params).name, 'server'))}`,
+        // The Agent SDK has no call that starts an MCP server's OAuth flow, so
+        // there is no authorization URL to hand the App. Say where to sign in
+        // instead of returning a link that leads nowhere.
+        throw new Error(mcpOauthUnavailable(stringOr(asRecord(params).name, '')))
+      case 'config/mcpServer/reload': {
+        // Every turn hands Claude Code the MCP config as it is then. What a
+        // reload adds: the server list is read afresh, sessions kept open by
+        // background work retry the servers that failed or wait for a
+        // sign-in, and every App window hears the servers configured now.
+        resetMcpStatusCache()
+        void this.runtime.reloadMcpServers?.()
+        for (const status of readMcpConfig().startupStatuses) {
+          this.notifyAll({
+            method: 'mcpServer/startupStatus/updated',
+            params: { name: status.name, status: status.status, error: status.error ?? null },
+          })
         }
-      case 'config/mcpServer/reload':
         return {}
+      }
       // Event streams feed MCP app widgets. This server forwards no MCP
       // events, so a subscription stays silent until the App stops it.
       case 'mcpServer/event/stream/start':
@@ -896,6 +987,7 @@ export class CodexClaudeAppServer {
           stringOr(asRecord(params).tool, ''),
           asRecord(params).arguments ?? {},
           this.mcpScope(params),
+          toolCallMeta(asRecord(params)._meta, stringOr(asRecord(params).threadId, '')),
         )
       case 'windowsSandbox/setupStart':
         return { started: false }
@@ -988,15 +1080,26 @@ export class CodexClaudeAppServer {
         return this.fuzzySessionUpdate(peer, asRecord(params))
       case 'fuzzyFileSearch/sessionStop':
         return this.fuzzySessionStop(peer, asRecord(params))
+      // Requests of the protocol that no App build sends. Codex itself answers
+      // thread/prediction/request with method not found, and
+      // thread/readState/update too when it keeps no read state.
+      case 'thread/items/read':
+      case 'thread/prediction/request':
+      case 'thread/readState/update':
+        throw methodNotFound(method)
       default: {
         const result = hostMethod(method, asRecord(params))
-        if (result === undefined) throw new Error(`method not implemented: ${method}`)
+        if (result === undefined) throw methodNotFound(method)
         return result
       }
     }
   }
 
   private threadStart(peer: RpcPeer, params: Record<string, unknown>): unknown {
+    // Specs Codex would reject fail the request, as they do there. With the
+    // switch off they are ignored.
+    // App rule: dynamic-tools
+    const dynamicTools = dynamicToolsEnabled() ? parseDynamicTools(params.dynamicTools) : []
     const id = newThreadId()
     const now = nowSeconds()
     const projectId = stringOr(params.projectId, '') || null
@@ -1033,6 +1136,9 @@ export class CodexClaudeAppServer {
       cwd,
       model,
       reasoningEffort,
+      // Never openai: the App would fork a Claude thread for its composer
+      // predictions.
+      // App rule: prediction-provider
       modelProvider: 'claude-code',
       claudeSessionId: null,
       // v2 SessionSource is camelCase; the old `app_server` falls through to
@@ -1063,6 +1169,14 @@ export class CodexClaudeAppServer {
         typeof params.developerInstructions === 'string' ? params.developerInstructions : null,
       ),
       personality: normalizePersonality(params.personality),
+      // The App's per-chat memories switches arrive as memories.* config.
+      // Helper threads never remember. Without the memories mapping no mode
+      // is kept.
+      memoryMode: !memoriesMappingEnabled()
+        ? null
+        : isTitleOrHelper
+          ? 'disabled'
+          : newThreadMemoryMode(asRecord(params.config), this.configOverrides),
       // Pick the runtime backend from the chosen model — picking gpt-* in
       // the App's model dropdown flips the new thread to runtimeBackend
       // 'codex' so turns get forwarded to `codex exec`. Default 'claude'.
@@ -1075,6 +1189,7 @@ export class CodexClaudeAppServer {
     }
     this.store.upsertThread(thread)
     if (projectId) this.store.setThreadProject(id, projectId)
+    this.store.putDynamicTools(id, dynamicTools)
     recordRunEvent('thread.started', {
       threadId: thread.id,
       cwd: thread.cwd,
@@ -1086,6 +1201,75 @@ export class CodexClaudeAppServer {
     this.activePeerByThread.set(id, peer)
     this.notify(peer, { method: 'thread/started', params: { thread: this.toThread(thread, []) } })
     return this.threadEnvelope(thread)
+  }
+
+  // thread_start: the chat goes through thread/start and turn/start as if
+  // the App had sent them on the leader's connection, with the leader's
+  // settings. thread/started puts it in the App's sidebar and the App then
+  // follows its turns live; the App drew no user message, so it is published.
+  // App rule: server-started-threads
+  private async startLeaderThread(
+    leader: ThreadRecord,
+    options: { prompt: string; cwd: string; model: string; title: string | null },
+  ): Promise<{ threadId: string; turnId: string }> {
+    // Claude chats only, for now: on the Codex proxy a new chat runs there.
+    if (
+      resolveProviderLoopSelection(this.providerLoopSelectionInput()).runtimeType === 'codex-proxy'
+    )
+      throw new Error(
+        'new chats run on the Codex proxy right now; thread_start starts Claude chats only',
+      )
+    const peer = this.peerForThread(leader.id)
+    const started = this.threadStart(peer, {
+      cwd: options.cwd,
+      model: options.model,
+      effort: leader.reasoningEffort,
+      // A leader without a policy asks before tools run. thread/start reads
+      // a missing one as never and full access, so pass the asking pair that
+      // runs the same: a started chat gets no more than its leader.
+      approvalPolicy: leader.approvalPolicy ?? 'on-request',
+      sandbox: leader.sandboxMode ?? 'workspace-write',
+      permissions: leader.permissionProfileId,
+      baseInstructions: leader.baseInstructions,
+      developerInstructions: leader.developerInstructions,
+      personality: leader.personality,
+      projectId: leader.projectId,
+      threadSource: 'user',
+    })
+    const threadId = stringOr(asRecord(asRecord(started).thread).id, '')
+    // No App follows the leader right now: let the chat find its peer when
+    // the App opens it, instead of pinning it to nobody.
+    if (peer === DETACHED_PEER) this.activePeerByThread.delete(threadId)
+    // Linked before its turn starts, so that turn already gets no leader tools.
+    this.store.addLeaderThread(threadId, leader.id)
+    if (options.title) this.threadNameSet({ threadId, name: options.title })
+    const result = await this.turnStart(peer, {
+      threadId,
+      input: [{ type: 'text', text: options.prompt, text_elements: [] }],
+      _emitUserMessage: true,
+    })
+    return { threadId, turnId: stringOr(asRecord(asRecord(result).turn).id, '') }
+  }
+
+  // thread_prompt: input goes in as the App sends a message. A running turn
+  // takes it as a steer, like the App's default follow-up mode; there is no
+  // queue to wait behind while the leader waits for an answer.
+  private async sendLeaderInput(
+    threadId: string,
+    text: string,
+  ): Promise<{ turnId: string; steered: boolean }> {
+    const running = this.activeTurnByThread.get(threadId) ?? null
+    const leaderId = this.store.leaderOf(threadId)
+    const peer =
+      this.activePeerByThread.get(threadId) ??
+      (leaderId ? this.peerForThread(leaderId) : DETACHED_PEER)
+    const result = await this.turnStart(peer, {
+      threadId,
+      input: [{ type: 'text', text, text_elements: [] }],
+      _emitUserMessage: true,
+    })
+    const turnId = stringOr(asRecord(asRecord(result).turn).id, '')
+    return { turnId, steered: running !== null && turnId === running }
   }
 
   private threadResume(peer: RpcPeer, params: Record<string, unknown>): unknown {
@@ -1158,6 +1342,10 @@ export class CodexClaudeAppServer {
     const parentId = stringOr(params.threadId, '')
     const parent = this.store.getThread(parentId)
     if (!parent) throw new Error(`unknown thread: ${parentId}`)
+    // A fork from one of the parent's turns keeps the history up to it, and
+    // Claude's context with it.
+    const parentTurns = this.store.listTurns(parent.id)
+    const kept = forkTurns(parentTurns, params)
     const now = nowSeconds()
     const id = newThreadId()
     const requestedModel = modelFromParams(params, parent.model)
@@ -1179,7 +1367,15 @@ export class CodexClaudeAppServer {
       : 'claude'
     const requestedCwd = stringOr(params.cwd, parent.cwd)
     const cwd = maybeCreateThreadWorktree(id, requestedCwd).cwd
-    const forkPoint = runtimeBackend === 'claude' ? this.forkPointOf(parent) : null
+    let forkPoint = runtimeBackend === 'claude' ? this.forkPointOf(parent, kept) : null
+    // Turns from before checkpoints give Claude's context no place to stop
+    // at the fork point: the fork keeps all of it, as a whole fork does.
+    const uncut =
+      kept !== null &&
+      forkPoint === null &&
+      runtimeBackend === 'claude' &&
+      parent.runtimeBackend !== 'codex'
+    if (uncut) forkPoint = this.forkPointOf(parent, null)
     const thread: ThreadRecord = {
       ...parent,
       id,
@@ -1193,7 +1389,8 @@ export class CodexClaudeAppServer {
       cwd,
       model: forkModel,
       reasoningEffort: reasoningEffortFromParams(params, parent.reasoningEffort),
-      claudeSessionId: forkPoint?.sessionId ?? parent.claudeSessionId,
+      claudeSessionId:
+        forkPoint === 'new' ? null : (forkPoint?.sessionId ?? parent.claudeSessionId),
       createdAt: now,
       updatedAt: now,
       status: { type: 'idle' },
@@ -1213,6 +1410,9 @@ export class CodexClaudeAppServer {
       // The App forks a thread to describe it and asks for an ephemeral fork;
       // like any helper thread, it stays out of the thread list.
       ephemeral: params.ephemeral === true || parent.ephemeral,
+      // A fork remembers like its parent; an ephemeral one never does.
+      memoryMode:
+        params.ephemeral === true || parent.ephemeral ? 'disabled' : (parent.memoryMode ?? null),
       threadSource:
         typeof params.threadSource === 'string'
           ? normalizeThreadSource(params.threadSource)
@@ -1241,11 +1441,17 @@ export class CodexClaudeAppServer {
       codexSessionId: null,
     }
     this.store.upsertThread(thread)
-    // A fork stays in its parent's project.
+    // A fork stays in its parent's project, and keeps its dynamic tools:
+    // thread/fork does not carry them.
     if (parent.projectId) this.store.setThreadProject(id, parent.projectId)
+    // As in Codex, a fork that is kept holds its parent's attachments (the
+    // worktree it ran in, the pull requests opened from it), so
+    // thread/attachmentOwner/list names it too; an ephemeral fork holds none.
+    if (!thread.ephemeral) this.store.copyThreadAttachments(parent.id, id)
+    this.store.putDynamicTools(id, this.store.getDynamicTools(parent.id))
     if (forkPoint) {
       this.store.setForkCheckpoint(id, forkPoint)
-      this.store.rewindClaudeSession(id, forkPoint.sessionId, forkPoint.messageUuid)
+      this.resumeClaudeAt(id, forkPoint)
     }
     recordRunEvent('thread.forked', {
       threadId: thread.id,
@@ -1255,20 +1461,31 @@ export class CodexClaudeAppServer {
       runtimeBackend: thread.runtimeBackend,
       threadSource: thread.threadSource,
       ephemeral: thread.ephemeral,
+      keptTurns: kept?.length ?? null,
     })
     this.activePeerByThread.set(id, peer)
     this.notify(peer, { method: 'thread/started', params: { thread: this.toThread(thread, []) } })
-    return this.threadEnvelope(
-      thread,
-      params.excludeTurns === true ? [] : this.store.listTurns(parent.id),
-    )
+    // App rule: config-warnings
+    if (uncut && kept.length < parentTurns.length) {
+      this.notify(peer, {
+        method: 'configWarning',
+        params: {
+          summary: 'Claude in a forked chat still remembers the turns after the fork point',
+          details: `Thread ${parent.id} has no Claude checkpoint up to the turn it was forked at (its turns predate checkpoints), so its fork ${id} resumes the whole Claude session, later turns included.`,
+        },
+      })
+    }
+    return this.threadEnvelope(thread, params.excludeTurns === true ? [] : (kept ?? parentTurns))
   }
 
-  // Where a fork of `thread` picks up Claude's context: the checkpoint the
-  // thread itself resumes at next if it was just rewound, else the end of its
-  // newest settled turn. Null for legacy threads, which fork the whole session.
-  private forkPointOf(thread: ThreadRecord): ClaudeCheckpoint | null {
+  // Where a fork of `thread` picks up Claude's context. A fork that keeps
+  // only `kept`, the thread's turns up to some turn, takes the context after
+  // them. A whole fork takes the checkpoint the thread itself resumes at next
+  // if it was just rewound, else the end of its newest settled turn. Null when
+  // the turns predate checkpoints; a whole fork then resumes the whole session.
+  private forkPointOf(thread: ThreadRecord, kept: TurnRecord[] | null): ClaudeResumePoint | null {
     if (thread.runtimeBackend === 'codex') return null
+    if (kept) return this.claudeContextAfter(thread, kept)
     const resumeAt = this.store.claudeResumeAt(thread.id)
     if (thread.claudeSessionId && resumeAt)
       return { sessionId: thread.claudeSessionId, messageUuid: resumeAt }
@@ -1649,6 +1866,28 @@ export class CodexClaudeAppServer {
     }
   }
 
+  // The threads holding an attachment, by thread id: the App keeps the
+  // worktree of a thread it archives while another thread still holds it.
+  // archived false lists the live threads only, true the archived ones.
+  private threadAttachmentOwnerList(params: Record<string, unknown>): unknown {
+    const attachmentType = stringOr(params.attachmentType, '')
+    const identityKey = stringOr(params.identityKey, '')
+    if (!attachmentType.trim()) throw new Error('attachmentType must not be empty')
+    if (!identityKey.trim()) throw new Error('identityKey must not be empty')
+    const archived = typeof params.archived === 'boolean' ? params.archived : null
+    const offset = offsetCursor(params.cursor, 'attachment owner')
+    const limit = pageLimit(params.limit, 200) ?? 25
+    const owners = this.store.listAttachmentOwners(
+      { attachmentType, identityKey, archived },
+      limit + 1,
+      offset,
+    )
+    return {
+      data: owners.slice(0, limit),
+      nextCursor: owners.length > limit ? String(offset + limit) : null,
+    }
+  }
+
   // Removing an attachment that is not there leaves nothing to report.
   private threadAttachmentRemove(params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
@@ -1729,6 +1968,7 @@ export class CodexClaudeAppServer {
     this.goalClockByThread.delete(threadId)
     this.goalTurnByThread.delete(threadId)
     this.goalToolHandlers.delete(threadId)
+    this.leaderThreads.forget(threadId)
     this.elicitationCounts.delete(threadId)
   }
 
@@ -2207,12 +2447,15 @@ export class CodexClaudeAppServer {
 
   // Settings for a turn the adapter starts on the user's behalf: whatever the
   // last user turn used, minus its input. Queued messages never carry a
-  // collaboration mode (the App keeps those in the window queue).
+  // collaboration mode (the App keeps those in the window queue). Nor the
+  // lineage of a turn started for another turn: such a turn is its own root.
   private followUpParams(threadId: string): Record<string, unknown> {
     const {
       input: _input,
       clientUserMessageId: _clientId,
       outputSchema: _schema,
+      parentTurnId: _parent,
+      rootTurnId: _root,
       ...rest
     } = this.lastTurnParamsByThread.get(threadId) ?? {}
     return { ...rest, threadId, planMode: false }
@@ -2452,27 +2695,40 @@ export class CodexClaudeAppServer {
       return dropped
     }
     this.runtime.resetSession?.(thread.id)
-    for (const turn of remaining.toReversed()) {
-      const checkpoint = this.store.turnCheckpoint(turn.id)
-      if (checkpoint) {
-        this.store.rewindClaudeSession(thread.id, checkpoint.sessionId, checkpoint.messageUuid)
-        return dropped
-      }
+    const point = this.claudeContextAfter(thread, remaining)
+    if (point) {
+      this.resumeClaudeAt(thread.id, point)
+      return dropped
     }
     if (remaining.length === 0) {
-      // Back to where the thread began: its fork point, or a new session.
-      const fork = this.store.forkCheckpoint(thread.id)
+      // A fork from before fork points goes back to its parent's session.
       const parent = thread.forkedFromId ? this.store.getThread(thread.forkedFromId) : null
-      this.store.rewindClaudeSession(
-        thread.id,
-        fork?.sessionId ?? parent?.claudeSessionId ?? null,
-        fork?.messageUuid ?? null,
-      )
+      this.store.rewindClaudeSession(thread.id, parent?.claudeSessionId ?? null, null)
       return dropped
     }
     // The remaining turns predate checkpoints: Claude keeps its context.
     debugLog('thread.rewind.unanchored', { threadId: thread.id, dropped })
     return dropped
+  }
+
+  // Where Claude's context stands once a thread has run `turns`, its first
+  // turns: the newest of their checkpoints, or with no turns, where the thread
+  // began (its fork point, or a new session). Null when the turns, or the fork
+  // they start from, predate checkpoints.
+  private claudeContextAfter(thread: ThreadRecord, turns: TurnRecord[]): ClaudeResumePoint | null {
+    for (const turn of turns.toReversed()) {
+      const checkpoint = this.store.turnCheckpoint(turn.id)
+      if (checkpoint) return checkpoint
+    }
+    if (turns.length > 0) return null
+    return thread.forkedFromId ? this.store.forkCheckpoint(thread.id) : 'new'
+  }
+
+  // Points a thread's next turn at `point`: a forked session resumed there,
+  // or a new session.
+  private resumeClaudeAt(threadId: string, point: ClaudeResumePoint): void {
+    if (point === 'new') this.store.rewindClaudeSession(threadId, null, null)
+    else this.store.rewindClaudeSession(threadId, point.sessionId, point.messageUuid)
   }
 
   // thread/delete removes a thread for good: its turns, goal and queue, and
@@ -2670,7 +2926,9 @@ export class CodexClaudeAppServer {
       const resolved = backend === 'codex' ? model : resolveClaudeModel(model)
       if (resolved) settings.model = resolved
     }
-    if (params.effort != null) {
+    // 'none' is the effort of a model that takes none (model/list gives it to
+    // Haiku), so it leaves the effort as it is.
+    if (params.effort != null && params.effort !== 'none') {
       const effort = resolveClaudeEffort(stringOr(params.effort, ''))
       if (!effort) throw new Error(`unsupported effort: ${String(params.effort)}`)
       settings.effort = effort
@@ -2761,6 +3019,7 @@ export class CodexClaudeAppServer {
       purpose: params.outputSchema == null ? 'normal' : 'summary',
     })
     this.activeTurnByThread.set(threadId, turnId)
+    this.unsteerableTurns.set(turnId, 'review')
     this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
     // The review/start RESPONSE carries the synthesized userMessage item (the
     // real app-server's build_review_turn does the same, with itemsView
@@ -2778,6 +3037,11 @@ export class CodexClaudeAppServer {
       this.notify(peer, {
         method: 'item/started',
         params: { threadId, turnId, item: entered, startedAtMs: nowMillis() },
+      })
+      // The marker is complete once the review is under way, as in Codex.
+      this.notify(peer, {
+        method: 'item/completed',
+        params: { threadId, turnId, item: entered, completedAtMs: nowMillis() },
       })
       void this.runRuntimeTurn(peer, thread, turn, prompt, {
         model: thread.model,
@@ -2799,6 +3063,7 @@ export class CodexClaudeAppServer {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
     if (!thread) throw new Error(`unknown thread: ${threadId}`)
+    this.activePeerByThread.set(threadId, peer)
     const turnId = newId()
     const compactItem: ThreadItem = { type: 'contextCompaction', id: newId() }
     const turn: TurnRecord = {
@@ -2819,9 +3084,10 @@ export class CodexClaudeAppServer {
       cwd: thread.cwd,
       model: thread.model,
       runtimeBackend: thread.runtimeBackend,
-      purpose: params.outputSchema == null ? 'normal' : 'summary',
+      purpose: 'compact',
     })
     this.activeTurnByThread.set(threadId, turnId)
+    this.unsteerableTurns.set(turnId, 'compact')
     this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
     setImmediate(() => {
       // stop() has already settled this turn; starting it now would launch
@@ -2835,80 +3101,222 @@ export class CodexClaudeAppServer {
         method: 'item/started',
         params: { threadId, turnId, item: compactItem, startedAtMs: nowMillis() },
       })
-      const agentItem: ThreadItem = {
+      void this.compactThread(peer, thread, turn, compactItem).catch((error) => {
+        debugLog('thread.compact.failed', {
+          threadId,
+          error: error instanceof Error ? error.message : String(error),
+        })
+      })
+    })
+    return {}
+  }
+
+  // Compacts the thread like Codex's /compact: Claude compacts the thread's
+  // own session, so the next turn goes on from its summary. A thread with no
+  // Claude session yet, or whose compaction fails, gets a summary written in
+  // a session of its own instead, and keeps its session as it was.
+  private async compactThread(
+    peer: RpcPeer,
+    thread: ThreadRecord,
+    turn: TurnRecord,
+    compactItem: ThreadItem,
+  ): Promise<void> {
+    const threadId = thread.id
+    const turnId = turn.id
+    let compactOpen = true
+    const completeCompactItem = (): void => {
+      if (!compactOpen) return
+      compactOpen = false
+      this.notify(peer, {
+        method: 'item/completed',
+        params: { threadId, turnId, item: compactItem, completedAtMs: nowMillis() },
+      })
+    }
+    let agentItem: ThreadItem | null = null
+    const completeAgentItem = (): void => {
+      if (!agentItem) return
+      let item: ThreadItem = agentItem
+      agentItem = null
+      try {
+        const id = item.id
+        item = this.store.getTurn(turnId)?.items.find((candidate) => candidate.id === id) ?? item
+      } catch {}
+      this.notify(peer, {
+        method: 'item/completed',
+        params: { threadId, turnId, item, completedAtMs: nowMillis() },
+      })
+    }
+    // An interrupt ends the turn from outside. Like Codex's, the compaction
+    // it cuts short stays open, which the App shows as interrupted.
+    this.closeStreamingItemsByTurn.set(turnId, () => {
+      completeAgentItem()
+    })
+    const active = (): boolean =>
+      !this.stopped &&
+      this.store.getTurn(turnId)?.status === 'inProgress' &&
+      this.activeTurnByThread.get(threadId) === turnId
+    try {
+      const current = this.store.getThread(threadId) ?? thread
+      let compacted = false
+      if (
+        current.runtimeBackend !== 'codex' &&
+        current.claudeSessionId &&
+        this.runtime.compactsSessions?.() === true
+      ) {
+        compacted = await this.runSessionCompaction(
+          peer,
+          current,
+          turnId,
+          active,
+          completeCompactItem,
+        ).catch((error) => {
+          debugLog('thread.compact.session_failed', {
+            threadId,
+            error: error instanceof Error ? error.message : String(error),
+          })
+          return false
+        })
+      }
+      if (compacted || !active()) return
+      const item: ThreadItem = {
         type: 'agentMessage',
         id: newId(),
         text: '',
         phase: null,
         memoryCitation: null,
       }
-      this.store.appendItem(turnId, agentItem)
+      agentItem = item
+      this.store.appendItem(turnId, item)
       this.notify(peer, {
         method: 'item/started',
-        params: { threadId, turnId, item: agentItem, startedAtMs: nowMillis() },
+        params: { threadId, turnId, item, startedAtMs: nowMillis() },
       })
-
-      // Drive an actual Claude (summary model) turn to compact the thread
-      // instead of just stringifying the last 12 snippets locally — the
-      // local fallback still kicks in if the runtime errors.
-      void this.runCompactTurn(peer, thread, turnId, agentItem.id, compactItem)
-        .catch((error) => {
-          debugLog('thread.compact.fallback', { threadId, error: error?.message ?? String(error) })
-          const fallback = compactSummary(thread, this.store.listTurns(threadId))
-          this.store.updateItem(turnId, agentItem.id, (item) =>
-            item.type === 'agentMessage' ? { ...item, text: fallback } : item,
-          )
-          this.notify(peer, {
-            method: 'item/agentMessage/delta',
-            params: { threadId, turnId, itemId: agentItem.id, delta: fallback },
-          })
+      try {
+        await this.runCompactTurn(peer, current, turnId, item.id, active)
+      } catch (error) {
+        debugLog('thread.compact.fallback', {
+          threadId,
+          error: error instanceof Error ? error.message : String(error),
         })
-        .finally(() => {
-          this.notify(peer, {
-            method: 'item/completed',
-            params: { threadId, turnId, item: compactItem, completedAtMs: nowMillis() },
-          })
-          let finalAgent: ThreadItem = agentItem
-          try {
-            finalAgent =
-              this.store.getTurn(turnId)?.items.find((i) => i.id === agentItem.id) ?? agentItem
-          } catch {}
-          this.notify(peer, {
-            method: 'item/completed',
-            params: { threadId, turnId, item: finalAgent, completedAtMs: nowMillis() },
-          })
-          // An interrupt already ended the turn and told the client.
-          const completed = this.endTurn(turn, 'completed', null)
-          if (!completed) return
+        if (!active()) return
+        const fallback = compactSummary(current, this.store.listTurns(threadId))
+        this.store.updateItem(turnId, item.id, (entry) =>
+          entry.type === 'agentMessage' ? { ...entry, text: fallback } : entry,
+        )
+        this.notify(peer, {
+          method: 'item/agentMessage/delta',
+          params: { threadId, turnId, itemId: item.id, delta: fallback },
+        })
+      }
+    } finally {
+      // stop() has already settled the turn and closes SQLite.
+      if (!this.stopped) {
+        if (active()) completeCompactItem()
+        completeAgentItem()
+        // An interrupt already ended the turn and told the client.
+        const completed = this.endTurn(turn, 'completed', null)
+        if (completed) {
           this.clearActiveTurn(threadId)
           this.setThreadStatus(peer, threadId, { type: 'idle' })
           this.notify(peer, {
             method: 'turn/completed',
             params: { threadId, turn: this.toLifecycleTurn(completed) },
           })
-          this.notify(peer, { method: 'thread/compacted', params: { threadId } })
-        })
-        // The fallback writes to the store too; the turn has still ended above.
-        .catch((error) => {
-          debugLog('thread.compact.fallback_failed', {
-            threadId,
-            error: error instanceof Error ? error.message : String(error),
+          this.notify(peer, { method: 'thread/compacted', params: { threadId, turnId } })
+        }
+      }
+    }
+  }
+
+  // Sends `/compact` to the thread's Claude session the way the thread's
+  // next turn would reach it: into the live session when one is up, else by
+  // resuming it. True once Claude reports the conversation compacted.
+  private async runSessionCompaction(
+    peer: RpcPeer,
+    thread: ThreadRecord,
+    turnId: string,
+    active: () => boolean,
+    completeCompactItem: () => void,
+  ): Promise<boolean> {
+    // The settings of the thread's last turn keep its session's signature,
+    // so the live session takes the command instead of a new one opening.
+    const params = this.lastTurnParamsByThread.get(thread.id) ?? {}
+    const built = this.runtimeTurnContext(thread, turnId, '/compact', params)
+    // thread/compact/start carries no instructions: a bare /compact, which
+    // no side-conversation note may precede either.
+    const context: RuntimeTurnContext = { ...built.context, prompt: '/compact', imageInputs: [] }
+    const noticesSeen = new Set<string>()
+    let compacted = false
+    let failure: string | null = null
+    await this.runtime.runTurn(context, {
+      onEvent: async (event) => {
+        // As in a user turn, where Claude's session ends up is where a
+        // rewind to this turn resumes.
+        if (event.type === 'checkpoint') {
+          this.store.setTurnCheckpoint(turnId, {
+            sessionId: event.claudeSessionId,
+            messageUuid: event.messageUuid,
           })
-        })
+          return
+        }
+        if (!active()) return
+        if (event.type === 'session') {
+          this.store.updateClaudeSessionId(thread.id, event.claudeSessionId)
+          if (built.resumeSessionAt) this.store.clearClaudeResumeAt(thread.id)
+          return
+        }
+        if (event.type === 'compaction_completed') {
+          compacted = true
+          completeCompactItem()
+          this.recordCompactedContext(peer, thread.id, turnId, event.postTokens, false)
+          return
+        }
+        if (event.type === 'notice') {
+          if (event.level !== 'info' && !noticesSeen.has(event.message)) {
+            noticesSeen.add(event.message)
+            this.notify(peer, {
+              method: 'warning',
+              params: { threadId: thread.id, message: event.message },
+            })
+          }
+          return
+        }
+        if (event.type === 'completed') {
+          if (event.claudeSessionId)
+            this.store.updateClaudeSessionId(thread.id, event.claudeSessionId)
+          if (!event.success) failure = event.result ?? 'Claude did not compact the conversation'
+          return
+        }
+        if (event.type === 'error') failure = event.message
+        // What the command prints, and the usage of the summary it wrote,
+        // are not part of the conversation.
+      },
+      // The command runs no tools and asks nothing.
+      onPermissionRequest: async () => ({ decision: 'cancel' }),
+      onUserInputRequest: async (event) => ({
+        answers: Object.fromEntries(event.questions.map((q) => [q.id, { answers: [] }])),
+      }),
     })
-    return {}
+    if (!compacted)
+      debugLog('thread.compact.session_incomplete', {
+        threadId: thread.id,
+        turnId,
+        failure,
+      })
+    return compacted
   }
 
   // Calls into the runtime with a structured "give me a 1-paragraph summary"
-  // prompt against the summary model alias (haiku). Streams the text into the
-  // placeholder agent message via item/agentMessage/delta. Errors propagate
-  // so the threadCompactStart fallback can substitute the local snippet.
+  // prompt against the summary model alias (haiku), in a session of its own.
+  // Streams the text into the placeholder agent message via
+  // item/agentMessage/delta. Errors propagate so compactThread can
+  // substitute the local snippet.
   private async runCompactTurn(
     peer: RpcPeer,
     thread: ThreadRecord,
     turnId: string,
     agentItemId: string,
-    compactItem: ThreadItem,
+    active: () => boolean,
   ): Promise<void> {
     const turns = this.store.listTurns(thread.id)
     const promptBody = compactSummary(thread, turns)
@@ -2946,7 +3354,7 @@ export class CodexClaudeAppServer {
       },
       {
         onEvent: async (event) => {
-          if (event.type === 'text_delta' && event.delta) {
+          if (event.type === 'text_delta' && event.delta && active()) {
             collected += event.delta
             this.store.updateItem(turnId, agentItemId, (item) =>
               item.type === 'agentMessage' ? { ...item, text: item.text + event.delta } : item,
@@ -2973,10 +3381,7 @@ export class CodexClaudeAppServer {
 
     // If Claude produced nothing usable, surface the local fallback so the
     // caller's catch path runs and the user still gets a summary.
-    if (!collected.trim()) {
-      void compactItem
-      throw new Error('compaction returned no content')
-    }
+    if (!collected.trim()) throw new Error('compaction returned no content')
   }
 
   private async turnStart(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
@@ -3092,6 +3497,9 @@ export class CodexClaudeAppServer {
     // thread, filtered from listings), so the short-circuit was just forcing a
     // hardcoded "处理X" string instead of the real model output. Now every turn
     // — including the structured title turn on Claude Haiku — runs end-to-end.
+    // Work started on behalf of another turn names that turn's root; as in
+    // Codex, without one (or with a blank one) the turn is its own root.
+    const rootTurnId = stringOr(params.rootTurnId, '')
     const turn: TurnRecord = {
       id: turnId,
       threadId,
@@ -3102,6 +3510,7 @@ export class CodexClaudeAppServer {
       items: initialItems,
       diff: '',
       error: null,
+      rootTurnId: rootTurnId.trim() ? rootTurnId : null,
     }
     this.store.upsertTurn(turn)
     recordRunEvent('turn.started', {
@@ -3304,178 +3713,19 @@ export class CodexClaudeAppServer {
     return lines.join('\n')
   }
 
-  private async runRuntimeTurn(
-    peer: RpcPeer,
+  // What the runtime gets for a turn of the thread: the policy, instructions,
+  // model and session a user turn with these params runs with.
+  private runtimeTurnContext(
     thread: ThreadRecord,
-    turn: TurnRecord,
+    turnId: string,
     prompt: string,
     params: Record<string, unknown>,
-  ): Promise<void> {
-    const itemIds = new Map<string, string>()
-    let agentItemId: string | null = null
-    let reasoningItemId: string | null = null
-    let hasTextOutput = false
-    const noticesSeen = new Set<string>()
-    const commandOutputSeen = new Set<string>()
-    // Hook runs by Claude's hook id, and the settings file each hook event
-    // was traced to (read once per turn).
-    const hookRuns = new Map<string, { summary: Record<string, unknown>; startedAtMs: number }>()
-    const hookSources = new Map<string, ReturnType<typeof claudeHookSource>>()
-    // MultiAgent V2 uses subAgentActivity for display/liveness and the
-    // spawnAgent/wait tool calls for the structured timeline. A naturally
-    // completed child is not closed again: wait/completed must remain the last
-    // parent state so Codex App retains the terminal snapshot.
-    const subagentContexts = new Map<string, SubagentContext>()
-    const activeSubagents = new Set<string>()
-    // A Workflow launch can be pending before it has produced a journal
-    // agent (or after its last projected agent has completed). Keep the
-    // watchdog armed for that whole async operation, not only while a child
-    // tool_use is present.
-    let workflowInFlight = false
-    const workflowLaunchToolUseIds = new Set<string>()
-    // Track per-item start time so commandExecution / mcpToolCall items can
-    // report a real durationMs in turn/completed (otherwise the App's status
-    // bar shows "—" for every command).
-    const itemStartedAtMs = new Map<string, number>()
-    // Tool items still waiting for their tool_result. A turn that ends first
-    // (interrupt, error, watchdog) drops the late result, so these are closed
-    // as failed before the turn completes.
-    const openToolItems = new Set<string>()
-    // Mutable holder rather than `let collectedMetrics`: TS's control-flow
-    // analysis doesn't see writes from inside the onEvent callback, so a bare
-    // `let` would still be inferred as `null` outside the closure.
-    const collectedMetrics: {
-      apiDurationMs: number | null
-      numTurns: number | null
-      costUsd: number | null
-      set: boolean
-    } = {
-      apiDurationMs: null,
-      numTurns: null,
-      costUsd: null,
-      set: false,
-    }
-    const forkSession =
-      thread.forkedFromId != null &&
-      thread.claudeSessionId != null &&
-      this.store.listTurns(thread.id).length <= 1
-    // Plan mode: Claude SDK runs with permissionMode='plan' — it produces
-    // planning text but does not execute tools. We surface the planning
-    // output as Codex's native `plan` ThreadItem (instead of agentMessage)
-    // and stream deltas via item/plan/delta + turn/plan/updated so the
-    // App's Plan-mode UI lights up properly. Detection:
-    //   * turn/start.planMode === true (App's explicit request)
-    //   * thread.approvalPolicy / sandbox flags don't suppress it
-    // The current planMode flag for this turn was computed above as
-    // `params.planMode === true`; reproduce here so the helpers can check it.
-    const planMode = params.planMode === true
-    let planItemId: string | null = null
-    const ensurePlanItem = (): string => {
-      if (planItemId) return planItemId
-      planItemId = newId()
-      const item: ThreadItem = { type: 'plan', id: planItemId, text: '' }
-      this.store.appendItem(turn.id, item)
-      this.notify(peer, {
-        method: 'item/started',
-        params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: nowMillis() },
-      })
-      return planItemId
-    }
-    const ensureAgentItem = (): string => {
-      if (agentItemId) return agentItemId
-      agentItemId = newId()
-      const item: ThreadItem = {
-        type: 'agentMessage',
-        id: agentItemId,
-        text: '',
-        phase: null,
-        memoryCitation: null,
-      }
-      this.store.appendItem(turn.id, item)
-      this.notify(peer, {
-        method: 'item/started',
-        params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: nowMillis() },
-      })
-      return agentItemId
-    }
-    const ensureReasoningItem = (): string => {
-      if (reasoningItemId) return reasoningItemId
-      reasoningItemId = newId()
-      const item: ThreadItem = {
-        type: 'reasoning',
-        id: reasoningItemId,
-        summary: [],
-        content: [''],
-      }
-      this.store.appendItem(turn.id, item)
-      this.notify(peer, {
-        method: 'item/started',
-        params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: nowMillis() },
-      })
-      return reasoningItemId
-    }
-    const completeReasoningItem = (): void => {
-      if (!reasoningItemId) return
-      const item = this.store.getTurn(turn.id)?.items.find((item) => item.id === reasoningItemId)
-      if (item)
-        this.notify(peer, {
-          method: 'item/completed',
-          params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
-        })
-      reasoningItemId = null
-    }
-    const completeAgentItem = (phase: 'commentary' | 'final_answer'): void => {
-      if (!agentItemId) return
-      // Visualize lines get their marks here and not in the deltas: the App
-      // shows the completed text in place of what streamed.
-      // App rule: visualize-line
-      const updated = this.store.updateItem(turn.id, agentItemId, (item) =>
-        item.type === 'agentMessage'
-          ? { ...item, phase, text: markVisualizeLines(item.text) }
-          : item,
-      )
-      const item = updated?.items.find((item) => item.id === agentItemId)
-      if (item)
-        this.notify(peer, {
-          method: 'item/completed',
-          params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
-        })
-      agentItemId = null
-    }
-    const completeMessage = (phase: 'commentary' | 'final_answer' = 'commentary'): void => {
-      completeReasoningItem()
-      completeAgentItem(phase)
-    }
-    const completePlanItem = (): void => {
-      const item = this.store.getTurn(turn.id)?.items.find((item) => item.id === planItemId)
-      if (item)
-        this.notify(peer, {
-          method: 'item/completed',
-          params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
-        })
-      planItemId = null
-    }
-    const completeOpenToolItems = (message: string): void => {
-      for (const itemId of openToolItems) {
-        const started = itemStartedAtMs.get(itemId)
-        const durationMs = started == null ? null : Math.max(0, nowMillis() - started)
-        const updated = this.store.updateItem(turn.id, itemId, (item) => {
-          if (item.type === 'commandExecution') return { ...item, status: 'failed', durationMs }
-          if (item.type === 'fileChange') return { ...item, status: 'failed' }
-          if (item.type === 'mcpToolCall')
-            return { ...item, status: 'failed', error: { message }, durationMs }
-          return item
-        })
-        const item = updated?.items.find((candidate) => candidate.id === itemId)
-        if (item)
-          this.notify(peer, {
-            method: 'item/completed',
-            params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
-          })
-      }
-      openToolItems.clear()
-    }
-
+  ): {
+    context: RuntimeTurnContext
+    isCodexThread: boolean
+    resumeSessionAt: string | null
+    turnCwd: string
+  } {
     // Allow per-turn override of policy (Codex App may attach updated values
     // when the user toggles Full access mid-conversation), then fall back to
     // the thread-level setting captured at start/resume. turn/start ships a
@@ -3504,12 +3754,6 @@ export class CodexClaudeAppServer {
       thread.personality
     const turnPurpose = params.outputSchema == null ? 'normal' : 'summary'
     const continuation = params._continuation === true
-    // A turn Claude starts on its own inherits the last user turn's policy,
-    // model and instructions.
-    if (turnPurpose === 'normal' && !continuation && params._hiddenPrompt == null) {
-      const { _imageInputs: _images, _emitUserMessage: _emit, ...rest } = params
-      this.lastTurnParamsByThread.set(thread.id, rest)
-    }
     const desktopPresentation = turnPurpose === 'normal' && thread.runtimeBackend !== 'codex'
     const appSkills = this.appSkillsFor(desktopPresentation ? thread.id : null)
     // Codex reads AGENTS.md itself; Claude gets it, and the Claude Code files
@@ -3577,7 +3821,7 @@ export class CodexClaudeAppServer {
     // what actually reached the SDK in one grep.
     debugLog('turn.runtime.applied', {
       threadId: thread.id,
-      turnId: turn.id,
+      turnId,
       paramsModel: params.model ?? null,
       paramsEffort: params.effort ?? null,
       threadModel: thread.model,
@@ -3588,6 +3832,24 @@ export class CodexClaudeAppServer {
       resolvedModel,
       resolvedEffort,
     })
+    const forkSession =
+      thread.forkedFromId != null &&
+      thread.claudeSessionId != null &&
+      this.store.listTurns(thread.id).length <= 1
+    // Set after a rewind or fork: this turn resumes the session only up to a
+    // checkpoint. It stays pending until Claude starts the forked session.
+    const resumeSessionAt = isCodexThread ? null : this.store.claudeResumeAt(thread.id)
+    const turnCwd = stringOr(params.cwd, thread.cwd)
+    // A Claude thread's own turns also get the MCP servers, subagents,
+    // permission rules and hooks the Codex and Claude Code configs bring.
+    const inheritConfig = desktopPresentation && !isCodexThread
+    const mcp = readMcpConfig({ cwd: turnCwd, inherit: inheritConfig })
+    const permissionRules = inheritConfig ? inheritedPermissionRules(turnCwd) : null
+    // The tools the client registered when it started the thread.
+    const dynamicTools =
+      turnPurpose === 'normal' && !isCodexThread && !thread.ephemeral && dynamicToolsEnabled()
+        ? dynamicToolServers(this.store.getDynamicTools(thread.id))
+        : []
     // For codex-backed threads, force the per-turn runtimeType to 'codex-proxy'
     // so the SelectableRuntime dispatches to CodexProxyRuntime instead of
     // the default Claude SDK runtime. Also route the codex session id (stored
@@ -3595,6 +3857,331 @@ export class CodexClaudeAppServer {
     // CodexProxyRuntime consumes it as the resume id. In mock mode the
     // mock runtime handles everything regardless of model id — bypass the
     // codex-proxy override so unit tests stay deterministic.
+    const context: RuntimeTurnContext = {
+      threadId: thread.id,
+      turnId,
+      purpose: turnPurpose,
+      prompt: effectivePrompt,
+      cwd: turnCwd,
+      runtimeType: isCodexThread ? 'codex-proxy' : null,
+      model: resolvedModel,
+      effort: resolvedEffort,
+      claudeSessionId: isCodexThread ? thread.codexSessionId : thread.claudeSessionId,
+      forkSession,
+      resumeSessionAt,
+      // createdAt is in whole seconds: the history a fork copies from its
+      // parent is older than the second after it.
+      forkedAt:
+        !isCodexThread && thread.forkedFromId != null ? (thread.createdAt + 1) * 1000 : null,
+      mcpServers: mcp.sdkValue,
+      allowedTools: defaultAllowedTools(),
+      inheritedAllowedTools: permissionRules?.allow ?? null,
+      inheritedAskRules: permissionRules?.ask ?? null,
+      disallowedTools: [...mcp.toolRules.disallowedTools, ...(permissionRules?.deny ?? [])],
+      mcpEnabledTools: mcp.toolRules.enabledTools,
+      agents: inheritConfig ? inheritedAgents(turnCwd) : null,
+      claudeHooks: inheritConfig ? inheritedHooks(turnCwd) : null,
+      addDirs: stringListFromEnv('CLAUDE_CODEX_ADD_DIRS', []),
+      enableFileCheckpointing: process.env.CLAUDE_CODEX_ENABLE_FILE_CHECKPOINTING === '1',
+      outputFormat: claudeOutputFormat(params.outputSchema),
+      approvalPolicy,
+      sandboxMode,
+      systemPromptAddendum,
+      readableRoots: [
+        ...appSkills.appSkills.map((skill) => dirname(skill.path)),
+        ...(appSkills.visualizationDir ? [appSkills.visualizationDir] : []),
+      ],
+      planMode: params.planMode === true,
+      imageInputs: Array.isArray(params._imageInputs) ? (params._imageInputs as ImageInput[]) : [],
+      goalTools:
+        turnPurpose === 'normal' &&
+        !isCodexThread &&
+        !thread.ephemeral &&
+        process.env.CLAUDE_CODEX_GOAL_TOOLS !== '0'
+          ? this.goalToolsFor(thread.id)
+          : null,
+      dynamicTools: dynamicTools.length > 0 ? dynamicTools : null,
+      leaderTools:
+        turnPurpose === 'normal' && !isCodexThread && this.leaderThreads.allowed(thread)
+          ? this.leaderThreads.handlersFor(thread.id)
+          : null,
+      // Without the memories mapping the runtime leaves auto-memory to
+      // Claude Code's own settings.
+      ...(memoriesMappingEnabled()
+        ? { autoMemory: !isCodexThread && this.autoMemoryFor(thread) }
+        : {}),
+      ...(continuation ? { continuation: true } : {}),
+    }
+    return { context, isCodexThread, resumeSessionAt, turnCwd }
+  }
+
+  private async runRuntimeTurn(
+    peer: RpcPeer,
+    thread: ThreadRecord,
+    turn: TurnRecord,
+    prompt: string,
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    const itemIds = new Map<string, string>()
+    let agentItemId: string | null = null
+    let reasoningItemId: string | null = null
+    let hasTextOutput = false
+    const noticesSeen = new Set<string>()
+    const commandOutputSeen = new Set<string>()
+    // Hook runs by Claude's hook id, and the settings file each hook event
+    // was traced to (read once per turn).
+    const hookRuns = new Map<string, { summary: Record<string, unknown>; startedAtMs: number }>()
+    const hookSources = new Map<string, ReturnType<typeof claudeHookSource>>()
+    // MultiAgent V2 uses subAgentActivity for display/liveness and the
+    // spawnAgent/wait tool calls for the structured timeline. A naturally
+    // completed child is not closed again: wait/completed must remain the last
+    // parent state so Codex App retains the terminal snapshot.
+    const subagentContexts = new Map<string, SubagentContext>()
+    const activeSubagents = new Set<string>()
+    // A Workflow launch can be pending before it has produced a journal
+    // agent (or after its last projected agent has completed). Keep the
+    // watchdog armed for that whole async operation, not only while a child
+    // tool_use is present.
+    let workflowInFlight = false
+    const workflowLaunchToolUseIds = new Set<string>()
+    // Track per-item start time so commandExecution / mcpToolCall items can
+    // report a real durationMs in turn/completed (otherwise the App's status
+    // bar shows "—" for every command).
+    const itemStartedAtMs = new Map<string, number>()
+    // Tool items still waiting for their tool_result. A turn that ends first
+    // (interrupt, error, watchdog) drops the late result, so these are closed
+    // as failed before the turn completes.
+    const openToolItems = new Set<string>()
+    // What Claude's auto-memory recalled for the turn's prompts.
+    const recalledMemories: RecalledMemory[] = []
+    // The item/tool/call requests of dynamic tool items still open, by item.
+    const dynamicToolCalls = new Map<string, AbortController>()
+    // Mutable holder rather than `let collectedMetrics`: TS's control-flow
+    // analysis doesn't see writes from inside the onEvent callback, so a bare
+    // `let` would still be inferred as `null` outside the closure.
+    const collectedMetrics: {
+      apiDurationMs: number | null
+      numTurns: number | null
+      costUsd: number | null
+      set: boolean
+    } = {
+      apiDurationMs: null,
+      numTurns: null,
+      costUsd: null,
+      set: false,
+    }
+    // Plan mode: Claude SDK runs with permissionMode='plan' — it produces
+    // planning text but does not execute tools. We surface the planning
+    // output as Codex's native `plan` ThreadItem (instead of agentMessage)
+    // and stream deltas via item/plan/delta + turn/plan/updated so the
+    // App's Plan-mode UI lights up properly. Detection:
+    //   * turn/start.planMode === true (App's explicit request)
+    //   * thread.approvalPolicy / sandbox flags don't suppress it
+    // The current planMode flag for this turn was computed above as
+    // `params.planMode === true`; reproduce here so the helpers can check it.
+    const planMode = params.planMode === true
+    let planItemId: string | null = null
+    const ensurePlanItem = (): string => {
+      if (planItemId) return planItemId
+      planItemId = newId()
+      const item: ThreadItem = { type: 'plan', id: planItemId, text: '' }
+      this.store.appendItem(turn.id, item)
+      this.notify(peer, {
+        method: 'item/started',
+        params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: nowMillis() },
+      })
+      return planItemId
+    }
+    const ensureAgentItem = (): string => {
+      if (agentItemId) return agentItemId
+      agentItemId = newId()
+      const item: ThreadItem = {
+        type: 'agentMessage',
+        id: agentItemId,
+        text: '',
+        phase: null,
+        memoryCitation: null,
+      }
+      this.store.appendItem(turn.id, item)
+      this.notify(peer, {
+        method: 'item/started',
+        params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: nowMillis() },
+      })
+      return agentItemId
+    }
+    const ensureReasoningItem = (): string => {
+      if (reasoningItemId) return reasoningItemId
+      reasoningItemId = newId()
+      const item: ThreadItem = {
+        type: 'reasoning',
+        id: reasoningItemId,
+        summary: [],
+        content: [''],
+      }
+      this.store.appendItem(turn.id, item)
+      this.notify(peer, {
+        method: 'item/started',
+        params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: nowMillis() },
+      })
+      return reasoningItemId
+    }
+    const completeReasoningItem = (): void => {
+      if (!reasoningItemId) return
+      const item = this.store.getTurn(turn.id)?.items.find((item) => item.id === reasoningItemId)
+      if (item)
+        this.notify(peer, {
+          method: 'item/completed',
+          params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
+        })
+      reasoningItemId = null
+    }
+    const completeAgentItem = (phase: 'commentary' | 'final_answer'): void => {
+      if (!agentItemId) return
+      // The answer cites the memories Claude recalled during the turn.
+      const citation = phase === 'final_answer' ? memoryCitation(recalledMemories) : null
+      // Visualize lines get their marks here and not in the deltas: the App
+      // shows the completed text in place of what streamed.
+      // App rule: visualize-line
+      const updated = this.store.updateItem(turn.id, agentItemId, (item) =>
+        item.type === 'agentMessage'
+          ? {
+              ...item,
+              phase,
+              text: markVisualizeLines(item.text),
+              ...(citation ? { memoryCitation: citation } : {}),
+            }
+          : item,
+      )
+      const item = updated?.items.find((item) => item.id === agentItemId)
+      if (item)
+        this.notify(peer, {
+          method: 'item/completed',
+          params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
+        })
+      agentItemId = null
+    }
+    const completeMessage = (phase: 'commentary' | 'final_answer' = 'commentary'): void => {
+      completeReasoningItem()
+      completeAgentItem(phase)
+    }
+    const completePlanItem = (): void => {
+      const item = this.store.getTurn(turn.id)?.items.find((item) => item.id === planItemId)
+      if (item)
+        this.notify(peer, {
+          method: 'item/completed',
+          params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
+        })
+      planItemId = null
+    }
+    const failToolItem = (itemId: string, message: string): void => {
+      openToolItems.delete(itemId)
+      const started = itemStartedAtMs.get(itemId)
+      const durationMs = started == null ? null : Math.max(0, nowMillis() - started)
+      const updated = this.store.updateItem(turn.id, itemId, (item) => {
+        if (item.type === 'commandExecution') return { ...item, status: 'failed', durationMs }
+        if (item.type === 'fileChange') return { ...item, status: 'failed' }
+        if (item.type === 'mcpToolCall')
+          return { ...item, status: 'failed', error: { message }, durationMs }
+        // Codex's shape for a call cancelled before the client answered.
+        if (item.type === 'dynamicToolCall')
+          return { ...item, status: 'failed', contentItems: [], success: false, durationMs }
+        return item
+      })
+      const item = updated?.items.find((candidate) => candidate.id === itemId)
+      if (item)
+        this.notify(peer, {
+          method: 'item/completed',
+          params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
+        })
+      dynamicToolCalls.get(itemId)?.abort()
+    }
+    const completeOpenToolItems = (message: string): void => {
+      for (const itemId of openToolItems) failToolItem(itemId, message)
+      openToolItems.clear()
+    }
+    // Claude compacting the conversation within the turn, on its own when
+    // the context fills up, shows as Codex's contextCompaction item. Like
+    // Codex's, a compaction an interrupt or a failed turn cuts short stays
+    // open, which the App shows as interrupted.
+    let compactionItemId: string | null = null
+    const startCompactionItem = (): void => {
+      if (compactionItemId) return
+      compactionItemId = newId()
+      const item: ThreadItem = { type: 'contextCompaction', id: compactionItemId }
+      this.store.appendItem(turn.id, item)
+      this.notify(peer, {
+        method: 'item/started',
+        params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: nowMillis() },
+      })
+    }
+    const completeCompactionItem = (): void => {
+      if (!compactionItemId) return
+      const item: ThreadItem = { type: 'contextCompaction', id: compactionItemId }
+      compactionItemId = null
+      this.notify(peer, {
+        method: 'item/completed',
+        params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
+      })
+    }
+    // File tool calls drawn from Claude's streamed input whose finished call
+    // has not arrived yet. Codex streams its own apply_patch input the same
+    // way: the card opens with the first part of the change and grows through
+    // item/fileChange/patchUpdated while the model writes the rest.
+    const previewToolUseIds = new Set<string>()
+    const patchFileChange = (
+      toolUseId: string,
+      toolName: string,
+      input: Record<string, unknown>,
+    ): void => {
+      const itemId = itemIds.get(toolUseId)
+      if (!itemId) return
+      const changes = fileChangeFromTool(toolName, input)
+      this.store.updateItem(turn.id, itemId, (item) =>
+        item.type === 'fileChange' ? { ...item, changes } : item,
+      )
+      this.notify(peer, {
+        method: 'item/fileChange/patchUpdated',
+        params: { threadId: thread.id, turnId: turn.id, itemId, changes },
+      })
+    }
+    // The finished call replaces what streamed, so the card, the approval and
+    // the completed item show exactly the change Claude makes.
+    const finishPreview = (
+      toolUseId: string,
+      toolName: string,
+      input: Record<string, unknown>,
+    ): boolean => {
+      if (!previewToolUseIds.delete(toolUseId)) return false
+      patchFileChange(toolUseId, toolName, input)
+      return true
+    }
+    // A model response that ended without finishing a call (its stream broke
+    // and Claude asked again) leaves a card no result will close.
+    const abandonPreviews = (): void => {
+      for (const toolUseId of previewToolUseIds) {
+        const itemId = itemIds.get(toolUseId)
+        if (itemId && openToolItems.has(itemId))
+          failToolItem(itemId, 'Claude did not finish this call.')
+      }
+      previewToolUseIds.clear()
+    }
+
+    // A turn Claude starts on its own inherits the last user turn's policy,
+    // model and instructions.
+    if (
+      params.outputSchema == null &&
+      params._continuation !== true &&
+      params._hiddenPrompt == null
+    ) {
+      const { _imageInputs: _images, _emitUserMessage: _emit, ...rest } = params
+      this.lastTurnParamsByThread.set(thread.id, rest)
+    }
+    const { context, isCodexThread, resumeSessionAt, turnCwd } = this.runtimeTurnContext(
+      thread,
+      turn.id,
+      prompt,
+      params,
+    )
     this.subagentStateByTurn.set(turn.id, {
       thread,
       turn,
@@ -3643,64 +4230,10 @@ export class CodexClaudeAppServer {
       acceptRuntimeEvents &&
       this.store.getTurn(turn.id)?.status === 'inProgress' &&
       this.activeTurnByThread.get(thread.id) === turn.id
-    // Set after a rewind or fork: this turn resumes the session only up to a
-    // checkpoint. It stays pending until Claude starts the forked session.
-    const resumeSessionAt = isCodexThread ? null : this.store.claudeResumeAt(thread.id)
     let resumedAtCheckpoint = false
-    const turnCwd = stringOr(params.cwd, thread.cwd)
-    // A Claude thread's own turns also get the MCP servers, subagents,
-    // permission rules and hooks the Codex and Claude Code configs bring.
-    const inheritConfig = desktopPresentation && !isCodexThread
-    const mcp = readMcpConfig({ cwd: turnCwd, inherit: inheritConfig })
-    const permissionRules = inheritConfig ? inheritedPermissionRules(turnCwd) : null
     const runtimeTurn = this.runtime.runTurn(
-      {
-        threadId: thread.id,
-        turnId: turn.id,
-        purpose: turnPurpose,
-        prompt: effectivePrompt,
-        cwd: turnCwd,
-        runtimeType: isCodexThread ? 'codex-proxy' : null,
-        model: resolvedModel,
-        effort: resolvedEffort,
-        claudeSessionId: isCodexThread ? thread.codexSessionId : thread.claudeSessionId,
-        forkSession,
-        resumeSessionAt,
-        // createdAt is in whole seconds: the history a fork copies from its
-        // parent is older than the second after it.
-        forkedAt:
-          !isCodexThread && thread.forkedFromId != null ? (thread.createdAt + 1) * 1000 : null,
-        mcpServers: mcp.sdkValue,
-        allowedTools: defaultAllowedTools(),
-        inheritedAllowedTools: permissionRules?.allow ?? null,
-        inheritedAskRules: permissionRules?.ask ?? null,
-        disallowedTools: [...mcp.toolRules.disallowedTools, ...(permissionRules?.deny ?? [])],
-        mcpEnabledTools: mcp.toolRules.enabledTools,
-        agents: inheritConfig ? inheritedAgents(turnCwd) : null,
-        claudeHooks: inheritConfig ? inheritedHooks(turnCwd) : null,
-        addDirs: stringListFromEnv('CLAUDE_CODEX_ADD_DIRS', []),
-        enableFileCheckpointing: process.env.CLAUDE_CODEX_ENABLE_FILE_CHECKPOINTING === '1',
-        outputFormat: claudeOutputFormat(params.outputSchema),
-        approvalPolicy,
-        sandboxMode,
-        systemPromptAddendum,
-        readableRoots: [
-          ...appSkills.appSkills.map((skill) => dirname(skill.path)),
-          ...(appSkills.visualizationDir ? [appSkills.visualizationDir] : []),
-        ],
-        planMode: params.planMode === true,
-        imageInputs: Array.isArray(params._imageInputs)
-          ? (params._imageInputs as ImageInput[])
-          : [],
-        goalTools:
-          turnPurpose === 'normal' &&
-          !isCodexThread &&
-          !thread.ephemeral &&
-          process.env.CLAUDE_CODEX_GOAL_TOOLS !== '0'
-            ? this.goalToolsFor(thread.id)
-            : null,
-        ...(continuation ? { continuation: true } : {}),
-      },
+      context,
+      // What Claude streams, and the approvals and answers it waits on.
       {
         onEvent: async (event) => {
           // Interrupts, watchdog expiry, and a peer reconnect can leave a few
@@ -3729,7 +4262,8 @@ export class CodexClaudeAppServer {
             if (
               event.type === 'text_delta' ||
               event.type === 'reasoning_delta' ||
-              event.type === 'message_boundary'
+              event.type === 'message_boundary' ||
+              event.type === 'tool_input_progress'
             )
               return
             if (event.type === 'tool_use' && !isSubagentToolName(event.toolName)) return
@@ -3744,9 +4278,43 @@ export class CodexClaudeAppServer {
           }
           if (event.type === 'message_boundary') {
             completeMessage()
+            abandonPreviews()
             return
           }
-          if (event.type === 'tool_use' && !itemIds.has(event.toolUseId)) completeMessage()
+          if (
+            (event.type === 'tool_use' || event.type === 'tool_input_progress') &&
+            !itemIds.has(event.toolUseId)
+          )
+            completeMessage()
+          if (event.type === 'tool_input_progress') {
+            // App rule: file-change-preview
+            if (itemIds.has(event.toolUseId)) {
+              if (previewToolUseIds.has(event.toolUseId))
+                patchFileChange(event.toolUseId, event.toolName, event.input)
+              return
+            }
+            const item = this.toolUseToItem({ ...event, type: 'tool_use' }, thread.cwd)
+            if (item.type !== 'fileChange') return
+            previewToolUseIds.add(event.toolUseId)
+            itemIds.set(event.toolUseId, item.id)
+            itemStartedAtMs.set(item.id, nowMillis())
+            openToolItems.add(item.id)
+            this.store.appendItem(turn.id, item)
+            this.notify(peer, {
+              method: 'item/started',
+              params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: nowMillis() },
+            })
+            this.notify(peer, {
+              method: 'item/fileChange/patchUpdated',
+              params: {
+                threadId: thread.id,
+                turnId: turn.id,
+                itemId: item.id,
+                changes: item.changes,
+              },
+            })
+            return
+          }
           if (
             event.type === 'tool_use' &&
             ((event.toolName === 'SendMessage' &&
@@ -3773,8 +4341,17 @@ export class CodexClaudeAppServer {
             const promptText = String(event.input.prompt ?? event.input.description ?? '')
             const subType =
               typeof event.input.subagent_type === 'string' ? event.input.subagent_type : null
+            // A fork runs on its parent's model and effort; Claude ignores
+            // the Agent tool's model and effort inputs for it. Claude matches
+            // the agent type ignoring case.
+            const forkSubagent = subType?.trim().toLowerCase() === 'fork'
             const subagentModel =
-              typeof event.input.model === 'string' ? event.input.model : thread.model
+              !forkSubagent && typeof event.input.model === 'string'
+                ? event.input.model
+                : thread.model
+            const subagentEffort =
+              (forkSubagent ? null : subagentEffortFromInput(event.input.effort)) ??
+              thread.reasoningEffort
             const childThreadId = newThreadId()
             // The id's random tail: its head is a timestamp, shared by agents
             // spawned in the same millisecond.
@@ -3795,7 +4372,7 @@ export class CodexClaudeAppServer {
               archived: false,
               cwd: thread.cwd,
               model: subagentModel,
-              reasoningEffort: thread.reasoningEffort,
+              reasoningEffort: subagentEffort,
               modelProvider: thread.modelProvider,
               claudeSessionId: null,
               source: normalizeSessionSource(thread.source),
@@ -3840,6 +4417,8 @@ export class CodexClaudeAppServer {
               ],
               diff: '',
               error: null,
+              // A spawned agent works for the turn that spawned it, as in Codex.
+              rootTurnId: turn.rootTurnId ?? turn.id,
             }
             this.store.upsertTurn(childTurn)
             this.notify(peer, {
@@ -3874,10 +4453,10 @@ export class CodexClaudeAppServer {
             // already created so there's no real latency here).
             const spawnId = newId()
             // Codex v2 collabAgentToolCall.reasoningEffort is `ReasoningEffort | null`
-            // (strict enum: none|minimal|low|medium|high|xhigh). Same Oops trap as
+            // (strict enum: none|minimal|low|medium|high|xhigh|max). Same Oops trap as
             // threadSource — an empty string from a sloppy resume crashes the App.
             // Normalize here once and reuse for every stage of the lifecycle.
-            const collabEffort = normalizeReasoningEffortEnum(thread.reasoningEffort)
+            const collabEffort = normalizeReasoningEffortEnum(subagentEffort)
             const spawnBegin: ThreadItem = {
               type: 'collabAgentToolCall',
               id: spawnId,
@@ -4237,6 +4816,9 @@ export class CodexClaudeAppServer {
             // anything slips through we'd otherwise create a husk
             // commandExecution item that never closes (the second emit
             // overwrites itemIds[] so the husk never sees its tool_result).
+            // A file change already drawn from the streamed input keeps its
+            // card and takes the finished input.
+            if (finishPreview(event.toolUseId, event.toolName, event.input)) return
             if (itemIds.has(event.toolUseId)) return
             // Claude's TodoWrite is the equivalent of Codex's `update_plan`
             // todo/checklist tool, which the real app-server maps to a
@@ -4259,6 +4841,8 @@ export class CodexClaudeAppServer {
             itemIds.set(event.toolUseId, item.id)
             itemStartedAtMs.set(item.id, nowMillis())
             openToolItems.add(item.id)
+            if (item.type === 'commandExecution')
+              this.rememberCommandItem(event.toolUseId, thread.id, turn.id, item.id)
             this.store.appendItem(turn.id, item)
             this.notify(peer, {
               method: 'item/started',
@@ -4279,11 +4863,15 @@ export class CodexClaudeAppServer {
           }
           if (event.type === 'tool_output_delta') {
             const itemId = itemIds.get(event.toolUseId)
-            if (!itemId) return
+            // Output that comes after the result is not the item's any more.
+            if (!itemId || !openToolItems.has(itemId)) return
             commandOutputSeen.add(itemId)
             this.store.updateItem(turn.id, itemId, (item) => {
               if (item.type === 'commandExecution') {
-                return { ...item, aggregatedOutput: `${item.aggregatedOutput ?? ''}${event.delta}` }
+                return {
+                  ...item,
+                  aggregatedOutput: appendCommandOutput(item.aggregatedOutput, event.delta),
+                }
               }
               return item
             })
@@ -4312,7 +4900,12 @@ export class CodexClaudeAppServer {
                 return {
                   ...item,
                   status: event.isError ? 'failed' : 'completed',
-                  aggregatedOutput: item.aggregatedOutput ?? resultText,
+                  // The result has all of the output, where what streamed in
+                  // may have skipped some.
+                  aggregatedOutput:
+                    commandOutputSeen.has(itemId) && resultText
+                      ? resultText
+                      : (item.aggregatedOutput ?? resultText),
                   exitCode: parsedExitCode,
                   durationMs,
                 }
@@ -4358,6 +4951,28 @@ export class CodexClaudeAppServer {
                 params: { threadId: thread.id, turnId: turn.id, diff },
               })
             }
+            return
+          }
+          if (event.type === 'compaction_started') {
+            // What Claude said so far stays above the compaction.
+            completeMessage()
+            startCompactionItem()
+            return
+          }
+          if (event.type === 'compaction_completed') {
+            // A boundary can arrive without the status before it.
+            completeMessage()
+            startCompactionItem()
+            completeCompactionItem()
+            this.notify(peer, {
+              method: 'thread/compacted',
+              params: { threadId: thread.id, turnId: turn.id },
+            })
+            this.recordCompactedContext(peer, thread.id, turn.id, event.postTokens, true)
+            return
+          }
+          if (event.type === 'memory_recall') {
+            recalledMemories.push(...event.memories)
             return
           }
           if (event.type === 'notice') {
@@ -4489,6 +5104,9 @@ export class CodexClaudeAppServer {
         onPermissionRequest: async (event) => {
           if (!turnIsActive()) return { decision: 'cancel' }
           completeMessage()
+          // The request can overtake the finished call; the approval must
+          // show the whole change, not the part that streamed.
+          finishPreview(event.toolUseId, event.toolName, event.input)
           let itemId = itemIds.get(event.toolUseId)
           if (!itemId) {
             const item = this.toolUseToItem(
@@ -4595,6 +5213,65 @@ export class CodexClaudeAppServer {
           completeMessage()
           return this.requestElicitation(peer, thread.id, turn.id, request, signal)
         },
+        // Claude called one of the client's dynamic tools: a dynamicToolCall
+        // item around the item/tool/call request, as Codex records it.
+        onDynamicToolCall: async (request, signal) => {
+          if (!turnIsActive()) return dynamicToolFailure(DYNAMIC_TOOL_CANCELLED)
+          completeMessage()
+          const item: ThreadItem = {
+            type: 'dynamicToolCall',
+            id: request.callId,
+            namespace: request.namespace,
+            tool: request.tool,
+            arguments: request.arguments,
+            status: 'inProgress',
+            contentItems: null,
+            success: null,
+            durationMs: null,
+          }
+          const startedAt = nowMillis()
+          itemStartedAtMs.set(item.id, startedAt)
+          openToolItems.add(item.id)
+          this.store.appendItem(turn.id, item)
+          this.notify(peer, {
+            method: 'item/started',
+            params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: startedAt },
+          })
+          const abort = new AbortController()
+          dynamicToolCalls.set(item.id, abort)
+          const response = await this.requestDynamicTool(
+            peer,
+            thread.id,
+            turn.id,
+            request,
+            AbortSignal.any([signal, abort.signal]),
+          )
+          dynamicToolCalls.delete(item.id)
+          // An interrupt or the end of the turn closed the item already.
+          if (!openToolItems.delete(item.id))
+            return response ?? dynamicToolFailure(DYNAMIC_TOOL_CANCELLED)
+          const durationMs = Math.max(0, nowMillis() - startedAt)
+          const completedItem: ThreadItem = response
+            ? {
+                ...item,
+                status: response.success ? 'completed' : 'failed',
+                contentItems: response.contentItems,
+                success: response.success,
+                durationMs,
+              }
+            : { ...item, status: 'failed', contentItems: [], success: false, durationMs }
+          this.store.updateItem(turn.id, item.id, () => completedItem)
+          this.notify(peer, {
+            method: 'item/completed',
+            params: {
+              threadId: thread.id,
+              turnId: turn.id,
+              item: completedItem,
+              completedAtMs: nowMillis(),
+            },
+          })
+          return response ?? dynamicToolFailure(DYNAMIC_TOOL_CANCELLED)
+        },
       },
     )
     const runtimeOutcome = runtimeTurn.then(
@@ -4666,6 +5343,9 @@ export class CodexClaudeAppServer {
     }
     if (this.store.getTurn(turn.id)?.status === 'inProgress') {
       completeOpenToolItems('Claude finished the turn without a result for this tool.')
+      // A compaction that failed never reached its boundary; the turn
+      // went on without it and completes.
+      completeCompactionItem()
       this.finalizeOrphanedSubagents(peer, thread, turn, subagentContexts, activeSubagents)
     }
     this.subagentStateByTurn.delete(turn.id)
@@ -4697,6 +5377,7 @@ export class CodexClaudeAppServer {
     this.quietTurnIfWorkRuns(peer, thread, turn.id, params, agentItemId)
     completeMessage('final_answer')
     completePlanItem()
+    this.exitReviewMode(peer, thread.id, turn.id)
     const completed: TurnRecord = this.store.completeTurn(turn.id, 'completed') ?? turn
     recordRunEvent('turn.completed', {
       threadId: thread.id,
@@ -5183,7 +5864,47 @@ export class CodexClaudeAppServer {
     }
   }
 
+  private rememberCommandItem(
+    toolUseId: string,
+    threadId: string,
+    turnId: string,
+    itemId: string,
+  ): void {
+    this.commandItems.set(toolUseId, { threadId, turnId, itemId })
+    if (this.commandItems.size > MAX_TRACKED_COMMAND_ITEMS) {
+      const oldest = this.commandItems.keys().next().value
+      if (oldest !== undefined) this.commandItems.delete(oldest)
+    }
+  }
+
+  // A background shell goes on printing after its Bash call returned and the
+  // call's item completed, maybe after its turn ended. The App appends the
+  // output to that item wherever it is.
+  // App rule: command-output-after-completion
+  private appendBackgroundOutput(
+    threadId: string,
+    event: Extract<RuntimeTaskEvent, { type: 'task_output' }>,
+  ): void {
+    const at = this.commandItems.get(event.toolUseId)
+    if (!at || at.threadId !== threadId || !event.delta) return
+    let found = false
+    this.store.updateItem(at.turnId, at.itemId, (item) => {
+      if (item.type !== 'commandExecution') return item
+      found = true
+      return { ...item, aggregatedOutput: appendCommandOutput(item.aggregatedOutput, event.delta) }
+    })
+    if (!found) return
+    this.notify(this.peerForThread(threadId), {
+      method: 'item/commandExecution/outputDelta',
+      params: { threadId, turnId: at.turnId, itemId: at.itemId, delta: event.delta },
+    })
+  }
+
   private handleTaskEvent(threadId: string, event: RuntimeTaskEvent): void {
+    if (event.type === 'task_output') {
+      this.appendBackgroundOutput(threadId, event)
+      return
+    }
     if (event.type === 'task_started') {
       if (!event.toolUseId) return
       const entry = this.findBackgroundSubagent(threadId, { toolUseId: event.toolUseId })
@@ -5443,14 +6164,17 @@ export class CodexClaudeAppServer {
       this.settleBackgroundSubagent(entry, 'interrupted', 'Stopped by the parent agent.', null)
       return
     }
-    this.resumeBackgroundChild(entry, pending.message, event.toolUseId)
+    this.resumeBackgroundChild(entry, pending.message, event.toolUseId, turn.rootTurnId ?? turn.id)
     this.emitSubagentActivity(peer, thread.id, turn.id, entry.context, 'interacted')
   }
 
+  // rootTurnId: the root of the parent turn that sent the message, which a
+  // turn it starts in the child works for, as in Codex.
   private resumeBackgroundChild(
     entry: BackgroundSubagent,
     message: string,
     sendToolUseId: string,
+    rootTurnId: string,
   ): void {
     const { context } = entry
     const peer = this.peerForThread(context.childThreadId)
@@ -5475,6 +6199,7 @@ export class CodexClaudeAppServer {
         items: [userItem],
         diff: '',
         error: null,
+        rootTurnId,
       }
       this.store.upsertTurn(turn)
       this.setThreadStatus(peer, context.childThreadId, { type: 'active', activeFlags: [] })
@@ -5804,6 +6529,44 @@ export class CodexClaudeAppServer {
       : { action }
   }
 
+  // A dynamic tool call as Codex's item/tool/call: the client runs the tool
+  // while the turn is in progress. Null when `signal` cancelled the call; a
+  // client error becomes a failed call, as in Codex.
+  // App rule: dynamic-tools
+  private async requestDynamicTool(
+    peer: RpcPeer,
+    threadId: string,
+    turnId: string,
+    request: DynamicToolCallRequest,
+    signal: AbortSignal,
+  ): Promise<DynamicToolCallResponse | null> {
+    const requestId = newId()
+    const params = {
+      threadId,
+      turnId,
+      callId: request.callId,
+      namespace: request.namespace,
+      tool: request.tool,
+      arguments: request.arguments,
+    }
+    try {
+      return dynamicToolResponse(
+        await this.sendServerRequest(peer, 'item/tool/call', requestId, params, signal),
+      )
+    } catch (error) {
+      if (signal.aborted) return null
+      debugLog('dynamicTools.callFailed', {
+        threadId,
+        turnId,
+        callId: request.callId,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      return dynamicToolFailure(DYNAMIC_TOOL_REQUEST_FAILED)
+    } finally {
+      this.notify(peer, { method: 'serverRequest/resolved', params: { threadId, requestId } })
+    }
+  }
+
   private async turnInterrupt(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
     const threadId = stringOr(params.threadId, '')
     const requestedTurnId = stringOr(params.turnId, '')
@@ -5838,6 +6601,7 @@ export class CodexClaudeAppServer {
           )
           this.subagentStateByTurn.delete(turnId)
         }
+        this.exitReviewMode(peer, threadId, turnId)
         const completed =
           this.store.completeTurn(turnId, 'interrupted', { message: 'interrupted' }) ?? turn
         this.notify(peer, {
@@ -5869,13 +6633,25 @@ export class CodexClaudeAppServer {
     if (!activeTurnId) throw new Error('no active turn to steer')
     if (expectedTurnId && expectedTurnId !== activeTurnId)
       throw new Error(`expected active turn id \`${expectedTurnId}\` but found \`${activeTurnId}\``)
-    const turn = this.store.getTurn(activeTurnId)
-    if (
-      turn?.items.some(
-        (item) => item.type === 'enteredReviewMode' || item.type === 'contextCompaction',
+    // Like Codex, a review or a compaction the user started takes no input
+    // until it ends; a turn Claude compacted on its own still does. The
+    // refusal is Codex's invalid-request error with the turn kind in
+    // `data`, which App builds that queue a message sent during a compaction
+    // match on.
+    const turnKind = this.unsteerableTurns.get(activeTurnId)
+    if (turnKind) {
+      const message = `cannot steer a ${turnKind} turn`
+      throw new RpcError(
+        message,
+        {
+          message,
+          codexErrorInfo: { activeTurnNotSteerable: { turnKind } },
+          additionalDetails: null,
+          misalignment: null,
+        },
+        INVALID_REQUEST,
       )
-    )
-      throw new Error('cannot steer a review or compaction turn')
+    }
     const input = turnInput(params)
     const { textPrompt, images } = extractImageInputs(input)
     // App rule: quiet-turn-heartbeat
@@ -5973,6 +6749,12 @@ export class CodexClaudeAppServer {
         service_tier: this.configOverrides.service_tier ?? null,
         analytics: this.configOverrides.analytics ?? null,
         apps: this.configOverrides.apps ?? null,
+        // The App reads its memories switches from the table; the adapter
+        // keeps the key paths it writes flat. Only the memories mapping
+        // gathers them.
+        ...(memoriesMappingEnabled()
+          ? { memories: memoriesConfigTable(this.configOverrides) }
+          : {}),
         model_providers: this.exposedModelProviders(),
         provider_loop_config: projectProviderLoopConfig(
           undefined,
@@ -6020,6 +6802,55 @@ export class CodexClaudeAppServer {
         ([key]) => !isProviderLoopSelectionConfigKey(key),
       ),
     )
+  }
+
+  // App rule: memories-settings
+  private memoriesOn(): boolean {
+    return memoriesEnabled(this.configOverrides, this.memoriesEnablement)
+  }
+
+  private experimentalFeatureList(params: Record<string, unknown>): unknown {
+    // Without the memories mapping no feature has anything to switch, so
+    // none is listed and the App hides its memories settings.
+    if (!memoriesMappingEnabled()) return { data: [], nextCursor: null }
+    // Codex reads the flags of a thread's own config; every thread here has
+    // the global ones.
+    const threadId = stringOr(params.threadId, '')
+    if (threadId && !this.store.getThread(threadId))
+      throw new Error(`thread not found: ${threadId}`)
+    return experimentalFeatureList(this.memoriesOn(), params)
+  }
+
+  // The App sets its defaults for the connection with this, memories among
+  // them. The other features have nothing to switch on Claude threads.
+  private experimentalFeatureEnablementSet(params: Record<string, unknown>): unknown {
+    const enablement = asRecord(params.enablement)
+    const memories = enablement[MEMORIES_FEATURE]
+    if (typeof memories === 'boolean') this.memoriesEnablement = memories
+    return { enablement }
+  }
+
+  // Without the memories mapping /memories has nothing to switch, and the
+  // call is acknowledged without effect.
+  private threadMemoryModeSet(params: Record<string, unknown>): unknown {
+    if (!memoriesMappingEnabled()) return {}
+    const threadId = stringOr(params.threadId, '')
+    const mode = parseMemoryMode(params.mode)
+    if (!mode) throw new Error(`invalid memory mode: ${String(params.mode)}`)
+    if (!this.store.getThread(threadId)) throw new Error(`unknown thread: ${threadId}`)
+    this.store.setThreadMemoryMode(threadId, mode)
+    debugLog('thread.memoryMode', { threadId, mode })
+    return {}
+  }
+
+  // Whether the thread's sessions run with Claude Code's auto-memory: the
+  // feature is on and so is the thread's mode, which threads saved before
+  // modes existed take from the config. The mode is read from the store
+  // because it can change while a turn holds an older record.
+  private autoMemoryFor(thread: ThreadRecord): boolean {
+    if (thread.ephemeral || !this.memoriesOn()) return false
+    const mode = this.store.getThread(thread.id)?.memoryMode ?? thread.memoryMode
+    return (mode ?? newThreadMemoryMode({}, this.configOverrides)) === 'enabled'
   }
 
   // Build the model_providers map served by config/read. Always exposes
@@ -6080,22 +6911,34 @@ export class CodexClaudeAppServer {
 
   private modelList(): unknown {
     const defaultModel = this.configModel
-    const claudeOptions = claudeModelOptions()
+    // Each Claude model offers the efforts Claude Code reported for it: 'max'
+    // where the model takes it, none on a model without effort. Ids and names
+    // stay the adapter's own; only the placeholder description gives way to
+    // Claude Code's.
+    // App rule: model-efforts
+    const claudeOptions = claudeModelOptions().map((option) => {
+      const reported = reportedClaudeModel(option.sdkModel)
+      return {
+        ...option,
+        description:
+          option.description === GENERIC_MODEL_DESCRIPTION && reported?.description
+            ? reported.description
+            : option.description,
+        efforts: reported?.efforts ?? DEFAULT_EFFORTS,
+      }
+    })
     // When a real Codex CLI binary is available on the host (CODEX_REAL env
     // or auto-discovered), expose its native models alongside Claude's so
     // the Codex App's per-thread model picker can route between backends
     // without any reconnect or shell flip. Picking gpt-* flips the thread
     // to runtimeBackend='codex' which the runtime router dispatches to
     // CodexProxyRuntime (shells out to `codex exec --json`).
-    const codexOptions = codexProxyModelOptions()
+    const codexOptions = codexProxyModelOptions().map((option) => ({
+      ...option,
+      efforts: DEFAULT_EFFORTS,
+    }))
     const options = [...claudeOptions, ...codexOptions]
     const hasConfiguredDefault = options.some((option) => option.id === defaultModel)
-    const reasoningEfforts = [
-      { reasoningEffort: 'low', description: 'Fast runtime response' },
-      { reasoningEffort: 'medium', description: 'Balanced runtime response' },
-      { reasoningEffort: 'high', description: 'Deeper runtime response' },
-      { reasoningEffort: 'xhigh', description: 'Maximum reasoning' },
-    ]
     return {
       data: options.map((option) => ({
         id: option.id,
@@ -6106,8 +6949,8 @@ export class CodexClaudeAppServer {
         displayName: option.displayName,
         description: option.description,
         hidden: false,
-        supportedReasoningEfforts: reasoningEfforts,
-        defaultReasoningEffort: this.configReasoningEffort,
+        supportedReasoningEfforts: reasoningEffortOptions(option.efforts),
+        defaultReasoningEffort: defaultReasoningEffort(option.efforts, this.configReasoningEffort),
         inputModalities: ['text', 'image'],
         supportsPersonality: false,
         additionalSpeedTiers: [],
@@ -6191,6 +7034,37 @@ export class CodexClaudeAppServer {
     // notification was empty noise. The initial snapshot still fires once
     // post-handshake in `initialize` so the UI populates on first connect.
     // App rule: rate-limit-banner
+  }
+
+  // Claude compacted the thread's context down to a summary of `postTokens`
+  // tokens: like Codex's after a compaction, the context meter drops to it.
+  // Within a turn the next call's usage measures the context again; after a
+  // compaction turn, which makes no further call, the meter keeps it.
+  private recordCompactedContext(
+    peer: RpcPeer,
+    threadId: string,
+    turnId: string,
+    postTokens: number | null,
+    midTurn: boolean,
+  ): void {
+    if (postTokens == null || postTokens <= 0) return
+    const last: TokenUsageBreakdown = {
+      ...emptyTokenBreakdown(),
+      totalTokens: postTokens,
+      inputTokens: postTokens,
+    }
+    if (midTurn) this.lastCallUsageByThread.set(threadId, last)
+    else this.lastCallUsageByThread.delete(threadId)
+    this.lastUsageByThread.set(threadId, last)
+    const tokenUsage: ThreadTokenUsage = {
+      total: this.tokenUsageByThread.get(threadId) ?? emptyTokenBreakdown(),
+      last,
+      modelContextWindow: this.contextWindowByThread.get(threadId) ?? null,
+    }
+    this.notify(peer, {
+      method: 'thread/tokenUsage/updated',
+      params: { threadId, turnId, tokenUsage },
+    })
   }
 
   private async fsReadFile(params: Record<string, unknown>): Promise<unknown> {
@@ -6733,19 +7607,40 @@ export class CodexClaudeAppServer {
   private pluginInstall(params: Record<string, unknown>): unknown {
     const plugin = claudeRunnableAppPlugin(params.marketplacePath, params.pluginName)
     const known = this.appPlugins.find((candidate) => candidate.name === plugin?.name)
+    let changed = false
     if (plugin && known?.root !== plugin.root) {
       this.appPlugins = [...this.appPlugins.filter((candidate) => candidate !== known), plugin]
-      this.persistConfig()
+      changed = true
     }
+    // App rule: code-review-plugin-server
+    const installed = appMarketplacePlugin(params.marketplacePath, params.pluginName)
+    if (installed?.marketplace) {
+      const id = `${installed.name}@${installed.marketplace}`
+      const was = this.installedAppPlugins.find((candidate) => candidate.id === id)
+      if (was?.root !== installed.root) {
+        this.installedAppPlugins = [
+          ...this.installedAppPlugins.filter((candidate) => candidate !== was),
+          { id, root: installed.root },
+        ]
+        changed = true
+      }
+    }
+    if (changed) this.persistConfig()
     return { authPolicy: 'ON_USE', appsNeedingAuth: [] }
   }
 
   private pluginUninstall(params: Record<string, unknown>): unknown {
     // Plugin ids read `<name>@<marketplace>`.
-    const name = stringOr(params.pluginId, '').split('@')[0]
+    const id = stringOr(params.pluginId, '')
+    const name = id.split('@')[0]
     const kept = this.appPlugins.filter((plugin) => plugin.name !== name)
-    if (kept.length !== this.appPlugins.length) {
+    const installed = this.installedAppPlugins.filter((plugin) => plugin.id !== id)
+    if (
+      kept.length !== this.appPlugins.length ||
+      installed.length !== this.installedAppPlugins.length
+    ) {
       this.appPlugins = kept
+      this.installedAppPlugins = installed
       this.persistConfig()
     }
     return {}
@@ -7086,10 +7981,13 @@ export class CodexClaudeAppServer {
 
   // Full turn payload for history reads (thread/read, turns/list) — carries the
   // loaded items. The Codex v2 `Turn` schema has no api/cost metadata fields, so
-  // the adapter's internal metrics are not serialized onto the wire.
+  // the adapter's internal metrics are not serialized onto the wire. Every
+  // payload carries rootTurnId (0.163), the turn itself unless it was started
+  // for another turn's work.
   private toTurn(turn: TurnRecord): unknown {
     return {
       id: turn.id,
+      rootTurnId: turn.rootTurnId ?? turn.id,
       items: turn.items,
       itemsView: 'full',
       status: turn.status,
@@ -7112,6 +8010,7 @@ export class CodexClaudeAppServer {
     if (lastAgent && lastAgent.id !== firstUser?.id) items.push(lastAgent)
     return {
       id: turn.id,
+      rootTurnId: turn.rootTurnId ?? turn.id,
       items,
       itemsView: 'summary',
       status: turn.status,
@@ -7128,6 +8027,7 @@ export class CodexClaudeAppServer {
   private toLifecycleTurn(turn: TurnRecord, items: ThreadItem[] = []): unknown {
     return {
       id: turn.id,
+      rootTurnId: turn.rootTurnId ?? turn.id,
       items,
       itemsView: 'notLoaded',
       status: turn.status,
@@ -7148,6 +8048,7 @@ export class CodexClaudeAppServer {
         : undefined
     return {
       id: turn.id,
+      rootTurnId: turn.rootTurnId ?? turn.id,
       items: lastAgent ? [lastAgent] : [],
       itemsView: lastAgent ? 'summary' : 'notLoaded',
       status: turn.status,
@@ -7222,6 +8123,7 @@ export class CodexClaudeAppServer {
     const target = peer ?? this.activePeerByThread.get(threadId)
     if (target)
       this.notify(target, { method: 'thread/status/changed', params: { threadId, status } })
+    this.leaderThreads.threadChanged()
   }
 
   // An aborted `signal` drops the request and rejects; the caller's
@@ -7281,6 +8183,8 @@ export class CodexClaudeAppServer {
     for (const [threadId, turnId] of this.activeTurnByThread.entries()) {
       const turn = this.store.getTurn(turnId)
       if (turn?.status === 'inProgress') {
+        // A review the stop cuts off still closes in the thread's history.
+        this.exitReviewMode(null, threadId, turnId)
         this.store.completeTurn(turnId, status, error)
       }
       this.store.updateThreadStatus(threadId, { type: 'idle' })
@@ -7315,7 +8219,10 @@ export class CodexClaudeAppServer {
   private clearActiveTurn(threadId: string): void {
     const turnId = this.activeTurnByThread.get(threadId)
     const existed = this.activeTurnByThread.delete(threadId)
-    if (turnId) this.closeStreamingItemsByTurn.delete(turnId)
+    if (turnId) {
+      this.closeStreamingItemsByTurn.delete(turnId)
+      this.unsteerableTurns.delete(turnId)
+    }
     let settled: TurnRecord | null = null
     try {
       settled = turnId ? this.store.getTurn(turnId) : null
@@ -7348,7 +8255,47 @@ export class CodexClaudeAppServer {
   private mcpScope(params: unknown): McpConfigScope {
     const threadId = stringOr(asRecord(params).threadId, '')
     const thread = threadId ? this.store.getThread(threadId) : null
-    return { cwd: thread && thread.runtimeBackend !== 'codex' ? thread.cwd : null }
+    return {
+      cwd: thread && thread.runtimeBackend !== 'codex' ? thread.cwd : null,
+      appPlugins: this.installedAppPlugins,
+    }
+  }
+
+  // Codex ends a review turn with an exitedReviewMode item holding the review,
+  // or a fallback text when the reviewer gave no answer (an interrupted or
+  // failed review). Before the turn completes, as there. Without a peer the
+  // item is only recorded: the adapter is stopping and tells no client. A
+  // store that refuses the item must not keep the turn from ending.
+  private exitReviewMode(peer: RpcPeer | null, threadId: string, turnId: string): void {
+    let item: ThreadItem
+    try {
+      const turn = this.store.getTurn(turnId)
+      if (turn?.status !== 'inProgress') return
+      if (!turn.items.some((item) => item.type === 'enteredReviewMode')) return
+      if (turn.items.some((item) => item.type === 'exitedReviewMode')) return
+      const answer = turn.items.findLast(
+        (item) => item.type === 'agentMessage' && item.phase === 'final_answer',
+      )
+      const text = answer?.type === 'agentMessage' ? answer.text.trim() : ''
+      item = { type: 'exitedReviewMode', id: newId(), review: text || REVIEW_FALLBACK }
+      this.store.appendItem(turnId, item)
+    } catch (error) {
+      debugLog('review.exit_failed', {
+        threadId,
+        turnId,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      return
+    }
+    if (!peer) return
+    this.notify(peer, {
+      method: 'item/started',
+      params: { threadId, turnId, item, startedAtMs: nowMillis() },
+    })
+    this.notify(peer, {
+      method: 'item/completed',
+      params: { threadId, turnId, item, completedAtMs: nowMillis() },
+    })
   }
 
   // Ends a turn whose runtime run failed. The client leaves its running state
@@ -7357,6 +8304,7 @@ export class CodexClaudeAppServer {
   // database past its busy timeout. Returns false for a turn that had already
   // ended, e.g. through turn/interrupt.
   private failTurn(peer: RpcPeer, threadId: string, turn: TurnRecord, error: Error): boolean {
+    this.exitReviewMode(peer, threadId, turn.id)
     const completed = this.endTurn(turn, 'failed', { message: error.message })
     if (!completed) {
       // Its end was recorded, but whatever ended it never let go of the
@@ -7501,6 +8449,14 @@ export class CodexClaudeAppServer {
             : []
         })
       }
+      if (Array.isArray(parsed.installedAppPlugins)) {
+        this.installedAppPlugins = parsed.installedAppPlugins.flatMap((entry) => {
+          const plugin = asRecord(entry)
+          return typeof plugin.id === 'string' && typeof plugin.root === 'string'
+            ? [{ id: plugin.id, root: plugin.root }]
+            : []
+        })
+      }
       if (shouldRepair) this.persistConfig()
     } catch {}
   }
@@ -7516,6 +8472,7 @@ export class CodexClaudeAppServer {
             model_reasoning_effort: this.configReasoningEffort,
             overrides: this.configOverrides,
             appPlugins: this.appPlugins,
+            installedAppPlugins: this.installedAppPlugins,
           },
           null,
           2,

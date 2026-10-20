@@ -154,7 +154,7 @@ export function modelFromParams(params: Record<string, unknown>, fallback: strin
 export function reasoningEffortFromParams(
   params: Record<string, unknown>,
   fallback: string | null,
-): 'low' | 'medium' | 'high' | 'xhigh' | null {
+): 'low' | 'medium' | 'high' | 'xhigh' | 'max' | null {
   const config = asRecord(params.config)
   const effort =
     typeof params.effort === 'string'
@@ -256,6 +256,9 @@ export function reviewLabel(target: unknown): string {
   if (type === 'custom') return stringOr(rec.instructions, 'custom review')
   return 'uncommitted changes'
 }
+
+// Codex's exitedReviewMode text when the reviewer gave no answer.
+export const REVIEW_FALLBACK = 'Reviewer failed to output a response.'
 
 export function reviewPrompt(target: unknown): string {
   const label = reviewLabel(target)
@@ -470,13 +473,14 @@ export function normalizePersonality(value: unknown): string | null {
   return null
 }
 
-// Codex v2 ReasoningEffort enum (top-level, used by collabAgentToolCall and
-// elsewhere). No serde(other) fallback — anything outside this set crashes
-// the App's deserializer (same trap as threadSource = ""). Pass any value
-// through here before emitting it on the wire.
+// Codex v2 ReasoningEffort as the App's schema knows it (top-level, used by
+// collabAgentToolCall and elsewhere). Anything outside this set, an empty
+// string included, crashes the App's deserializer (same trap as
+// threadSource = ""). Pass any value through here before emitting it on the
+// wire.
 export function normalizeReasoningEffortEnum(
   value: string | null | undefined,
-): 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | null {
+): 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | null {
   if (typeof value !== 'string') return null
   const v = value.trim()
   if (
@@ -485,10 +489,18 @@ export function normalizeReasoningEffortEnum(
     v === 'low' ||
     v === 'medium' ||
     v === 'high' ||
-    v === 'xhigh'
+    v === 'xhigh' ||
+    v === 'max'
   )
     return v
   return null
+}
+
+// The Agent tool's `effort` input on the Codex effort scale. Claude's `max`
+// sits above that scale, whose top is `xhigh`.
+export function subagentEffortFromInput(value: unknown): string | null {
+  if (value === 'max') return 'xhigh'
+  return typeof value === 'string' ? normalizeReasoningEffortEnum(value) : null
 }
 
 // Codex App's settings sheet writes the persistent reasoning-effort default

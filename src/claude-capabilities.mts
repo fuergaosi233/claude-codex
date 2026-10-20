@@ -103,6 +103,18 @@ export function claudeRunnableAppPlugin(
   pluginName: unknown,
 ): AppPlugin | null {
   if (typeof pluginName !== 'string' || !CLAUDE_RUNNABLE_APP_PLUGINS.has(pluginName)) return null
+  const plugin = appMarketplacePlugin(marketplacePath, pluginName)
+  return plugin ? { name: plugin.name, root: plugin.root } : null
+}
+
+// Any local plugin of a marketplace plugin/install names, with the
+// marketplace's own name, which makes up the plugin's id in the Codex config
+// (<plugin>@<marketplace>).
+export function appMarketplacePlugin(
+  marketplacePath: unknown,
+  pluginName: unknown,
+): (AppPlugin & { readonly marketplace: string | null }) | null {
+  if (typeof pluginName !== 'string' || !pluginName) return null
   if (typeof marketplacePath !== 'string' || !isAbsolute(marketplacePath)) return null
   try {
     const marketplace = asRecord(JSON.parse(readFileSync(marketplacePath, 'utf8')))
@@ -119,7 +131,9 @@ export function claudeRunnableAppPlugin(
       ? marketplacePath.slice(0, -MARKETPLACE_MANIFEST.length)
       : dirname(marketplacePath)
     const root = resolve(base, path)
-    return isPathInside(base, root) ? { name: pluginName, root } : null
+    if (!isPathInside(base, root)) return null
+    const name = typeof marketplace.name === 'string' && marketplace.name ? marketplace.name : null
+    return { name: pluginName, root, marketplace: name }
   } catch {
     return null
   }

@@ -17,7 +17,7 @@ export interface AppRule {
 }
 
 // App builds every rule below was checked against.
-export const VERIFIED_APP_VERSIONS: readonly string[] = ['26.930.21537']
+export const VERIFIED_APP_VERSIONS: readonly string[] = ['26.930.21537', '26.1013.40934']
 
 // initialize.clientInfo.name of the desktop App. Its other app-server clients
 // (the LaTeX preview, for one) use their own names and versions.
@@ -40,9 +40,18 @@ export const APP_RULES: readonly AppRule[] = [
       'check:app-upgrade lists the gate table and the minimum next to the version the adapter reports.',
   },
   {
+    id: 'prediction-provider',
+    app: 'From 26.1013, with experimentalPredictionForkMode on, predicts the next composer message in a thread/fork with experimentalPredictionMode, only for a thread whose modelProvider is openai.',
+    adapter:
+      'Reports modelProvider claude-code for every thread, so the App never forks a Claude thread for a prediction.',
+    verify:
+      'In the bundle, the prediction path still gives up with unsupported_provider before its thread/fork when modelProvider is not openai.',
+  },
+  {
     id: 'config-warnings',
     app: 'Lists configWarning notifications under Settings > Agent > Configuration, keeping the last 20 per host.',
-    adapter: 'Reports an App build missing from VERIFIED_APP_VERSIONS there.',
+    adapter:
+      "Reports an App build missing from VERIFIED_APP_VERSIONS there, and a fork from one of a chat's turns whose Claude context keeps the later turns because they predate checkpoints.",
     verify:
       'Connect an App build that is not listed and look for the warning in that settings page.',
   },
@@ -51,6 +60,21 @@ export const APP_RULES: readonly AppRule[] = [
     app: 'Filters the model picker through its OpenAI model allowlist unless account/read returns a Bedrock-shaped account.',
     adapter: 'Answers account/read with an amazonBedrock account.',
     verify: 'The model picker still lists the Claude models.',
+  },
+  {
+    id: 'model-efforts',
+    app: 'Offers each model the model/list efforts that are also enabled under Settings > Agent > Model features > Available reasoning efforts. Max is off there by default and listed once a model offers it. When a model does not list the current effort, its defaultReasoningEffort takes over; a model listing none gets "none".',
+    adapter:
+      "Lists each Claude model's efforts as Claude Code reports them (max where the model takes it, none on Haiku), and low to xhigh until Claude Code has reported.",
+    verify:
+      'After a Claude turn, Model features lists Max; with it on, Claude Opus offers Max and Claude Haiku offers no effort levels.',
+  },
+  {
+    id: 'bedrock-govcloud',
+    app: 'From 26.1013, checks a Bedrock account with account/bedrock/checkGovCloudRequirements at startup and shows an "AWS GovCloud guidance" modal until the user acknowledges it, unless the answer has isGovCloud false. An error leaves the check unverified, which shows the modal too.',
+    adapter: 'Answers isGovCloud false and shouldWarn false.',
+    verify:
+      'Start an App that never acknowledged the guidance: no "AWS GovCloud guidance" modal appears.',
   },
   {
     id: 'bedrock-auth-status',
@@ -70,8 +94,25 @@ export const APP_RULES: readonly AppRule[] = [
   {
     id: 'optimistic-user-message',
     app: 'Draws its own user message for every turn/start it sends.',
-    adapter: 'Publishes the userMessage item only for turns it starts from the server-side queue.',
+    adapter:
+      'Publishes the userMessage item only for turns it starts itself: from the server-side queue, or for the leader tools.',
     verify: 'A sent message shows once; a queued one shows when it starts.',
+  },
+  {
+    id: 'server-started-threads',
+    app: "Adds a thread it did not start to the sidebar as soon as thread/started announces it on its connection, and follows that thread's turns live from then on.",
+    adapter:
+      "Announces a chat the leader tools start with thread/started on the leader's connection before the chat's first turn starts.",
+    verify:
+      'With CLAUDE_CODEX_LEADER_TOOLS=1, ask Claude to start a chat with thread_start: it shows in the sidebar, and its first message and answer stream in when opened.',
+  },
+  {
+    id: 'created-thread-card',
+    app: 'Shows a card for a chat from a `::created-thread{threadId="…"}` line of its own in a reply, which its instructions for its own thread tools ask for after create_thread, and refreshes the card\'s status with thread/read (includeTurns false) and thread/turns/list (limit 1). It reads the line from a completed reply.',
+    adapter:
+      "Ends a successful thread_start result with that line for the new chat; the tool's description asks Claude to put the line in its final response.",
+    verify:
+      'With CLAUDE_CODEX_LEADER_TOOLS=1, ask Claude to start a chat: its reply shows a card for the new chat, and the card follows that chat while its first turn runs and ends.',
   },
   {
     id: 'tool-output-turns',
@@ -175,6 +216,14 @@ export const APP_RULES: readonly AppRule[] = [
       'Have a reply name a visualization as a plain visualize{…} line: it shows rendered once the message completes, and again after the chat is reopened.',
   },
   {
+    id: 'code-review-plugin-server',
+    app: "Starts a local app-server with -c plugins.code-review@openai-bundled.mcp_servers.code-review.enabled=true and CODEX_MCP_NODE_PATH set to its bundled Node, installs the code-review plugin with plugin/install, and drives its Pull Requests panel, PR search, PR view and code-review settings through mcpServer/tool/call (server code-review, pull_requests.* tools, _meta with the thread id), mcpServer/resource/read (ui://pull-requests/*) and mcpServerStatus/list, which counts the server as started when serverInfo is set and finds the panel entry points in the tools' _meta (ui.resourceUri, openai/ui entrypoints).",
+    adapter:
+      "With CLAUDE_CODEX_APP_PLUGIN_MCP=1, remembers the plugins plugin/install names, reads the -c settings and the Codex config's [plugins] tables, and runs the code-review plugin's .mcp.json server as one long-lived process in the plugin's folder, with Codex's default variables and the ones the entry lists, credentials left out. Lists it with pluginId, serverInfo, runtimeStatus and its tools as the server lists them, _meta included, and sets the thread id in a call's _meta as Codex does. Refuses to start an app-server from inside a plugin server.",
+    verify:
+      'With the switch on and gh signed in, open the Pull Requests panel: it lists pull requests and a PR opens; mcpServerStatus/list shows code-review connected.',
+  },
+  {
     id: 'quiet-turn-heartbeat',
     app: "On turn/completed reads the turn's last agentMessage, and when it ends with a <heartbeat> block deciding DONT_NOTIFY neither marks the thread unread nor sends a desktop notification. Shows a completed message without the block, and a streaming one raw.",
     adapter:
@@ -198,23 +247,80 @@ export const APP_RULES: readonly AppRule[] = [
     verify:
       'Open a new chat without sending anything, restart the adapter and reload the App: no empty chat shows in the sidebar.',
   },
+  {
+    id: 'file-change-preview',
+    app: 'Replaces the changes of the fileChange item with each item/fileChange/patchUpdated, adding an inProgress fileChange item when it has none of that id, and redraws its card while the item is still in progress. Its approval card shows the changes the item holds when the request comes.',
+    adapter:
+      "Opens the fileChange card of an Edit, Write or MultiEdit call once Claude's streamed input names the file, sends the change written so far at most every 500 ms as Codex does for apply_patch, and replaces it with the finished call's change before any approval. A card whose call never finished fails at the next model response. CLAUDE_CODEX_LIVE_FILE_CHANGES=0 turns it off.",
+    verify:
+      'Ask Claude to write a long new file: its card shows up while Claude is still writing and grows, and the approval and the completed card show the whole file.',
+  },
+  {
+    id: 'memories-settings',
+    app: 'Shows the Memories settings under Settings > Personalization, and the /memories command, only while experimentalFeature/list lists the memories feature enabled. Sets its defaults for the connection with experimentalFeature/enablement/set (memories off) when it connects. Its switches write features.memories, memories.generate_memories and memories.use_memories with config/batchWrite and read them back from the memories table of config/read. A chat started with its own switches carries them as memories.* config on thread/start; /memories in a chat sends thread/memoryMode/set. Delete calls memory/reset and shows an error toast when it fails.',
+    adapter:
+      "Only with CLAUDE_CODEX_MEMORIES=1: lists memories as a beta feature, on only when features.memories in the config, or else the connection's enablement, turns it on, serves the memories table in config/read, and keeps each thread's mode. It then runs Claude Code with auto-memory only for threads whose mode is enabled while the feature is on, switching it off with CLAUDE_CODE_DISABLE_AUTO_MEMORY otherwise. Without the switch it lists no features, acknowledges thread/memoryMode/set without effect and leaves auto-memory to Claude Code's own settings. Either way it refuses memory/reset, since Claude Code's memory folders are shared with Claude Code outside the App.",
+    verify:
+      'With CLAUDE_CODEX_MEMORIES=1, turn Memories on in Settings > Personalization: the switch stays on after a reload, and /memories shows in the composer of a chat. Without it, Settings > Personalization shows no Memories settings.',
+  },
+  {
+    id: 'dynamic-tools',
+    app: 'Registers its own tools (the codex_app namespace) as thread/start dynamicTools only on hosts that do not use its desktop MCP server, such as remote hosts, and runs an item/tool/call request only while the turn it names is in progress, answering with contentItems and success.',
+    adapter:
+      'With CLAUDE_CODEX_DYNAMIC_TOOLS=1, checks and stores the dynamicTools of thread/start, offers each namespace to Claude as an MCP server, and sends each call as item/tool/call with the running turn and a dynamicToolCall item around it. Local hosts get no tools, as the App sends none.',
+    verify:
+      'On a remote host with the switch on, start a chat and ask Claude to list the chat artifacts: a dynamic tool call card shows the App tool and its result.',
+  },
+  {
+    id: 'command-output-after-completion',
+    app: 'Appends item/commandExecution/outputDelta to the commandExecution item with that id in whichever turn of the thread holds it, completed or not, keeping the last 20000 characters behind an `[output truncated]` line, and drops a delta whose item it cannot find.',
+    adapter:
+      "Streams a background shell's output into the completed item of the Bash call that started it, also after its turn ended, and stores it cut the same way.",
+    verify:
+      'Ask Claude to start a background command that prints a line every second: after the turn ends, its command item keeps showing new lines.',
+  },
 ]
 
 // The methods the App starts calling, or sends new parameters to, once the
 // app-server version turns a feature gate on (the gate table is in its
 // bundle; see scripts/app-baseline.json). check:app-upgrade flags a gate the
-// adapter's version turns on while one of these has no case.
+// adapter's version turns on while one of these has no case. An empty list
+// is a gate checked to need no method: most of those only let a Codex feature
+// key through in the config the App sends, which Claude threads ignore.
 export const GATED_METHODS: Readonly<Record<string, readonly string[]>> = {
   appRead: ['app/read'],
+  asyncCompaction: [],
+  // For an attached audio file, looks the model up in model/list and adds
+  // localAudio input to turn/start or turn/steer only when the model takes
+  // audio, which no Claude model does.
+  audioInputs: ['model/list', 'turn/start', 'turn/steer'],
+  // An access-key option in the Bedrock sign-in form, which signs in with
+  // account/login/start; account/read already reports a Bedrock account.
+  bedrockAccessKeysLogin: ['account/login/start'],
   diagnostics: ['server/diagnostics'],
+  // Composer predictions fork only a thread whose modelProvider is openai;
+  // every thread here reports claude-code.
+  experimentalPredictionForkMode: [],
   gatewayOAuth: [
     'account/gatewayOAuth/read',
     'account/gatewayOAuth/login',
     'account/gatewayOAuth/cancel',
   ],
+  guardianV2DecisionsComparison: [],
+  incrementalTools: [],
+  instantInterrupt: [],
+  // Whether a configured application requirement still lets the App set up
+  // its search MCP (see searchMcpClient).
+  mcpApplicationNetworkPolicy: [],
   mcpEventStream: ['mcpServer/event/stream/start', 'mcpServer/event/stream/stop'],
   mcpResourceReadOriginCallId: ['mcpServer/resource/read'],
   mcpServerStatusByName: ['mcpServerStatus/list'],
+  // Reviews a turn that failed with codexErrorInfo
+  // misalignmentPolicyViolation, which no turn here reports.
+  misalignmentReviewTarget: [],
+  multiAgentWaitToolConfig: [],
+  outputTokenReplay: [],
+  preserveForkPrefix: [],
   projects: [
     'project/list',
     'project/read',
@@ -224,16 +330,32 @@ export const GATED_METHODS: Readonly<Record<string, readonly string[]>> = {
     'project/delete',
     'project/move',
   ],
-  // The verified App never reads this gate.
+  // 26.930 never reads this gate; 26.1013 only lets a Codex feature key
+  // through in the config it sends while it is on.
   reasoningEffortUpdates: [],
   rolloutCompression: ['rollout/compress'],
+  // Reads config/read, account/read and configRequirements/read as a thread
+  // starts. mcpServerStatus/list and the rest of its search MCP setup need a
+  // gpt- model and a ChatGPT account, which no thread here has.
+  searchMcpClient: [
+    'config/read',
+    'account/read',
+    'configRequirements/read',
+    'mcpServerStatus/list',
+  ],
   // A serviceTier on the heartbeat's turn/start, which Claude ignores.
   serviceTierForTurn: ['turn/start'],
+  // Keeps the worktree of an archived thread while another thread holds it.
+  threadAttachmentOwners: ['thread/attachmentOwner/list'],
   threadAttachments: [
     'thread/attachment/add',
     'thread/attachment/list',
     'thread/attachment/remove',
   ],
+  // thread/fork with beforeTurnId.
+  threadForkBeforeTurn: ['thread/fork'],
+  // thread/items/list with an { itemId } cursor.
+  threadItemAnchors: ['thread/items/list'],
   threadQueue: [
     'thread/queue/add',
     'thread/queue/list',
@@ -245,6 +367,9 @@ export const GATED_METHODS: Readonly<Record<string, readonly string[]>> = {
   threadRevert: ['thread/revert'],
   threadTimeline: ['thread/timeline/list'],
   turnApprovalsReviewer: ['turn/settings/update'],
+  // parentTurnId and rootTurnId on turn/start; the turn reports its
+  // rootTurnId back.
+  turnLineage: ['turn/start'],
   turnToolOutput: ['turn/start'],
 }
 

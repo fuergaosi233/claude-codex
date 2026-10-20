@@ -34,12 +34,14 @@ const fixtures = [
     kind: 'notification',
     method: 'turn/started',
     schemaFile: 'ServerNotification.ts',
+    turn: true,
   },
   {
     file: 'turn-completed.notification.json',
     kind: 'notification',
     method: 'turn/completed',
     schemaFile: 'ServerNotification.ts',
+    turn: true,
   },
   {
     file: 'mcp-server-status-list.response.json',
@@ -238,9 +240,12 @@ function generateSchema(generator, outDir) {
       'schema generation exited 0 but did not emit ClientRequest.ts and ServerNotification.ts; this usually means an adapter shim handled app-server instead of the real Codex CLI. Set CODEX_REAL to the real codex binary.',
     )
   }
+  const turn = join(outDir, 'v2', 'Turn.ts')
+  if (!existsSync(turn)) fail('schema generation did not emit v2/Turn.ts')
   return {
     'ClientRequest.ts': readFileSync(clientRequest, 'utf8'),
     'ServerNotification.ts': readFileSync(serverNotification, 'utf8'),
+    'v2/Turn.ts': readFileSync(turn, 'utf8'),
   }
 }
 
@@ -248,12 +253,31 @@ function methodLiteral(method) {
   return `"method": "${method}"`
 }
 
+// The field names a generated object type declares, its doc comments aside.
+function typeFields(source, name) {
+  const body = new RegExp(`export type ${name} = \\{([\\s\\S]*?)\\};`).exec(source)?.[1]
+  if (body == null) fail(`generated schema has no ${name} object type`)
+  return [...body.replace(/\/\*[\s\S]*?\*\//g, '').matchAll(/(\w+)\??:/g)]
+    .map((match) => match[1])
+    .sort()
+}
+
 function validateSchema(fixturesByFile) {
+  const turnFields = typeFields(fixturesByFile['v2/Turn.ts'], 'Turn')
   for (const fixture of fixtures) {
     const schema = fixturesByFile[fixture.schemaFile]
     const method = fixture.method ?? fixture.requestMethod
     if (!schema.includes(methodLiteral(method))) {
       fail(`${method} is missing from generated ${fixture.schemaFile}`)
+    }
+    // A Turn fixture carries every field of the generated Turn, and only those.
+    if (fixture.turn) {
+      const fields = Object.keys(readFixture(fixture.file).params.turn).sort()
+      if (JSON.stringify(fields) !== JSON.stringify(turnFields)) {
+        fail(
+          `${fixture.file} turn fields ${fields.join(',')} are not the generated Turn fields ${turnFields.join(',')}`,
+        )
+      }
     }
   }
 }

@@ -3,6 +3,8 @@ import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import type {
   ClaudeCheckpoint,
+  ClaudeResumePoint,
+  DynamicToolSpec,
   ImportHistoryRecord,
   ProjectRecord,
   QueuedSubmission,
@@ -16,7 +18,7 @@ import type {
   TurnRecord,
   TurnStatus,
 } from './types.mjs'
-import { adapterHome, jsonClone, nowSeconds } from './util.mjs'
+import { adapterHome, jsonClone, newId, nowSeconds } from './util.mjs'
 
 const require = createRequire(import.meta.url)
 
@@ -139,6 +141,10 @@ export class SessionStore {
         thread_id TEXT PRIMARY KEY,
         items_json TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS thread_dynamic_tools (
+        thread_id TEXT PRIMARY KEY,
+        tools_json TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS projects (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -159,6 +165,8 @@ export class SessionStore {
         created_at INTEGER NOT NULL,
         UNIQUE(thread_id, attachment_type, identity_key)
       );
+      CREATE INDEX IF NOT EXISTS idx_thread_attachments_identity
+        ON thread_attachments(attachment_type, identity_key, thread_id);
       CREATE TABLE IF NOT EXISTS import_histories (
         id TEXT PRIMARY KEY,
         provider_id TEXT,
@@ -166,6 +174,14 @@ export class SessionStore {
         successes_json TEXT NOT NULL,
         failures_json TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS leader_threads (
+        thread_id TEXT PRIMARY KEY,
+        leader_thread_id TEXT NOT NULL,
+        seen_turn_id TEXT,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_leader_threads_leader
+        ON leader_threads(leader_thread_id, created_at);
     `)
     this.ensureColumn('threads', 'is_pinned', 'INTEGER NOT NULL DEFAULT 0')
     this.ensureColumn('threads', 'section_id', 'TEXT')
@@ -197,11 +213,17 @@ export class SessionStore {
     this.ensureColumn('threads', 'claude_resume_at', 'TEXT')
     this.ensureColumn('threads', 'claude_fork_session_id', 'TEXT')
     this.ensureColumn('threads', 'claude_fork_message_uuid', 'TEXT')
+    this.ensureColumn('threads', 'claude_fork_new_session', 'INTEGER NOT NULL DEFAULT 0')
     this.ensureColumn('turns', 'claude_session_id', 'TEXT')
     this.ensureColumn('turns', 'claude_message_uuid', 'TEXT')
+    // TurnRecord.rootTurnId; NULL when the turn is its own root.
+    this.ensureColumn('turns', 'root_turn_id', 'TEXT')
     // Project membership; written only by setThreadProject and deleteProject.
     this.ensureColumn('threads', 'project_id', 'TEXT')
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_threads_project ON threads(project_id)')
+    // Codex's per-thread memory mode; set when the thread is created, then
+    // only by setThreadMemoryMode.
+    this.ensureColumn('threads', 'memory_mode', 'TEXT')
     this.ensurePinnedSection()
     this.migrateLegacyPinState()
     this.sanitizeLegacyEnumColumns()
@@ -290,10 +312,11 @@ export class SessionStore {
           preview, name, archived, cwd, model, reasoning_effort, model_provider, claude_session_id,
           source, created_at, updated_at, status_json,
           approval_policy, sandbox_mode, permission_profile_id, ephemeral, thread_source, agent_role, agent_nickname,
-          base_instructions, developer_instructions, personality, runtime_backend, codex_session_id
+          base_instructions, developer_instructions, personality, runtime_backend, codex_session_id,
+          memory_mode
         ) VALUES (
           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         ON CONFLICT(id) DO UPDATE SET
           session_id=excluded.session_id,
@@ -358,6 +381,7 @@ export class SessionStore {
         thread.personality,
         thread.runtimeBackend,
         thread.codexSessionId,
+        thread.memoryMode ?? null,
       )
   }
 
@@ -837,6 +861,12 @@ export class SessionStore {
     return Number(result.changes) > 0
   }
 
+  // Like the project, outside upsertThread: a turn saving the thread record it
+  // read before the switch must not undo it.
+  setThreadMemoryMode(threadId: string, mode: 'enabled' | 'disabled'): void {
+    this.db.prepare('UPDATE threads SET memory_mode = ? WHERE id = ?').run(mode, threadId)
+  }
+
   private projectIds(): string[] {
     return (
       this.db
@@ -911,6 +941,53 @@ export class SessionStore {
         )
         .all(threadId, limit, offset) as unknown[]
     ).map((row) => this.rowToAttachment(row))
+  }
+
+  // The threads holding an attachment with this type and key, by thread id;
+  // archived null lists archived and live threads alike.
+  listAttachmentOwners(
+    owner: { attachmentType: string; identityKey: string; archived: boolean | null },
+    limit: number,
+    offset: number,
+  ): { threadId: string; archived: boolean }[] {
+    const archived = owner.archived == null ? '' : 'AND t.archived = ?'
+    const params = owner.archived == null ? [] : [owner.archived ? 1 : 0]
+    const rows = this.db
+      .prepare(
+        `SELECT a.thread_id AS thread_id, t.archived AS archived
+         FROM thread_attachments a JOIN threads t ON t.id = a.thread_id
+         WHERE a.attachment_type = ? AND a.identity_key = ? ${archived}
+         ORDER BY a.thread_id LIMIT ? OFFSET ?`,
+      )
+      .all(owner.attachmentType, owner.identityKey, ...params, limit, offset) as Array<{
+      thread_id: string
+      archived: unknown
+    }>
+    return rows.map((row) => ({ threadId: row.thread_id, archived: Number(row.archived) === 1 }))
+  }
+
+  // A fork holds what its parent held when it forked, as in Codex: each
+  // attachment is copied with its type, key, payload and time under a new id.
+  copyThreadAttachments(fromThreadId: string, toThreadId: string): void {
+    this.transaction(() => {
+      const rows = this.db
+        .prepare('SELECT * FROM thread_attachments WHERE thread_id = ? ORDER BY created_at, rowid')
+        .all(fromThreadId) as Array<Record<string, unknown>>
+      const insert = this.db.prepare(
+        `INSERT OR IGNORE INTO thread_attachments
+           (id, thread_id, attachment_type, identity_key, payload_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      for (const row of rows)
+        insert.run(
+          newId(),
+          toThreadId,
+          row.attachment_type,
+          row.identity_key,
+          row.payload_json,
+          row.created_at,
+        )
+    })
   }
 
   // Returns the removed attachment, or null when there was none.
@@ -1023,8 +1100,8 @@ export class SessionStore {
   upsertTurn(turn: TurnRecord): void {
     this.db
       .prepare(`
-        INSERT INTO turns (id, thread_id, status, started_at, completed_at, duration_ms, items_json, diff, error_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO turns (id, thread_id, status, started_at, completed_at, duration_ms, items_json, diff, error_json, root_turn_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           status=excluded.status,
           started_at=excluded.started_at,
@@ -1032,7 +1109,8 @@ export class SessionStore {
           duration_ms=excluded.duration_ms,
           items_json=excluded.items_json,
           diff=excluded.diff,
-          error_json=excluded.error_json
+          error_json=excluded.error_json,
+          root_turn_id=COALESCE(excluded.root_turn_id, turns.root_turn_id)
       `)
       .run(
         turn.id,
@@ -1044,6 +1122,7 @@ export class SessionStore {
         JSON.stringify(turn.items),
         turn.diff,
         turn.error == null ? null : JSON.stringify(turn.error),
+        turn.rootTurnId ?? null,
       )
   }
 
@@ -1076,6 +1155,17 @@ export class SessionStore {
       )
       .get(threadId)
     return row ? this.rowToTurn(row) : null
+  }
+
+  // Id and status of the thread's newest turn, also without decoding items.
+  lastTurnRef(threadId: string): { id: string; status: TurnRecord['status'] } | null {
+    const row = this.db
+      .prepare(
+        'SELECT id, status FROM turns WHERE thread_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1',
+      )
+      .get(threadId) as { id?: unknown; status?: unknown } | undefined
+    if (typeof row?.id !== 'string' || typeof row.status !== 'string') return null
+    return { id: row.id, status: row.status as TurnRecord['status'] }
   }
 
   // Used by thread/rollback to drop the N most recent turns from a thread's
@@ -1124,21 +1214,35 @@ export class SessionStore {
   }
 
   // Where a forked thread branched off its parent's Claude session; a rewind
-  // past the thread's own first turn returns there.
-  setForkCheckpoint(threadId: string, checkpoint: ClaudeCheckpoint | null): void {
+  // past the thread's own first turn returns there. A fork taken before
+  // anything Claude remembers starts at 'new'.
+  setForkCheckpoint(threadId: string, point: ClaudeResumePoint | null): void {
+    const checkpoint = point === 'new' ? null : point
     this.db
       .prepare(
-        'UPDATE threads SET claude_fork_session_id = ?, claude_fork_message_uuid = ? WHERE id = ?',
+        'UPDATE threads SET claude_fork_session_id = ?, claude_fork_message_uuid = ?, claude_fork_new_session = ? WHERE id = ?',
       )
-      .run(checkpoint?.sessionId ?? null, checkpoint?.messageUuid ?? null, threadId)
+      .run(
+        checkpoint?.sessionId ?? null,
+        checkpoint?.messageUuid ?? null,
+        point === 'new' ? 1 : 0,
+        threadId,
+      )
   }
 
-  forkCheckpoint(threadId: string): ClaudeCheckpoint | null {
+  forkCheckpoint(threadId: string): ClaudeResumePoint | null {
     const row = this.db
-      .prepare('SELECT claude_fork_session_id, claude_fork_message_uuid FROM threads WHERE id = ?')
+      .prepare(
+        'SELECT claude_fork_session_id, claude_fork_message_uuid, claude_fork_new_session FROM threads WHERE id = ?',
+      )
       .get(threadId) as
-      | { claude_fork_session_id?: unknown; claude_fork_message_uuid?: unknown }
+      | {
+          claude_fork_session_id?: unknown
+          claude_fork_message_uuid?: unknown
+          claude_fork_new_session?: unknown
+        }
       | undefined
+    if (Number(row?.claude_fork_new_session) === 1) return 'new'
     return checkpointFrom(row?.claude_fork_session_id, row?.claude_fork_message_uuid)
   }
 
@@ -1185,7 +1289,11 @@ export class SessionStore {
       this.db.prepare('DELETE FROM turns WHERE thread_id = ?').run(id)
       this.db.prepare('DELETE FROM thread_goals WHERE thread_id = ?').run(id)
       this.db.prepare('DELETE FROM thread_queues WHERE thread_id = ?').run(id)
+      this.db.prepare('DELETE FROM thread_dynamic_tools WHERE thread_id = ?').run(id)
       this.db.prepare('DELETE FROM thread_attachments WHERE thread_id = ?').run(id)
+      // Only the thread's own link: threads it led keep theirs, so they
+      // stay below the depth limit after their leader is gone.
+      this.db.prepare('DELETE FROM leader_threads WHERE thread_id = ?').run(id)
       this.db.prepare('DELETE FROM threads WHERE id = ?').run(id)
     }
     return ids
@@ -1421,6 +1529,44 @@ export class SessionStore {
     return Number(result.changes) > 0
   }
 
+  // Threads another thread started with the leader tools. The link decides
+  // who may prompt and wait on a thread and keeps a led thread from leading
+  // in turn; seen_turn_id is the last finished turn its leader has read.
+  addLeaderThread(threadId: string, leaderThreadId: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO leader_threads (thread_id, leader_thread_id, seen_turn_id, created_at)
+         VALUES (?, ?, NULL, ?)
+         ON CONFLICT(thread_id) DO UPDATE SET leader_thread_id = excluded.leader_thread_id`,
+      )
+      .run(threadId, leaderThreadId, nowSeconds())
+  }
+
+  leaderOf(threadId: string): string | null {
+    const row = this.db
+      .prepare('SELECT leader_thread_id FROM leader_threads WHERE thread_id = ?')
+      .get(threadId) as { leader_thread_id: string } | undefined
+    return row?.leader_thread_id ?? null
+  }
+
+  listLeaderThreads(
+    leaderThreadId: string,
+  ): Array<{ threadId: string; seenTurnId: string | null }> {
+    const rows = this.db
+      .prepare(
+        `SELECT thread_id, seen_turn_id FROM leader_threads
+         WHERE leader_thread_id = ? ORDER BY created_at, rowid`,
+      )
+      .all(leaderThreadId) as Array<{ thread_id: string; seen_turn_id: string | null }>
+    return rows.map((row) => ({ threadId: row.thread_id, seenTurnId: row.seen_turn_id }))
+  }
+
+  markLeaderSeen(threadId: string, turnId: string): void {
+    this.db
+      .prepare('UPDATE leader_threads SET seen_turn_id = ? WHERE thread_id = ?')
+      .run(turnId, threadId)
+  }
+
   listQueue(threadId: string): QueuedSubmission[] {
     const row = this.db
       .prepare('SELECT items_json FROM thread_queues WHERE thread_id = ?')
@@ -1439,6 +1585,28 @@ export class SessionStore {
          ON CONFLICT(thread_id) DO UPDATE SET items_json = excluded.items_json`,
       )
       .run(threadId, JSON.stringify(items))
+  }
+
+  // The dynamic tools the client registered on thread/start. Codex keeps them
+  // in the session meta, so a resumed or restarted thread still has them.
+  getDynamicTools(threadId: string): DynamicToolSpec[] {
+    const row = this.db
+      .prepare('SELECT tools_json FROM thread_dynamic_tools WHERE thread_id = ?')
+      .get(threadId) as { tools_json: string } | undefined
+    return row ? (JSON.parse(row.tools_json) as DynamicToolSpec[]) : []
+  }
+
+  putDynamicTools(threadId: string, tools: DynamicToolSpec[]): void {
+    if (tools.length === 0) {
+      this.db.prepare('DELETE FROM thread_dynamic_tools WHERE thread_id = ?').run(threadId)
+      return
+    }
+    this.db
+      .prepare(
+        `INSERT INTO thread_dynamic_tools (thread_id, tools_json) VALUES (?, ?)
+         ON CONFLICT(thread_id) DO UPDATE SET tools_json = excluded.tools_json`,
+      )
+      .run(threadId, JSON.stringify(tools))
   }
 
   close(): void {
@@ -1481,6 +1649,8 @@ export class SessionStore {
       personality: row.personality == null ? null : String(row.personality),
       runtimeBackend: row.runtime_backend === 'codex' ? 'codex' : 'claude',
       codexSessionId: row.codex_session_id == null ? null : String(row.codex_session_id),
+      memoryMode:
+        row.memory_mode === 'enabled' || row.memory_mode === 'disabled' ? row.memory_mode : null,
       projectId: row.project_id == null ? null : String(row.project_id),
     }
   }
@@ -1540,6 +1710,7 @@ export class SessionStore {
       items: JSON.parse(String(row.items_json)),
       diff: String(row.diff ?? ''),
       error: row.error_json == null ? null : JSON.parse(String(row.error_json)),
+      rootTurnId: row.root_turn_id == null ? null : String(row.root_turn_id),
     }
   }
 }

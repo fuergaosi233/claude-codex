@@ -64,3 +64,8 @@ node dist/src/adapter.mjs app-server proxy
 node dist/src/adapter.mjs app-server --listen stdio://
 node dist/src/adapter.mjs app-server --listen ws://127.0.0.1:8788
 ```
+
+A `ws://` listener on a non-loopback address (such as `0.0.0.0`) needs a
+capability token (`--ws-auth capability-token`), or the explicit opt-out
+`--ws-allow-unauthenticated`; without either the adapter refuses to start. See
+[WebSocket listener](/guide/configuration#websocket-listener).

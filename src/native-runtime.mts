@@ -43,25 +43,47 @@ if (!process.env.ANTHROPIC_BETAS) {
 
 import type { Query } from '@anthropic-ai/claude-agent-sdk'
 import { noteClaudeCommands } from './claude-commands.mjs'
+import { noteClaudeModels } from './claude-models.mjs'
 import { removeCliMcpConfig, writeCliMcpConfig } from './cli-mcp-config.mjs'
 import { recordCliChildren } from './cli-orphans.mjs'
+import {
+  type BackgroundSink,
+  COMMAND_OUTPUT_POLL_MS,
+  CommandOutputs,
+  type OutputSink,
+} from './command-output.mjs'
 import { CronJobs } from './cron-jobs.mjs'
+import { dynamicToolCallResult } from './dynamic-tools.mjs'
 import {
   CREATE_GOAL_DESCRIPTION,
   GET_GOAL_DESCRIPTION,
   UPDATE_GOAL_DESCRIPTION,
 } from './goal-prompts.mjs'
+import {
+  LEADER_MCP_SERVER,
+  LEADER_READ_ONLY_TOOLS,
+  THREAD_LIST_DESCRIPTION,
+  THREAD_PROMPT_DESCRIPTION,
+  THREAD_READ_DESCRIPTION,
+  THREAD_START_DESCRIPTION,
+  THREAD_WAIT_DESCRIPTION,
+} from './leader-tools.mjs'
+import { autoMemoryEnv } from './memories.mjs'
 import { echoedUuids, TurnInput, type TurnInputMessage } from './native-turn-input.mjs'
 import { sdkHooks } from './sdk-hooks.mjs'
 import { readTaskResult } from './task-output.mjs'
+import { ToolInputPreviews } from './tool-input-preview.mjs'
 import type {
   ClaudeRuntime,
+  DynamicToolServer,
   ElicitationResponse,
   GoalToolHandlers,
   HookOutputEntry,
   HookRunStatus,
   ImageInput,
+  LeaderToolHandlers,
   PermissionDecision,
+  RecalledMemory,
   RuntimeBackgroundListener,
   RuntimeHandlers,
   RuntimeLiveTask,
@@ -121,6 +143,9 @@ interface PendingTurn {
   // ToolUseBlock twice; we keep only the AssistantMessage copy because
   // content_block_start arrives with empty input).
   toolStartSeen: Set<string>
+  // The streamed input of the current response's file tool calls, null when
+  // CLAUDE_CODEX_LIVE_FILE_CHANGES=0 turns the live preview off.
+  toolInputPreviews: ToolInputPreviews | null
   // Buffer + tool ids for StructuredOutput coercion: when the SDK ships a
   // synthetic StructuredOutput tool_use we want to suppress the streamed
   // text and emit only the final coerced JSON.
@@ -167,8 +192,9 @@ interface LiveSession {
   query: Query
   input: TurnInput
   abort: AbortController
-  // Registered for reuse by later turns of the thread. Structured-output,
-  // summary and compaction turns run in sessions of their own.
+  // Registered for reuse by later turns of the thread. Structured-output and
+  // summary turns run in sessions of their own, including the summary a
+  // compaction falls back to; `/compact` itself runs in the thread's session.
   reusable: boolean
   signature: string
   lastContext: RuntimeTurnContext
@@ -204,6 +230,8 @@ interface LiveSession {
   // stopped every one of them.
   stoppedTasks: Set<string>
   endedWhileIdle: string[]
+  // Live output of the Bash commands the main loop runs.
+  commandOutputs: CommandOutputs
   // Interrupted while the process stays alive (see SessionSink).
   sink: SessionSink | null
   settleTimer: NodeJS.Timeout | null
@@ -483,6 +511,22 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     this.cronJobs.delete(threadId)
   }
 
+  // Claude Code runs a `/compact` prompt as its built-in command and reports
+  // it with the `status` / `compact_boundary` system messages, unless
+  // DISABLE_COMPACT turns the command off.
+  compactsSessions(): boolean {
+    return !truthyEnv(process.env.DISABLE_COMPACT)
+  }
+
+  // Each turn hands Claude Code the MCP config as it is then, so only the
+  // sessions still open hold an older one. Those retry the servers that failed
+  // or wait for a sign-in, which picks up a sign-in made since. A connected
+  // server is left alone: no call to it is cut off.
+  async reloadMcpServers(): Promise<void> {
+    const open = [...this.sessions.values()].filter((live) => !live.closed)
+    await Promise.all(open.map((live) => this.retryMcpServers(live)))
+  }
+
   async stop(): Promise<void> {
     for (const pending of this.turns.values()) {
       await this.stopWorkflowTasks(pending)
@@ -491,6 +535,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     for (const session of this.sessions.values()) {
       this.clearSessionTimers(session)
       session.closed = true
+      session.commandOutputs.close()
       session.abort.abort()
       session.input.close()
     }
@@ -511,6 +556,45 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   }
 
   // ── private ──
+
+  private async retryMcpServers(live: LiveSession): Promise<void> {
+    const query = live.query as Query & {
+      mcpServerStatus?: () => Promise<Array<{ name: string; status: string }>>
+      reconnectMcpServer?: (serverName: string) => Promise<void>
+    }
+    if (typeof query.mcpServerStatus !== 'function') return
+    if (typeof query.reconnectMcpServer !== 'function') return
+    let statuses: Array<{ name: string; status: string }> = []
+    await settlesWithin(
+      query.mcpServerStatus().then(
+        (found) => {
+          statuses = Array.isArray(found) ? found : []
+        },
+        () => {},
+      ),
+      SESSION_CONTROL_TIMEOUT_MS,
+    )
+    const retry = statuses.filter(
+      (server) => server.status === 'failed' || server.status === 'needs-auth',
+    )
+    for (const server of retry) {
+      if (live.closed) return
+      let failure: string | null = null
+      const settled = await settlesWithin(
+        query.reconnectMcpServer(server.name).catch((error: unknown) => {
+          failure = error instanceof Error ? error.message : String(error)
+        }),
+        SESSION_CONTROL_TIMEOUT_MS,
+      )
+      debugLog('native.mcp.reconnect', {
+        threadId: live.threadId,
+        server: server.name,
+        status: server.status,
+        settled,
+        failure,
+      })
+    }
+  }
 
   private async loadSdk(): Promise<ClaudeSdk> {
     if (this.sdk) return this.sdk
@@ -579,7 +663,13 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }
     // session_state_changed tells a session that outlives its turn when the
     // CLI has finished answering everything queued (see maybeRelease).
-    opts.env = { ...process.env, CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1' }
+    // With the memories mapping on, auto-memory runs only for threads the
+    // user turned memories on for.
+    opts.env = {
+      ...process.env,
+      CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1',
+      ...autoMemoryEnv(context.autoMemory),
+    }
     // A forked thread resumes a transcript that opens with its parent's
     // history. Left alone, the CLI would schedule the parent's session cron
     // jobs a second time and report the parent's background tasks as its own
@@ -618,6 +708,32 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         [GOAL_MCP_SERVER]: goalToolServer(sdk, this.zod, context.goalTools),
       }
     }
+    // The client's dynamic tools, one in-process server per namespace.
+    const dynamicServers = registeredDynamicServers(context)
+    for (const server of context.dynamicTools ?? []) {
+      if (!dynamicServers.includes(server))
+        debugLog('dynamicTools.skipped', { server: server.server, reason: 'unavailable' })
+    }
+    if (dynamicServers.length > 0 && this.zod && typeof sdk.createSdkMcpServer === 'function') {
+      const z = this.zod
+      opts.mcpServers = {
+        ...((opts.mcpServers as Record<string, unknown> | undefined) ?? {}),
+        ...Object.fromEntries(
+          dynamicServers.map((server) => [
+            server.server,
+            this.dynamicToolServer(sdk, z, server, sessionRef),
+          ]),
+        ),
+      }
+    }
+    let leaderServer = false
+    if (context.leaderTools && this.zod && typeof sdk.createSdkMcpServer === 'function') {
+      leaderServer = true
+      opts.mcpServers = {
+        ...((opts.mcpServers as Record<string, unknown> | undefined) ?? {}),
+        [LEADER_MCP_SERVER]: leaderToolServer(sdk, this.zod, context.leaderTools),
+      }
+    }
     if (context.outputFormat) opts.outputFormat = context.outputFormat
 
     // Codex App's pinned policies map onto Claude SDK's permissionMode. plan
@@ -635,6 +751,14 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       opts.allowedTools = [
         ...((opts.allowedTools as string[] | undefined) ?? []),
         `mcp__${GOAL_MCP_SERVER}`,
+      ]
+    }
+    // Leader tools likewise, but a plan only looks: no starting or prompting
+    // other chats.
+    if (leaderServer && mode === 'plan') {
+      opts.allowedTools = [
+        ...((opts.allowedTools as string[] | undefined) ?? []),
+        ...LEADER_READ_ONLY_TOOLS.map((tool) => `mcp__${LEADER_MCP_SERVER}__${tool}`),
       ]
     }
 
@@ -686,8 +810,14 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       { behavior: 'allow'; updatedInput?: unknown } | { behavior: 'deny'; message: string }
     > => {
       if (toolName.startsWith(`mcp__${GOAL_MCP_SERVER}__`)) return { behavior: 'allow' }
-      const toolUseId = options.toolUseID || `tool-${newId()}`
+      // The chats leader tools start ask for their own approvals.
+      if (toolName.startsWith(`mcp__${LEADER_MCP_SERVER}__`)) return { behavior: 'allow' }
       const session = sessionRef()
+      // As in Codex, a dynamic tool runs without an approval prompt: the
+      // client that registered it answers the call.
+      if (session && dynamicToolNames(session.lastContext).has(toolName))
+        return { behavior: 'allow' }
+      const toolUseId = options.toolUseID || `tool-${newId()}`
       const pending = session?.current
       if (!session || !pending || pending.resolved) {
         // A background task asked between turns. There is no turn to surface
@@ -797,6 +927,68 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }
   }
 
+  // One namespace of the client's dynamic tools as an in-process MCP server.
+  // A tool the client marked deferLoading stays behind Claude Code's tool
+  // search; the others load up front, as in Codex.
+  private dynamicToolServer(
+    sdk: ClaudeSdk,
+    z: Zod,
+    server: DynamicToolServer,
+    sessionRef: () => LiveSession | null,
+  ) {
+    return sdk.createSdkMcpServer({
+      name: server.server,
+      version: '1.0.0',
+      ...(server.description ? { instructions: server.description } : {}),
+      tools: server.tools.map((tool) =>
+        sdk.tool(
+          tool.name,
+          tool.description,
+          // The client's JSON Schema, listed as given; the client checks
+          // the arguments. Typed as the shape of any object.
+          z.looseObject({}).meta(tool.inputSchema) as unknown as Record<
+            string,
+            ReturnType<Zod['unknown']>
+          >,
+          (args: unknown, extra: unknown) =>
+            this.callDynamicTool(sessionRef, server.namespace, tool.name, args, extra),
+          tool.deferLoading ? undefined : { alwaysLoad: true },
+        ),
+      ),
+    })
+  }
+
+  private async callDynamicTool(
+    sessionRef: () => LiveSession | null,
+    namespace: string | null,
+    tool: string,
+    args: unknown,
+    extra: unknown,
+  ) {
+    const meta = recordOrNull(recordOrNull(extra)?._meta)
+    const callId = stringOrNull(meta?.['claudecode/toolUseId']) ?? `call-${newId()}`
+    const signal = (recordOrNull(extra)?.signal as AbortSignal | undefined) ?? null
+    const pending = sessionRef()?.current
+    // Between turns (a background task's call) no client turn can answer.
+    if (!pending || pending.resolved || !pending.handlers.onDynamicToolCall)
+      return dynamicToolCallResult({
+        contentItems: [
+          { type: 'inputText', text: 'dynamic tools are only available during a turn' },
+        ],
+        success: false,
+      })
+    try {
+      const response = await pending.handlers.onDynamicToolCall(
+        { callId, namespace, tool, arguments: args },
+        signal ?? new AbortController().signal,
+      )
+      return dynamicToolCallResult(response)
+    } catch (error) {
+      const text = error instanceof Error ? error.message : String(error)
+      return dynamicToolCallResult({ contentItems: [{ type: 'inputText', text }], success: false })
+    }
+  }
+
   private openSession(
     sdk: ClaudeSdk,
     context: RuntimeTurnContext,
@@ -815,9 +1007,10 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       let session: LiveSession | null = null
       const options = this.buildOptions(sdk, context, abort, () => session)
       if (reusable) this.trackCronJobs(context, options)
+      const query = sdk.query({ prompt: input, options })
       const opened: LiveSession = {
         threadId: context.threadId,
-        query: sdk.query({ prompt: input, options }),
+        query,
         input,
         abort,
         reusable,
@@ -845,6 +1038,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         steers: new Map(),
         stoppedTasks: new Set(),
         endedWhileIdle: [],
+        commandOutputs: new CommandOutputs(taskOutputReader(query), commandOutputPollMs()),
         sink: null,
         settleTimer: null,
         idleTimer: null,
@@ -971,6 +1165,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       skippedWorkflowTaskIds: new Set(),
       workflowTasks: new Map(),
       toolStartSeen: new Set(),
+      toolInputPreviews:
+        process.env.CLAUDE_CODEX_LIVE_FILE_CHANGES === '0' ? null : new ToolInputPreviews(),
       structuredBuffer: '',
       pendingUserMessage: null,
       deferredResult: null,
@@ -1402,6 +1598,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (session.closed) return
     session.closed = true
     this.clearSessionTimers(session)
+    session.commandOutputs.close()
     session.input.close()
     try {
       ;(session.query as Query & { close?: () => void }).close?.()
@@ -1418,6 +1615,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   private async endSession(session: LiveSession, failure: Error | null): Promise<void> {
     this.clearSessionTimers(session)
     session.closed = true
+    session.commandOutputs.close()
     // A superseded session winds down after its replacement registered; the
     // thread's background work now belongs to the replacement.
     const registered = this.sessions.get(session.threadId)
@@ -1540,7 +1738,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         const taskId = stringOrNull(task?.task_id)
         if (taskId && task?.ambient !== true) next.add(taskId)
       }
-      for (const taskId of session.liveTasks) if (!next.has(taskId)) this.markTaskEnded(session)
+      for (const taskId of session.liveTasks) {
+        if (next.has(taskId)) continue
+        this.markTaskEnded(session)
+        session.commandOutputs.taskEnded(taskId)
+      }
+      for (const taskId of next) session.commandOutputs.taskBackgrounded(taskId)
       session.liveTasks = next
       session.levelSeen = true
       return
@@ -1566,6 +1769,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         typeof message.is_backgrounded === 'boolean' ? message.is_backgrounded : null
       if (!session.levelSeen && backgrounded === true && message.ambient !== true)
         session.liveTasks.add(taskId)
+      if (taskType === 'local_bash')
+        session.commandOutputs.taskStarted(taskId, toolUseId, backgrounded)
       await listener?.onTaskEvent(session.threadId, {
         type: 'task_started',
         taskId,
@@ -1594,6 +1799,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       const patch = recordOrNull(message.patch) ?? {}
       const status = stringOrNull(patch.status)
       const backgrounded = typeof patch.is_backgrounded === 'boolean' ? patch.is_backgrounded : null
+      if (status && TERMINAL_TASK_STATUSES.has(status)) session.commandOutputs.taskEnded(taskId)
+      else if (backgrounded === true) session.commandOutputs.taskBackgrounded(taskId)
       if (!session.levelSeen) {
         if (status && IDLE_TASK_STATUSES.has(status)) {
           if (session.liveTasks.delete(taskId)) this.markTaskEnded(session)
@@ -1619,6 +1826,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     // Interrupting a turn also stops the background agents it launched. Like
     // a stop from the user, that is no news to wake the thread with.
     if (status === 'stopped') session.stoppedTasks.add(taskId)
+    // A shell that did not complete says how it ended after its output (a
+    // stop, its background time limit, a failed exit).
+    session.commandOutputs.taskNotified(
+      taskId,
+      status === 'completed' ? null : stringOrNull(message.summary),
+    )
     // An interrupted turn answers nothing more: what ends while it drains is
     // left for the turn after it, same as when the CLI is idle.
     if (!session.cliRunning || session.sink) session.endedWhileIdle.push(taskId)
@@ -1691,8 +1904,44 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
           ?.supportedCommands()
           .then((commands) => noteClaudeCommands(commands, skills))
           .catch(() => {})
+      // Which efforts each model takes, for model/list. An older SDK has no
+      // supportedModels(), and model/list then keeps its static efforts.
+      const query = pending.session.query
+      void Promise.resolve()
+        .then(() => query?.supportedModels())
+        .then(noteClaudeModels)
+        .catch(() => {})
       const sessionId = String(message.session_id ?? '')
       if (sessionId) await pending.handlers.onEvent({ type: 'session', claudeSessionId: sessionId })
+      return
+    }
+    if (subtype === 'status' || subtype === 'compact_boundary') {
+      // A subagent compacting its own context leaves the thread's alone.
+      if (message.parent_tool_use_id) return
+      if (subtype === 'compact_boundary') {
+        const metadata = recordOrNull(message.compact_metadata) ?? {}
+        await pending.handlers.onEvent({
+          type: 'compaction_completed',
+          trigger: metadata.trigger === 'manual' ? 'manual' : 'auto',
+          preTokens: numberOrNull(metadata.pre_tokens),
+          postTokens: numberOrNull(metadata.post_tokens),
+        })
+        return
+      }
+      if (message.status === 'compacting') {
+        await pending.handlers.onEvent({ type: 'compaction_started' })
+        return
+      }
+      if (message.compact_result === 'failed') {
+        const reason = stringOrNull(message.compact_error)
+        await pending.handlers.onEvent({
+          type: 'notice',
+          level: 'warning',
+          message: reason
+            ? `Claude could not compact the conversation: ${reason}`
+            : 'Claude could not compact the conversation.',
+        })
+      }
       return
     }
     if (subtype === 'hook_started' || subtype === 'hook_response') {
@@ -1742,6 +1991,11 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         level: 'warning',
         message: `Permission denied for ${toolName}`,
       })
+      return
+    }
+    if (subtype === 'memory_recall') {
+      const memories = recalledMemories(message.memories)
+      if (memories.length > 0) await pending.handlers.onEvent({ type: 'memory_recall', memories })
       return
     }
     if (subtype === 'task_started' && isWorkflowBackgroundTask(message)) {
@@ -1973,14 +2227,30 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         // full block lands later inside the AssistantMessage. Without this
         // we'd emit one orphan inProgress item per tool and a real one.
         if (id) pending.toolStartSeen.add(id)
+        // A file tool's input is followed as it streams, so the App can draw
+        // the change while Claude is still writing it.
+        if (typeof event.index === 'number') {
+          pending.toolInputPreviews?.start(event.index, id, String(block.name ?? ''))
+        }
       }
+      return
+    }
+    if (eventType === 'content_block_stop') {
+      if (typeof event.index === 'number') pending.toolInputPreviews?.stop(event.index)
       return
     }
     if (eventType === 'content_block_delta') {
       const delta = event.delta as Record<string, unknown> | undefined
       if (!delta) return
       const deltaType = String(delta.type ?? '')
-      if (deltaType === 'text_delta') {
+      if (deltaType === 'input_json_delta') {
+        if (typeof event.index !== 'number') return
+        const preview = pending.toolInputPreviews?.push(
+          event.index,
+          String(delta.partial_json ?? ''),
+        )
+        if (preview) await pending.handlers.onEvent({ type: 'tool_input_progress', ...preview })
+      } else if (deltaType === 'text_delta') {
         const text = String(delta.text ?? '')
         if (!text) return
         this.recordStreamedBlock(pending, event.index, 'text', text)
@@ -2008,6 +2278,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (messageId ? messageId === pending.assistantMessageId : !streamStart) return
     pending.assistantMessageId = messageId
     pending.streamedBlocks = new Map()
+    pending.toolInputPreviews?.clear()
     if (!pending.context?.outputFormat) {
       await pending.handlers.onEvent({ type: 'message_boundary' })
     }
@@ -2088,10 +2359,44 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
           // for the same question.
           continue
         }
+        // The server draws a dynamic tool call as a dynamicToolCall item
+        // when it runs (onDynamicToolCall).
+        if (dynamicToolNames(pending.context).has(name)) continue
         await pending.handlers.onEvent({ type: 'tool_use', toolUseId: id, toolName: name, input })
         if (isWorkflowTool(name)) pending.workflowToolUseIds.add(id)
+        if (name === 'Bash' && !nestedMessage)
+          pending.session.commandOutputs.call(id, this.commandOutputSink(pending, id))
       }
     }
+  }
+
+  // A running Bash command's output goes to its item in the turn.
+  private commandOutputSink(pending: PendingTurn, toolUseId: string): OutputSink {
+    return {
+      live: () => !pending.resolved && !pending.session.closed,
+      emit: (delta) => pending.handlers.onEvent({ type: 'tool_output_delta', toolUseId, delta }),
+    }
+  }
+
+  // The Bash call returned. A shell it left running in the background goes on
+  // reporting its output to the thread.
+  private endCommandOutput(session: LiveSession, toolUseId: string): void {
+    const listener = session.reusable ? this.listener : null
+    const background: BackgroundSink | null = listener
+      ? (taskId) => ({
+          live: () => !session.closed,
+          emit: (delta) =>
+            listener.onTaskEvent(session.threadId, {
+              type: 'task_output',
+              taskId,
+              toolUseId,
+              delta,
+            }),
+        })
+      : null
+    session.commandOutputs.callEnded(toolUseId, background, (taskId) =>
+      session.liveTasks.has(taskId),
+    )
   }
 
   private async handleUser(pending: PendingTurn, message: Record<string, unknown>): Promise<void> {
@@ -2127,6 +2432,9 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         isError,
         ...(structured ? { structured } : {}),
       })
+      // After the result, which replaces what the command's item showed.
+      if (!message.parent_tool_use_id && pending.session)
+        this.endCommandOutput(pending.session, toolUseId)
       if (!workflowLaunchAttached && isWorkflowLaunch && toolResultCount === 1) {
         workflowLaunchAttached = true
         this.attachWorkflowJournal(pending, workflowLaunchResult, toolUseId)
@@ -2543,6 +2851,24 @@ function hookRunOutcome(message: Record<string, unknown>): {
   return { status: 'completed', entries }
 }
 
+// memory_recall's memories: a file path with its text left out, or the text
+// itself under a `<synthesis:DIR>` marker or a URL.
+function recalledMemories(value: unknown): RecalledMemory[] {
+  if (!Array.isArray(value)) return []
+  return value.flatMap((raw) => {
+    const memory = recordOrNull(raw)
+    const path = stringOrNull(memory?.path)
+    if (!memory || !path) return []
+    return [
+      {
+        path,
+        scope: stringOrNull(memory.scope),
+        content: typeof memory.content === 'string' ? memory.content : null,
+      },
+    ]
+  })
+}
+
 function parseHookOutput(value: unknown): Record<string, unknown> {
   const text = String(value ?? '').trim()
   if (!text.startsWith('{')) return {}
@@ -2751,6 +3077,128 @@ function goalToolServer(sdk: ClaudeSdk, z: Zod, goal: GoalToolHandlers) {
   })
 }
 
+// The dynamic tool servers a session offers. Plan mode runs no tool that acts,
+// and a configured MCP server keeps its name.
+function registeredDynamicServers(context: RuntimeTurnContext): DynamicToolServer[] {
+  if (!context?.dynamicTools?.length) return []
+  if (
+    derivePermissionMode(context.approvalPolicy, context.sandboxMode, context.planMode) === 'plan'
+  )
+    return []
+  const taken = new Set([
+    GOAL_MCP_SERVER,
+    LEADER_MCP_SERVER,
+    ...Object.keys(recordOrNull(context.mcpServers) ?? {}),
+  ])
+  return context.dynamicTools.filter((server) => !taken.has(server.server))
+}
+
+// Claude Code's names for the dynamic tools a session offers.
+function dynamicToolNames(context: RuntimeTurnContext): Set<string> {
+  return new Set(
+    registeredDynamicServers(context).flatMap((server) =>
+      server.tools.map((tool) => `mcp__${server.server}__${tool.name}`),
+    ),
+  )
+}
+
+// The tool call's abort signal, which the SDK passes in `extra`.
+function toolSignal(extra: unknown): AbortSignal | undefined {
+  const signal = (extra as { signal?: unknown } | null)?.signal
+  return signal instanceof AbortSignal ? signal : undefined
+}
+
+function leaderToolServer(sdk: ClaudeSdk, z: Zod, leader: LeaderToolHandlers) {
+  const run = async (call: () => Promise<string>) => {
+    try {
+      return { content: [{ type: 'text' as const, text: await call() }] }
+    } catch (error) {
+      const text = error instanceof Error ? error.message : String(error)
+      return { content: [{ type: 'text' as const, text }], isError: true }
+    }
+  }
+  const readOnly = { annotations: { readOnlyHint: true } }
+  const threadId = z.string().describe('The threadId thread_start or thread_list returned.')
+  const timeoutSec = z
+    .number()
+    .min(0)
+    .optional()
+    .describe('Seconds to wait at most (default 300, at most 3600).')
+  return sdk.createSdkMcpServer({
+    name: LEADER_MCP_SERVER,
+    version: '1.0.0',
+    tools: [
+      sdk.tool(
+        'thread_list',
+        THREAD_LIST_DESCRIPTION,
+        {
+          scope: z
+            .enum(['children', 'all'])
+            .optional()
+            .describe('"children" (default): the chats you started. "all": recent chats too.'),
+        },
+        (args) => run(() => leader.list(args)),
+        readOnly,
+      ),
+      sdk.tool(
+        'thread_start',
+        THREAD_START_DESCRIPTION,
+        {
+          prompt: z.string().describe('The first message of the new chat, complete on its own.'),
+          title: z.string().optional().describe('A short title for the sidebar.'),
+          cwd: z
+            .string()
+            .optional()
+            .describe("Absolute working directory. Defaults to this chat's."),
+          model: z.string().optional().describe("Claude model id. Defaults to this chat's."),
+        },
+        (args) => run(() => leader.start(args)),
+      ),
+      sdk.tool(
+        'thread_prompt',
+        THREAD_PROMPT_DESCRIPTION,
+        {
+          threadId,
+          text: z.string().describe('The message to send.'),
+          wait: z
+            .boolean()
+            .optional()
+            .describe('Wait for the turn that takes the message to finish and return its result.'),
+          timeoutSec,
+        },
+        (args, extra) => run(() => leader.prompt(args, toolSignal(extra))),
+      ),
+      sdk.tool(
+        'thread_wait',
+        THREAD_WAIT_DESCRIPTION,
+        {
+          threadIds: z.array(z.string()).min(1).describe('Chats you started to wait for.'),
+          until: z
+            .enum(['any', 'all'])
+            .optional()
+            .describe('"any" (default): return when one is done or blocked. "all": when all are.'),
+          timeoutSec,
+        },
+        (args, extra) => run(() => leader.wait(args, toolSignal(extra))),
+        readOnly,
+      ),
+      sdk.tool(
+        'thread_read',
+        THREAD_READ_DESCRIPTION,
+        {
+          threadId,
+          sinceCursor: z
+            .string()
+            .optional()
+            .describe('The cursor a previous thread_read returned, to read only what came after.'),
+        },
+        (args) => run(() => leader.read(args)),
+        readOnly,
+      ),
+    ],
+  })
+}
+
 // Codex's approval policy says "never ask" (or the sandbox is wide open) and
 // no explicit permission mode overrides it: tools run without a prompt.
 function autoAllowsTools(context: RuntimeTurnContext): boolean {
@@ -2810,6 +3258,8 @@ function sessionSignature(context: RuntimeTurnContext): string {
     context.systemPromptAddendum ?? '',
     context.mcpServers ?? null,
     context.goalTools ? GOAL_MCP_SERVER : null,
+    context.dynamicTools ?? null,
+    context.leaderTools ? LEADER_MCP_SERVER : null,
     context.addDirs ?? [],
     context.allowedTools ?? [],
     inheritedAllowedTools(context),
@@ -2822,6 +3272,7 @@ function sessionSignature(context: RuntimeTurnContext): string {
     parseWorkflowCommand(context.prompt)?.type === 'run',
     context.planMode === true,
     configuredPermissionMode(),
+    context.autoMemory ?? null,
   ])
 }
 
@@ -2831,6 +3282,22 @@ function sessionSettleMs(): number {
 
 function backgroundIdleMs(): number {
   return positiveEnvMs('CLAUDE_CODEX_BACKGROUND_IDLE_MS') ?? BACKGROUND_IDLE_MS
+}
+
+// 0 turns live command output off.
+function commandOutputPollMs(): number {
+  const raw = process.env.CLAUDE_CODEX_COMMAND_OUTPUT_POLL_MS
+  const value = raw ? Number(raw) : Number.NaN
+  return Number.isFinite(value) && value >= 0 ? value : COMMAND_OUTPUT_POLL_MS
+}
+
+// The SDK's get_task_output request, which Query implements without declaring
+// it. Older SDKs lack it, and commands then show their output when they end.
+function taskOutputReader(query: Query): ((taskId: string) => Promise<unknown>) | null {
+  const read = (query as Query & { getTaskOutput?: (taskId: string) => Promise<unknown> })
+    .getTaskOutput
+  if (typeof read !== 'function') return null
+  return (taskId) => read.call(query, taskId)
 }
 
 function truthyEnv(value: string | undefined): boolean {

@@ -113,6 +113,11 @@ export interface ThreadRecord {
   baseInstructions: string | null
   developerInstructions: string | null
   personality: string | null
+  // Codex's per-thread memory mode, from the memories.* config of
+  // thread/start. Saved only when the thread is created; change it through
+  // SessionStore.setThreadMemoryMode (thread/memoryMode/set). Null on threads
+  // saved before it existed; they follow the global memories config.
+  memoryMode?: 'enabled' | 'disabled' | null
   // The project the thread belongs to. Read-only here: upsertThread leaves it
   // alone, so a stale record saved after a turn cannot undo an assignment
   // made meanwhile. Assign through SessionStore.setThreadProject.
@@ -181,6 +186,10 @@ export interface TurnRecord {
   items: ThreadItem[]
   diff: string
   error: unknown | null
+  // The first turn in the chain of work that led to this one, when that is
+  // another turn: the rootTurnId of turn/start, or for a subagent's turn the
+  // root of the turn that spawned it. Null or absent: the turn is its own root.
+  rootTurnId?: string | null
   // Claude Agent SDK ResultMessage metrics. Surface them in turn/completed
   // so Codex App's status bar can show real timing + cost instead of blanks.
   apiDurationMs?: number | null
@@ -229,6 +238,29 @@ export interface TurnToolOutput {
   output: string | Array<Record<string, unknown>>
 }
 
+// Codex v2 MemoryCitation: the memories an answer drew on. The App lists each
+// entry's note under the answer; threadIds names Codex rollouts.
+export interface MemoryCitation {
+  entries: MemoryCitationEntry[]
+  threadIds: string[]
+}
+
+export interface MemoryCitationEntry {
+  path: string
+  lineStart: number
+  lineEnd: number
+  note: string
+}
+
+// A memory Claude's auto-memory put into its context. `path` is the memory
+// file, or a `<synthesis:DIR>` marker or a URL for a memory that is not a
+// local file; `content` is the memory's text when Claude reported it.
+export interface RecalledMemory {
+  path: string
+  scope: string | null
+  content: string | null
+}
+
 export type ThreadItem =
   // clientId echoes turn/start's or turn/steer's clientUserMessageId so the
   // App can reconcile its optimistic copy of the message.
@@ -236,7 +268,13 @@ export type ThreadItem =
   // A codex_app tool result that turn/start carried in place of user input,
   // such as a thread handoff. The App shows it as the turn's user message.
   | ({ type: 'functionCallOutput'; id: string } & TurnToolOutput)
-  | { type: 'agentMessage'; id: string; text: string; phase: string | null; memoryCitation: null }
+  | {
+      type: 'agentMessage'
+      id: string
+      text: string
+      phase: string | null
+      memoryCitation: MemoryCitation | null
+    }
   | { type: 'plan'; id: string; text: string }
   | { type: 'reasoning'; id: string; summary: string[]; content: string[] }
   | { type: 'enteredReviewMode'; id: string; review: string }
@@ -355,10 +393,11 @@ export type ThreadItem =
       agentThreadId: string
       agentPath: string
     }
-  // Codex's native dynamic tool call item — used to surface AskUserQuestion as
-  // a structured choice card the App renders inline (paired with the
-  // item/tool/requestUserInput reverse RPC). The contentItems array carries
-  // the user's free-form answer text (Codex `DynamicToolCallOutputContentItem`).
+  // Codex's native dynamic tool call item: a call to a tool the client
+  // registered on thread/start (answered through item/tool/call), and
+  // AskUserQuestion shown as a structured choice card (paired with the
+  // item/tool/requestUserInput reverse RPC). contentItems is the tool result
+  // (Codex `DynamicToolCallOutputContentItem`).
   | {
       type: 'dynamicToolCall'
       id: string
@@ -366,12 +405,63 @@ export type ThreadItem =
       tool: string
       arguments: unknown
       status: 'inProgress' | 'completed' | 'failed'
-      contentItems: Array<
-        { type: 'inputText'; text: string } | { type: 'inputImage'; imageUrl: string }
-      > | null
+      contentItems: DynamicToolContentItem[] | null
       success: boolean | null
       durationMs: number | null
     }
+
+// Codex's DynamicToolCallOutputContentItem.
+export type DynamicToolContentItem =
+  | { type: 'inputText'; text: string }
+  | { type: 'inputImage'; imageUrl: string }
+  | { type: 'inputAudio'; audioUrl: string }
+
+// A dynamic tool as the client registers it on thread/start, in Codex's
+// canonical DynamicToolSpec form (a lone function or a namespace of them).
+export interface DynamicToolFunctionSpec {
+  type: 'function'
+  name: string
+  description: string
+  inputSchema: unknown
+  deferLoading?: boolean
+}
+
+export type DynamicToolSpec =
+  | DynamicToolFunctionSpec
+  | {
+      type: 'namespace'
+      name: string
+      description: string
+      tools: DynamicToolFunctionSpec[]
+    }
+
+// The dynamic tools of one namespace (or the ones without a namespace), as
+// one in-process MCP server Claude sees as mcp__<server>__<tool>.
+export interface DynamicToolServer {
+  server: string
+  namespace: string | null
+  description: string
+  tools: Array<{
+    name: string
+    description: string
+    inputSchema: Record<string, unknown>
+    deferLoading: boolean
+  }>
+}
+
+// Claude called a dynamic tool: the item/tool/call request without the
+// thread and turn, which the server knows.
+export interface DynamicToolCallRequest {
+  callId: string
+  namespace: string | null
+  tool: string
+  arguments: unknown
+}
+
+export interface DynamicToolCallResponse {
+  contentItems: DynamicToolContentItem[]
+  success: boolean
+}
 
 export interface FileUpdateChange {
   path: string
@@ -382,8 +472,9 @@ export interface FileUpdateChange {
 export interface RuntimeTurnContext {
   threadId: string
   turnId: string
-  // normal = user-visible chat/review turn; summary = Codex App's structured
-  // title/metadata turn; compact = explicit context compaction.
+  // normal = user-visible chat/review turn, and a /compact run in the
+  // thread's own session; summary = Codex App's structured title/metadata
+  // turn; compact = the summary a compaction falls back to.
   purpose?: 'normal' | 'summary' | 'compact'
   prompt: string
   cwd: string
@@ -448,6 +539,20 @@ export interface RuntimeTurnContext {
   // The thread has a goal: expose Codex's goal tools (get_goal, create_goal,
   // update_goal) to Claude. Backends without in-process tools ignore it.
   goalTools?: GoalToolHandlers | null
+  // Let Claude Code's auto-memory read and write its memory folder. Set only
+  // with the memories mapping on (CLAUDE_CODEX_MEMORIES=1): true when the user
+  // turned memories on in the App and the thread's memory mode is enabled,
+  // false to have the runtime switch auto-memory off. Unset leaves it to
+  // Claude Code's own settings.
+  autoMemory?: boolean
+  // Tools the client registered on thread/start, one MCP server per
+  // namespace. Claude's calls reach RuntimeHandlers.onDynamicToolCall of the
+  // turn in flight. Backends without in-process tools ignore it.
+  dynamicTools?: DynamicToolServer[] | null
+  // The thread may lead other threads: expose the thread_* tools that start,
+  // prompt, wait on and read separate chats. Off unless the adapter enables
+  // them; backends without in-process tools ignore it.
+  leaderTools?: LeaderToolHandlers | null
 }
 
 // Each handler returns the text of the tool result; a thrown Error becomes an
@@ -457,6 +562,33 @@ export interface GoalToolHandlers {
   getGoal(): Promise<string>
   createGoal(objective: string, tokenBudget: number | null): Promise<string>
   updateGoal(status: string): Promise<string>
+}
+
+// Same contract as GoalToolHandlers: each returns the tool result text (JSON
+// here), a thrown Error becomes an error result. `signal` aborts a wait when
+// Claude's tool call is cancelled.
+export interface LeaderToolHandlers {
+  list(input: { scope?: string | undefined }): Promise<string>
+  start(input: {
+    prompt: string
+    cwd?: string | undefined
+    model?: string | undefined
+    title?: string | undefined
+  }): Promise<string>
+  prompt(
+    input: {
+      threadId: string
+      text: string
+      wait?: boolean | undefined
+      timeoutSec?: number | undefined
+    },
+    signal?: AbortSignal,
+  ): Promise<string>
+  wait(
+    input: { threadIds: string[]; until?: string | undefined; timeoutSec?: number | undefined },
+    signal?: AbortSignal,
+  ): Promise<string>
+  read(input: { threadId: string; sinceCursor?: string | undefined }): Promise<string>
 }
 
 export interface ImageInput {
@@ -475,6 +607,10 @@ export interface ClaudeCheckpoint {
   messageUuid: string
 }
 
+// Where a thread's Claude context starts over after a rewind or a fork: a
+// checkpoint, or 'new' for a new session that remembers nothing.
+export type ClaudeResumePoint = ClaudeCheckpoint | 'new'
+
 export type RuntimeEvent =
   | { type: 'session'; claudeSessionId: string }
   // Claude wrote a top-level transcript entry; the newest one of a turn is
@@ -485,6 +621,14 @@ export type RuntimeEvent =
   | { type: 'text_delta'; delta: string }
   | { type: 'reasoning_delta'; delta: string }
   | { type: 'tool_use'; toolUseId: string; toolName: string; input: Record<string, unknown> }
+  // The input of a file tool call (Edit, Write, MultiEdit) as far as the
+  // model has written it; the finished call follows as `tool_use`.
+  | {
+      type: 'tool_input_progress'
+      toolUseId: string
+      toolName: string
+      input: Record<string, unknown>
+    }
   | { type: 'tool_output_delta'; toolUseId: string; delta: string }
   | {
       type: 'tool_result'
@@ -509,6 +653,16 @@ export type RuntimeEvent =
       questions: UserInputQuestion[]
     }
   | { type: 'notice'; level: 'info' | 'warning' | 'error'; message: string }
+  // Claude began compacting the conversation (on its own when the context
+  // fills, or for /compact) and finished it: the earlier history is now a
+  // summary of `postTokens` tokens, when Claude measured it.
+  | { type: 'compaction_started' }
+  | {
+      type: 'compaction_completed'
+      trigger: 'manual' | 'auto'
+      preTokens: number | null
+      postTokens: number | null
+    }
   // A result's usage. `child` marks tokens a subagent or workflow spent:
   // they add to the thread's total, not to its context window.
   | {
@@ -545,6 +699,8 @@ export type RuntimeEvent =
       category: string | null
       message: string
     }
+  // Claude's auto-memory recalled these memories for the prompt.
+  | { type: 'memory_recall'; memories: RecalledMemory[] }
   | { type: 'completed'; claudeSessionId?: string | null; result?: string | null; success: boolean }
   | { type: 'error'; message: string }
 
@@ -632,6 +788,13 @@ export interface RuntimeHandlers {
     request: ElicitationRequest,
     signal: AbortSignal,
   ): Promise<ElicitationResponse>
+  // Routed when Claude calls one of RuntimeTurnContext.dynamicTools. The
+  // server bridges it to Codex's `item/tool/call`; `signal` aborts when
+  // Claude cancels the call. When absent the runtime returns an error result.
+  onDynamicToolCall?(
+    request: DynamicToolCallRequest,
+    signal: AbortSignal,
+  ): Promise<DynamicToolCallResponse>
 }
 
 export interface RuntimeTaskUsage {
@@ -680,6 +843,15 @@ export type RuntimeTaskEvent =
       // agents: the last assistant message of the sidechain transcript).
       result: string | null
       usage: RuntimeTaskUsage | null
+    }
+  | {
+      // Output of a background shell, after the Bash call that started it
+      // returned (a call still waiting for its result streams through its
+      // turn as tool_output_delta).
+      type: 'task_output'
+      taskId: string
+      toolUseId: string
+      delta: string
     }
 
 export interface RuntimeBackgroundListener {
@@ -752,4 +924,11 @@ export interface ClaudeRuntime {
   // Close the thread's live session, background tasks included, so its next
   // turn starts a new one: the thread's history was rewound or deleted.
   resetSession?(threadId: string): void
+  // True when a turn whose prompt is `/compact` compacts the Claude session
+  // it resumes, reporting it with compaction_started / compaction_completed.
+  compactsSessions?(): boolean
+  // The MCP config was reloaded. Sessions still open retry their MCP servers
+  // that failed or wait for a sign-in; a session opened later reads the
+  // config itself. Never rejects.
+  reloadMcpServers?(): Promise<void>
 }

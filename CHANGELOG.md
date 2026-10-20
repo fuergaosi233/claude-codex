@@ -7,8 +7,47 @@ versioning or publishing metadata.
 
 ## Unreleased
 
+### `ws://` listener authentication
+
+- **Breaking:** `--listen ws://` on a non-loopback address (`0.0.0.0`, `::`,
+  a LAN or public IP) now refuses to start without a capability token, as
+  `codex app-server` does. It used to accept any client, which put an agent
+  with shell access on the network. Pass `--ws-auth capability-token`
+  (`CLAUDE_CODEX_WS_AUTH=capability-token`) to require a token or, when
+  something else protects the listener, opt out explicitly with
+  `--ws-allow-unauthenticated` (`CLAUDE_CODEX_WS_ALLOW_UNAUTHENTICATED=1`);
+  the adapter then warns at startup. Loopback listeners keep working without
+  a token, and the Codex App, which uses stdio or the unix socket, is not
+  affected.
+- **Breaking:** a `ws://` upgrade that carries an `Origin` header is refused
+  (403) unless the origin is in `CLAUDE_CODEX_WS_ALLOWED_ORIGINS` /
+  `--ws-allowed-origins`, on loopback too, so web pages (and DNS rebinding)
+  cannot reach the listener. App-server clients outside a browser send no
+  `Origin`.
+- Capability-token auth (`--ws-auth capability-token`, `--ws-token-file`,
+  `--ws-token-sha256`, `CLAUDE_CODEX_WS_TOKEN*`) takes the token as
+  `Authorization: Bearer`, which `codex --remote-auth-token-env` sends, or as
+  a `claude-codex.bearer.<token>` subprotocol from a browser. Without a token
+  source the adapter creates a 0600 `ws-token` file in its home and prints
+  only the path.
+- `ws://[::1]:port` listens on the IPv6 loopback address (the brackets used
+  to reach `listen()` and fail), and the `listening on` line shows the bound
+  port, so `ws://127.0.0.1:0` is usable.
+- A refused listener or another bad listener option ends the adapter with
+  exit code 1 and the message alone, without a stack trace.
+
 ### App-server and protocol compatibility
 
+- Opt-in Memories: with `CLAUDE_CODEX_MEMORIES=1`, the App's Memories
+  settings (Settings > Personalization) and `/memories` decide whether Claude
+  threads run with Claude Code's auto-memory, and while Memories is off in the
+  App they run with `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`. Without the switch
+  nothing changes: the App shows no Memories settings and Claude Code's own
+  settings decide.
+- `memory/reset` is refused instead of reporting success, since Claude Code's
+  memory folders are shared with Claude Code outside the App and the adapter
+  deletes nothing, and `memory/status` checks `minConsolidatedThreads` against
+  Codex's bounds (1 to 4096).
 - The model picker reads the Codex model catalog from `CODEX_HOME` instead of
   `~/.codex`, so an App with its own home lists its catalog rather than the
   built-in fallback models.
@@ -48,6 +87,16 @@ versioning or publishing metadata.
 - The context gauge follows the main loop's latest API call, like Codex's
   `last_token_usage`, and tokens spent by subagents and workflows count toward
   the thread total without moving the gauge or goal progress.
+- `thread/compact/start` compacts the thread's own Claude session with
+  `/compact`, so the conversation goes on from Claude's summary instead of a
+  summary written beside it; a thread with no session yet, or whose
+  compaction fails, still gets the summary-model summary. Claude compacting
+  on its own within a turn now shows as a `contextCompaction` item, and the
+  context gauge drops to the compacted size either way. Only compaction and
+  review turns refuse `turn/steer`, with Codex's invalid-request code
+  (`-32600`) and its `activeTurnNotSteerable` error as data, which newer App
+  builds take as a cue to queue a message sent during a compaction; a turn
+  Claude compacted keeps taking messages.
 - A turn that ends early completes the message still streaming and fails the
   tool calls still running before `turn/completed`, instead of leaving them
   in progress in the App.
@@ -74,11 +123,6 @@ versioning or publishing metadata.
   server failed also stops the CLI turn behind it.
 - An ephemeral `thread/fork`, which the App uses to describe a thread, stays
   out of `thread/list`.
-- The adapter advertises app-server `0.159.0-alpha.12.1`, the Codex build of
-  Codex App 26.930, so every feature gate of that App is on.
-  `CLAUDE_CODEX_COMPAT_VERSION` still overrides it, and
-  `docs/reference/app-compat.md` lists what the gates change, including the
-  two that also depend on the App's server-side flags.
 - A `turn/start` carrying `toolOutput` instead of input (a thread handoff, or
   a message from another thread) prompts Claude with its text and images and
   records it as a `functionCallOutput` item, instead of starting a turn with
@@ -117,6 +161,120 @@ versioning or publishing metadata.
   state on `turn/completed` only, so such a turn kept the thread spinning for
   the rest of the connection — with the answer already written to Claude's
   transcript — until the user interrupted it by hand.
+- Codex App 26.1013 is a verified build. Its GovCloud check for a Bedrock
+  account is answered "not GovCloud", so the App no longer shows the GovCloud
+  modal; `thread/attachmentOwner/list` lists the threads holding a worktree,
+  by thread id and with the `archived` filter; and a request the adapter has
+  no case for fails with JSON-RPC `-32601` (method not found), the code the
+  App treats as unsupported, instead of the generic `-32000`.
+- As in Codex, a fork that is kept holds the thread attachments its parent
+  held (the worktree, pull requests), so `thread/attachmentOwner/list` names
+  it too and the App keeps a worktree a fork of an archived chat still holds.
+- `npm run check:app-upgrade` also takes an `app.asar` or an extracted App,
+  reads the protocol from a codex checkout with `--protocol-source` or skips
+  it with `--bundle-only`, and lists every request the App's scripts name that
+  the adapter would answer with method not found.
+- `thread/fork` honours `lastTurnId` (fork through that turn) and
+  `beforeTurnId` (fork before it), which the App sends to fork a chat from one
+  of its turns. The fork's history stops there, and so does Claude's context:
+  its first turn resumes at the newest kept turn's checkpoint, or where the
+  chat began when the fork keeps no turn, so the forked chat no longer
+  remembers what came after. As in Codex, the two ids together, an unknown
+  turn and a `lastTurnId` that is still running are rejected. When the kept
+  turns predate checkpoints, the fork keeps Claude's whole session, as before,
+  and a `configWarning` says so.
+- The adapter advertises app-server `0.163.0-alpha.10.2`, the Codex build of
+  Codex App 26.1013, so every feature gate of 26.1013 is on; App 26.930 turns
+  on every one of its own gates, as with the `0.159.0-alpha.12.1` the adapter
+  advertised before. Codex `0.163.0` has the same app-server protocol.
+  `CLAUDE_CODEX_COMPAT_VERSION` still overrides it, and
+  `docs/reference/app-compat.md` lists what the gates change, including the
+  two that also depend on the App's server-side flags. The App's composer
+  predictions, which that version turns
+  on, fork only a thread whose `modelProvider` is `openai`, so they leave
+  Claude threads (`claude-code`) alone.
+- Every turn carries `rootTurnId`, new in that protocol: the root a
+  `turn/start` names for work it starts on behalf of another turn, else the
+  turn's own id. A subagent's turn takes the root of the turn that spawned it,
+  and input that joins a running turn keeps that turn's root, as in Codex; a
+  queued message or goal turn the adapter starts afterwards is its own root.
+- CI checks the Rust protocol fixtures against `@openai/codex@0.163.0`, and
+  the `turn/started` and `turn/completed` fixtures must carry exactly the
+  fields of the generated `Turn`.
+- With `CLAUDE_CODEX_DYNAMIC_TOOLS=1`, Claude gets the dynamic tools a client
+  registers on `thread/start` (the Codex App's own tools, which it sends to
+  remote hosts), one in-process MCP server per namespace. A call goes back to
+  the client as `item/tool/call` and shows as a `dynamicToolCall` item; specs
+  Codex refuses fail `thread/start` with its messages, and a chat keeps its
+  tools across restarts, resumes and forks. Off by default, since the App's
+  tools act on the desktop without an approval prompt.
+- Claude's file edits show while Claude is still writing them, as Codex's
+  patches do: the `fileChange` card of an Edit, Write or MultiEdit call in
+  the main loop opens once Claude's streamed input names the file and grows
+  through `item/fileChange/patchUpdated`, at most every 500 ms. The finished
+  call, or an approval request that comes first, replaces the streamed
+  input, so the approval and the completed item show exactly the change
+  Claude makes; a card whose call never finished fails at the next model
+  response. `CLAUDE_CODEX_LIVE_FILE_CHANGES=0` shows a change only once the
+  whole call has arrived, as before.
+- `model/list` offers each Claude model the reasoning efforts Claude Code
+  reports for it instead of low to xhigh for all: `max` on the models that
+  take it, and none on a model without effort levels, such as Claude Haiku,
+  whose `defaultReasoningEffort` is then `none`. The native runtime asks the
+  SDK for `supportedModels()` when a Claude session starts and keeps the
+  answer in `claude-models.json` under the adapter home, so a restarted
+  adapter still lists the levels. Before the first report, or with a Claude
+  Code that reports none, every model offers low to xhigh as before, and
+  Codex proxy models keep those levels. `max` is kept as a thread and config
+  effort; a `turn/start` with effort `none` runs without an effort and keeps
+  the thread's, and `turn/settings/update` ignores `none`. The App picks the
+  levels up when it reloads the model list (on window focus, at most every
+  five minutes) and shows Max only once it is turned on under Settings >
+  Agent > Model features.
+- With `CLAUDE_CODEX_APP_PLUGIN_MCP=1` (off by default), the adapter runs
+  the MCP server of the Codex App's code-review plugin, which draws the
+  App's Pull Requests panel, and answers the App's `mcpServerStatus/list`,
+  `mcpServer/tool/call` and `mcpServer/resource/read` for server
+  `code-review` instead of treating it as unknown. The server runs as one
+  long-lived stdio process from the plugin's folder with only an
+  environment allowlist, uses the host's GitHub credentials (such as an
+  existing `gh` login) and is never offered to Claude threads. A
+  comma-separated value names other plugins to run; `codex-app-tools`,
+  `browser-use` and the `codex_app` server never run. The App turns the
+  server on only for an app-server on the same machine, and starting a
+  review from the panel runs the real Codex CLI, so it needs a working
+  Codex install. For every server, `mcpServerStatus/list` now keeps each
+  tool's `annotations`, `icons` and `_meta`, and `mcpServer/tool/call`
+  forwards the request's `_meta` with the call's `threadId` set, as Codex
+  does.
+- `mcpServer/oauth/login` fails with an error saying to sign in with `/mcp`
+  in a Claude Code session, instead of handing the App an authorization URL
+  that led nowhere: Claude Code signs in to MCP servers itself, and the
+  adapter cannot start that sign-in. The App shows only its own "couldn't
+  connect" message. `config/mcpServer/reload` is no longer a no-op: it drops
+  the cached server statuses, sends every window each configured server's
+  startup status again, and has sessions kept open by background work retry
+  the servers that failed or wait for a sign-in, leaving connected ones
+  alone.
+- Memories Claude Code recalls during a turn show under its answer as a
+  Codex `memoryCitation`: each memory once, with its file's lines and its
+  description or first line as the note.
+- Review turns complete their `enteredReviewMode` item right away and end
+  with an `exitedReviewMode` item that carries Claude's answer, or Codex's
+  fallback text when there is none, also when the review is interrupted,
+  fails or is cut off by the adapter stopping, as Codex does.
+- The Claude Agent SDK is 0.3.304, which bundles Claude Code 2.1.304. The
+  adapter always passes a permission mode, so the CLI's changed default for
+  SDK sessions without one does not reach Claude threads.
+- Claude's Bash commands stream their output into the App's command item
+  while they run, read about once a second through the SDK's
+  `get_task_output` request: a foreground command once Claude Code makes it a
+  task, about two seconds in, and a background shell after its call returned,
+  also after the turn ended, followed by Claude Code's note when it was
+  stopped, failed or reached its background time limit (30 minutes in Agent
+  SDK sessions since Claude Code 2.1.285, or the call's own `timeout` up to 2
+  hours). `CLAUDE_CODEX_COMMAND_OUTPUT_POLL_MS=0` shows the output only when
+  the command finishes, as before.
 
 ### Provider and multi-agent boundaries
 
@@ -147,6 +305,26 @@ versioning or publishing metadata.
   children as Codex does, `SendMessage` / `TaskStop` map to agent calls, the
   CLI 2.1.283 hand-back report and usage trailer are parsed, and a finishing
   child no longer clears its still-running siblings from the roster.
+- A subagent's spawn card and thread show the effort Claude Code 2.1.292+
+  runs it at when the Agent call sets one (`max` shows as `xhigh`, the top of
+  the App's scale). A fork subagent, on by default in Agent SDK sessions since
+  Claude Code 2.1.302, shows its parent's model and effort, since Claude
+  ignores the Agent call's `model` and `effort` for it.
+- Opt-in leader tools: with `CLAUDE_CODEX_LEADER_TOOLS=1`, Claude in a chat
+  the user started gets a `codex_leader` MCP server whose `thread_start`,
+  `thread_list`, `thread_wait`, `thread_prompt` and `thread_read` tools
+  start other Claude chats, which the Codex App adds to the sidebar, and
+  wait for, message and read them. A started chat shows as a card when
+  Claude repeats the `::created-thread{threadId="…"}` line the tool returns.
+  Started chats take the leader's cwd and model by default and its approval
+  policy, sandbox and permissions, never anything more permissive (a leader
+  without a policy starts chats that ask); they, forks, subagents and
+  ephemeral chats get no leader tools. A leader runs at most
+  `CLAUDE_CODEX_LEADER_MAX_RUNNING` (default 4) chats at once, never answers
+  their approvals or questions (such a chat shows as blocked), starts none
+  while new chats run on the Codex proxy, and in plan mode only lists, waits
+  and reads. Which chat leads which survives restarts. Without the switch
+  nothing changes.
 - Deleting a thread ends its running background agents first, so each child
   turn completes as interrupted; stopping a turn no longer wakes the thread to
   acknowledge the background agents Claude Code stopped with it; and
@@ -219,7 +397,7 @@ versioning or publishing metadata.
 - No support is included for personal subscription sharing, credential pooling,
   browser cookie/session-token reuse, private provider endpoints, or provider
   bypass behavior.
-- The App's dynamic tools (the worktree tools of its `threadAttachments`
-  gate), MCP tool-call progress, incremental Bash output, and Claude Code
-  plugin skills in the "/" popup are not included. Hook runs are shown live
-  but not kept in history.
+- The App's worktree tools (its `threadAttachments` gate) on a local host,
+  where the App names them for its bundled `codex_app` MCP server instead of
+  sending them as `dynamicTools`, MCP tool-call progress, and Claude Code
+  plugin skills in the "/" popup are not included. Hook runs are shown live but not kept in history.

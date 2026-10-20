@@ -2,6 +2,7 @@ import { type ChildProcess, execFileSync, spawn } from 'node:child_process'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { autoMemoryEnv } from './memories.mjs'
 import type { ClaudeRuntime, RuntimeHandlers, RuntimeTurnContext } from './types.mjs'
 
 export interface ClaudePRuntimeOptions {
@@ -39,7 +40,16 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
       }
 
       const args = this.argsForContext(context, inputFile)
-      const result = await this.runProcessWithRetry(context.threadId, args, context.cwd, handlers)
+      // With the memories mapping on, auto-memory only for threads the user
+      // turned memories on for.
+      const env = { ...process.env, ...autoMemoryEnv(context.autoMemory) }
+      const result = await this.runProcessWithRetry(
+        context.threadId,
+        args,
+        context.cwd,
+        env,
+        handlers,
+      )
       const parsed = parseClaudePJson(result.stdout)
       const text = parsed?.result ?? result.stdout.trim()
       const sessionId = parsed?.sessionId
@@ -120,10 +130,11 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
     threadId: string,
     args: string[],
     cwd: string,
+    env: NodeJS.ProcessEnv,
   ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
     const child = spawn(this.options.command, args, {
       cwd,
-      env: { ...process.env },
+      env,
       stdio: ['ignore', 'pipe', 'pipe'],
       detached: process.platform !== 'win32',
     })
@@ -173,6 +184,7 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
     threadId: string,
     args: string[],
     cwd: string,
+    env: NodeJS.ProcessEnv,
     handlers: RuntimeHandlers,
   ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
     const attempts = 1 + Math.max(0, this.options.stopTimeoutRetries ?? 0)
@@ -180,7 +192,7 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       let result: { stdout: string; stderr: string; exitCode: number }
       try {
-        result = await this.runProcess(threadId, args, cwd)
+        result = await this.runProcess(threadId, args, cwd, env)
       } catch (error) {
         if (isClaudePTimeoutError(error) && attempt < attempts) {
           await handlers.onEvent({

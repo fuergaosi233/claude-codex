@@ -46,7 +46,9 @@ The Rust-first direction is documented in
 - Representative app-server JSON fixtures are checked in.
 - Rust tests parse and re-serialize the covered fixtures.
 - CI runs `cargo test --workspace`.
-- CI runs a pinned fixture drift check against `@openai/codex@0.142.3`.
+- CI runs a pinned fixture drift check against `@openai/codex@0.163.0`: the
+  methods the fixtures use exist, and the Turn fixtures carry exactly the
+  fields of the generated `Turn`.
 
 Not claimed yet:
 

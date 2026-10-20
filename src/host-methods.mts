@@ -11,14 +11,27 @@ import { basename } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { stringOr } from './server-helpers.mjs'
 
-// A JSON-RPC error whose `data` the App reads.
+// JSON-RPC error codes. Every error without its own code is a SERVER_ERROR.
+export const SERVER_ERROR = -32000
+export const INVALID_REQUEST = -32600
+export const METHOD_NOT_FOUND = -32601
+
+// A JSON-RPC error whose code or `data` the App reads.
 export class RpcError extends Error {
   readonly data: unknown
+  readonly code: number
 
-  constructor(message: string, data: unknown) {
+  constructor(message: string, data?: unknown, code = SERVER_ERROR) {
     super(message)
     this.data = data
+    this.code = code
   }
+}
+
+// The answer to a method this server does not have, in the JSON-RPC form the
+// App takes as "not supported here" and falls back from without an error.
+export function methodNotFound(method: string): RpcError {
+  return new RpcError(`method not found: ${method}`, undefined, METHOD_NOT_FOUND)
 }
 
 // The answer to one of these methods; undefined for any other method.
@@ -77,6 +90,13 @@ export function hostMethod(method: string, params: Record<string, unknown>): unk
     // sign-in configure Codex's model provider.
     case 'account/bedrock/discover':
       return { profiles: [], environmentCredentials: [] }
+    // The App checks a Bedrock account (which account/read reports) against
+    // AWS GovCloud at startup and asks for an acknowledgement until the
+    // answer clears it. That guidance is about Codex's own Bedrock provider;
+    // Claude Code picks its provider and region on its own.
+    // App rule: bedrock-govcloud
+    case 'account/bedrock/checkGovCloudRequirements':
+      return { isGovCloud: false, shouldWarn: false }
     case 'account/bedrock/setup':
       throw new Error('Bedrock is configured in Claude Code, not through the Codex App')
     case 'account/gatewayOAuth/read':
