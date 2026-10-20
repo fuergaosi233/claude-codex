@@ -1353,7 +1353,7 @@ test('with Codex routing off, the App titles a chat on the Claude summary model'
     assert.equal(fork.error, undefined)
     assert.equal(fork.result.model, 'sonnet')
 
-    // A chat of the user's own on a Codex model keeps it.
+    // A chat of the user's own on a Codex model has nowhere to run.
     proc.stdin.write(
       json({
         id: 6,
@@ -1361,9 +1361,31 @@ test('with Codex routing off, the App titles a chat on the Claude summary model'
         params: { cwd: process.cwd(), model: 'gpt-5.6-luna' },
       }),
     )
-    const own = await reader.nextResponse(6)
-    assert.equal(own.error, undefined)
-    assert.equal(own.result.model, 'gpt-5.6-luna')
+    const refused = await reader.nextResponse(6)
+    assert.equal(refused.result, undefined)
+    assert.match(
+      refused.error?.message ?? '',
+      /Codex model routing is disabled, so gpt-5\.6-luna cannot run here; pick a Claude model/,
+    )
+
+    // Nor does a first message that names one in a chat started on Claude.
+    proc.stdin.write(
+      json({
+        id: 7,
+        method: 'turn/start',
+        params: {
+          threadId: chat.result.thread.id,
+          model: 'gpt-5.6-luna',
+          input: [{ type: 'text', text: 'hi', text_elements: [] }],
+        },
+      }),
+    )
+    const firstTurn = await reader.nextResponse(7)
+    assert.equal(firstTurn.result, undefined)
+    assert.match(
+      firstTurn.error?.message ?? '',
+      /Codex model routing is disabled, so gpt-5\.6-luna cannot run here; pick a Claude model/,
+    )
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -1379,6 +1401,139 @@ test('with Codex routing on, the App title thread keeps its Codex model', async 
     const start = await reader.nextResponse(1)
     assert.equal(start.error, undefined)
     assert.equal(start.result.model, 'gpt-5.6-luna')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('a thread keeps the runtime backend of its conversation', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  // The picker lists gpt-5.5, as it lists the Codex models with routing on.
+  const proc = spawnMockAdapter(home, {
+    ...titleAdapterEnv,
+    CLAUDE_CODEX_DISABLE_CODEX_PROXY: '',
+    CLAUDE_CODEX_MODELS: 'sonnet,opus,haiku,gpt-5.5',
+  })
+  const reader = new JsonLineReader(proc)
+  let nextId = 1
+  const request = async (method: string, params: Record<string, unknown>) => {
+    const id = nextId++
+    proc.stdin.write(json({ id, method, params }))
+    return reader.nextResponse(id)
+  }
+  const waitForTurnCompleted = async () => {
+    let text = ''
+    for (;;) {
+      const message = await reader.next()
+      if (message.method === 'item/agentMessage/delta') text += message.params.delta
+      if (message.method === 'turn/completed') return { text, turn: message.params.turn }
+    }
+  }
+  const input = [{ type: 'text', text: 'output schema check', text_elements: [] }]
+  const resumed = async (threadId: string) => (await request('thread/resume', { threadId })).result
+  const threadModel = async (threadId: string) => (await resumed(threadId)).model
+  const crossing =
+    /cannot change runtime backend from claude to codex for gpt-5\.5; start a new thread/
+  try {
+    const chat = await request('thread/start', { cwd: process.cwd(), model: 'sonnet' })
+    assert.equal(chat.error, undefined)
+    const threadId = chat.result.thread.id
+    assert.equal((await request('turn/start', { threadId, input })).error, undefined)
+    await waitForTurnCompleted()
+
+    // A Codex model would move the Claude conversation to Codex: refused, by
+    // a turn, by the model menu and by a metadata update, and the thread keeps
+    // its model and everything else the refused request carried.
+    const crossed = await request('turn/start', { threadId, model: 'gpt-5.5', input })
+    assert.equal(crossed.result, undefined)
+    assert.match(crossed.error?.message ?? '', crossing)
+    assert.equal(await threadModel(threadId), 'sonnet')
+    const menu = await request('thread/settings/update', {
+      threadId,
+      model: 'gpt-5.5',
+      effort: 'low',
+    })
+    assert.equal(menu.result, undefined)
+    assert.match(menu.error?.message ?? '', crossing)
+    const metadata = await request('thread/metadata/update', {
+      threadId,
+      model: 'gpt-5.5',
+      isPinned: true,
+    })
+    assert.equal(metadata.result, undefined)
+    assert.match(metadata.error?.message ?? '', crossing)
+    const kept = await resumed(threadId)
+    assert.equal(kept.model, 'sonnet')
+    assert.notEqual(kept.reasoningEffort, 'low')
+    assert.equal(kept.thread.isPinned, false)
+
+    // Another Claude model is fine and becomes the thread's model.
+    const opus = await request('turn/start', { threadId, model: 'opus', input })
+    assert.equal(opus.error, undefined)
+    assert.equal(JSON.parse((await waitForTurnCompleted()).text).model, 'opus')
+    assert.equal(await threadModel(threadId), 'opus')
+
+    // A structured summary turn names the App's Codex model: it runs on the
+    // summary model for that turn alone.
+    const summary = await request('turn/start', {
+      threadId,
+      model: 'gpt-5.4-mini',
+      outputSchema: {
+        type: 'object',
+        properties: { title: { type: 'string' } },
+        required: ['title'],
+        additionalProperties: false,
+      },
+      input,
+    })
+    assert.equal(summary.error, undefined)
+    const summaryTurn = await waitForTurnCompleted()
+    assert.equal(summaryTurn.turn.status, 'completed')
+    assert.equal(JSON.parse(summaryTurn.text).model, 'haiku')
+    assert.equal(await threadModel(threadId), 'opus')
+
+    // The App starts a new chat's thread before anything is sent, and sends
+    // the first message on whatever model was picked meanwhile: until there
+    // is a conversation, the model picks the backend.
+    const fresh = await request('thread/start', { cwd: process.cwd(), model: 'sonnet' })
+    const freshId = fresh.result.thread.id
+    const first = await request('turn/start', { threadId: freshId, model: 'gpt-5.5', input })
+    assert.equal(first.error, undefined)
+    await waitForTurnCompleted()
+    assert.equal(await threadModel(freshId), 'gpt-5.5')
+    // Its conversation is on Codex now, and does not move to Claude either.
+    const back = await request('turn/start', { threadId: freshId, model: 'sonnet', input })
+    assert.equal(back.result, undefined)
+    assert.match(
+      back.error?.message ?? '',
+      /cannot change runtime backend from codex to claude for sonnet; start a new thread/,
+    )
+    assert.equal(await threadModel(freshId), 'gpt-5.5')
+
+    // The same goes for a model picked through the settings of a chat with
+    // nothing sent yet.
+    const unsent = await request('thread/start', { cwd: process.cwd(), model: 'sonnet' })
+    const unsentId = unsent.result.thread.id
+    const picked = await request('thread/settings/update', { threadId: unsentId, model: 'gpt-5.5' })
+    assert.equal(picked.error, undefined)
+    assert.equal(await threadModel(unsentId), 'gpt-5.5')
+
+    // The App sends the chat's current model along with other settings; that
+    // is no change, even for a model the picker does not list.
+    const unlisted = await request('thread/start', { cwd: process.cwd(), model: 'gpt-5.4' })
+    const unlistedId = unlisted.result.thread.id
+    assert.equal((await request('turn/start', { threadId: unlistedId, input })).error, undefined)
+    await waitForTurnCompleted()
+    const effort = await request('thread/settings/update', {
+      threadId: unlistedId,
+      model: 'gpt-5.4',
+      effort: 'low',
+    })
+    assert.equal(effort.error, undefined)
+    const unlistedThread = await resumed(unlistedId)
+    assert.equal(unlistedThread.model, 'gpt-5.4')
+    assert.equal(unlistedThread.reasoningEffort, 'low')
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -2432,6 +2587,55 @@ test('app-server proxy forwards websocket handshake bytes to unix daemon', {
     proxy.stdin?.end()
     await Promise.all([stopProcess(proxy), stopProcess(daemon)])
     await rm(sock, { force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('the daemon and the proxy meet at CLAUDE_CODEX_SOCKET_PATH without a path argument', {
+  timeout: 15_000,
+}, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const sock = join(tmpdir(), `ccx-test-${randomUUID().slice(0, 8)}.sock`)
+  // Started as the App starts them: `--listen unix://` and `proxy`, no path.
+  const env = {
+    ...process.env,
+    CODEX_HOME: home,
+    CLAUDE_CODEX_SOCKET_PATH: sock,
+    CLAUDE_CODEX_MOCK: '1',
+    NODE_NO_WARNINGS: '1',
+  }
+  const daemon = spawn(process.execPath, [adapter, 'app-server', '--listen', 'unix://'], {
+    stdio: ['ignore', 'ignore', 'pipe'],
+    env,
+  })
+  let proxy: ChildProcess | null = null
+  try {
+    await waitForStderr(daemon, /listening on/)
+    assert.equal(existsSync(sock), true)
+    assert.equal(existsSync(join(home, 'app-server-control')), false)
+    proxy = spawn(process.execPath, [adapter, 'app-server', 'proxy'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env,
+    })
+    const stdout = new TextCollector(proxy)
+    proxy.stdin?.write(
+      [
+        'GET / HTTP/1.1',
+        'Host: localhost',
+        'Upgrade: websocket',
+        'Connection: Upgrade',
+        'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==',
+        'Sec-WebSocket-Version: 13',
+        '',
+        '',
+      ].join('\r\n'),
+    )
+    await stdout.waitFor(/101 Switching Protocols/)
+  } finally {
+    proxy?.stdin?.end()
+    await Promise.all([proxy ? stopProcess(proxy) : null, stopProcess(daemon)])
+    await rm(sock, { force: true })
+    await rm(`${sock}.pid`, { force: true })
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
@@ -5994,7 +6198,9 @@ test('debug.jsonl rotates once it crosses CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES', asy
 test('defaultSocketPath stays within the platform sun_path limit', async () => {
   const util = await import(resolve('dist/src/util.mjs'))
   const prev = process.env.CODEX_HOME
+  const prevSocket = process.env.CLAUDE_CODEX_SOCKET_PATH
   process.env.CODEX_HOME = '/' + 'very-long-codex-home-segment'.repeat(8)
+  delete process.env.CLAUDE_CODEX_SOCKET_PATH
   try {
     const socketPath = util.defaultSocketPath()
     assert.ok(
@@ -6004,6 +6210,7 @@ test('defaultSocketPath stays within the platform sun_path limit', async () => {
   } finally {
     if (prev == null) delete process.env.CODEX_HOME
     else process.env.CODEX_HOME = prev
+    if (prevSocket != null) process.env.CLAUDE_CODEX_SOCKET_PATH = prevSocket
   }
 })
 

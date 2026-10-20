@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import test from 'node:test'
 import {
   codexProxyModelOptions,
+  defaultSocketPath,
   isPathInside,
   newThreadId,
   resolveCodexBinary,
@@ -47,6 +48,31 @@ test('isPathInside accepts strict descendants only', () => {
   assert.equal(isPathInside('/a/b', '/a/bc/d'), false)
   assert.equal(isPathInside('/a/b', '/a/b/../c'), false)
   assert.equal(isPathInside('/a/b', '/a/b/..c/d'), true)
+})
+
+test('defaultSocketPath takes CLAUDE_CODEX_SOCKET_PATH over CODEX_HOME', () => {
+  const keys = ['CODEX_HOME', 'CLAUDE_CODEX_SOCKET_PATH'] as const
+  const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]))
+  process.env.CODEX_HOME = '/tmp/codex-home'
+  try {
+    process.env.CLAUDE_CODEX_SOCKET_PATH = '/run/claude-codex/app-server.sock'
+    assert.equal(defaultSocketPath(), '/run/claude-codex/app-server.sock')
+    // A relative path resolves against the working directory.
+    process.env.CLAUDE_CODEX_SOCKET_PATH = ' run/app-server.sock '
+    assert.equal(defaultSocketPath(), resolve('run/app-server.sock'))
+    // Blank means unset.
+    process.env.CLAUDE_CODEX_SOCKET_PATH = '  '
+    assert.equal(
+      defaultSocketPath(),
+      join('/tmp/codex-home', 'app-server-control', 'app-server-control.sock'),
+    )
+  } finally {
+    for (const key of keys) {
+      const value = previous[key]
+      if (value == null) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
 })
 
 test('resolveCodexBinary prefers CODEX_REAL over PATH and homedir fallbacks', async () => {

@@ -188,17 +188,25 @@ export const APP_RULES: readonly AppRule[] = [
     id: 'helper-thread-model',
     app: 'Generates chat titles, descriptions and turn summaries in ephemeral helper threads (threadSource thread_title, thread_description, thread_summary) on its own OpenAI model, the ephemeralGenerationModel of its statsig config, and allows the server to fall back to another model. A title starts a thread and a description forks the chat; its turn/start carries model null and an outputSchema its zod schemas declare as JSON Schema draft 2020-12, and the JSON in the last agentMessage counts once turn/completed reports completed within 30 seconds. When title generation fails, the chat keeps its first words as its title.',
     adapter:
-      'With CLAUDE_CODEX_DISABLE_CODEX_PROXY=1 and no Codex proxy selected, starts a helper thread that names a Codex model on the Claude summary model instead of the Codex backend, maps a Codex model on its turns the same way, and keeps an ephemeral fork of a Claude chat on the chat model. Other threads that name a Codex model are left on Codex. Drops the draft declaration of an outputSchema, which the Claude CLI refuses.',
+      'With CLAUDE_CODEX_DISABLE_CODEX_PROXY=1 and no Codex proxy selected, starts a helper thread that names a Codex model on the Claude summary model instead of the Codex backend, maps a Codex model on its turns the same way, and keeps an ephemeral fork of a Claude chat on the chat model. Refuses any other thread/start that names a Codex model, since the picker offers none. Drops the draft declaration of an outputSchema, which the Claude CLI refuses.',
     verify:
       'With Codex routing off, send the first message of a new chat: the chat gets a generated title, not its first words.',
   },
   {
-    id: 'prewarmed-threads',
-    app: 'Starts the thread of a new chat with thread/start before the user sends anything, keeps it out of thread/list and holds back its thread/started until it sends turn/start there, and deletes it with thread/delete once the chat goes unused for 10 minutes. It forgets such threads when the app-server connection drops or the App quits.',
+    id: 'model-menu-settings',
+    app: 'Applies a model picked from the menu of an open chat it has resumed with thread/settings/update (model, effort and multiAgentMode); in a new chat the pick only rides on the first turn/start. When the request fails it shows a “Couldn’t update model settings” toast, adding the error message only for code -32600, and puts the menu back. Only code -32601, or a message saying method not found, or unknown method or unknown variant next to the method name, counts as the server lacking the method.',
     adapter:
-      'Lists and searches a thread only once it has a turn or a preview, as Codex lists a thread only once it has a user message, so a prewarmed chat the App forgot does not show up empty in the sidebar. The archive, a chosen section and subagent queries still list every thread.',
+      "Refuses a model on the other backend from the chat's (a Codex model in a Claude chat, or a Claude model in a Codex chat unless the Codex proxy carries every thread) once the chat has a conversation, with a plain error raised before anything changes, so the menu goes back and the chat keeps its model. The chat's current model sent along with other settings is no change.",
     verify:
-      'Open a new chat without sending anything, restart the adapter and reload the App: no empty chat shows in the sidebar.',
+      'With Codex models in the menu, pick one in a Claude chat that has a reply: a toast says the model settings could not be updated and the menu shows the Claude model again; another Claude model still applies.',
+  },
+  {
+    id: 'prewarmed-threads',
+    app: "Starts the thread of a new chat with thread/start before the user sends anything, keeps it out of thread/list and holds back its thread/started until it sends turn/start there, and deletes it with thread/delete once the chat goes unused for 10 minutes. It forgets such threads when the app-server connection drops or the App quits. It sends the chat's first message to that thread whatever model was picked meanwhile, comparing only permissions, instructions and feature overrides.",
+    adapter:
+      'Lists and searches a thread only once it has a turn or a preview, as Codex lists a thread only once it has a user message, so a prewarmed chat the App forgot does not show up empty in the sidebar. The archive, a chosen section and subagent queries still list every thread. A thread with no conversation yet takes the backend of the model its first turn names, so that message runs on the model picked.',
+    verify:
+      'Open a new chat without sending anything, restart the adapter and reload the App: no empty chat shows in the sidebar. Open a new chat, pick a model of the other backend and send: the reply comes from that model.',
   },
 ]
 

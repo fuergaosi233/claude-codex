@@ -32,6 +32,17 @@ Selecting it does not itself enable plan mode, so an ordinary conversation may
 correctly run on Sonnet. Choose **Claude Opus** to use Opus throughout. See the
 [Claude Code model configuration](https://code.claude.com/docs/en/model-config#opusplan-model-setting).
 
+A new chat runs on whichever model is picked before its first message. After
+that it stays on that model's backend, since its conversation lives in a Claude
+session or a Codex one and neither carries over. Picking a Codex model in a
+Claude chat, or a Claude model in a Codex chat (unless the `codex-proxy` route
+carries every chat), is refused: the App reports that it couldn't update the
+model settings and the chat keeps its model. Pick another model from the same
+family, or start a new chat for the other one. With
+`CLAUDE_CODEX_DISABLE_CODEX_PROXY=1` the menu lists no Codex models and a new chat
+on one is refused, while the App's own title and summary requests run on the
+Claude summary model.
+
 ## Inline visualizations
 
 With the default native Claude Agent SDK backend, Claude can answer with a

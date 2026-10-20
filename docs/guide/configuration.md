@@ -107,6 +107,12 @@ When enabled, each new Codex thread runs in a dedicated `git worktree`.
 # Idle shutdown grace period in ms (default 15000; 0 = never exit).
 export CLAUDE_CODEX_IDLE_EXIT_MS="15000"
 
+# Unix socket of `app-server --listen unix://` and `app-server proxy`
+# (default $CODEX_HOME/app-server-control/app-server-control.sock). Set it
+# where both commands run, such as the login shell profile or runtime.env,
+# and give it a folder of its own: the daemon makes that folder private.
+export CLAUDE_CODEX_SOCKET_PATH="$HOME/.claude-codex/run/app-server.sock"
+
 # Pin a node binary for the shim (e.g. when default node is < 24).
 export CLAUDE_CODEX_NODE="/absolute/path/to/node"
 ```
@@ -128,6 +134,7 @@ export CLAUDE_CODEX_NODE="/absolute/path/to/node"
 | `CLAUDE_CODEX_DEFAULT_MODEL` / `_EFFORT` | Defaults for new threads. |
 | `CLAUDE_CODEX_MODELS` | Codex App model picker list. |
 | `CLAUDE_CODEX_CODEX_MODELS` | Codex models the picker offers through the bundled `codex` (comma-separated). Without it the list comes from `model_catalog.json` in `CODEX_HOME`. |
+| `CLAUDE_CODEX_DISABLE_CODEX_PROXY` | `1` turns Codex model routing off, unless the Codex proxy is the selected loop: the picker offers only Claude models, a new thread on a Codex model is refused, and the App's title and summary threads run on `CLAUDE_CODEX_SUMMARY_MODEL` (else `CLAUDE_CODEX_TITLE_MODEL`, else haiku). |
 | `CLAUDE_CODEX_MODEL_ALIASES` / `_EFFORT_ALIASES` | Id remapping. |
 | `CLAUDE_CODEX_MCP_SERVERS` | MCP server config (JSON or path to a JSON file; a file may wrap the servers in `mcpServers` as `.mcp.json` does). Wins a name over inherited servers. |
 | `CLAUDE_CODEX_CODEX_MCP_SERVERS` | `1` starts the Codex config's `[mcp_servers]` (user `config.toml` and trusted project `.codex/config.toml`) in Claude threads; off otherwise, since the Codex App writes its own desktop servers into that file. See [Inherited configuration](https://github.com/fuergaosi233/claude-codex#inherited-configuration). |
@@ -142,6 +149,7 @@ export CLAUDE_CODEX_NODE="/absolute/path/to/node"
 | `CLAUDE_CODEX_ENABLE_FILE_CHECKPOINTING` | Enable SDK file checkpointing. |
 | `CLAUDE_CODEX_AUTO_WORKTREE` / `_WORKTREE_ROOT` | Per-thread worktree isolation. |
 | `CLAUDE_CODEX_IDLE_EXIT_MS` | Daemon idle shutdown. |
+| `CLAUDE_CODEX_SOCKET_PATH` | Unix socket that `app-server --listen unix://` listens on and `app-server proxy` connects to when neither names one (`app-server proxy --sock <path>` still wins). Default `app-server-control/app-server-control.sock` under `CODEX_HOME`, or a short path in the temp directory when that is too long for a socket. Both commands read it, so set it where both run, as an absolute path (a relative one resolves against each command's working directory) within the socket path limit (about 104 bytes on macOS, 108 on Linux). The daemon creates the socket's folder if needed and makes it private to the user (mode 700), with a `.pid` file next to the socket, so give the socket a folder of its own. |
 | `CLAUDE_CODEX_BACKGROUND_IDLE_MS` | How long a Claude session keeps background agents alive without any message (default 2 hours). |
 | `CLAUDE_CODEX_QUIET_BACKGROUND_TURNS` | `0` marks every finished turn unread in the Codex App again. By default a turn that ends while its background agents or workflows still run leaves the chat read and sends no notification (background Bash shells do not count, since one can run for the rest of the chat); see [Background work and the unread dot](/guide/gui#background-work-and-the-unread-dot). |
 | `CLAUDE_CODEX_SESSION_SETTLE_MS` | How long an idle session waits for Claude to answer a task that just ended, when the CLI does not report session state (default `15000`). |

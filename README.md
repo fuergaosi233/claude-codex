@@ -65,6 +65,14 @@ diffs. Runtime selection maps only to existing backend paths today: default
 in-process Claude Agent SDK, `agent-http`, `agentapi`, `claude-p`, `codex-proxy`,
 and `mock`.
 
+The App starts one adapter daemon with `codex app-server --listen unix://` and
+reaches it through `codex app-server proxy`. Neither names a socket, so both use
+`$CODEX_HOME/app-server-control/app-server-control.sock` by default. To put it
+somewhere else, set `CLAUDE_CODEX_SOCKET_PATH` to an absolute path in a folder of
+its own, in the login shell or `~/.claude-codex/runtime.env`, since the daemon
+and the proxy must agree on it. See
+[Configuration](https://fuergaosi233.github.io/claude-codex/guide/configuration).
+
 ### Desktop conversation and visual explanations
 
 The native Claude Agent SDK backend receives presentation guidance modeled on

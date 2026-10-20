@@ -394,6 +394,13 @@ function claudeHelperModel(model: string): string {
   return resolveClaudeModel(model, 'summary') ?? model
 }
 
+// A Codex model with Codex routing off has nowhere to run.
+function codexRoutingDisabledError(model: string): Error {
+  return new Error(
+    `Codex model routing is disabled, so ${model} cannot run here; pick a Claude model`,
+  )
+}
+
 export class CodexClaudeAppServer {
   // Keyed by request id. A request goes to every peer following its thread;
   // the first answer resolves it.
@@ -1017,24 +1024,28 @@ export class CodexClaudeAppServer {
     const now = nowSeconds()
     const projectId = stringOr(params.projectId, '') || null
     if (projectId) this.requireProject(projectId)
-    const requestedCwd = stringOr(params.cwd, process.cwd())
-    const cwd = maybeCreateThreadWorktree(id, requestedCwd).cwd
     const requestedModel = modelFromParams(params, this.configModel)
-    const reasoningEffort = reasoningEffortFromParams(params, this.configReasoningEffort)
-    const permissionProfileId = permissionProfileIdFromParams(params)
-    const permissionProfile = permissionProfilePolicy(permissionProfileId)
-    const selectedProviderLoop = resolveProviderLoopSelection(this.providerLoopSelectionInput())
     const isTitleOrHelper =
       params.ephemeral === true ||
       params.threadSource === 'title_generation' ||
       params.threadSource === 'memory_consolidation'
+    const codexRoutingDisabled = this.codexRoutingDisabled()
     // The App names its own OpenAI model for titles and other helper threads,
     // and accepts another one; with Codex routing off they run on Claude.
     // App rule: helper-thread-model
     const model =
-      isTitleOrHelper && this.codexRoutingDisabled() && isCodexOpenAiModel(requestedModel)
+      isTitleOrHelper && codexRoutingDisabled && isCodexOpenAiModel(requestedModel)
         ? claudeHelperModel(requestedModel)
         : requestedModel
+    // Any other thread on a Codex model has nowhere to run, and the picker
+    // offers none: refuse it before a worktree is made for it.
+    if (codexRoutingDisabled && isCodexOpenAiModel(model)) throw codexRoutingDisabledError(model)
+    const requestedCwd = stringOr(params.cwd, process.cwd())
+    const cwd = maybeCreateThreadWorktree(id, requestedCwd).cwd
+    const reasoningEffort = reasoningEffortFromParams(params, this.configReasoningEffort)
+    const permissionProfileId = permissionProfileIdFromParams(params)
+    const permissionProfile = permissionProfilePolicy(permissionProfileId)
+    const selectedProviderLoop = resolveProviderLoopSelection(this.providerLoopSelectionInput())
     const thread: ThreadRecord = {
       id,
       sessionId: id,
@@ -2284,14 +2295,10 @@ export class CodexClaudeAppServer {
     if (projectId) this.requireProject(projectId)
 
     // Support dynamic model, reasoning effort, approval policy and sandbox updates
-    const rawModel = modelFromParams(params, null)
-    const model = rawModel ? normalizeSelectableModelId(rawModel, thread.model) : null
+    const model = this.requestedModelChange(thread, params)
     const reasoningEffort = reasoningEffortFromParams(params, null)
-    if (model) {
-      const newBackend = isCodexOpenAiModel(model) ? 'codex' : 'claude'
-      thread.runtimeBackend = newBackend
-      thread.model = model
-    }
+    // First, so a model on the other backend is refused before anything changes.
+    if (model) this.setThreadModel(thread, model)
     if (reasoningEffort) thread.reasoningEffort = reasoningEffort
     if (typeof params.approvalPolicy === 'string')
       thread.approvalPolicy = normalizeApprovalPolicy(params.approvalPolicy)
@@ -2337,12 +2344,12 @@ export class CodexClaudeAppServer {
     // legacy settings fields in the compatibility handler so removing the
     // duplicate dispatch case does not silently disable profile/model
     // switching for existing clients.
-    const rawModel = modelFromParams(params, null)
-    const model = rawModel ? normalizeSelectableModelId(rawModel, thread.model) : null
-    if (model) {
-      thread.runtimeBackend = isCodexOpenAiModel(model) ? 'codex' : 'claude'
-      thread.model = model
-    }
+    // The App's model menu lands here. A model on the other backend is
+    // refused before anything changes: the App then reports that it could
+    // not update the settings and the chat keeps its model.
+    // App rule: model-menu-settings
+    const model = this.requestedModelChange(thread, params)
+    if (model) this.setThreadModel(thread, model)
     const reasoningEffort = reasoningEffortFromParams(params, null)
     if (reasoningEffort) thread.reasoningEffort = reasoningEffort
     if (typeof params.personality === 'string')
@@ -3051,24 +3058,27 @@ export class CodexClaudeAppServer {
       )
       if (joined) return { turn: this.toLifecycleTurn(joined) }
     }
-    if (typeof params.cwd === 'string' && params.cwd.length > 0) thread.cwd = params.cwd
+    // A structured summary or title turn runs its model, mapped to the
+    // summary model, for that turn alone; it never rebinds the thread's.
+    const summaryTurn = params.outputSchema != null
     const requestedModel = modelFromParams(params, thread.model)
     // A helper thread on Claude maps a Codex model like thread/start does.
-    // Structured summary/title turns map theirs to the summary model anyway.
     // App rule: helper-thread-model
     const helperModel =
-      params.outputSchema == null &&
+      !summaryTurn &&
       thread.ephemeral &&
       thread.runtimeBackend === 'claude' &&
       isCodexOpenAiModel(requestedModel) &&
       this.codexRoutingDisabled()
         ? claudeHelperModel(requestedModel)
         : null
-    const model = helperModel ?? requestedModel
+    const model = summaryTurn ? null : (helperModel ?? requestedModel)
+    // First, so a model on the other backend is refused before anything changes.
+    if (model && model !== thread.model) this.setThreadModel(thread, model)
+    if (typeof params.cwd === 'string' && params.cwd.length > 0) thread.cwd = params.cwd
     const reasoningEffort = reasoningEffortFromParams(params, thread.reasoningEffort)
     const permissionProfileId = permissionProfileIdFromParams(params)
     const permissionProfile = permissionProfilePolicy(permissionProfileId)
-    if (model) thread.model = model
     if (reasoningEffort) thread.reasoningEffort = reasoningEffort
     if (permissionProfileId) {
       thread.permissionProfileId = permissionProfileId
@@ -6010,10 +6020,70 @@ export class CodexClaudeAppServer {
   // Codex models have nowhere to run: CLAUDE_CODEX_DISABLE_CODEX_PROXY turned
   // Codex routing off, and no Codex proxy carries every thread.
   private codexRoutingDisabled(): boolean {
+    return process.env.CLAUDE_CODEX_DISABLE_CODEX_PROXY === '1' && !this.codexProxySelected()
+  }
+
+  // The Codex proxy carries every thread, whatever its model.
+  private codexProxySelected(): boolean {
     return (
-      process.env.CLAUDE_CODEX_DISABLE_CODEX_PROXY === '1' &&
-      resolveProviderLoopSelection(this.providerLoopSelectionInput()).runtimeType !== 'codex-proxy'
+      resolveProviderLoopSelection(this.providerLoopSelectionInput()).runtimeType === 'codex-proxy'
     )
+  }
+
+  // The model a settings or metadata update moves the thread to, or null. The
+  // App sends the chat's current model along with other settings; that is no
+  // change, even when the picker no longer lists it and repairing it would
+  // pick a model on the other backend.
+  private requestedModelChange(
+    thread: ThreadRecord,
+    params: Record<string, unknown>,
+  ): string | null {
+    const rawModel = modelFromParams(params, null)
+    if (!rawModel || rawModel === thread.model) return null
+    const model = normalizeSelectableModelId(rawModel, thread.model)
+    return model === thread.model ? null : model
+  }
+
+  // Whether `model` runs on another backend than the thread's. The Codex
+  // proxy runs Claude models too, so a Codex thread keeps it for either.
+  private crossesRuntimeBackend(thread: ThreadRecord, model: string): boolean {
+    const codexModel = isCodexOpenAiModel(model)
+    return thread.runtimeBackend === 'claude'
+      ? codexModel
+      : !codexModel && !this.codexProxySelected()
+  }
+
+  // Something was said in the thread, or it carries a parent's conversation.
+  private threadHasConversation(thread: ThreadRecord): boolean {
+    return (
+      thread.forkedFromId != null ||
+      thread.claudeSessionId != null ||
+      thread.codexSessionId != null ||
+      this.activeTurnByThread.has(thread.id) ||
+      this.store.lastTurn(thread.id) != null
+    )
+  }
+
+  // Moves the thread to `model`, or throws before anything changes. A thread
+  // stays on the backend it started on: its conversation lives in a Claude
+  // session or a Codex one, and neither carries over to the other. So another
+  // Claude model is fine for a Claude thread but a Codex one is not, and the
+  // other way round unless the Codex proxy carries every thread. A thread with
+  // no conversation yet has nothing to lose, so its model still picks its
+  // backend: the App starts a new chat's thread before the user picks a model.
+  // App rule: prewarmed-threads
+  private setThreadModel(thread: ThreadRecord, model: string): void {
+    if (this.crossesRuntimeBackend(thread, model)) {
+      const codexModel = isCodexOpenAiModel(model)
+      if (this.threadHasConversation(thread)) {
+        throw new Error(
+          `cannot change runtime backend from ${thread.runtimeBackend} to ${codexModel ? 'codex' : 'claude'} for ${model}; start a new thread`,
+        )
+      }
+      if (codexModel && this.codexRoutingDisabled()) throw codexRoutingDisabledError(model)
+      thread.runtimeBackend = codexModel ? 'codex' : 'claude'
+    }
+    thread.model = model
   }
 
   private providerLoopSelectionInput(): ProviderLoopSelectionInput {

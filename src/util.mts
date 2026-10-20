@@ -71,7 +71,12 @@ export function socketPathLimit(): number {
   return platform() === 'darwin' ? 104 : 108
 }
 
+// CLAUDE_CODEX_SOCKET_PATH moves the socket. The daemon and the proxy each
+// resolve it, so both need it set. An explicit path is used as given, without
+// the short temp-directory fallback for a path too long for a socket.
 export function defaultSocketPath(): string {
+  const explicit = process.env.CLAUDE_CODEX_SOCKET_PATH?.trim()
+  if (explicit) return resolve(explicit)
   const preferred = join(codexHome(), 'app-server-control', 'app-server-control.sock')
   if (preferred.length <= socketPathLimit()) return preferred
   return join(tmpdir(), `ccx-${stableHash(preferred).slice(0, 16)}.sock`)
