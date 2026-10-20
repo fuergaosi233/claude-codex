@@ -158,8 +158,8 @@ versioning or publishing metadata.
 - `thread/timeline/list` serves the newest page first and pages back, as Codex
   does, instead of starting from the oldest entries.
 - `turn/settings/update` switches a running turn's model and effort in place,
-  and accepts the `user` reviewer the App sends when permissions change during
-  a turn, instead of failing on any change. An unknown model fails instead of
+  and accepts the reviewer the App sends when permissions change during a
+  turn, instead of failing on any change. An unknown model fails instead of
   falling back to the thread's model.
 - Claude Code command hooks the adapter runs honour `onFailure: "block"`: a
   hook that cannot start, times out, exits with a code other than 0 or 2, or
@@ -407,6 +407,78 @@ versioning or publishing metadata.
   `CLAUDE_CODEX_CODEX_AUTO_COMPACT=1`, since users set the key there for Codex
   models. Without the key nothing changes. Bridged Claude Code subagents keep
   their `autoCompactWindow` frontmatter, which used to be dropped.
+- Claude chats have the Codex App's Plan mode: `collaborationMode/list`
+  returns Plan and Default presets, which turns on `/plan` and the
+  composer's Plan toggle, and `turn/start`, `thread/settings/update` and
+  `thread/resume` take the App's `collaborationMode`, reading the model and
+  effort from its settings first. A Plan turn runs in Claude Code's plan
+  permission mode: Claude explores read-only and may ask questions, a tool
+  call that would need approval is refused, and the plan Claude hands over
+  (`ExitPlanMode`) becomes a single `plan` item, so the turn completes and
+  the App offers "Implement this plan?"; accepting sends a Default turn. A
+  thread keeps its mode across turns and restarts and reports it on
+  `thread/settings/updated` and `thread/resume`; a fork starts in Default,
+  as in Codex. The legacy `planMode` flag still works.
+- A skill picked in the composer, or from a plugin or setup card, reaches
+  Claude the way Codex reads it: the adapter adds a `<skill>` block with its
+  `SKILL.md` to the prompt when the file sits in a folder `skills/list`
+  reads or belongs to an App skill Claude can run, up to 64 KiB, and
+  otherwise asks Claude to read the file. `additionalContext` on
+  `turn/start` and `turn/steer`, which used to be dropped, follows the
+  message as `<app_context>` blocks of at most 32,768 characters each,
+  with a note that untrusted entries are data, not instructions. The
+  `userMessage` item keeps the input as sent, and `outputSchema` helper
+  turns get neither. Desktop prompts add a "# Tool availability" note
+  naming the App-only tools the App's instructions mention (starting and
+  reading threads, automations, worktrees, the sidebar), so Claude asks the
+  user to use the App instead of looking for them or writing their
+  directives; tools a chat has a counterpart for (the leader tools, or a
+  dynamic tool of the same name) are left out of the note. No tool is
+  added.
+- Claude's approval requests look like a Codex thread's: the card carries
+  Claude's reason; a tool other than Edit, Write and MultiEdit asks on the
+  command card with its name and what it touches (`WebFetch https://…`),
+  where such calls used to show no card while the turn waited; a file
+  change outside the workspace sets `grantRoot`; and an MCP tool asks with
+  the App's MCP tool approval card (`mcpServer/elicitation/request` with
+  `_meta.codex_approval_kind` `"mcp_tool_call"`). "Allow for this session"
+  covers the same Bash command, the same input of another tool, or every
+  call of that MCP tool for the rest of the thread while the adapter runs;
+  a remembered Bash command no longer approves another tool whose input has
+  the same `command`. Decline ends the call declined while Claude goes on,
+  Cancel also stops the turn, and a call Claude refuses without asking (a
+  deny rule, the auto-mode classifier) ends declined with a warning naming
+  the reason.
+- The App's "remember" choices save the permission rules Claude Code offers
+  with a request: a shell command for which Claude offers exactly one rule
+  gets "Allow similar commands" (`proposedExecpolicyAmendment` with the
+  rule's command prefix, answered with `acceptWithExecpolicyAmendment`),
+  and an MCP tool card gets "Always allow", which saves
+  `mcp__<server>__<tool>` for that tool alone. Claude Code writes the rule,
+  always to the project's `.claude/settings.local.json`. Nothing is saved
+  unless one of these two is picked, and a call only the user may answer,
+  or one Claude offers no rule for, gets neither. With
+  `CLAUDE_CODEX_SESSION_SUGGESTIONS=1`, "Allow for this session" also
+  applies the session rules and folders Claude offers with the call, which
+  can cover more than a Codex session approval (every fetch from a domain,
+  a folder outside the workspace), so it is off by default; Claude's offer
+  to switch permission mode is never passed on.
+- The App's auto-review permissions preset works in Claude chats:
+  `approvalsReviewer` `auto_review` (`guardian_subagent` from older App
+  builds) is kept per thread, across later turns, restarts and forks, and
+  reported back, and a Claude thread with it runs in Claude Code's `auto`
+  permission mode, where a classifier decides the calls that would
+  otherwise ask. A call the classifier blocks ends declined after an
+  `item/autoApprovalReview/completed` denied review with its reason;
+  `thread/approveGuardianDeniedAction` stays a no-op. Where auto mode is
+  unavailable (the model lacks it, Claude Code refuses it, a read-only
+  sandbox, `CLAUDE_CODEX_PERMISSION_MODE` set to another mode, a backend
+  other than the Agent SDK), the thread keeps and reports `user` with a
+  `configWarning` saying why, and a model switch checks again.
+  `turn/settings/update` switches a running turn into or out of auto mode.
+  A thread that names no reviewer runs as before, except that a call Claude
+  Code says only the user may answer now asks in every mode, Full access
+  included, and "Allow for this session" covers only that call.
 
 ### Provider and multi-agent boundaries
 
@@ -595,4 +667,5 @@ versioning or publishing metadata.
 - The App's worktree tools (its `threadAttachments` gate) on a local host,
   where the App names them for its bundled `codex_app` MCP server instead of
   sending them as `dynamicTools`, MCP tool-call progress, and Claude Code
-  plugin skills in the "/" popup are not included. Hook runs are shown live but not kept in history.
+  plugin skills in the "/" popup are not included. Hook runs are shown live
+  but not kept in history.
