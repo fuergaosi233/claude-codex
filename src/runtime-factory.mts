@@ -106,6 +106,11 @@ class SelectableRuntime implements ClaudeRuntime {
     await Promise.allSettled([...this.runtimes.values()].map((entry) => entry.interrupt(threadId)))
   }
 
+  async abandonTurn(threadId: string, turnId: string): Promise<boolean> {
+    const runtime = this.activeRuntimeByThread.get(threadId)
+    return (await runtime?.abandonTurn?.(threadId, turnId)) === true
+  }
+
   async stop(): Promise<void> {
     await Promise.allSettled([...this.runtimes.values()].map((runtime) => runtime.stop()))
   }

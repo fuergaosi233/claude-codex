@@ -248,9 +248,11 @@ import { maybeCreateThreadWorktree } from './worktree.mjs'
 const execFileAsync = promisify(execFile)
 
 // A missing Claude Task result must not keep the Codex App in its working state
-// forever. This is deliberately a long, configurable watchdog for the whole
-// subagent phase; it is not the short journal-drain grace period used when a
-// terminal notification has already arrived.
+// forever. This is deliberately a long, configurable inactivity window: any
+// sign of life from the turn's subagents or workflow (their output, task
+// progress, a projected workflow agent starting or finishing) starts it over,
+// so a long but healthy run never trips it. It is not the short journal-drain
+// grace period used when a terminal notification has already arrived.
 const DEFAULT_SUBAGENT_WATCHDOG_MS = 30 * 60 * 1000
 const MIN_SUBAGENT_WATCHDOG_MS = 100
 
@@ -313,6 +315,8 @@ interface ActiveSubagentState {
   turn: TurnRecord
   contexts: Map<string, SubagentContext>
   active: Set<string>
+  // Tells the turn's watchdog its subagents are still working.
+  noteProgress: () => void
 }
 
 // An Agent call Claude ran in the background. Its tool call returns at once
@@ -4182,21 +4186,15 @@ export class CodexClaudeAppServer {
       prompt,
       params,
     )
-    this.subagentStateByTurn.set(turn.id, {
-      thread,
-      turn,
-      contexts: subagentContexts,
-      active: activeSubagents,
-    })
-    this.closeStreamingItemsByTurn.set(turn.id, () => {
-      completeMessage()
-      completePlanItem()
-      completeOpenToolItems('Interrupted by the user.')
-    })
-    this.flushQueuedSubagentActivity(peer, thread.id, turn.id)
     let acceptRuntimeEvents = true
     let watchdogTimer: NodeJS.Timeout | null = null
     let resolveWatchdog: (() => void) | null = null
+    // When the turn last heard from the subagents or workflow it waits on.
+    // A busy child reports many times a second, so progress only moves this
+    // mark; a timer that comes due early waits out the rest of the window.
+    // It is read off the monotonic clock the timer runs on, so a jump of the
+    // wall clock (a laptop waking from sleep) neither fails nor stretches it.
+    let lastProgressAtMs = 0
     const watchdogTimeoutMs = subagentWatchdogTimeoutMs()
     const watchdogPromise =
       watchdogTimeoutMs > 0
@@ -4208,6 +4206,24 @@ export class CodexClaudeAppServer {
       if (watchdogTimer) clearTimeout(watchdogTimer)
       watchdogTimer = null
     }
+    const noteProgress = (): void => {
+      lastProgressAtMs = performance.now()
+    }
+    const scheduleWatchdog = (delayMs: number): void => {
+      watchdogTimer = setTimeout(() => {
+        watchdogTimer = null
+        const idleMs = performance.now() - lastProgressAtMs
+        if (idleMs < watchdogTimeoutMs) {
+          scheduleWatchdog(watchdogTimeoutMs - idleMs)
+          return
+        }
+        // Flip this before resolving the race so an already-buffered SDK event
+        // cannot create a fresh child after the watchdog has decided to fail.
+        acceptRuntimeEvents = false
+        resolveWatchdog?.()
+      }, delayMs)
+      watchdogTimer.unref()
+    }
     const armWatchdog = (): void => {
       if (
         !watchdogPromise ||
@@ -4216,15 +4232,22 @@ export class CodexClaudeAppServer {
         (activeSubagents.size === 0 && !workflowInFlight)
       )
         return
-      watchdogTimer = setTimeout(() => {
-        watchdogTimer = null
-        // Flip this before resolving the race so an already-buffered SDK event
-        // cannot create a fresh child after the watchdog has decided to fail.
-        acceptRuntimeEvents = false
-        resolveWatchdog?.()
-      }, watchdogTimeoutMs)
-      watchdogTimer.unref()
+      noteProgress()
+      scheduleWatchdog(watchdogTimeoutMs)
     }
+    this.subagentStateByTurn.set(turn.id, {
+      thread,
+      turn,
+      contexts: subagentContexts,
+      active: activeSubagents,
+      noteProgress,
+    })
+    this.closeStreamingItemsByTurn.set(turn.id, () => {
+      completeMessage()
+      completePlanItem()
+      completeOpenToolItems('Interrupted by the user.')
+    })
+    this.flushQueuedSubagentActivity(peer, thread.id, turn.id)
     const turnIsActive = (): boolean =>
       !this.stopped &&
       acceptRuntimeEvents &&
@@ -4250,6 +4273,11 @@ export class CodexClaudeAppServer {
             return
           }
           if (!turnIsActive()) return
+          // Anything the turn still hears (a child's output, its progress, a
+          // projected workflow agent) shows it is moving; the watchdog only
+          // gives up after a whole window without any of it.
+          noteProgress()
+          if (event.type === 'subagent_progress') return
           if (event.type === 'session') {
             this.store.updateClaudeSessionId(thread.id, event.claudeSessionId)
             if (resumeSessionAt) {
@@ -5328,7 +5356,7 @@ export class CodexClaudeAppServer {
         // Do not await the SDK interrupt here: some SDK versions wait for the
         // same result that has just timed out. The server catch path will
         // terminalize the parent turn immediately and late events are guarded.
-        void this.runtime.interrupt(thread.id).catch(() => {})
+        void this.releaseStalledTurn(thread.id, turn.id).catch(() => {})
       }
       throw new Error(message)
     }
@@ -5905,6 +5933,14 @@ export class CodexClaudeAppServer {
       this.appendBackgroundOutput(threadId, event)
       return
     }
+    // A foreground agent's progress keeps the turn waiting on it from giving
+    // up on it.
+    const toolUseId = event.type === 'task_updated' ? null : event.toolUseId
+    if (toolUseId) {
+      for (const state of this.subagentStateByTurn.values()) {
+        if (state.thread.id === threadId && state.active.has(toolUseId)) state.noteProgress()
+      }
+    }
     if (event.type === 'task_started') {
       if (!event.toolUseId) return
       const entry = this.findBackgroundSubagent(threadId, { toolUseId: event.toolUseId })
@@ -6381,6 +6417,19 @@ export class CodexClaudeAppServer {
       }
     }
     return false
+  }
+
+  // The watchdog gave up on a turn whose subagents went quiet. An interrupt
+  // stops it like the user's stop does, which keeps what earlier turns left
+  // running but also ends the background agents this turn handed off, so a
+  // backend that can let go of the turn alone does that while any of them
+  // still run.
+  private async releaseStalledTurn(threadId: string, turnId: string): Promise<void> {
+    const abandoned =
+      (await this.runtime.abandonTurn?.(threadId, turnId).catch(() => false)) === true
+    debugLog('subagent.watchdog.release', { threadId, turnId, abandoned })
+    if (abandoned) return
+    await this.runtime.interrupt(threadId)
   }
 
   private async requestApproval(

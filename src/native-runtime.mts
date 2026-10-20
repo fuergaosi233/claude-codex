@@ -138,6 +138,9 @@ interface PendingTurn {
   workflowTranscriptRoots: string[]
   skippedWorkflowTaskIds: Set<string>
   workflowTasks: Map<string, WorkflowTaskState>
+  // Tasks Claude started while this turn ran. An interrupt of the turn also
+  // ends the background agents among them (see abandonTurn).
+  startedTasks: Set<string>
   // Tool ids whose content_block_start we already saw — used to skip the
   // second delivery via AssistantMessage.content (the SDK ships every
   // ToolUseBlock twice; we keep only the AssistantMessage copy because
@@ -155,6 +158,10 @@ interface PendingTurn {
   workflowFailure: string | null
   // The model behind the main loop's latest response.
   model: string | null
+  // When the server was last told a subagent or workflow of the turn is
+  // still working (see noteSubagentProgress), on the monotonic clock: a wall
+  // clock set back must not hold the reports back for as long.
+  progressReportedAtMs: number
 }
 
 interface PendingTurnResult {
@@ -281,6 +288,10 @@ const SESSION_CONTROL_TIMEOUT_MS = 5_000
 // How long a new turn waits for an interrupted session to drain before it
 // gives up on the sink and goes ahead.
 const SINK_DRAIN_TIMEOUT_MS = 30_000
+// How often at most a turn tells the server its subagents are still working.
+// A busy child streams many frames a second; the server's watchdog, which
+// waits minutes, only needs to hear of it now and then.
+const SUBAGENT_PROGRESS_INTERVAL_MS = 250
 // setTimeout's ceiling (about 24.8 days).
 const MAX_TIMER_MS = 2 ** 31 - 1
 // How long past their budget stopping waits for SessionEnd hooks: a killed
@@ -454,16 +465,77 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }
   }
 
+  // The server gave up on a turn whose subagents stopped reporting progress.
+  // An interrupt ends the CLI's turn and keeps what earlier turns left
+  // running (see interrupt), but it also ends the background agents this
+  // turn handed off. While any of those still run, the turn is let go
+  // instead: its stuck agents and workflows stop, and what the CLI still
+  // sends for it is dropped like an interrupted turn's tail. The choice is
+  // made before queueing behind the session, so the interrupt the server
+  // falls back to still finds this turn and not the user's next one.
+  async abandonTurn(threadId: string, turnId: string): Promise<boolean> {
+    const live = this.sessions.get(threadId)
+    const pending = this.turns.get(turnId)
+    if (!live || live.closed || !pending || pending.resolved || pending.session !== live)
+      return false
+    const handedOff = this.handedOffTasks(live, pending)
+    debugLog('native.turn.abandon', { threadId, turnId, handedOff })
+    if (handedOff.length === 0) return false
+    await this.serialize(live, async () => {
+      if (live.closed || pending.resolved) return
+      await this.stopSessionTasks(live, this.turnTaskIds(live, pending))
+      await this.stopWorkflowTasks(pending)
+      if (live.current === pending) {
+        const cancelled = this.cancelSends(live)
+        live.current = null
+        live.steers.clear()
+        live.backlog.length = 0
+        live.autonomousRequested = false
+        if (live.cliRunning || cancelled.length > 0)
+          this.beginSink(live, cancelled, live.cliRunning)
+      }
+      this.releaseTurn(pending)
+      this.maybeRelease(live)
+    })
+    return true
+  }
+
+  // Background tasks the turn started that still run without it waiting on
+  // them.
+  private handedOffTasks(live: LiveSession, pending: PendingTurn): string[] {
+    const own = this.turnTaskIds(live, pending)
+    return [...live.liveTasks].filter(
+      (taskId) => pending.startedTasks.has(taskId) && !own.has(taskId),
+    )
+  }
+
   // A workflow belongs to the turn that launched it; the turn waits for it.
   // Left running past an interrupt, it would finish later and wake the thread.
   private async stopLiveWorkflows(live: LiveSession, pending: PendingTurn): Promise<void> {
-    const query = live.query as (Query & { stopTask?: (taskId: string) => Promise<void> }) | null
-    if (typeof query?.stopTask !== 'function') return
+    await this.stopSessionTasks(live, this.workflowTaskIds(live, pending))
+  }
+
+  private workflowTaskIds(live: LiveSession, pending: PendingTurn): Set<string> {
     const taskIds = new Set<string>()
     for (const [taskId, state] of pending.workflowTasks ?? [])
       if (!state.terminal) taskIds.add(taskId)
     for (const taskId of live.liveTasks)
       if (live.tasks.get(taskId)?.taskType === 'local_workflow') taskIds.add(taskId)
+    return taskIds
+  }
+
+  // What the turn runs itself: its workflows and the foreground agents it
+  // waits on. Agents it handed off left activeSubagents at launch.
+  private turnTaskIds(live: LiveSession, pending: PendingTurn): Set<string> {
+    const taskIds = this.workflowTaskIds(live, pending)
+    for (const [taskId, task] of live.tasks)
+      if (task.toolUseId && pending.activeSubagents.has(task.toolUseId)) taskIds.add(taskId)
+    return taskIds
+  }
+
+  private async stopSessionTasks(live: LiveSession, taskIds: Set<string>): Promise<void> {
+    const query = live.query as (Query & { stopTask?: (taskId: string) => Promise<void> }) | null
+    if (typeof query?.stopTask !== 'function') return
     for (const taskId of taskIds) {
       live.stoppedTasks.add(taskId)
       let failed = false
@@ -474,7 +546,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         SESSION_CONTROL_TIMEOUT_MS,
       )
       if (failed) live.stoppedTasks.delete(taskId)
-      debugLog('native.workflow.stop', { threadId: live.threadId, taskId, settled, failed })
+      debugLog('native.task.stop', { threadId: live.threadId, taskId, settled, failed })
     }
   }
 
@@ -1164,6 +1236,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       workflowTranscriptRoots: defaultWorkflowTranscriptRoots(process.env, context.cwd),
       skippedWorkflowTaskIds: new Set(),
       workflowTasks: new Map(),
+      startedTasks: new Set(),
       toolStartSeen: new Set(),
       toolInputPreviews:
         process.env.CLAUDE_CODEX_LIVE_FILE_CHANGES === '0' ? null : new ToolInputPreviews(),
@@ -1172,6 +1245,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       deferredResult: null,
       workflowFailure: null,
       model: null,
+      progressReportedAtMs: Number.NEGATIVE_INFINITY,
     }
   }
 
@@ -1506,6 +1580,10 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
 
   private maybeRelease(session: LiveSession): void {
     if (session.closed || session.current || session.backlog.length > 0) return
+    // Every message restarts the idle wait (routeMessage), and so does this:
+    // a timer armed earlier and left running would close the session on its
+    // old deadline while its background tasks are still reporting progress.
+    this.clearSessionTimers(session)
     if (!session.reusable) {
       this.closeSession(session)
       return
@@ -1765,6 +1843,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
 
     if (subtype === 'task_started') {
       session.tasks.set(taskId, { taskType, toolUseId, outputFile: known?.outputFile ?? null })
+      session.current?.startedTasks.add(taskId)
       const backgrounded =
         typeof message.is_backgrounded === 'boolean' ? message.is_backgrounded : null
       if (!session.levelSeen && backgrounded === true && message.ambient !== true)
@@ -1869,6 +1948,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       if (messageUuid && claudeSessionId)
         await pending.handlers.onEvent({ type: 'checkpoint', claudeSessionId, messageUuid })
     }
+    await this.noteSubagentProgress(pending, type, message)
     switch (type) {
       case 'system':
         await this.handleSystem(pending, message)
@@ -1889,6 +1969,60 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         // Rate-limit notifications and other non-system frames.
         await this.handleOther(pending, type, message)
     }
+  }
+
+  // A subagent's own frames, the progress of the turn's tasks and the CLI's
+  // tool_progress heartbeats for a tool that runs quietly stay here
+  // (filtersNestedEvents), so the server would otherwise take a long but
+  // healthy Agent call or workflow for a stuck one. Agents the turn handed
+  // off are no longer its concern and do not count.
+  private async noteSubagentProgress(
+    pending: PendingTurn,
+    type: string,
+    message: Record<string, unknown>,
+  ): Promise<void> {
+    const toolUseId = this.progressToolUseId(pending, type, message)
+    if (!toolUseId) return
+    const now = performance.now()
+    if (now - pending.progressReportedAtMs < SUBAGENT_PROGRESS_INTERVAL_MS) return
+    pending.progressReportedAtMs = now
+    await pending.handlers.onEvent({ type: 'subagent_progress', toolUseId })
+  }
+
+  private progressToolUseId(
+    pending: PendingTurn,
+    type: string,
+    message: Record<string, unknown>,
+  ): string | null {
+    const parent = stringOrNull(message.parent_tool_use_id)
+    if (parent && this.waitsOn(pending, parent)) return parent
+    const progress = type === 'tool_progress'
+    const subtype = String(message.subtype ?? '')
+    if (
+      !progress &&
+      (type !== 'system' ||
+        !['task_progress', 'task_updated', 'task_notification'].includes(subtype))
+    )
+      return null
+    const taskId = stringOrNull(message.task_id)
+    const workflow = taskId ? pending.workflowTasks.get(taskId) : undefined
+    if (workflow)
+      return workflow.terminal ? null : workflow.toolUseId || workflowTaskToolUseId(workflow.taskId)
+    const toolUseId =
+      stringOrNull(message.tool_use_id) ??
+      (taskId ? pending.session.tasks.get(taskId)?.toolUseId : null) ??
+      null
+    return toolUseId && this.waitsOn(pending, toolUseId) ? toolUseId : null
+  }
+
+  // The turn is waiting on this tool call: a foreground Agent call (or a
+  // workflow agent projected as one) or a workflow it launched.
+  private waitsOn(pending: PendingTurn, toolUseId: string): boolean {
+    if (pending.activeSubagents.has(toolUseId) || pending.workflowToolUseIds.has(toolUseId))
+      return true
+    for (const state of pending.workflowTasks.values())
+      if (!state.terminal && state.toolUseId === toolUseId) return true
+    return false
   }
 
   private async handleSystem(

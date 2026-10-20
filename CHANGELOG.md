@@ -265,6 +265,19 @@ versioning or publishing metadata.
   do not count, since a dev server or watcher can run for the rest of the chat.
   `CLAUDE_CODEX_QUIET_BACKGROUND_TURNS=0` marks every finished turn unread
   again.
+- The subagent watchdog (`CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS`, default 30
+  minutes, now documented) waits for inactivity instead of a fixed deadline:
+  a subagent's output and tool heartbeats, task progress and workflow agents
+  starting or finishing all start it over. It used to fail every workflow
+  that ran past 30 minutes, however busy, and interrupt the whole Claude
+  session, which ended every workflow agent and unrelated background agent
+  with it. When it does give up, the turn is stopped as an interrupt would
+  stop it, which keeps background work earlier turns left running; while
+  background agents the turn itself handed off still run, only its own stuck
+  agents and workflows stop and those agents keep going.
+- An interrupt while a session idles no longer leaves its earlier idle timer
+  running, which could close the session (and its background agents) on the
+  old deadline although they kept reporting progress.
 
 ### Rust-first protocol groundwork
 
