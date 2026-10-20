@@ -43,6 +43,7 @@ if (!process.env.ANTHROPIC_BETAS) {
 
 import type { Query } from '@anthropic-ai/claude-agent-sdk'
 import { noteClaudeCommands } from './claude-commands.mjs'
+import { noteClaudeModels } from './claude-models.mjs'
 import { removeCliMcpConfig, writeCliMcpConfig } from './cli-mcp-config.mjs'
 import { recordCliChildren } from './cli-orphans.mjs'
 import { CronJobs } from './cron-jobs.mjs'
@@ -1691,6 +1692,13 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
           ?.supportedCommands()
           .then((commands) => noteClaudeCommands(commands, skills))
           .catch(() => {})
+      // Which efforts each model takes, for model/list. An older SDK has no
+      // supportedModels(), and model/list then keeps its static efforts.
+      const query = pending.session.query
+      void Promise.resolve()
+        .then(() => query?.supportedModels())
+        .then(noteClaudeModels)
+        .catch(() => {})
       const sessionId = String(message.session_id ?? '')
       if (sessionId) await pending.handlers.onEvent({ type: 'session', claudeSessionId: sessionId })
       return

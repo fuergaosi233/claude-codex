@@ -56,7 +56,9 @@ or session tokens, configure private endpoints, or bypass provider terms.
 ## Models & effort
 
 ```bash
-# Defaults for new threads, surfaced through config/read.
+# Defaults for new threads, surfaced through config/read. The effort is one of
+# low, medium, high, xhigh, max; a model that does not take it defaults to the
+# closest level below.
 export CLAUDE_CODEX_DEFAULT_MODEL="sonnet"
 export CLAUDE_CODEX_DEFAULT_EFFORT="medium"
 
@@ -67,6 +69,21 @@ export CLAUDE_CODEX_MODELS="sonnet,opus,fable,haiku,sonnet-1m,opus-plan"
 export CLAUDE_CODEX_MODEL_ALIASES='{"my-long-context":"sonnet[1m]"}'
 export CLAUDE_CODEX_EFFORT_ALIASES='{"xhigh":"max"}'
 ```
+
+Each Claude model in the picker offers the reasoning efforts Claude Code reports
+for it: `max` only on the models that take it, and none on a model without an
+effort setting, such as Haiku. For such a model the App sends the effort
+`none`, and its turns run without one. Claude Code reports the efforts when a
+session starts. The adapter keeps the last report in
+`~/.codex/claude-codex-adapter/claude-models.json`, so the list is right again
+after a restart. The App reloads the list when its window regains focus, at
+most every five minutes, so the levels can take that long to appear after the
+first Claude turn. Before that turn, and with a Claude Code too old to report
+efforts, every model offers low to xhigh. A model in
+`CLAUDE_CODEX_MODELS` is matched to Claude Code's report by the id it passes to
+Claude Code, so an alias for a full model id gets that model's efforts. The
+Codex App hides `max` until it is turned on under Settings > Agent > Model
+features > Available reasoning efforts.
 
 ## MCP, tools & directories
 
