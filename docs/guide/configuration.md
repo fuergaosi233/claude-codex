@@ -85,6 +85,17 @@ Claude Code, so an alias for a full model id gets that model's efforts. The
 Codex App hides `max` until it is turned on under Settings > Agent > Model
 features > Available reasoning efforts.
 
+Without model process profiles, the picker also lists the per-model config
+folders a model router keeps under `~/.cache/*/claude-router/`, or in the
+folders `CLAUDE_CONFIG_DIRS` (or `CLAUDE_ROUTER_DIR`) lists. When a chat
+resumes and the newest copy of its session transcript is in another config
+folder, say because it ran on another model, the adapter copies it into the one
+folder this turn's Claude Code runs from: `CLAUDE_CONFIG_DIR`, else
+`~/.claude`, or, with `CLAUDE_CODEX_CLI` set, the router folder named after the
+model when there is one. An up-to-date copy is left alone. Since a transcript
+holds the whole conversation, the copy keeps the transcript's file mode, and it
+is a clone where the file system supports it.
+
 ## Model process profiles
 
 Every Claude thread normally runs the same Claude Code: the one the SDK ships

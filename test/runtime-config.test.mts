@@ -1,20 +1,24 @@
 import assert from 'node:assert/strict'
 import { once } from 'node:events'
+import { existsSync } from 'node:fs'
 import {
   appendFile,
   chmod,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   realpath,
   rename,
   rm,
+  stat,
   symlink,
+  utimes,
   writeFile,
 } from 'node:fs/promises'
 import http from 'node:http'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import test from 'node:test'
 import * as z from 'zod'
 import { ClaudePTranscriptRuntime } from '../src/claude-p-runtime.mjs'
@@ -103,6 +107,97 @@ test('native SDK runtime ignores bridge session markers when resuming SDK turns'
   assert.equal(sdkResumeSessionId('agentapi:http://127.0.0.1:3284'), null)
   assert.equal(sdkResumeSessionId('claude-p:session'), null)
   assert.equal(sdkResumeSessionId('sdk-session'), 'sdk-session')
+})
+
+test('a resumed transcript is copied only into the config dir its session runs from', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'claude-codex-transcripts-')))
+  const cwd = join(root, 'work')
+  const slug = cwd.replace(/[^a-zA-Z0-9-]/g, '-')
+  const transcript = (configDir: string) => join(configDir, 'projects', slug, 'session.jsonl')
+  const ownRoot = join(root, '.claude')
+  const routers = join(root, '.cache', 'router-tool', 'claude-router')
+  const routerRoot = join(routers, 'router-model')
+  const otherRouterRoot = join(routers, 'other-model')
+  const extraRoot = join(root, 'extra', 'extra-model')
+  const keys = [
+    'HOME',
+    'CLAUDE_CONFIG_DIR',
+    'CLAUDE_CONFIG_DIRS',
+    'CLAUDE_ROUTER_DIR',
+    'CLAUDE_CODEX_CLI',
+  ]
+  const saved = keys.map((key) => [key, process.env[key]] as const)
+  for (const key of keys) delete process.env[key]
+  process.env.HOME = root
+  process.env.CLAUDE_CONFIG_DIRS = join(root, 'extra')
+  try {
+    await mkdir(cwd, { recursive: true })
+    await mkdir(otherRouterRoot, { recursive: true })
+    await mkdir(extraRoot, { recursive: true })
+    await mkdir(dirname(transcript(routerRoot)), { recursive: true })
+    await writeFile(transcript(routerRoot), '{"n":1}\n', { mode: 0o600 })
+    const sourceTime = new Date(Date.now() - 60_000)
+    await utimes(transcript(routerRoot), sourceTime, sourceTime)
+
+    // The SDK's own Claude Code runs from ~/.claude: the transcript goes there
+    // and nowhere else, with its owner-only mode and its mtime.
+    assert.equal(sdkResumeSessionId('session', cwd, undefined, 'router-model'), 'session')
+    const copied = await stat(transcript(ownRoot))
+    assert.equal(await readFile(transcript(ownRoot), 'utf8'), '{"n":1}\n')
+    assert.equal(copied.mode & 0o777, 0o600)
+    assert.equal((await stat(dirname(transcript(ownRoot)))).mode & 0o777, 0o700)
+    assert.equal(Math.round(copied.mtimeMs), Math.round(sourceTime.getTime()))
+    assert.equal(existsSync(transcript(otherRouterRoot)), false)
+    assert.equal(existsSync(transcript(extraRoot)), false)
+    assert.equal(existsSync(transcript(join(root, 'extra'))), false)
+    assert.deepEqual(
+      (await readdir(dirname(transcript(ownRoot)))).filter((name) => name.endsWith('.tmp')),
+      [],
+    )
+
+    // An up-to-date copy is not copied again.
+    assert.equal(sdkResumeSessionId('session', cwd, undefined, 'router-model'), 'session')
+    assert.equal((await stat(transcript(ownRoot))).ino, copied.ino)
+
+    // A newer source replaces a stale copy.
+    await appendFile(transcript(routerRoot), '{"n":2}\n')
+    assert.equal(sdkResumeSessionId('session', cwd, undefined, 'router-model'), 'session')
+    assert.equal(await readFile(transcript(ownRoot), 'utf8'), '{"n":1}\n{"n":2}\n')
+    const refreshed = await stat(transcript(ownRoot))
+    assert.notEqual(refreshed.ino, copied.ino)
+    assert.equal(refreshed.mode & 0o777, 0o600)
+
+    // Once the session went on where it runs, that copy is the newest: it is
+    // resumed as it is, and nothing is copied back.
+    await appendFile(transcript(ownRoot), '{"n":3}\n')
+    const later = new Date(Date.now() + 60_000)
+    await utimes(transcript(ownRoot), later, later)
+    assert.equal(sdkResumeSessionId('session', cwd, undefined, 'router-model'), 'session')
+    assert.equal((await stat(transcript(ownRoot))).ino, refreshed.ino)
+    assert.equal(await readFile(transcript(routerRoot), 'utf8'), '{"n":1}\n{"n":2}\n')
+
+    // A custom Claude Code, such as a model router, runs a model from the
+    // router config dir named after it.
+    process.env.CLAUDE_CODEX_CLI = join(root, 'router-claude')
+    assert.equal(sdkResumeSessionId('session', cwd, undefined, 'other-model'), 'session')
+    assert.equal(await readFile(transcript(otherRouterRoot), 'utf8'), '{"n":1}\n{"n":2}\n{"n":3}\n')
+    assert.equal(existsSync(transcript(extraRoot)), false)
+    assert.equal(sdkResumeSessionId('session', cwd, undefined, 'extra-model'), 'session')
+    assert.equal(existsSync(transcript(extraRoot)), true)
+    // A model it has no config dir for, or no plain name, runs from ~/.claude.
+    const own = (await stat(transcript(ownRoot))).ino
+    assert.equal(sdkResumeSessionId('session', cwd, undefined, '../other-model'), 'session')
+    assert.equal((await stat(transcript(ownRoot))).ino, own)
+
+    // A session no config dir has is not resumed.
+    assert.equal(sdkResumeSessionId('missing', cwd, undefined, 'router-model'), null)
+  } finally {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+    await rm(root, { recursive: true, force: true })
+  }
 })
 
 test('native SDK runtime maps manual /workflows prompts to the human workflow trigger', async () => {

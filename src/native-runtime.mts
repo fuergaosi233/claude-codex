@@ -1,10 +1,17 @@
 import {
+  chmodSync,
   copyFileSync,
   existsSync,
+  constants as fsConstants,
   mkdirSync,
   readdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
+  rmSync,
+  type Stats,
+  statSync,
+  utimesSync,
 } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, join } from 'node:path'
@@ -609,6 +616,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       context.claudeSessionId,
       context.cwd,
       modelProcess ? defaultWorkflowTranscriptRoots(modelProcess.env, context.cwd)[0] : undefined,
+      context.model,
     )
     if (resume) opts.resume = resume
     if (resume && context.forkSession) opts.forkSession = true
@@ -3026,89 +3034,159 @@ function stringOrNull(value: unknown): string | null {
   return typeof value === 'string' && value.length > 0 ? value : null
 }
 
-// `configRoot` pins the lookup to one Claude config dir (a model process
-// profile's CLAUDE_CONFIG_DIR): its transcripts are only resumed from there and
-// never mirrored into other roots.
+// The session to resume, or null when no config dir has its transcript. The
+// CLI resumes it from the config dir it runs from: a model process profile's
+// (`configRoot`), else the adapter's (CLAUDE_CONFIG_DIR or ~/.claude), or, for
+// a custom CLI such as a model router, the router config dir named after
+// `model`. When the newest copy of the transcript is elsewhere (the session
+// ran on another model or router), it is copied into that one config dir,
+// unless an up-to-date copy is there already. A profile's transcripts are only
+// resumed from its own config dir and never copied in from another one.
 export function sdkResumeSessionId(
   value: string | null,
   cwd?: string,
   configRoot?: string,
+  model?: string | null,
 ): string | null {
   if (!value) return null
   if (/^(agent-http|agentapi|claude-p):/.test(value)) return null
-  if (cwd) {
-    const home = homedir()
-    const slug = (dir: string) => dir.replace(/[^a-zA-Z0-9-]/g, '-')
-    const slugs = [slug(cwd)]
-    try {
-      const real = realpathSync(cwd)
-      if (real !== cwd) slugs.push(slug(real))
-    } catch {}
-
-    // Discover all candidate config directories (default ~/.claude plus any custom router / multi-model roots)
-    const configRoots = new Set<string>([configRoot ?? join(home, '.claude')])
-    if (!configRoot && process.env.CLAUDE_CONFIG_DIR) configRoots.add(process.env.CLAUDE_CONFIG_DIR)
-    const extraRoots = configRoot
-      ? []
-      : (process.env.CLAUDE_CONFIG_DIRS || process.env.CLAUDE_ROUTER_DIR || '')
-          .split(/[,:]/)
-          .map((p) => p.trim())
-          .filter(Boolean)
-    for (const extra of extraRoots) {
-      if (existsSync(extra)) configRoots.add(extra)
-    }
-
-    // Generic discovery of cached multi-model router config workspaces under ~/.cache/*/claude-router
-    const cacheBase = join(home, '.cache')
-    if (!configRoot && existsSync(cacheBase)) {
-      try {
-        for (const sub of readdirSync(cacheBase)) {
-          const routerDir = join(cacheBase, sub, 'claude-router')
-          if (existsSync(routerDir)) {
-            for (const item of readdirSync(routerDir)) {
-              configRoots.add(join(routerDir, item))
-            }
-          }
-        }
-      } catch {}
-    }
-
-    let sourceFile: string | null = null
-    for (const root of configRoots) {
-      for (const s of slugs) {
-        const p = join(root, 'projects', s, value + '.jsonl')
-        if (existsSync(p)) {
-          sourceFile = p
-          break
-        }
-      }
-      if (sourceFile) break
-      const sessFile = join(root, 'sessions', value + '.jsonl')
-      if (existsSync(sessFile)) {
-        sourceFile = sessFile
-        break
-      }
-    }
-
-    if (!sourceFile) return null
-
-    // Ensure the session transcript is mirrored across candidate project roots
-    // so switching models or routers retains 100% conversation history
-    for (const root of configRoots) {
-      for (const s of slugs) {
-        const targetDir = join(root, 'projects', s)
-        const targetFile = join(targetDir, value + '.jsonl')
-        if (targetFile === sourceFile) continue
-        try {
-          if (!existsSync(targetDir)) mkdirSync(targetDir, { recursive: true })
-          if (!existsSync(targetFile)) {
-            copyFileSync(sourceFile, targetFile)
-          }
-        } catch {}
-      }
+  if (!cwd) return value
+  const slugs = [projectSlug(cwd)]
+  try {
+    const real = realpathSync(cwd)
+    if (real !== cwd) slugs.push(projectSlug(real))
+  } catch {}
+  const runRoot = configRoot ?? nativeConfigRoot(model)
+  const roots = configRoot ? [configRoot] : [runRoot, ...knownConfigRoots()]
+  let source: TranscriptCopy | null = null
+  for (const root of new Set(roots)) {
+    const files = slugs.map((slug) => join(root, 'projects', slug, `${value}.jsonl`))
+    files.push(join(root, 'sessions', `${value}.jsonl`))
+    for (const file of files) {
+      const stat = regularFileStat(file)
+      // The newest copy wins; on a tie, the one already in the run root.
+      if (stat && (!source || stat.mtimeMs > source.stat.mtimeMs)) source = { file, stat }
     }
   }
+  if (!source) return null
+  for (const slug of slugs) {
+    mirrorTranscript(value, source, join(runRoot, 'projects', slug, `${value}.jsonl`))
+  }
   return value
+}
+
+interface TranscriptCopy {
+  file: string
+  stat: Stats
+}
+
+function projectSlug(dir: string): string {
+  return dir.replace(/[^a-zA-Z0-9-]/g, '-')
+}
+
+// The config dir a turn without a model process profile runs from. The CLI
+// the SDK starts reads CLAUDE_CONFIG_DIR, else ~/.claude. A custom CLI
+// (CLAUDE_CODEX_CLI) may be a model router that runs each model from its own
+// config dir, the ones the model list is discovered from (util.mts).
+function nativeConfigRoot(model: string | null | undefined): string {
+  const own = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')
+  if (!model || !process.env.CLAUDE_CODEX_CLI) return own
+  if (basename(model) !== model || model === '.' || model === '..') return own
+  for (const parent of routerConfigParents()) {
+    const root = join(parent, model)
+    if (isDirectory(root)) return root
+  }
+  return own
+}
+
+// Every config dir a session may have run from: the adapter's own, the
+// CLAUDE_CONFIG_DIRS (or CLAUDE_ROUTER_DIR) entries, and the router config
+// dirs under them and under ~/.cache/*/claude-router.
+function knownConfigRoots(): string[] {
+  const roots = [join(homedir(), '.claude')]
+  if (process.env.CLAUDE_CONFIG_DIR) roots.push(process.env.CLAUDE_CONFIG_DIR)
+  for (const extra of extraConfigRoots()) {
+    if (existsSync(extra)) roots.push(extra)
+  }
+  for (const parent of routerConfigParents()) {
+    try {
+      for (const item of readdirSync(parent)) roots.push(join(parent, item))
+    } catch {}
+  }
+  return roots
+}
+
+function extraConfigRoots(): string[] {
+  return (process.env.CLAUDE_CONFIG_DIRS || process.env.CLAUDE_ROUTER_DIR || '')
+    .split(/[,:]/)
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+}
+
+// Folders whose subfolders are per-model router config dirs.
+function routerConfigParents(): string[] {
+  const parents = extraConfigRoots().filter(isDirectory)
+  const cacheBase = join(homedir(), '.cache')
+  try {
+    for (const sub of readdirSync(cacheBase)) {
+      const routerDir = join(cacheBase, sub, 'claude-router')
+      if (isDirectory(routerDir)) parents.push(routerDir)
+    }
+  } catch {}
+  return parents
+}
+
+function isDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory()
+  } catch {
+    return false
+  }
+}
+
+function regularFileStat(path: string): Stats | null {
+  try {
+    const stat = statSync(path)
+    return stat.isFile() ? stat : null
+  } catch {
+    return null
+  }
+}
+
+// Puts `source` at `target` unless an up-to-date copy is there. A transcript
+// holds the whole conversation, with what each request sent: the copy keeps
+// the source's (owner-only) mode, is a clone where the file system has them
+// (APFS, Btrfs, XFS) and replaces the target in one step. Not a hard link: the
+// CLI appends to the copy in the run root, which must not change the
+// transcript in the other config dir.
+function mirrorTranscript(sessionId: string, source: TranscriptCopy, target: string): void {
+  if (target === source.file) return
+  const existing = regularFileStat(target)
+  if (existing && transcriptUpToDate(existing, source.stat)) return
+  const temp = `${target}.${newId()}.tmp`
+  try {
+    mkdirSync(dirname(target), { recursive: true, mode: 0o700 })
+    copyFileSync(source.file, temp, fsConstants.COPYFILE_EXCL | fsConstants.COPYFILE_FICLONE)
+    chmodSync(temp, source.stat.mode & 0o777)
+    utimesSync(temp, source.stat.atimeMs / 1000, source.stat.mtimeMs / 1000)
+    renameSync(temp, target)
+    debugLog('native.transcript.mirrored', {
+      sessionId,
+      bytes: source.stat.size,
+      from: source.file,
+      to: target,
+    })
+  } catch (error) {
+    rmSync(temp, { force: true })
+    debugLog('native.transcript.mirror_failed', { sessionId, to: target, error: String(error) })
+  }
+}
+
+// A copy carries its source's mtime, which utimes keeps to about a
+// microsecond.
+function transcriptUpToDate(copy: Stats, source: Stats): boolean {
+  if (copy.mtimeMs > source.mtimeMs) return true
+  return copy.size === source.size && source.mtimeMs - copy.mtimeMs < 1
 }
 
 // ── AskUserQuestion bridging helpers ──
