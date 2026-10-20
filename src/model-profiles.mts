@@ -48,16 +48,30 @@ const PROVIDER_ENV_KEYS = new Set([
   'ANTHROPIC_API_KEY',
   'ANTHROPIC_AUTH_TOKEN',
   'ANTHROPIC_BASE_URL',
+  'ANTHROPIC_CUSTOM_HEADERS',
   'ANTHROPIC_MODEL',
+  'ANTHROPIC_SMALL_FAST_MODEL',
   'ANTHROPIC_DEFAULT_OPUS_MODEL',
   'ANTHROPIC_DEFAULT_SONNET_MODEL',
   'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  'ANTHROPIC_BEDROCK_BASE_URL',
+  'ANTHROPIC_VERTEX_BASE_URL',
+  'ANTHROPIC_VERTEX_PROJECT_ID',
+  'ANTHROPIC_FOUNDRY_API_KEY',
+  'ANTHROPIC_FOUNDRY_BASE_URL',
+  'ANTHROPIC_FOUNDRY_RESOURCE',
+  'AWS_BEARER_TOKEN_BEDROCK',
+  'CLAUDE_CODE_USE_BEDROCK',
+  'CLAUDE_CODE_USE_VERTEX',
+  'CLAUDE_CODE_USE_FOUNDRY',
   'CLAUDE_CODE_OAUTH_TOKEN',
   'CLAUDE_CODE_SUBAGENT_MODEL',
   'CLAUDE_CODE_EFFORT_LEVEL',
   'CLAUDE_CONFIG_DIR',
 ])
 const SECRET_ENV_KEY = /(TOKEN|KEY|SECRET|PASSWORD|AUTH)/i
+// Token budgets such as CLAUDE_CODE_MAX_OUTPUT_TOKENS are counts, not secrets.
+const TOKEN_COUNT = /TOKENS(?=_|$)/gi
 const ENV_REFERENCE = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g
 const ENV_REFERENCE_ONLY = /^\$\{[A-Za-z_][A-Za-z0-9_]*\}$/
 const DEFAULT_INHERITED_ENV = [
@@ -122,7 +136,7 @@ export function loadClaudeModelProfiles(env: Environment = process.env): ClaudeM
     const envFile = envFileValue ? expandPath(envFileValue, source.directory, env, 'envFile') : null
     const profileEnv = stringRecord(record.env, `Claude model profile ${id} env`)
     for (const [key, value] of Object.entries(profileEnv)) {
-      if (SECRET_ENV_KEY.test(key) && !ENV_REFERENCE_ONLY.test(value)) {
+      if (secretLikeEnvKey(key) && !ENV_REFERENCE_ONLY.test(value)) {
         throw new Error(
           `Claude model profile ${id} secret-like environment key must reference a parent environment variable: ${key}`,
         )
@@ -165,14 +179,16 @@ export function resolveClaudeModelProfile(
 
 // The process a turn of `modelId` runs in, or null when no profiles are
 // configured. The child environment starts from the profile's inherited keys,
-// drops every provider setting and every secret the profile references, then
-// applies the env file and the profile env.
+// drops every provider setting and every secret the profile references (with
+// `*`, every secret any profile's env references), then applies the env file
+// and the profile env.
 export function resolveClaudeModelProcess(
   modelId: string | null | undefined,
   env: Environment = process.env,
   expectedFingerprint: string | null = null,
 ): ClaudeModelProcess | null {
-  const profile = requiredConfiguredProfile(modelId, env)
+  const profiles = loadClaudeModelProfiles(env)
+  const profile = requiredConfiguredProfile(modelId, profiles)
   if (!profile) return null
   const envFileAssignments = profile.envFile ? readPrivateEnvAssignments(profile.envFile) : {}
   const fingerprint = fingerprintForProfile(profile, env, envFileAssignments)
@@ -194,6 +210,12 @@ export function resolveClaudeModelProcess(
   }
   for (const key of PROVIDER_ENV_KEYS) delete childEnv[key]
   for (const key of referencedSecretEnvKeys(profile, envFileAssignments)) delete childEnv[key]
+  if (profile.inheritEnv.includes('*')) {
+    // Nor does another profile's credential.
+    for (const other of profiles) {
+      for (const key of referencedSecretEnvKeys(other, {})) delete childEnv[key]
+    }
+  }
   Object.assign(
     childEnv,
     resolveEnvAssignments(envFileAssignments, env, profile.envFile ?? `${profile.id}.envFile`),
@@ -214,7 +236,7 @@ export function modelProfileFingerprint(
   modelId: string | null | undefined,
   env: Environment = process.env,
 ): string | null {
-  const profile = requiredConfiguredProfile(modelId, env)
+  const profile = requiredConfiguredProfile(modelId, loadClaudeModelProfiles(env))
   if (!profile) return null
   const envFileAssignments = profile.envFile ? readPrivateEnvAssignments(profile.envFile) : {}
   return fingerprintForProfile(profile, env, envFileAssignments)
@@ -245,9 +267,8 @@ export function assertModelProfileTransition(
 
 function requiredConfiguredProfile(
   modelId: string | null | undefined,
-  env: Environment,
+  profiles: ClaudeModelProfile[],
 ): ClaudeModelProfile | null {
-  const profiles = loadClaudeModelProfiles(env)
   if (profiles.length === 0) return null
   const id = (modelId ?? '').trim()
   const profile = profiles.find((entry) => entry.id === id)
@@ -256,20 +277,32 @@ function requiredConfiguredProfile(
 }
 
 // Stored per thread, so the serialization must stay stable across releases.
+// `${VAR}` resolves as in the child environment: an env file assignment reads
+// the adapter's environment and the file's earlier assignments, a profile env
+// assignment also the whole file and the profile's earlier ones.
 function fingerprintForProfile(
   profile: ClaudeModelProfile,
   env: Environment,
   envFileAssignments: Record<string, string>,
 ): string {
-  const rawEnvironment: Record<string, string> = { ...envFileAssignments }
-  Object.assign(rawEnvironment, profile.env)
-  const identityEnvironment: Record<string, string> = {}
-  for (const key of Object.keys(rawEnvironment).sort()) {
-    const value = rawEnvironment[key]
-    if (value === undefined) continue
-    identityEnvironment[key] = SECRET_ENV_KEY.test(key)
+  const scope: Environment = { ...env }
+  const environment: Record<string, string> = {}
+  const add = (key: string, value: string, label: string) => {
+    const identity = secretLikeEnvKey(key)
       ? '<secret>'
-      : interpolateForFingerprint(value, env, `${profile.id}.env.${key}`)
+      : interpolateForFingerprint(value, scope, label)
+    environment[key] = identity
+    scope[key] = identity
+  }
+  const envFileLabel = profile.envFile ?? `${profile.id}.envFile`
+  for (const [key, value] of Object.entries(envFileAssignments))
+    add(key, value, `${envFileLabel}:${key}`)
+  for (const [key, value] of Object.entries(profile.env))
+    add(key, value, `${profile.id}.env.${key}`)
+  const identityEnvironment: Record<string, string> = {}
+  for (const key of Object.keys(environment).sort()) {
+    const value = environment[key]
+    if (value !== undefined) identityEnvironment[key] = value
   }
   const identity = {
     id: profile.id,
@@ -284,11 +317,15 @@ function fingerprintForProfile(
 
 function interpolateForFingerprint(value: string, env: Environment, label: string): string {
   return value.replace(ENV_REFERENCE, (_match, key: string) => {
-    if (SECRET_ENV_KEY.test(key)) return '<secret>'
+    if (secretLikeEnvKey(key)) return '<secret>'
     const resolved = env[key]
     if (resolved === undefined) throw new Error(`missing environment variable ${key} for ${label}`)
     return resolved
   })
+}
+
+function secretLikeEnvKey(key: string): boolean {
+  return SECRET_ENV_KEY.test(key.replace(TOKEN_COUNT, ''))
 }
 
 function modelProfilesSource(env: Environment): { text: string; directory: string } | null {
@@ -372,7 +409,7 @@ function referencedSecretEnvKeys(
   for (const value of values) {
     for (const match of value.matchAll(ENV_REFERENCE)) {
       const key = match[1]
-      if (key && SECRET_ENV_KEY.test(key)) keys.add(key)
+      if (key && secretLikeEnvKey(key)) keys.add(key)
     }
   }
   return keys

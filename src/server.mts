@@ -1277,9 +1277,10 @@ export class CodexClaudeAppServer {
     const runtimeBackend: ThreadRecord['runtimeBackend'] = isCodexOpenAiModel(forkModel)
       ? 'codex'
       : 'claude'
-    // The fork carries the parent's conversation, which lives in the
-    // parent's model process profile.
-    if (parent.runtimeBackend === 'claude' || runtimeBackend === 'claude') {
+    // The fork carries the parent's conversation, which a Claude parent keeps
+    // in its model process profile. A Codex parent's lives in Codex, so its
+    // fork may take any profile, as it takes any Claude model without them.
+    if (parent.runtimeBackend === 'claude') {
       assertModelProfileTransition(parent.model, forkModel)
     }
     const profileFingerprint = profileFingerprintForModel(forkModel, runtimeBackend)

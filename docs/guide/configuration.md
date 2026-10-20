@@ -146,17 +146,27 @@ environment; a missing variable is an error. `executable` and `envFile` may
 also start with `~/`, and a relative path is taken from the profiles file's
 folder (the adapter's working folder for inline profiles). A key in `env` that looks like a secret (its name contains `TOKEN`,
 `KEY`, `SECRET`, `PASSWORD` or `AUTH`) must be a single `${VAR}` reference, so
-the file itself never holds a credential.
+the file itself never holds a credential. A token budget such as
+`CLAUDE_CODE_MAX_OUTPUT_TOKENS` (`TOKENS` at the end of a word) is no secret.
+`${VAR}` in the env file also reads the file's earlier lines, and in `env`
+the whole env file.
 
 The process starts from the inherited variables without the adapter's provider
 settings (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`,
-`ANTHROPIC_MODEL`, the `ANTHROPIC_DEFAULT_*_MODEL` variables,
+`ANTHROPIC_CUSTOM_HEADERS`, `ANTHROPIC_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`,
+the `ANTHROPIC_DEFAULT_*_MODEL` variables, the Bedrock, Vertex and Foundry
+switches, endpoints and keys (`CLAUDE_CODE_USE_BEDROCK` / `_VERTEX` /
+`_FOUNDRY`, `ANTHROPIC_BEDROCK_BASE_URL`, `ANTHROPIC_VERTEX_BASE_URL`,
+`ANTHROPIC_VERTEX_PROJECT_ID`, `ANTHROPIC_FOUNDRY_*`, `AWS_BEARER_TOKEN_BEDROCK`),
 `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_SUBAGENT_MODEL`,
 `CLAUDE_CODE_EFFORT_LEVEL` and `CLAUDE_CONFIG_DIR`), even with `["*"]`, and
-without the secret variables the profile reads from; then the env file and
-`env` apply. So each profile sets its own provider and config folder, and the
-adapter's own credentials never reach it. A profile without `CLAUDE_CONFIG_DIR`
-uses Claude Code's default folder.
+without the secret variables the profile reads from (with `["*"]`, those any
+profile's `env` reads); then the env file and `env` apply. So each profile
+sets its own provider and config folder, and the adapter's own credentials
+never reach it. A profile without `CLAUDE_CONFIG_DIR` uses Claude Code's
+default folder. Profiles need the native runtime: with another
+`CLAUDE_CODEX_RUNTIME_TYPE`, a profile turn fails rather than run on the
+adapter's own provider.
 
 The profiles file must be a regular file owned by the user running the adapter,
 neither a symbolic link nor writable by group or others. An env file must be a

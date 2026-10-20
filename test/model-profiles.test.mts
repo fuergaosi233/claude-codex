@@ -11,6 +11,7 @@ import {
   resolveClaudeModelProcess,
 } from '../src/model-profiles.mjs'
 import { NativeClaudeRuntime, sdkResumeSessionId } from '../src/native-runtime.mjs'
+import { createRuntime } from '../src/runtime-factory.mjs'
 import { CodexClaudeAppServer } from '../src/server.mjs'
 import { SessionStore } from '../src/store.mjs'
 import type {
@@ -782,6 +783,142 @@ test('without model profiles nothing changes', async () => {
     assert.equal(options.pathToClaudeCodeExecutable, '/usr/local/bin/claude')
     assert.equal((options.env as Record<string, string>).ANTHROPIC_API_KEY, 'adapter-key')
   } finally {
+    restore()
+  }
+})
+
+test('a profile reads what its env file sets, and token budgets are no secrets', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'claude-codex-model-profiles-'))
+  const envFile = join(root, 'provider.env')
+  const configFile = join(root, 'models.json')
+  const writeEnvFile = (host: string) =>
+    writeFile(
+      envFile,
+      [
+        `PROVIDER_HOST=${host}`,
+        'PROVIDER_URL=https://${PROVIDER_HOST}/v1',
+        'ANTHROPIC_AUTH_TOKEN=${PROVIDER_TOKEN}',
+        '',
+      ].join('\n'),
+      { mode: 0o600 },
+    )
+  await writeEnvFile('gateway.example')
+  await writeFile(
+    configFile,
+    JSON.stringify({
+      models: [
+        {
+          id: 'main-model',
+          envFile,
+          env: { ANTHROPIC_BASE_URL: '${PROVIDER_URL}', CLAUDE_CODE_MAX_OUTPUT_TOKENS: '64000' },
+        },
+      ],
+    }),
+    { mode: 0o600 },
+  )
+  const env = {
+    HOME: root,
+    PATH: '/usr/bin',
+    PROVIDER_TOKEN: 'first-secret',
+    CLAUDE_CODEX_MODEL_PROFILES_FILE: configFile,
+  }
+  try {
+    const pinned = modelProfileFingerprint('main-model', env)
+    assert.match(pinned ?? '', /^[a-f0-9]{64}$/)
+    const main = resolveClaudeModelProcess('main-model', env, pinned)
+    assert.equal(main?.env.ANTHROPIC_BASE_URL, 'https://gateway.example/v1')
+    assert.equal(main?.env.ANTHROPIC_AUTH_TOKEN, 'first-secret')
+    assert.equal(main?.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS, '64000')
+    // The endpoint counts however the file spells it.
+    await writeEnvFile('other.example')
+    assert.notEqual(modelProfileFingerprint('main-model', env), pinned)
+    // A key that names a credential still cannot hold one.
+    assert.throws(
+      () =>
+        loadClaudeModelProfiles({
+          HOME: root,
+          CLAUDE_CODEX_MODEL_PROFILES: JSON.stringify([
+            { id: 'a', env: { PROXY_AUTH_TOKENS: 'literal' } },
+          ]),
+        }),
+      /secret-like environment key must reference a parent environment variable: PROXY_AUTH_TOKENS/,
+    )
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a profile that inherits everything gets no provider setting or other credential', () => {
+  const env = {
+    HOME: tmpdir(),
+    PATH: '/usr/bin',
+    UNRELATED_SETTING: 'kept',
+    MAIN_PROVIDER_TOKEN: 'main-secret',
+    SECOND_PROVIDER_TOKEN: 'second-secret',
+    CLAUDE_CODE_USE_BEDROCK: '1',
+    AWS_BEARER_TOKEN_BEDROCK: 'adapter-bedrock-secret',
+    ANTHROPIC_CUSTOM_HEADERS: 'x-gateway-key: adapter-secret',
+    CLAUDE_CODEX_MODEL_PROFILES: JSON.stringify([
+      {
+        id: 'main-model',
+        inheritEnv: ['*'],
+        env: { ANTHROPIC_AUTH_TOKEN: '${MAIN_PROVIDER_TOKEN}' },
+      },
+      { id: 'second-model', env: { ANTHROPIC_AUTH_TOKEN: '${SECOND_PROVIDER_TOKEN}' } },
+    ]),
+  }
+  const main = resolveClaudeModelProcess('main-model', env)
+  assert.equal(main?.env.UNRELATED_SETTING, 'kept')
+  assert.equal(main?.env.ANTHROPIC_AUTH_TOKEN, 'main-secret')
+  for (const key of [
+    'MAIN_PROVIDER_TOKEN',
+    'SECOND_PROVIDER_TOKEN',
+    'CLAUDE_CODE_USE_BEDROCK',
+    'AWS_BEARER_TOKEN_BEDROCK',
+    'ANTHROPIC_CUSTOM_HEADERS',
+  ]) {
+    assert.equal(main?.env[key], undefined, key)
+  }
+})
+
+test('the fork of a Codex thread may take a profile', async () => {
+  const harness = await profileServer(TWO_PROFILES)
+  const { call } = harness
+  try {
+    const { result: started } = await call('thread/start', {
+      cwd: harness.root,
+      model: 'gpt-5.6-luna',
+    })
+    const forked = await call('thread/fork', {
+      threadId: started.thread.id,
+      model: 'second-model',
+    })
+    assert.equal(forked.error, undefined, forked.error?.message)
+    assert.equal(forked.result.model, 'second-model')
+    assert.equal(
+      harness.store.getThread(forked.result.thread.id)?.modelProfileFingerprint,
+      fingerprint('second-model'),
+    )
+  } finally {
+    await harness.close()
+  }
+})
+
+test('a runtime other than the native one refuses a profile turn', async () => {
+  const restore = saveEnv(['CLAUDE_CODEX_RUNTIME_TYPE', 'CLAUDE_CODEX_RUNTIME'])
+  process.env.CLAUDE_CODEX_RUNTIME_TYPE = 'claude-p'
+  delete process.env.CLAUDE_CODEX_RUNTIME
+  const runtime = createRuntime()
+  try {
+    await assert.rejects(
+      runtime.runTurn(
+        { ...baseContext, model: 'vendor/main-1', modelProfileId: 'main-model' },
+        runtimeHandlers(),
+      ),
+      /model process profile main-model needs the native Claude runtime, not claude-p/,
+    )
+  } finally {
+    await runtime.stop()
     restore()
   }
 })
