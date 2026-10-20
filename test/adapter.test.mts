@@ -7611,6 +7611,441 @@ test('workflow watchdog disarms when the original Workflow tool result arrives',
   }
 })
 
+// Runs `body` in a child process whose subagent watchdog waits `windowMs`.
+// The body builds a server on `store` with the runtime it needs; it gets the
+// peer's messages (`receivedAt` holds when each arrived) and helpers to start
+// a turn, find its turn/completed and read a child agent's status by prompt.
+async function runWatchdogScript(windowMs: number, body: string): Promise<void> {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  try {
+    execFileSync(
+      process.execPath,
+      [
+        '--no-warnings',
+        '--input-type=module',
+        '-e',
+        `
+      import assert from 'node:assert/strict'
+      import { join } from 'node:path'
+      import { NativeClaudeRuntime } from './dist/src/native-runtime.mjs'
+      import { CodexClaudeAppServer } from './dist/src/server.mjs'
+      import { SessionStore } from './dist/src/store.mjs'
+
+      process.env.CLAUDE_CODEX_HOME = ${JSON.stringify(home)}
+      process.env.CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS = '${windowMs}'
+      process.env.CLAUDE_CODEX_GOAL_TOOLS = '0'
+      const store = new SessionStore(join(${JSON.stringify(home)}, 'state.sqlite'))
+      const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+      const messages = []
+      const receivedAt = new Map()
+      const peer = {
+        id: 'peer',
+        send: (message) => {
+          messages.push(message)
+          receivedAt.set(message, Date.now())
+        },
+        close() {},
+      }
+      const response = (id) => messages.find((message) => 'id' in message && message.id === id)
+      const completion = (turnId) =>
+        messages.find(
+          (message) => message.method === 'turn/completed' && message.params.turn.id === turnId,
+        )
+      const waitFor = async (probe, label) => {
+        const deadline = Date.now() + 5000
+        while (Date.now() < deadline) {
+          const value = probe()
+          if (value) return value
+          await sleep(10)
+        }
+        throw new Error('timed out waiting for ' + label)
+      }
+      const children = () =>
+        store
+          .listThreads({ includeEphemeral: true })
+          .filter((thread) => thread.threadSource === 'subagent')
+      const childStatus = (prompt) => {
+        const child = children().find((thread) => thread.preview === prompt)
+        return child ? store.listTurns(child.id)[0]?.status : 'missing'
+      }
+      const startTurn = async (server, text) => {
+        await server.handle(peer, {
+          id: 1,
+          method: 'thread/start',
+          params: { cwd: process.cwd(), persistExtendedHistory: false },
+        })
+        const threadId = response(1).result.thread.id
+        await server.handle(peer, {
+          id: 2,
+          method: 'turn/start',
+          params: { threadId, input: [{ type: 'text', text, text_elements: [] }] },
+        })
+        return { threadId, turnId: response(2).result.turn.id }
+      }
+      ${body}
+    `,
+      ],
+      { cwd: resolve('.'), stdio: 'pipe' },
+    )
+  } finally {
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+}
+
+test('subagent watchdog waits as long as a foreground agent keeps reporting progress', async () => {
+  await runWatchdogScript(
+    300,
+    `
+      const interrupted = []
+      let listener = null
+      const server = new CodexClaudeAppServer(store, {
+        setBackgroundListener(next) {
+          listener = next
+        },
+        async runTurn(context, handlers) {
+          const toolUseId = 'busy-' + context.turnId
+          await handlers.onEvent({
+            type: 'tool_use',
+            toolUseId,
+            toolName: 'Task',
+            input: { description: 'long check', prompt: 'run the long check' },
+          })
+          // Either kind of report alone spans two windows.
+          for (let beat = 0; beat < 6; beat += 1) {
+            await sleep(100)
+            await handlers.onEvent({ type: 'subagent_progress', toolUseId })
+          }
+          for (let beat = 0; beat < 6; beat += 1) {
+            await sleep(100)
+            await listener.onTaskEvent(context.threadId, {
+              type: 'task_progress',
+              taskId: 'task-1',
+              toolUseId,
+              description: 'long check',
+              summary: null,
+              lastToolName: 'Bash',
+              usage: null,
+            })
+          }
+          await handlers.onEvent({ type: 'tool_result', toolUseId, content: 'all checks passed' })
+          await handlers.onEvent({ type: 'completed', success: true, result: 'checked' })
+        },
+        async steer() {},
+        async interrupt(threadId) {
+          interrupted.push(threadId)
+        },
+        async stop() {},
+      })
+      const { turnId } = await startTurn(server, 'check everything')
+      const completed = await waitFor(() => completion(turnId), 'turn completion')
+      assert.equal(completed.params.turn.status, 'completed')
+      assert.equal(completed.params.turn.error, null)
+      assert.deepEqual(interrupted, [])
+      assert.equal(childStatus('run the long check'), 'completed')
+      await server.stop()
+    `,
+  )
+})
+
+test('workflow watchdog waits while overlapping workflow agents keep starting and finishing', async () => {
+  await runWatchdogScript(
+    300,
+    `
+      const interrupted = []
+      const server = new CodexClaudeAppServer(store, {
+        async runTurn(context, handlers) {
+          const launch = 'workflow-' + context.turnId
+          await handlers.onEvent({
+            type: 'tool_use',
+            toolUseId: launch,
+            toolName: 'Workflow',
+            input: { command: '/workflows review' },
+          })
+          await handlers.onEvent({ type: 'tool_result', toolUseId: launch, content: 'launch accepted' })
+          // Projected from the workflow journal: six agents, each running
+          // longer than the window and always one running.
+          const agent = (index) => 'workflow-agent:task-1:a' + index
+          for (let tick = 0; tick < 9; tick += 1) {
+            if (tick < 6)
+              await handlers.onEvent({
+                type: 'tool_use',
+                toolUseId: agent(tick),
+                toolName: 'Agent',
+                input: {
+                  description: 'part ' + tick,
+                  prompt: 'review part ' + tick,
+                  subagent_type: 'workflow',
+                },
+              })
+            if (tick >= 3)
+              await handlers.onEvent({
+                type: 'tool_result',
+                toolUseId: agent(tick - 3),
+                content: 'part ' + (tick - 3) + ' reviewed',
+              })
+            await sleep(150)
+          }
+          await handlers.onEvent({ type: 'completed', success: true, result: 'review done' })
+        },
+        async steer() {},
+        async interrupt(threadId) {
+          interrupted.push(threadId)
+        },
+        async stop() {},
+      })
+      const { turnId } = await startTurn(server, '/workflows review')
+      const completed = await waitFor(() => completion(turnId), 'turn completion')
+      assert.equal(completed.params.turn.status, 'completed')
+      assert.equal(completed.params.turn.error, null)
+      assert.deepEqual(interrupted, [])
+      for (let index = 0; index < 6; index += 1)
+        assert.equal(childStatus('review part ' + index), 'completed')
+      await server.stop()
+    `,
+  )
+})
+
+test('subagent watchdog fails a turn whose agent goes quiet for a whole window', async () => {
+  await runWatchdogScript(
+    300,
+    `
+      const interrupted = []
+      const abandoned = []
+      let turnHandlers = null
+      let lastProgressAt = 0
+      const server = new CodexClaudeAppServer(store, {
+        async runTurn(context, handlers) {
+          turnHandlers = handlers
+          const toolUseId = 'quiet-' + context.turnId
+          await handlers.onEvent({
+            type: 'tool_use',
+            toolUseId,
+            toolName: 'Task',
+            input: { description: 'flaky check', prompt: 'goes quiet' },
+          })
+          for (let beat = 0; beat < 4; beat += 1) {
+            await sleep(100)
+            await handlers.onEvent({ type: 'subagent_progress', toolUseId })
+            lastProgressAt = Date.now()
+          }
+          return new Promise(() => {})
+        },
+        async steer() {},
+        async interrupt(threadId) {
+          interrupted.push(threadId)
+        },
+        // Nothing else runs in the session: the backend leaves it to an interrupt.
+        async abandonTurn(_threadId, turnId) {
+          abandoned.push(turnId)
+          return false
+        },
+        async stop() {},
+      })
+      const startedAt = Date.now()
+      const { threadId, turnId } = await startTurn(server, 'check, then hang')
+      const completed = await waitFor(() => completion(turnId), 'watchdog')
+      const failedAt = receivedAt.get(completed)
+      assert.equal(completed.params.turn.status, 'failed')
+      assert.match(completed.params.turn.error.message, /terminal result within 1 second/)
+      assert.ok(failedAt - startedAt >= 650, 'each report starts the window over')
+      assert.ok(failedAt - lastProgressAt >= 250, 'the turn fails a window after the last report')
+      await waitFor(() => interrupted.length === 1, 'interrupt')
+      assert.deepEqual(abandoned, [turnId])
+      assert.equal(childStatus('goes quiet'), 'failed')
+      assert.equal(store.listTurns(threadId)[0].items.at(-1).status, 'failed')
+      // A frame the runtime still delivers does not bring the turn back.
+      await turnHandlers.onEvent({
+        type: 'tool_use',
+        toolUseId: 'late',
+        toolName: 'Task',
+        input: { description: 'late', prompt: 'too late' },
+      })
+      assert.equal(children().length, 1)
+      await server.stop()
+    `,
+  )
+})
+
+test('subagent watchdog leaves the background agents a stalled turn handed off running', async () => {
+  await runWatchdogScript(
+    300,
+    `
+      const interrupted = []
+      const abandoned = []
+      let listener = null
+      const server = new CodexClaudeAppServer(store, {
+        setBackgroundListener(next) {
+          listener = next
+        },
+        async runTurn(context, handlers) {
+          await handlers.onEvent({
+            type: 'tool_use',
+            toolUseId: 'bg-use',
+            toolName: 'Agent',
+            input: { description: 'survey', prompt: 'survey the code', run_in_background: true },
+          })
+          await listener.onTaskEvent(context.threadId, {
+            type: 'task_started',
+            taskId: 'bg-task',
+            toolUseId: 'bg-use',
+            taskType: 'local_agent',
+            description: 'survey',
+            subagentType: null,
+            prompt: 'survey the code',
+            backgrounded: true,
+          })
+          await handlers.onEvent({
+            type: 'tool_result',
+            toolUseId: 'bg-use',
+            content: 'Async agent launched successfully. agentId: bg-task',
+            structured: { status: 'async_launched', agentId: 'bg-task', isAsync: true },
+          })
+          await handlers.onEvent({
+            type: 'tool_use',
+            toolUseId: 'stuck-use',
+            toolName: 'Agent',
+            input: { description: 'stuck', prompt: 'never returns' },
+          })
+          return new Promise(() => {})
+        },
+        async steer() {},
+        async interrupt(threadId) {
+          interrupted.push(threadId)
+        },
+        // The session still runs the background agent: the backend lets the
+        // turn go without interrupting Claude.
+        async abandonTurn(_threadId, turnId) {
+          abandoned.push(turnId)
+          return true
+        },
+        async stop() {},
+      })
+      const { threadId, turnId } = await startTurn(server, 'survey in the background, then check')
+      // The background agent reports all along; that is no sign of the stuck one.
+      const beats = setInterval(() => {
+        void listener.onTaskEvent(threadId, {
+          type: 'task_progress',
+          taskId: 'bg-task',
+          toolUseId: 'bg-use',
+          description: 'survey',
+          summary: null,
+          lastToolName: 'Grep',
+          usage: null,
+        })
+      }, 100)
+      try {
+        const completed = await waitFor(() => completion(turnId), 'watchdog')
+        assert.equal(completed.params.turn.status, 'failed')
+        assert.match(completed.params.turn.error.message, /terminal result within 1 second/)
+        await waitFor(() => abandoned.length === 1, 'abandon')
+        assert.deepEqual(abandoned, [turnId])
+        assert.deepEqual(interrupted, [], 'an interrupt would end the background agent too')
+        assert.equal(childStatus('never returns'), 'failed')
+        assert.equal(childStatus('survey the code'), 'inProgress')
+      } finally {
+        clearInterval(beats)
+      }
+      await listener.onTaskEvent(threadId, {
+        type: 'task_notification',
+        taskId: 'bg-task',
+        toolUseId: 'bg-use',
+        status: 'completed',
+        summary: 'Agent "survey" completed',
+        result: 'Found three modules.',
+        usage: null,
+      })
+      assert.equal(childStatus('survey the code'), 'completed')
+      await server.stop()
+    `,
+  )
+})
+
+test('subagent watchdog counts tool_progress heartbeats of a quiet agent as progress', async () => {
+  await runWatchdogScript(
+    600,
+    `
+      const runtime = new NativeClaudeRuntime()
+      let interrupts = 0
+      // The CLI's frames: an Agent call whose only sign of life is
+      // tool_progress, first for the subagent's quiet Bash call, then for the
+      // Agent call itself. Either kind alone spans two windows.
+      const frames = async function* () {
+        yield { type: 'system', subtype: 'init', session_id: 'session-1' }
+        yield {
+          type: 'assistant',
+          parent_tool_use_id: null,
+          message: {
+            id: 'm1',
+            content: [
+              {
+                type: 'tool_use',
+                id: 'agent-1',
+                name: 'Agent',
+                input: { description: 'slow build', prompt: 'run the slow build' },
+              },
+            ],
+          },
+        }
+        for (let beat = 0; beat < 24; beat += 1) {
+          await sleep(100)
+          yield beat < 12
+            ? {
+                type: 'tool_progress',
+                tool_use_id: 'bash-1',
+                tool_name: 'Bash',
+                parent_tool_use_id: 'agent-1',
+                elapsed_time_seconds: beat / 10,
+              }
+            : {
+                type: 'tool_progress',
+                tool_use_id: 'agent-1',
+                tool_name: 'Agent',
+                parent_tool_use_id: null,
+                elapsed_time_seconds: beat / 10,
+              }
+        }
+        yield {
+          type: 'user',
+          parent_tool_use_id: null,
+          message: {
+            content: [{ type: 'tool_result', tool_use_id: 'agent-1', content: 'build passed' }],
+          },
+        }
+        yield {
+          type: 'assistant',
+          parent_tool_use_id: null,
+          message: { id: 'm2', content: [{ type: 'text', text: 'The build passed.' }] },
+        }
+        yield { type: 'result', subtype: 'success', result: 'The build passed.' }
+      }
+      Reflect.set(runtime, 'sdk', {
+        query: ({ prompt }) => {
+          void (async () => {
+            for await (const _message of prompt) {
+            }
+          })()
+          return Object.assign(frames(), {
+            interrupt: async () => {
+              interrupts += 1
+            },
+            close() {},
+            setModel: async () => {},
+            setPermissionMode: async () => {},
+          })
+        },
+      })
+      const server = new CodexClaudeAppServer(store, runtime)
+      const { turnId } = await startTurn(server, 'build it')
+      const completed = await waitFor(() => completion(turnId), 'turn completion')
+      assert.equal(completed.params.turn.status, 'completed')
+      assert.equal(completed.params.turn.error, null)
+      assert.equal(interrupts, 0)
+      assert.equal(childStatus('run the slow build'), 'completed')
+      await server.stop()
+    `,
+  )
+})
+
 test('server shutdown terminalizes active child turns before closing the store', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const database = join(home, 'state.sqlite')

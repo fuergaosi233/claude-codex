@@ -520,6 +520,11 @@ export type RuntimeEvent =
   // One API call of the main loop, before the turn's result settles its
   // usage. A message can be reported again with a larger count.
   | { type: 'usage_progress'; messageId: string; usage: Record<string, unknown> }
+  // A subagent or workflow the turn waits on is still working: its own
+  // output, a task progress frame or a tool_progress heartbeat, which a
+  // backend that filters nested events would otherwise keep to itself.
+  // `toolUseId` is the call that started it.
+  | { type: 'subagent_progress'; toolUseId: string }
   | {
       type: 'metrics'
       durationMs: number | null
@@ -725,6 +730,12 @@ export interface ClaudeRuntime {
     options?: RuntimeSteerOptions,
   ): Promise<boolean | undefined>
   interrupt(threadId: string): Promise<void>
+  // Let go of a turn the server gave up on (its subagents stopped reporting
+  // progress) while the session keeps the rest of its work: the turn's own
+  // stuck agents and workflows stop, background tasks it handed off and the
+  // session's other tasks keep running. Resolves false when the session has
+  // nothing else alive, so an interrupt would cost nothing.
+  abandonTurn?(threadId: string, turnId: string): Promise<boolean>
   stop(): Promise<void>
   // Switch the running turn's model or effort until it ends; the next turn
   // runs on its own settings again. Resolves false when the thread is not
