@@ -7,6 +7,8 @@ import {
   type ClaudeHookSpec,
   claudeHookSession,
   claudeHookSpecs,
+  failureOutput,
+  type HookCommandResult,
   hookOutput,
   runHookCommand,
   sessionEndBudgetSec,
@@ -57,6 +59,7 @@ const spec = (overrides: Partial<ClaudeHookSpec>): ClaudeHookSpec => ({
   timeoutSec: 30,
   async: false,
   if: null,
+  onFailure: 'continue',
   source: 'settings.json',
   ...overrides,
 })
@@ -111,7 +114,7 @@ test('Claude Code hooks are read from the user settings, and a trusted project o
             matcher: 'Bash',
             hooks: [
               command('guard.sh', { timeout: 5 }),
-              command('guard.sh', { timeout: 9 }),
+              command('guard.sh', { timeout: 9, onFailure: 'block' }),
               command('filtered.sh', { if: 'Bash(git *)' }),
               command('pwsh.ps1', { shell: 'powershell' }),
               { type: 'prompt', prompt: 'Is this safe?' },
@@ -143,7 +146,14 @@ test('Claude Code hooks are read from the user settings, and a trusted project o
       )
     const user = join(configDir, 'settings.json')
     const userSpecs = [
-      spec({ matcher: 'Bash', command: 'guard.sh', timeoutSec: 5, source: user }),
+      // The command runs once, and blocks on failure as a copy asks.
+      spec({
+        matcher: 'Bash',
+        command: 'guard.sh',
+        timeoutSec: 5,
+        onFailure: 'block',
+        source: user,
+      }),
       spec({
         matcher: 'Bash',
         command: 'filtered.sh',
@@ -332,6 +342,147 @@ test('exit code 2 blocks a tool call and plain output only feeds the events that
     ),
     { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny' } },
   )
+})
+
+test('a hook that blocks on failure answers as exit 2 when it fails, and only then', () => {
+  const guard = (overrides: Partial<ClaudeHookSpec> = {}) =>
+    spec({ command: 'guard.sh', timeoutSec: 5, onFailure: 'block', ...overrides })
+  const reason = (failure: string, event = 'PreToolUse', name = 'guard.sh') =>
+    `The ${event} hook \`${name}\` ${failure}, and it blocks on failure (onFailure: "block").`
+  const deny = (text: string) => ({
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'deny',
+      permissionDecisionReason: text,
+    },
+  })
+  const failures: Array<[HookCommandResult, string]> = [
+    [{ ...result(null), timedOut: true }, 'timed out after 5 s'],
+    [{ ...result(0, '{"decision":"approve"}'), timedOut: true }, 'timed out after 5 s'],
+    [
+      { ...result(null), error: 'spawn guard.sh ENOENT' },
+      'could not start (spawn guard.sh ENOENT)',
+    ],
+    [result(null), 'was killed'],
+    [result(1), 'exited with code 1'],
+    [result(127), 'exited with code 127'],
+    [result(0, '{"decision":'), 'printed invalid JSON'],
+  ]
+  for (const [run, failure] of failures) {
+    // onFailure continue, the default: a failure lets the action go ahead.
+    assert.equal(failureOutput(guard({ onFailure: 'continue' }), run), null, failure)
+    assert.deepEqual(hookOutput('PreToolUse', run), {}, failure)
+    assert.deepEqual(failureOutput(guard(), run), deny(reason(failure)), failure)
+  }
+  // What the hook wrote to stderr follows the reason.
+  assert.deepEqual(
+    failureOutput(guard(), result(1, '', 'jq: not found\n')),
+    deny(`${reason('exited with code 1')}\njq: not found`),
+  )
+  // A hook that ran as it should answers as before.
+  for (const run of [result(0), result(0, 'plain'), result(0, '{"systemMessage":"ok"}'), result(2)])
+    assert.equal(failureOutput(guard(), run), null)
+  // Async hooks, Stop and SubagentStop ignore onFailure, as in Claude Code.
+  for (const ignored of [
+    guard({ async: true }),
+    guard({ event: 'Stop' }),
+    guard({ event: 'SubagentStop' }),
+  ])
+    assert.equal(failureOutput(ignored, result(1)), null)
+  // Every other event gets what exit 2 gives it.
+  assert.deepEqual(failureOutput(guard({ event: 'UserPromptSubmit' }), result(1)), {
+    decision: 'block',
+    reason: reason('exited with code 1', 'UserPromptSubmit'),
+  })
+  assert.deepEqual(failureOutput(guard({ event: 'PostToolUse' }), result(1)), {
+    decision: 'block',
+    reason: reason('exited with code 1', 'PostToolUse'),
+  })
+  assert.deepEqual(failureOutput(guard({ event: 'PostToolUseFailure' }), result(1)), {
+    hookSpecificOutput: {
+      hookEventName: 'PostToolUseFailure',
+      additionalContext: reason('exited with code 1', 'PostToolUseFailure'),
+    },
+  })
+  assert.deepEqual(failureOutput(guard({ event: 'SessionStart' }), result(1)), {
+    systemMessage: reason('exited with code 1', 'SessionStart'),
+  })
+  assert.deepEqual(failureOutput(guard({ event: 'Notification' }), result(1)), {})
+  // The reason names an exec-form hook with its arguments, without what
+  // looks like a secret, and shortens a long one.
+  assert.deepEqual(
+    failureOutput(guard({ command: 'node', args: ['check.mjs', 'API_KEY=hunter22'] }), result(1)),
+    deny(reason('exited with code 1', 'PreToolUse', 'node check.mjs API_KEY=[redacted]')),
+  )
+  const long = failureOutput(guard({ command: `echo ${'x'.repeat(300)}` }), result(1)) as any
+  assert.match(
+    long.hookSpecificOutput.permissionDecisionReason,
+    /^The PreToolUse hook `echo x{114}…` exited with code 1/,
+  )
+})
+
+test('a hook command that blocks on failure blocks when it times out, cannot start or fails', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'claude-hooks-failure-')))
+  const input = { hook_event_name: 'PreToolUse', cwd: root, tool_name: 'Bash', tool_input: {} }
+  // What the hook answers, and the timeout its callback gets.
+  const outcome = async (hook: ClaudeHookSpec) => {
+    const { hooks } = claudeHookSession([hook], { projectDir: root, approvals: true })
+    return {
+      output: await call(hooks, hook.event, input),
+      timeout: hooks[hook.event]?.[0]?.timeout,
+    }
+  }
+  const denial = (output: HookOutput) =>
+    (output.hookSpecificOutput as Record<string, unknown> | undefined)?.permissionDecisionReason
+  try {
+    const failures: Array<[Partial<ClaudeHookSpec>, RegExp]> = [
+      [
+        { command: 'sleep 5', timeoutSec: 0.3 },
+        /^The PreToolUse hook `sleep 5` timed out after 0\.3 s/,
+      ],
+      [
+        { command: join(root, 'missing'), args: [] },
+        /^The PreToolUse hook `.*missing` could not start \(.*ENOENT.*\)/,
+      ],
+      [
+        { command: join(root, 'missing.sh') },
+        /^The PreToolUse hook `.*missing\.sh` exited with code 127/,
+      ],
+      [{ command: "echo 'jq: not found' >&2; exit 1" }, /exited with code 1, .*\njq: not found$/],
+      [{ command: 'echo \'{"decision":\'' }, /printed invalid JSON/],
+    ]
+    for (const [overrides, pattern] of failures) {
+      const timeoutSec = overrides.timeoutSec ?? 30
+      const open = await outcome(spec(overrides))
+      assert.deepEqual(open.output, {}, String(pattern))
+      assert.equal(open.timeout, timeoutSec)
+      const closed = await outcome(spec({ ...overrides, onFailure: 'block' }))
+      assert.equal(
+        (closed.output.hookSpecificOutput as Record<string, unknown>).permissionDecision,
+        'deny',
+      )
+      assert.match(String(denial(closed.output)), pattern)
+      // The command's own timeout comes first.
+      assert.equal(closed.timeout, timeoutSec + 1)
+    }
+    // A hook that does its job is not a failure.
+    assert.deepEqual((await outcome(spec({ command: 'true', onFailure: 'block' }))).output, {})
+    // Stop ignores onFailure.
+    const stop = spec({ event: 'Stop', command: 'exit 1', onFailure: 'block' })
+    assert.deepEqual(await outcome(stop), { output: {}, timeout: 30 })
+
+    // A failed SessionStart hook shows its reason with the first prompt.
+    const start = claudeHookSession(
+      [spec({ event: 'SessionStart', command: 'exit 3', onFailure: 'block' })],
+      { projectDir: root, approvals: true, origin: 'startup' },
+    )
+    assert.deepEqual(await call(start.hooks, 'UserPromptSubmit', { session_id: 'session' }), {
+      systemMessage:
+        'The SessionStart hook `exit 3` exited with code 3, and it blocks on failure (onFailure: "block").',
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
 })
 
 test('hooks time out or run in the background, as configured', async () => {

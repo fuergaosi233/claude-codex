@@ -101,6 +101,12 @@ versioning or publishing metadata.
   and accepts the `user` reviewer the App sends when permissions change during
   a turn, instead of failing on any change. An unknown model fails instead of
   falling back to the thread's model.
+- Claude Code command hooks the adapter runs honour `onFailure: "block"`: a
+  hook that cannot start, times out, exits with a code other than 0 or 2, or
+  prints JSON that does not parse blocks the tool call or prompt as exit 2
+  would, with a reason that names the hook and the failure, instead of letting
+  it through. `continue` stays the default; async hooks and `Stop` /
+  `SubagentStop` hooks ignore it, as in Claude Code.
 - Claude Code's hook runs show as `hook/started` / `hook/completed` in the
   turn's hook summary, with the settings file that configures them and a
   blocked status for a hook that blocks; `hooks/list` also lists `SessionEnd`,

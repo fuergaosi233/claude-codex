@@ -239,9 +239,14 @@ everything it started. Exit 0 passes JSON output on (plain output becomes
 context for `UserPromptSubmit` and `SessionStart`), exit 2 blocks with stderr as
 the reason (for `SubagentStart`, `SessionStart` and `SessionEnd` it only shows
 stderr, for `Notification` it does nothing), other exits are non-blocking
-errors, and `disableAllHooks` turns them all off. In plan mode or a read-only
-sandbox a hook can still deny or ask but its approval is dropped, leaving the
-call to Codex. The CLI runs `SessionStart` hooks for a new, resumed or forked
+errors, and `disableAllHooks` turns them all off. A hook with
+`onFailure: "block"` fails closed, as in Claude Code: when it cannot start,
+times out, exits with a code other than 0 or 2, or prints JSON that does not
+parse, it answers as exit 2 would, with a reason that names the hook and the
+failure; async hooks and `Stop` and `SubagentStop` hooks ignore it. In plan mode
+or a read-only sandbox a hook can still deny or ask but its approval is dropped,
+leaving the call to Codex.
+The CLI runs `SessionStart` hooks for a new, resumed or forked
 session before the SDK has registered its callbacks, and `SessionEnd` hooks
 after the SDK has let go of them, so the adapter runs those two itself:
 `SessionStart` once the session takes its first prompt, with the source
