@@ -20,9 +20,12 @@ plain `.mjs` / shell.
 - `acceptance-*.mjs` — end-to-end checks (local-remote, gui-ssh-localhost,
   ssh-runtime-matrix); transcripts land under git-ignored `.claude-codex/`.
 - `probe-*.mjs` — capability / codex-cli-remote probes.
-- `check-app-upgrade.mjs` — checks a new Codex App bundle against
-  `app-baseline.json` (the last verified build) and lists the App rules to
-  re-check (`npm run check:app-upgrade`); see `docs/reference/app-compat.md`.
+- `check-app-upgrade.mjs` — checks a new Codex App bundle (or its `app.asar`,
+  or an extracted copy) against `app-baseline.json` (the last verified build)
+  and lists the App rules to re-check (`npm run check:app-upgrade`). The
+  protocol comes from the bundled `codex`, from a codex checkout with
+  `--protocol-source`, or from the baseline with `--bundle-only`; see
+  `docs/reference/app-compat.md`.
 
 ## Conventions
 

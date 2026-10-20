@@ -159,6 +159,8 @@ export class SessionStore {
         created_at INTEGER NOT NULL,
         UNIQUE(thread_id, attachment_type, identity_key)
       );
+      CREATE INDEX IF NOT EXISTS idx_thread_attachments_identity
+        ON thread_attachments(attachment_type, identity_key, thread_id);
       CREATE TABLE IF NOT EXISTS import_histories (
         id TEXT PRIMARY KEY,
         provider_id TEXT,
@@ -911,6 +913,29 @@ export class SessionStore {
         )
         .all(threadId, limit, offset) as unknown[]
     ).map((row) => this.rowToAttachment(row))
+  }
+
+  // The threads holding an attachment with this type and key, by thread id;
+  // archived null lists archived and live threads alike.
+  listAttachmentOwners(
+    owner: { attachmentType: string; identityKey: string; archived: boolean | null },
+    limit: number,
+    offset: number,
+  ): { threadId: string; archived: boolean }[] {
+    const archived = owner.archived == null ? '' : 'AND t.archived = ?'
+    const params = owner.archived == null ? [] : [owner.archived ? 1 : 0]
+    const rows = this.db
+      .prepare(
+        `SELECT a.thread_id AS thread_id, t.archived AS archived
+         FROM thread_attachments a JOIN threads t ON t.id = a.thread_id
+         WHERE a.attachment_type = ? AND a.identity_key = ? ${archived}
+         ORDER BY a.thread_id LIMIT ? OFFSET ?`,
+      )
+      .all(owner.attachmentType, owner.identityKey, ...params, limit, offset) as Array<{
+      thread_id: string
+      archived: unknown
+    }>
+    return rows.map((row) => ({ threadId: row.thread_id, archived: Number(row.archived) === 1 }))
   }
 
   // Returns the removed attachment, or null when there was none.

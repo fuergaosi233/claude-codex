@@ -9,6 +9,7 @@ import {
   unverifiedAppWarning,
   VERIFIED_APP_VERSIONS,
 } from '../src/app-compat.mjs'
+import { codexCompatVersion } from '../src/util.mjs'
 
 // Tests run from dist/test; the sources sit two levels up.
 const root = new URL('../../', import.meta.url)
@@ -51,34 +52,68 @@ test('the App baseline is a verified build', () => {
   assert.ok(baseline.clientNames.includes(DESKTOP_CLIENT_NAME))
 })
 
-// The methods the adapter's request switches have a case for.
-function handledMethods(): Set<string> {
-  const handled = new Set<string>()
+// The methods the adapter's request switches have a case for, and the ones
+// whose case answers "method not found", as check:app-upgrade reads them.
+function dispatchCases(): { cases: Set<string>; notFound: Set<string> } {
+  const cases = new Set<string>()
+  const notFound = new Set<string>()
   for (const file of ['server.mts', 'host-methods.mts']) {
     const text = readFileSync(new URL(`src/${file}`, root), 'utf8')
-    for (const match of text.matchAll(/case '([A-Za-z][\w/]*)':/g)) handled.add(match[1] as string)
+    for (const match of text.matchAll(/case '([A-Za-z][\w/]*)':/g)) cases.add(match[1] as string)
+    for (const block of text.matchAll(/((?:case '[^']+':\s*)+)throw methodNotFound\(method\)/g))
+      for (const match of (block[1] as string).matchAll(/case '([^']+)':/g))
+        notFound.add(match[1] as string)
   }
-  return handled
+  return { cases, notFound }
 }
 
 test('every request the verified App can send has a case', () => {
   const baseline = JSON.parse(readFileSync(new URL('scripts/app-baseline.json', root), 'utf8'))
-  const handled = handledMethods()
+  const { cases } = dispatchCases()
   assert.deepEqual(
-    baseline.clientRequests.filter((method: string) => !handled.has(method)),
+    baseline.clientRequests.filter((method: string) => !cases.has(method)),
+    [],
+  )
+})
+
+test('the adapter answers every request the scripts of the verified App name', () => {
+  const baseline = JSON.parse(readFileSync(new URL('scripts/app-baseline.json', root), 'utf8'))
+  const { cases, notFound } = dispatchCases()
+  assert.ok(baseline.appRequests.length > 100, 'the baseline records the requests the App names')
+  assert.ok(notFound.size > 0, 'the cases that answer "method not found" are found')
+  assert.deepEqual(
+    baseline.appRequests.filter((method: string) => !cases.has(method) || notFound.has(method)),
     [],
   )
 })
 
 test('GATED_METHODS names the baseline gates and their requests', () => {
   const baseline = JSON.parse(readFileSync(new URL('scripts/app-baseline.json', root), 'utf8'))
-  const handled = handledMethods()
+  const { cases, notFound } = dispatchCases()
   for (const [gate, methods] of Object.entries(GATED_METHODS)) {
     assert.ok(gate in baseline.gates, `${gate} is not a gate of the baseline App`)
     for (const method of methods) {
       assert.ok(baseline.clientRequests.includes(method), `${method} is not an App request`)
-      assert.ok(handled.has(method), `${gate} needs a case for ${method}`)
+      assert.ok(cases.has(method) && !notFound.has(method), `${gate} needs an answer to ${method}`)
     }
+  }
+})
+
+test('the codex shim reports the same compat version as the adapter', () => {
+  const shim = readFileSync(new URL('scripts/codex-shim', root), 'utf8')
+  const shimDefault = /CODEX_SHIM_COMPAT_VERSION:-([^}]+)\}/.exec(shim)?.[1]
+  const saved = {
+    CLAUDE_CODEX_COMPAT_VERSION: process.env.CLAUDE_CODEX_COMPAT_VERSION,
+    CODEX_SHIM_COMPAT_VERSION: process.env.CODEX_SHIM_COMPAT_VERSION,
+  }
+  delete process.env.CLAUDE_CODEX_COMPAT_VERSION
+  delete process.env.CODEX_SHIM_COMPAT_VERSION
+  try {
+    assert.equal(shimDefault, codexCompatVersion())
+    assert.ok(shim.includes(`default to ${codexCompatVersion()}`), 'the shim comment names it')
+  } finally {
+    for (const [name, value] of Object.entries(saved))
+      if (value !== undefined) process.env[name] = value
   }
 })
 

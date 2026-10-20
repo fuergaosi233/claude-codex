@@ -13,10 +13,12 @@ import { setTimeout as delay } from 'node:timers/promises'
 const adapter = resolve('dist/src/adapter.mjs')
 
 class RpcError extends Error {
+  readonly code: number
   readonly data: unknown
 
-  constructor(message: string, data: unknown) {
+  constructor(code: number, message: string, data: unknown) {
     super(message)
+    this.code = code
     this.data = data
   }
 }
@@ -120,8 +122,10 @@ class AppServer {
       const pending = this.pending.get(message.id)
       if (!pending) continue
       this.pending.delete(message.id)
-      if (message.error) pending.reject(new RpcError(message.error.message, message.error.data))
-      else pending.resolve(message.result)
+      if (message.error) {
+        const { code, message: text, data } = message.error
+        pending.reject(new RpcError(code, text, data))
+      } else pending.resolve(message.result)
     }
   }
 }
@@ -433,6 +437,62 @@ test('thread attachments are kept per type and key, with notifications', async (
   })
 })
 
+test('attachment owners list the threads holding a worktree, by thread id', async () => {
+  await withServer(async (server) => {
+    const worktree = { attachmentType: 'worktree', identityKey: '/repo/wt-1' }
+    const attach = (threadId: string, attachment: Record<string, string>) =>
+      server.request('thread/attachment/add', { threadId, ...attachment, payload: {} })
+    const holders = [await server.startThread(), await server.startThread()]
+    const other = await server.startThread()
+    for (const threadId of holders) await attach(threadId, worktree)
+    await attach(other, { attachmentType: 'worktree', identityKey: '/repo/wt-2' })
+    await attach(other, { attachmentType: 'pullRequest', identityKey: '/repo/wt-1' })
+    const [first, second] = [...holders].sort()
+    await server.request('thread/archive', { threadId: second })
+
+    const owners = (params: Record<string, unknown>) =>
+      server.request('thread/attachmentOwner/list', { ...worktree, ...params })
+    assert.deepEqual(await owners({}), {
+      data: [
+        { threadId: first, archived: false },
+        { threadId: second, archived: true },
+      ],
+      nextCursor: null,
+    })
+    assert.deepEqual(await owners({ archived: false }), {
+      data: [{ threadId: first, archived: false }],
+      nextCursor: null,
+    })
+    assert.deepEqual(await owners({ archived: true }), {
+      data: [{ threadId: second, archived: true }],
+      nextCursor: null,
+    })
+
+    // The App pages with the cursor until it is null and stops on a cursor
+    // it saw before.
+    const page = await owners({ limit: 1 })
+    assert.deepEqual(page, { data: [{ threadId: first, archived: false }], nextCursor: '1' })
+    assert.deepEqual(await owners({ limit: 1, cursor: page.nextCursor }), {
+      data: [{ threadId: second, archived: true }],
+      nextCursor: null,
+    })
+    assert.deepEqual(await owners({ cursor: '2' }), { data: [], nextCursor: null })
+
+    assert.deepEqual(
+      await server.request('thread/attachmentOwner/list', {
+        attachmentType: 'worktree',
+        identityKey: '/repo/none',
+        archived: false,
+        limit: 100,
+      }),
+      { data: [], nextCursor: null },
+    )
+    await assert.rejects(owners({ attachmentType: ' ' }), /attachmentType must not be empty/)
+    await assert.rejects(owners({ identityKey: '' }), /identityKey must not be empty/)
+    await assert.rejects(owners({ cursor: 'x' }), /invalid attachment owner cursor/)
+  })
+})
+
 test('background shells are listed and stopped as background terminals', async () => {
   await withServer(async (server) => {
     const threadId = await server.startThread()
@@ -612,11 +672,37 @@ test('toolOutput sent while a turn runs joins that turn as its input', async () 
 
 test('host methods answer truthfully: empty, disabled or unavailable', async () => {
   await withServer(async (server) => {
-    await assert.rejects(server.request('x/y'), /method not implemented: x\/y/)
+    // The App treats -32601 as "not supported here" and falls back quietly;
+    // these three are Codex methods its App builds do not use.
+    for (const method of [
+      'x/y',
+      'thread/items/read',
+      'thread/prediction/request',
+      'thread/readState/update',
+    ]) {
+      await assert.rejects(server.request(method), (error: unknown) => {
+        assert.ok(error instanceof RpcError)
+        assert.equal(error.code, -32601)
+        assert.equal(error.message, `method not found: ${method}`)
+        assert.equal(error.data, undefined)
+        return true
+      })
+    }
     await assert.rejects(server.request('userVerification/enroll'), (error: unknown) => {
       assert.ok(error instanceof RpcError)
+      assert.equal(error.code, -32000)
       assert.deepEqual(error.data, { type: 'unavailable', reason: 'providerUnavailable' })
       return true
+    })
+    await assert.rejects(server.request('remoteControl/enable'), (error: unknown) => {
+      assert.ok(error instanceof RpcError)
+      assert.equal(error.code, -32000)
+      assert.equal(error.data, undefined)
+      return true
+    })
+    assert.deepEqual(await server.request('account/bedrock/checkGovCloudRequirements', {}), {
+      isGovCloud: false,
+      shouldWarn: false,
     })
     assert.deepEqual(await server.request('app/read', { appIds: ['calendar'] }), {
       apps: [],

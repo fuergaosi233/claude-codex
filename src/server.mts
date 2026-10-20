@@ -27,7 +27,13 @@ import {
   isGoalStatus,
   MODEL_GOAL_STATUSES,
 } from './goal-prompts.mjs'
-import { accountUsage, hostMethod, RpcError } from './host-methods.mjs'
+import {
+  accountUsage,
+  hostMethod,
+  methodNotFound,
+  RpcError,
+  SERVER_ERROR,
+} from './host-methods.mjs'
 import { inheritedAgents, inheritedHooks, inheritedPermissionRules } from './inherited-config.mjs'
 import {
   callMcpTool,
@@ -573,9 +579,9 @@ export class CodexClaudeAppServer {
         stack: error instanceof Error ? error.stack : null,
       })
       this.sendResponse(peer, request.id, undefined, {
-        code: -32000,
+        code: error instanceof RpcError ? error.code : SERVER_ERROR,
         message: error instanceof Error ? error.message : String(error),
-        ...(error instanceof RpcError ? { data: error.data } : {}),
+        ...(error instanceof RpcError && error.data !== undefined ? { data: error.data } : {}),
       })
     }
   }
@@ -662,6 +668,8 @@ export class CodexClaudeAppServer {
         return this.threadAttachmentList(asRecord(params))
       case 'thread/attachment/remove':
         return this.threadAttachmentRemove(asRecord(params))
+      case 'thread/attachmentOwner/list':
+        return this.threadAttachmentOwnerList(asRecord(params))
       case 'thread/name/set':
         return this.threadNameSet(asRecord(params))
       case 'thread/archive':
@@ -847,8 +855,8 @@ export class CodexClaudeAppServer {
         return { effectiveEnabled: asRecord(params).enabled === true }
       case 'plugin/share/list':
         return { data: [] }
-      // Stub the three RPC methods Codex App may call but our dispatcher
-      // previously threw "method not implemented" on. Stubs return the
+      // Stub the three RPC methods Codex App may call that our dispatcher
+      // would otherwise answer as unknown. Stubs return the
       // schema-correct empty shape so the App's call sites don't surface an
       // RPC error toast.
       case 'plugin/share/checkout':
@@ -988,9 +996,16 @@ export class CodexClaudeAppServer {
         return this.fuzzySessionUpdate(peer, asRecord(params))
       case 'fuzzyFileSearch/sessionStop':
         return this.fuzzySessionStop(peer, asRecord(params))
+      // Requests of the protocol that no App build sends. Codex itself answers
+      // thread/prediction/request with method not found, and
+      // thread/readState/update too when it keeps no read state.
+      case 'thread/items/read':
+      case 'thread/prediction/request':
+      case 'thread/readState/update':
+        throw methodNotFound(method)
       default: {
         const result = hostMethod(method, asRecord(params))
-        if (result === undefined) throw new Error(`method not implemented: ${method}`)
+        if (result === undefined) throw methodNotFound(method)
         return result
       }
     }
@@ -1646,6 +1661,28 @@ export class CodexClaudeAppServer {
     return {
       data: attachments.slice(0, limit),
       nextCursor: attachments.length > limit ? String(offset + limit) : null,
+    }
+  }
+
+  // The threads holding an attachment, by thread id: the App keeps the
+  // worktree of a thread it archives while another thread still holds it.
+  // archived false lists the live threads only, true the archived ones.
+  private threadAttachmentOwnerList(params: Record<string, unknown>): unknown {
+    const attachmentType = stringOr(params.attachmentType, '')
+    const identityKey = stringOr(params.identityKey, '')
+    if (!attachmentType.trim()) throw new Error('attachmentType must not be empty')
+    if (!identityKey.trim()) throw new Error('identityKey must not be empty')
+    const archived = typeof params.archived === 'boolean' ? params.archived : null
+    const offset = offsetCursor(params.cursor, 'attachment owner')
+    const limit = pageLimit(params.limit, 200) ?? 25
+    const owners = this.store.listAttachmentOwners(
+      { attachmentType, identityKey, archived },
+      limit + 1,
+      offset,
+    )
+    return {
+      data: owners.slice(0, limit),
+      nextCursor: owners.length > limit ? String(offset + limit) : null,
     }
   }
 

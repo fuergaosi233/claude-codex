@@ -117,6 +117,18 @@ versioning or publishing metadata.
   state on `turn/completed` only, so such a turn kept the thread spinning for
   the rest of the connection — with the answer already written to Claude's
   transcript — until the user interrupted it by hand.
+- Codex App 26.1013 is a verified build. Its GovCloud check for a Bedrock
+  account is answered "not GovCloud", so the App no longer shows the GovCloud
+  modal; `thread/attachmentOwner/list` lists the threads holding a worktree,
+  by thread id and with the `archived` filter; and a request the adapter has
+  no case for fails with JSON-RPC `-32601` (method not found), the code the
+  App treats as unsupported, instead of the generic `-32000`. The advertised
+  app-server version stays the Codex build of App 26.930, which leaves a few
+  newer 26.1013 gates off; `docs/reference/app-compat.md` lists them.
+- `npm run check:app-upgrade` also takes an `app.asar` or an extracted App,
+  reads the protocol from a codex checkout with `--protocol-source` or skips
+  it with `--bundle-only`, and lists every request the App's scripts name that
+  the adapter would answer with method not found.
 
 ### Provider and multi-agent boundaries
 

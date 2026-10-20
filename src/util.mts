@@ -162,11 +162,13 @@ export function platformOs(): string {
 }
 
 // Codex app-server protocol version the adapter advertises (codex --version /
-// initialize userAgent). The App turns its feature gates on by this version,
-// so it is the Codex build of the verified App (codexVersion in
-// scripts/app-baseline.json): every gate that build knows is on, and
-// check:app-upgrade checks each against the adapter. Older App builds only
-// check a minimum version. Override per host with CLAUDE_CODEX_COMPAT_VERSION.
+// initialize userAgent). The App turns its feature gates on by this version.
+// This is the Codex build of App 26.930, so every gate that build knows is on;
+// App 26.1013, the baseline (codexVersion in scripts/app-baseline.json), has
+// newer gates this leaves off, listed in docs/reference/app-compat.md.
+// check:app-upgrade checks each gate it turns on against the adapter. Older
+// App builds only check a minimum version. Keep the default in scripts/codex-shim
+// the same. Override per host with CLAUDE_CODEX_COMPAT_VERSION.
 // App rule: feature-gates
 const DEFAULT_CODEX_COMPAT_VERSION = '0.159.0-alpha.12.1'
 
