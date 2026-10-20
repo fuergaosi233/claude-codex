@@ -11,6 +11,7 @@ import {
   appPluginSkills,
   claudeHookSource,
   claudeRunnableAppPlugin,
+  claudeSkillDirs,
   codexHookEventName,
   listClaudeHooks,
   listClaudeSkills,
@@ -133,6 +134,7 @@ import {
   sortDirectionOr,
   threadSnippet,
 } from './thread-history.mjs'
+import { additionalContextBlocks, skillInstructions, withTurnContext } from './turn-context.mjs'
 import type {
   ClaudeCheckpoint,
   ClaudeRuntime,
@@ -3179,7 +3181,7 @@ export class CodexClaudeAppServer {
       }
       // Carry parsed images through the params bag so runRuntimeTurn can hand
       // them to the runtime context without re-parsing user input.
-      this.launchRuntimeTurn(peer, thread, turn, prompt, {
+      this.launchRuntimeTurn(peer, thread, turn, this.modelPrompt(thread, prompt, params), {
         ...params,
         ...collaborationModeSettings(params),
         ...(helperModel ? { model: helperModel } : {}),
@@ -5937,7 +5939,9 @@ export class CodexClaudeAppServer {
       this.store.appendItem(activeTurnId, item)
       this.emitItemLifecycle(this.peerForThread(threadId), threadId, activeTurnId, item)
     }
-    const steered = await this.steerRunningTurn(threadId, activeTurnId, prompt, {
+    const thread = this.store.getThread(threadId)
+    const modelPrompt = thread ? this.modelPrompt(thread, prompt, params) : prompt
+    const steered = await this.steerRunningTurn(threadId, activeTurnId, modelPrompt, {
       imageInputs: images,
       onAccepted: accept,
     })
@@ -6749,6 +6753,27 @@ export class CodexClaudeAppServer {
       filePath,
       overriddenMetadata: null,
     }
+  }
+
+  // What Claude reads for a user message: the message, then the SKILL.md of
+  // each skill it picks and the context the App attached to it. Helper turns
+  // and the adapter's own prompts get neither.
+  // App rule: skill-injection
+  // App rule: additional-context
+  private modelPrompt(
+    thread: ThreadRecord,
+    prompt: string,
+    params: Record<string, unknown>,
+  ): string {
+    if (params.outputSchema != null || typeof params._hiddenPrompt === 'string') return prompt
+    const skillDirs = [
+      ...claudeSkillDirs(thread.cwd),
+      ...this.appSkillsFor(thread.id).appSkills.map((skill) => dirname(skill.path)),
+    ]
+    return withTurnContext(prompt, [
+      skillInstructions(prompt, skillDirs),
+      additionalContextBlocks(params.additionalContext),
+    ])
   }
 
   // The Codex App skills Claude can run in a thread, and where the thread's

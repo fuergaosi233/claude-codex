@@ -44,6 +44,25 @@ the plan as a new turn, in which Claude carries it out; writing feedback instead
 keeps Plan mode on for a revised plan. In Plan mode a tool call that would need
 your approval (a command, an edit) is refused rather than asked about.
 
+## Skills and the App's tools
+
+Skills you pick with `$` or `/` in the composer work as they do in Codex chats.
+Claude Code's built-in commands (`/simplify`, `/code-review`, …) run as slash
+commands. For any other skill, the adapter adds its `SKILL.md` to what Claude
+reads for that message, so Claude follows it without first looking for the
+file. That covers the skills in your Claude Code and project `.claude/skills`
+folders and the App's own skills Claude can run, up to 64 KiB per skill;
+Claude reads any other skill file itself. Your message shows only the chip.
+
+Context the App attaches to a message without showing it, such as the follow-up
+after you connect a suggested plugin, reaches Claude after the message, marked
+as data rather than instructions when the App does not vouch for it.
+
+The App's instructions to the model describe tools only Codex chats have:
+starting and messaging other threads, worktrees, automations and the sidebar.
+Claude chats are told which of these they lack, so instead of searching for
+them Claude asks you to use the App for such steps.
+
 ## Inline visualizations
 
 With the default native Claude Agent SDK backend, Claude can answer with a

@@ -207,6 +207,30 @@ export const APP_RULES: readonly AppRule[] = [
       'Ask for a plan in Plan mode: one plan card shows, "Implement this plan?" follows, and accepting runs the plan outside plan mode.',
   },
   {
+    id: 'skill-injection',
+    app: 'Sends a skill picked in the composer as a [$name](path) link to its SKILL.md inside the prompt text, and a skill picked from a plugin or setup card as a skill input item with name and path.',
+    adapter:
+      'Renders a skill item as the same link and, for a SKILL.md under a listed skill folder (64 KiB at most), adds a <skill> block with its content to the prompt Claude reads; for any other SKILL.md it asks Claude to read the file. The userMessage item keeps the input as sent.',
+    verify:
+      'Pick a Claude skill with "$" or "/" and send a message: Claude follows the skill without reading its file first, and the message shows only the chip.',
+  },
+  {
+    id: 'additional-context',
+    app: "Attaches additionalContext ({key: {value, kind}}, kind untrusted or application) to turn/start and turn/steer, for the turn that follows connecting a suggested plugin, an edited page or writing block, and quick chat. It does not show the context in the user's message.",
+    adapter:
+      'Adds each entry to the prompt Claude reads as an <app_context key kind> block, capped at 32 KiB, behind a note that untrusted blocks are data and not instructions; the userMessage item and the chat preview leave it out.',
+    verify:
+      'Connect a suggested plugin from a Claude chat and continue: the reply uses the attached context, and the message shows no context text.',
+  },
+  {
+    id: 'app-tool-availability',
+    app: 'Writes developerInstructions for every local thread that describe its own tools (create_thread, read_thread, automation_update, create_worktree, sidebar tools and others) and the ::created-thread directive, and gives Codex threads those tools.',
+    adapter:
+      'Gives Claude threads none of them, so it appends a short "# Tool availability" section after the developer instructions naming the tools they mention, and asks Claude not to look for them or write their directives and to send the user to the App instead.',
+    verify:
+      "In a Claude chat, ask to start a new thread or a worktree: Claude says to do it in the App instead of searching for the tool. Search the new build's thread-start instructions for tool names missing from the list in src/turn-context.mts.",
+  },
+  {
     id: 'prewarmed-threads',
     app: 'Starts the thread of a new chat with thread/start before the user sends anything, keeps it out of thread/list and holds back its thread/started until it sends turn/start there, and deletes it with thread/delete once the chat goes unused for 10 minutes. It forgets such threads when the app-server connection drops or the App quits.',
     adapter:

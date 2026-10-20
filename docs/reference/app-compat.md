@@ -44,6 +44,9 @@ line a rule touches.
 | `helper-thread-model` | generates titles, descriptions and turn summaries in ephemeral helper threads on its own OpenAI model, accepting another one, with `model: null` and an `outputSchema` declaring JSON Schema draft 2020-12 on `turn/start`, waiting 30 seconds for the answer; keeps the first words as the title when that fails | with Codex routing off, a new chat gets a generated title |
 | `collaboration-modes` | enables `/plan` and the Plan toggle only when `collaborationMode/list` has a `plan` preset, sends the mode with the picker's model and effort in `collaborationMode.settings` (top-level `model` and `effort` null on `turn/start`), and adopts the mode `thread/settings/updated` and `thread/resume` report | in a Claude chat `/plan` is enabled, and the Plan toggle stays on after a message |
 | `plan-implementation` | asks "Implement this plan?" when a completed turn has a non-empty `plan` item, and sends the plan back as a default-mode turn when accepted | a plan asked for in Plan mode shows as one card, followed by the prompt |
+| `skill-injection` | sends a skill picked in the composer as a `[$name](path)` link, and one picked from a plugin or setup card as a `skill` input item | Claude follows a picked skill without reading its file first; the message shows only the chip |
+| `additional-context` | attaches `additionalContext` entries (`untrusted` or `application`) to `turn/start` and `turn/steer`, for example after connecting a suggested plugin, and keeps them out of the user's message | the turn after connecting a plugin uses the context; the message shows none of it |
+| `app-tool-availability` | writes developer instructions describing its own tools (`create_thread`, `automation_update`, `create_worktree`, …) and gives them to Codex threads only | asked for a new thread or worktree, Claude points to the App; tool names new in the build's instructions are added to the list in `src/turn-context.mts` |
 | `prewarmed-threads` | starts a new chat's thread before anything is sent, hides it from `thread/list` until its first `turn/start`, and forgets it when the connection drops or the App quits | after an adapter restart, a new chat left empty does not show in the sidebar |
 
 The full text of each rule, including the adapter side, is in
@@ -150,8 +153,13 @@ which the bundle does not show and which can change without an App release:
   on as well. Otherwise the App reads `thread/turns/list`, as before. The
   adapter serves both.
 - **`threadAttachments`** adds the worktree tools (`create_worktree`,
-  `attach_worktree`, `list_artifacts` and others) to `thread/start` as
-  `dynamicTools`. The adapter does not offer dynamic tools to Claude. With one
+  `attach_worktree`, `get_worktree_creation_status` and others) to the App's
+  own tools for `thread/start`. On a local host it names them in `config`
+  (`enabled_tools` of the bundled `codex_app` MCP server, which Codex runs);
+  only on a remote host does it send them as `dynamicTools`. Claude gets
+  neither, and the App's developer instructions, which describe these tools,
+  are followed by a note naming the ones Claude lacks (rule
+  `app-tool-availability`). With one
   more flag on, the App starts a chat in worktree mode in the local checkout
   and leaves creating the worktree to the agent's `create_worktree` call, so
   with Claude the task would run in the local checkout. If that happens, set

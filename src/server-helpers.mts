@@ -6,6 +6,7 @@ import type { AppSkill } from './claude-capabilities.mjs'
 import { callMcpTool, readMcpConfig, readMcpResource } from './mcp.mjs'
 import { stripQuietTurnHeartbeat } from './quiet-turns.mjs'
 import type { SessionStore } from './store.mjs'
+import { appToolAvailabilityNote } from './turn-context.mjs'
 import type {
   ClaudeRuntime,
   CollaborationModeKind,
@@ -686,6 +687,9 @@ export function buildSystemPromptAddendum(input: {
   if (base) sections.push(`# Project instructions\n${base}`)
   const dev = (input.developerInstructions ?? '').trim()
   if (dev) sections.push(`# Developer instructions\n${dev}`)
+  // App rule: app-tool-availability
+  const tools = input.desktopPresentation ? appToolAvailabilityNote(dev) : null
+  if (tools) sections.push(tools)
   const cue = personalityPromptCue(input.personality)
   if (cue) sections.push(cue)
   return sections.length > 0 ? sections.join('\n\n') : null
