@@ -9,6 +9,7 @@ import {
 } from './app-plugin-mcp.mjs'
 import { inheritedMcpServers, type McpToolRules, mcpToolRules } from './inherited-config.mjs'
 import { ownVariable, remoteCredential } from './mcp-credentials.mjs'
+import type { RuntimeMcpServerStatus } from './types.mjs'
 
 export interface McpConfigSnapshot {
   sdkValue: unknown | null
@@ -79,9 +80,11 @@ const STATUS_CACHE_MS = 10_000
 
 // mcpServerStatus/list with real tools/resources enumerated from each server.
 // Falls back to the conformant empty shape per server on any error/timeout so a
-// single unreachable server never fails the whole list.
+// single unreachable server never fails the whole list. session is what the
+// thread's live Claude session says of its servers, when it has one.
 export async function listMcpServerStatuses(
   scope: McpConfigScope = {},
+  session: readonly RuntimeMcpServerStatus[] | null = null,
 ): Promise<Array<Record<string, unknown>>> {
   const snapshot = readMcpConfig(scope)
   const names = serverNames(snapshot.sdkValue)
@@ -90,15 +93,48 @@ export async function listMcpServerStatuses(
     snapshot.sdkValue ?? null,
     plugins.map((server) => [server.pluginId, server.name, server.cwd]),
   ])
-  if (statusCache && statusCache.key === key && Date.now() - statusCache.at < STATUS_CACHE_MS) {
-    return statusCache.data
+  let data =
+    statusCache && statusCache.key === key && Date.now() - statusCache.at < STATUS_CACHE_MS
+      ? statusCache.data
+      : null
+  if (!data) {
+    data = await Promise.all([
+      ...names.map((name) => enumerateServerStatus(name, snapshot.sdkValue)),
+      ...plugins.map((server) => pluginServerStatus(server)),
+    ])
+    statusCache = { key, at: Date.now(), data }
   }
-  const data = await Promise.all([
-    ...names.map((name) => enumerateServerStatus(name, scope)),
-    ...plugins.map((server) => pluginServerStatus(server)),
-  ])
-  statusCache = { key, at: Date.now(), data }
-  return data
+  return session ? data.map((status) => withSessionStatus(status, session)) : data
+}
+
+// Codex's McpServerConnectionStatus for each state Claude Code gives an MCP
+// server in a live session.
+const SESSION_STATES = new Map([
+  ['connected', 'connected'],
+  ['failed', 'failed'],
+  ['needs-auth', 'authenticationRequired'],
+  ['pending', 'starting'],
+  ['disabled', 'disabled'],
+])
+
+// runtimeStatus is the state of the thread's own connection to the server,
+// which only the thread's live Claude session knows. A server the session
+// does not list, or a plugin server the adapter runs itself, keeps what the
+// adapter found.
+function withSessionStatus(
+  status: Record<string, unknown>,
+  session: readonly RuntimeMcpServerStatus[],
+): Record<string, unknown> {
+  if (status.pluginId != null) return status
+  const seen = session.find((server) => server.name === status.name)
+  if (!seen) return status
+  return {
+    ...status,
+    runtimeStatus: SESSION_STATES.get(seen.status) ?? null,
+    serverInfo:
+      status.serverInfo ??
+      (seen.serverInfo ? mcpServerInfo(seen.serverInfo, String(status.name)) : null),
+  }
 }
 
 // config/mcpServer/reload: the next mcpServerStatus/list asks the servers
@@ -136,80 +172,141 @@ async function pluginServerStatus(server: AppPluginServer): Promise<Record<strin
     ...listStatusEntry(server.name),
     runtimeStatus: 'failed',
     pluginId: server.pluginId,
-    httpOrigin: null,
-    serverInfo: null,
-    serverCapabilities: null,
-    toolsError: null,
   }
   let capabilities: Record<string, unknown>
   try {
     const initialized = await startAppPluginServer(server)
     capabilities = asRecord(initialized.capabilities)
-    const info = asRecord(initialized.serverInfo)
     status.runtimeStatus = 'connected'
-    status.serverInfo = {
-      ...info,
-      name: stringOr(info.name, server.name),
-      version: typeof info.version === 'string' ? info.version : '',
-    }
+    status.serverInfo = mcpServerInfo(initialized.serverInfo, server.name)
     status.serverCapabilities = initialized.capabilities ?? null
   } catch (error) {
-    status.toolsError = error instanceof Error ? error.message : String(error)
+    status.toolsError = errorText(error)
     return status
   }
-  const list = async (method: string, key: string): Promise<unknown[]> => {
-    const items: unknown[] = []
-    let cursor: string | null = null
-    for (let page = 0; page < 20; page++) {
-      const result = asRecord(
-        await appPluginRequest(server, method, cursor == null ? {} : { cursor }),
-      )
-      if (Array.isArray(result[key])) items.push(...(result[key] as unknown[]))
-      cursor = typeof result.nextCursor === 'string' && result.nextCursor ? result.nextCursor : null
-      if (cursor == null) break
-    }
-    return items
-  }
+  const request = (method: string, params: unknown) => appPluginRequest(server, method, params)
   if (capabilities.tools) {
     try {
-      status.tools = toolMap(await list('tools/list', 'tools'))
+      const tools = await listPages(request, 'tools/list', 'tools')
+      status.tools = toolMap(tools.items)
+      status.toolListMeta = tools.meta
     } catch (error) {
-      status.toolsError = error instanceof Error ? error.message : String(error)
+      status.toolsError = errorText(error)
     }
   }
   if (capabilities.resources) {
     const [resources, templates] = await Promise.all([
-      list('resources/list', 'resources').catch(() => []),
-      list('resources/templates/list', 'resourceTemplates').catch(() => []),
+      listPages(request, 'resources/list', 'resources').catch(() => null),
+      listPages(request, 'resources/templates/list', 'resourceTemplates').catch(() => null),
     ])
-    status.resources = resources.map(asRecord).filter((r) => typeof r.uri === 'string')
-    status.resourceTemplates = templates
-      .map(asRecord)
-      .filter((r) => typeof r.uriTemplate === 'string')
+    status.resources = resourceList(resources?.items ?? [])
+    status.resourceTemplates = templateList(templates?.items ?? [])
   }
   return status
 }
 
+// A Claude server's status from the adapter's own look at it: one connection
+// that initializes the server and lists its tools and resources. A server it
+// cannot reach on its own (another transport, or a sign-in Claude Code keeps)
+// is left as unknown rather than failed. runtimeStatus stays null here: it is
+// the state of a thread's connection, see withSessionStatus.
 async function enumerateServerStatus(
   name: string,
-  scope: McpConfigScope,
+  servers: unknown,
 ): Promise<Record<string, unknown>> {
-  const base = listStatusEntry(name)
-  const [tools, resources, resourceTemplates] = await Promise.all([
-    safeMcpList(name, 'tools/list', 'tools', scope),
-    safeMcpList(name, 'resources/list', 'resources', scope),
-    safeMcpList(name, 'resources/templates/list', 'resourceTemplates', scope),
-  ])
-  if (Array.isArray(tools)) base.tools = toolMap(tools)
-  if (Array.isArray(resources)) {
-    base.resources = resources.map((raw) => asRecord(raw)).filter((r) => typeof r.uri === 'string')
+  const status = listStatusEntry(name)
+  let connection: McpConnection
+  try {
+    const config = configFrom(servers, name)
+    status.httpOrigin = httpOrigin(config)
+    connection = await connectMcp(name, config)
+  } catch (error) {
+    if (!(error instanceof OutOfReach)) status.toolsError = errorText(error)
+    return status
   }
-  if (Array.isArray(resourceTemplates)) {
-    base.resourceTemplates = resourceTemplates
-      .map((raw) => asRecord(raw))
-      .filter((r) => typeof r.uriTemplate === 'string')
+  try {
+    const { initialized } = connection
+    const capabilities = asRecord(initialized.capabilities)
+    if (isObject(initialized.serverInfo)) {
+      status.serverInfo = mcpServerInfo(initialized.serverInfo, name)
+    }
+    if (isObject(initialized.capabilities)) status.serverCapabilities = initialized.capabilities
+    const [tools, resources, templates] = await Promise.allSettled([
+      listPages(connection.request, 'tools/list', 'tools'),
+      listPages(connection.request, 'resources/list', 'resources'),
+      listPages(connection.request, 'resources/templates/list', 'resourceTemplates'),
+    ])
+    if (tools.status === 'fulfilled') {
+      status.tools = toolMap(tools.value.items)
+      status.toolListMeta = tools.value.meta
+    } else if (capabilities.tools) {
+      // A server that does not offer tools has none to fail to list.
+      status.toolsError = errorText(tools.reason)
+    }
+    if (resources.status === 'fulfilled') status.resources = resourceList(resources.value.items)
+    if (templates.status === 'fulfilled') {
+      status.resourceTemplates = templateList(templates.value.items)
+    }
+  } finally {
+    connection.close()
   }
-  return base
+  return status
+}
+
+// Every page of a list, up to 20, and the _meta of the first: Codex reports
+// a tool catalog's _meta as toolListMeta.
+async function listPages(
+  request: (method: string, params: unknown) => Promise<unknown>,
+  method: string,
+  key: string,
+): Promise<{ items: unknown[]; meta: Record<string, unknown> | null }> {
+  const items: unknown[] = []
+  let meta: Record<string, unknown> | null = null
+  let cursor: string | null = null
+  for (let page = 0; page < 20; page++) {
+    const result = asRecord(await request(method, cursor == null ? {} : { cursor }))
+    if (page === 0 && isObject(result._meta)) meta = result._meta
+    if (Array.isArray(result[key])) items.push(...(result[key] as unknown[]))
+    cursor = typeof result.nextCursor === 'string' && result.nextCursor ? result.nextCursor : null
+    if (cursor == null) break
+  }
+  return { items, meta }
+}
+
+function resourceList(items: unknown[]): Record<string, unknown>[] {
+  return items.map(asRecord).filter((resource) => typeof resource.uri === 'string')
+}
+
+function templateList(items: unknown[]): Record<string, unknown>[] {
+  return items.map(asRecord).filter((template) => typeof template.uriTemplate === 'string')
+}
+
+// Codex's McpServerInfo from the serverInfo of an initialize reply: every
+// field present, null where the server gave none.
+function mcpServerInfo(raw: unknown, fallbackName: string): Record<string, unknown> {
+  const info = asRecord(raw)
+  const text = (value: unknown) => (typeof value === 'string' ? value : null)
+  return {
+    name: stringOr(info.name, fallbackName),
+    title: text(info.title),
+    version: text(info.version) ?? '',
+    description: text(info.description),
+    icons: Array.isArray(info.icons) ? info.icons : null,
+    websiteUrl: text(info.websiteUrl),
+  }
+}
+
+// The origin of a remote server's url as Codex reports it: scheme, host and
+// port, without credentials or path; null for a server that is not reached
+// over HTTP.
+function httpOrigin(config: Record<string, unknown>): string | null {
+  if (typeof config.url !== 'string') return null
+  try {
+    const url = new URL(config.url)
+    return url.protocol === 'http:' || url.protocol === 'https:' ? url.origin : null
+  } catch {
+    return null
+  }
 }
 
 // The tools as Codex lists them, annotations, icons and _meta included: the
@@ -234,21 +331,6 @@ function toolMap(tools: unknown[]): Record<string, Record<string, unknown>> {
       },
     ])
   return Object.fromEntries(entries)
-}
-
-async function safeMcpList(
-  name: string,
-  method: string,
-  key: string,
-  scope: McpConfigScope,
-): Promise<unknown[] | null> {
-  const result = await runMcpRequest(name, method, {}, scope).then(
-    (value) => asRecord(value),
-    () => null,
-  )
-  if (!result) return null
-  const value = result[key]
-  return Array.isArray(value) ? value : []
 }
 
 // The _meta Codex hands the server with a client's tool call: the client's
@@ -315,15 +397,50 @@ async function runMcpRequest(
   params: unknown,
   scope: McpConfigScope,
 ): Promise<unknown> {
-  const config = getServerConfig(serverName, scope)
-  if (config.type === 'http') {
-    return runHttpMcpRequest(config, method, params)
+  const connection = await connectMcp(serverName, getServerConfig(serverName, scope))
+  try {
+    return await connection.request(method, params)
+  } finally {
+    connection.close()
   }
+}
+
+// A connection to a server the adapter reaches itself, past the initialize
+// handshake: the server's reply to it, and requests over the same connection.
+interface McpConnection {
+  readonly initialized: Record<string, unknown>
+  readonly request: (method: string, params: unknown) => Promise<unknown>
+  readonly close: () => void
+}
+
+// The adapter speaks to stdio and http servers on its own. Another transport,
+// or a remote server that wants the sign-in Claude Code keeps for it, is out
+// of its reach, which says nothing of how Claude reaches the server.
+class OutOfReach extends Error {}
+
+const INITIALIZE_PARAMS = {
+  protocolVersion: '2024-11-05',
+  capabilities: {},
+  clientInfo: { name: 'claude-codex-adapter', version: '0.1.0' },
+}
+
+async function connectMcp(
+  serverName: string,
+  config: Record<string, unknown>,
+): Promise<McpConnection> {
+  if (config.type === 'http') return connectHttp(config)
   if (config.type && config.type !== 'stdio') {
-    throw new Error(
-      `direct MCP ${method} only supports stdio servers; ${serverName} is ${config.type}`,
+    throw new OutOfReach(
+      `direct MCP requests only support stdio and http servers; ${serverName} is ${config.type}`,
     )
   }
+  return connectStdio(serverName, config)
+}
+
+async function connectStdio(
+  serverName: string,
+  config: Record<string, unknown>,
+): Promise<McpConnection> {
   const command = stringOr(config.command, '')
   if (!command) throw new Error(`MCP server ${serverName} has no command`)
   const child = spawn(command, Array.isArray(config.args) ? config.args.map(String) : [], {
@@ -338,13 +455,25 @@ async function runMcpRequest(
   let nextId = 1
   let buffer = ''
   let stderr = ''
-  let spawnError: Error | null = null
-  // Without an error handler a failed spawn (for example ENOENT for a missing
-  // server binary) emits an unhandled error and crashes the adapter.
-  child.on('error', (error) => {
-    spawnError = error
+  // Why the connection ended; every request still waiting, and every later
+  // one, fails with it.
+  let ended: Error | null = null
+  const end = (error: Error) => {
+    ended ??= error
     for (const wait of pending.values()) wait.reject(error)
     pending.clear()
+  }
+  // Without an error handler a failed spawn (for example ENOENT for a missing
+  // server binary) emits an unhandled error and crashes the adapter.
+  child.on('error', end)
+  // A server that exits leaves nothing to wait for. Its output is read by
+  // now, so every answer it gave has arrived.
+  child.on('close', (code) => {
+    end(
+      new Error(
+        `MCP server exited${code == null ? '' : ` with code ${code}`}${stderrNote(stderr)}`,
+      ),
+    )
   })
   // child.stdin can emit EPIPE when spawn fails; the child error above carries
   // the useful cause, so keep this stream from becoming an unhandled error too.
@@ -361,7 +490,12 @@ async function runMcpRequest(
       const line = buffer.slice(0, lineEnd).trim()
       buffer = buffer.slice(lineEnd + 1)
       if (!line || !line.startsWith('{')) continue
-      const message = JSON.parse(line) as Record<string, unknown>
+      let message: Record<string, unknown>
+      try {
+        message = JSON.parse(line) as Record<string, unknown>
+      } catch {
+        continue
+      }
       const id = Number(message.id)
       const wait = pending.get(id)
       if (!wait) continue
@@ -371,43 +505,36 @@ async function runMcpRequest(
     }
   })
 
-  const request = (requestMethod: string, requestParams: unknown): Promise<unknown> => {
-    if (spawnError) return Promise.reject(spawnError)
+  const request = (method: string, params: unknown): Promise<unknown> => {
+    if (ended) return Promise.reject(ended)
     const id = nextId++
-    child.stdin.write(
-      `${JSON.stringify({ jsonrpc: '2.0', id, method: requestMethod, params: requestParams })}\n`,
-    )
+    child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`)
     return new Promise((resolve, reject) => pending.set(id, { resolve, reject }))
   }
 
   const timeout = setTimeout(() => {
-    for (const wait of pending.values())
-      wait.reject(new Error(`MCP request timed out${stderr ? `: ${stderr}` : ''}`))
-    pending.clear()
+    end(new Error(`MCP request timed out${stderrNote(stderr)}`))
     child.kill()
   }, 20_000)
+  const close = () => {
+    clearTimeout(timeout)
+    end(new Error('MCP connection closed'))
+    child.kill()
+  }
 
   try {
-    await request('initialize', {
-      protocolVersion: '2024-11-05',
-      capabilities: {},
-      clientInfo: { name: 'claude-codex-adapter', version: '0.1.0' },
-    })
+    const initialized = asRecord(await request('initialize', INITIALIZE_PARAMS))
     child.stdin.write(
       `${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} })}\n`,
     )
-    return await request(method, params)
-  } finally {
-    clearTimeout(timeout)
-    child.kill()
+    return { initialized, request, close }
+  } catch (error) {
+    close()
+    throw error
   }
 }
 
-async function runHttpMcpRequest(
-  config: Record<string, unknown>,
-  method: string,
-  params: unknown,
-): Promise<unknown> {
+async function connectHttp(config: Record<string, unknown>): Promise<McpConnection> {
   const url = stringOr(config.url, '')
   if (!url) throw new Error('HTTP MCP server has no url')
   const headers = {
@@ -415,21 +542,15 @@ async function runHttpMcpRequest(
     accept: 'application/json',
     ...stringRecord(config.headers),
   }
-  const initialize = await fetchJsonRpc(url, headers, {
-    jsonrpc: '2.0',
-    id: 1,
-    method: 'initialize',
-    params: {
-      protocolVersion: '2024-11-05',
-      capabilities: {},
-      clientInfo: { name: 'claude-codex-adapter', version: '0.1.0' },
-    },
-  })
-  if (asRecord(initialize).error) throw new Error(JSON.stringify(asRecord(initialize).error))
-  const response = await fetchJsonRpc(url, headers, { jsonrpc: '2.0', id: 2, method, params })
-  const record = asRecord(response)
-  if (record.error) throw new Error(JSON.stringify(record.error))
-  return record.result
+  let nextId = 1
+  const request = async (method: string, params: unknown): Promise<unknown> => {
+    const body = { jsonrpc: '2.0', id: nextId++, method, params }
+    const record = asRecord(await fetchJsonRpc(url, headers, body))
+    if (record.error) throw new Error(JSON.stringify(record.error))
+    return record.result
+  }
+  const initialized = asRecord(await request('initialize', INITIALIZE_PARAMS))
+  return { initialized, request, close: () => {} }
 }
 
 async function fetchJsonRpc(
@@ -439,6 +560,9 @@ async function fetchJsonRpc(
 ): Promise<unknown> {
   const response = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) })
   const text = await response.text()
+  if (response.status === 401 || response.status === 403) {
+    throw new OutOfReach(`HTTP MCP request failed ${response.status}: ${text}`)
+  }
   if (!response.ok) throw new Error(`HTTP MCP request failed ${response.status}: ${text}`)
   const trimmed = text.trim()
   if (trimmed.startsWith('event:') || trimmed.startsWith('data:')) {
@@ -448,11 +572,20 @@ async function fetchJsonRpc(
   return JSON.parse(trimmed)
 }
 
+// What a stdio server wrote to stderr, to go with an error.
+function stderrNote(stderr: string): string {
+  const text = stderr.trim()
+  return text ? `: ${text}` : ''
+}
+
 // A server's config with its ${VAR} references filled in, as the CLI
 // would fill them in for the servers it starts.
 function getServerConfig(serverName: string, scope: McpConfigScope): Record<string, unknown> {
-  const snapshot = readMcpConfig(scope)
-  const value = snapshot.sdkValue
+  return configFrom(readMcpConfig(scope).sdkValue, serverName)
+}
+
+// The named server's config in the servers by name, filled in the same way.
+function configFrom(value: unknown, serverName: string): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value))
     throw new Error(`unknown MCP server: ${serverName}`)
   const config = (value as Record<string, unknown>)[serverName]
@@ -518,18 +651,29 @@ function serverNames(value: unknown): string[] {
   return Object.keys(value as Record<string, unknown>)
 }
 
-// Codex v2 McpServerStatus: { name, tools: { [name]: Tool }, resources: [],
-// resourceTemplates: [], authStatus }. The adapter does not eagerly enumerate
-// tools/resources, so it reports the conformant empty shape with authStatus
-// "unsupported" (no Codex-managed OAuth) instead of a non-schema object.
+// Codex v2 McpServerStatus before anything is known of the server: every
+// field the 0.159 to 0.164 protocols require, null where the adapter cannot
+// say, and authStatus "unsupported" (Claude Code, not Codex, signs in to
+// these servers).
 function listStatusEntry(name: string): Record<string, unknown> {
   return {
     name,
+    runtimeStatus: null,
+    pluginId: null,
+    httpOrigin: null,
+    serverInfo: null,
+    serverCapabilities: null,
+    toolListMeta: null,
     tools: {},
+    toolsError: null,
     resources: [],
     resourceTemplates: [],
     authStatus: 'unsupported',
   }
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

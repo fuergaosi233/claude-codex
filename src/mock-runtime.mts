@@ -5,6 +5,7 @@ import type {
   RuntimeBackgroundListener,
   RuntimeHandlers,
   RuntimeLiveTask,
+  RuntimeMcpServerStatus,
   RuntimeSteerOptions,
   RuntimeTurnContext,
   RuntimeTurnSettings,
@@ -35,6 +36,9 @@ export class MockRuntime implements ClaudeRuntime {
   private resets = new Map<string, number>()
   // reloadMcpServers calls, echoed by the mcp reload check scenario.
   private mcpReloads = 0
+  // The MCP servers each thread's session sees, set by the mcp session
+  // scenario.
+  private mcpSessions = new Map<string, RuntimeMcpServerStatus[]>()
   // Background Bash shells by task id.
   private shells = new Map<string, { threadId: string; toolUseId: string }>()
   // Background workflows: task id to thread id.
@@ -187,6 +191,26 @@ export class MockRuntime implements ClaudeRuntime {
       const text = `${this.mcpReloads} MCP reloads`
       await handlers.onEvent({ type: 'text_delta', delta: text })
       await handlers.onEvent({ type: 'completed', success: true, result: text })
+      return
+    }
+
+    // "mcp session <name>=<state> ...": the thread's session now sees those
+    // MCP servers in those states; a connected one names itself
+    // "<name>-session" at version 2.0.0.
+    const mcpSession = /mcp session((?:\s+[\w-]+=[\w-]+)+)/i.exec(context.prompt)
+    if (mcpSession) {
+      const statuses = (mcpSession[1] ?? '')
+        .trim()
+        .split(/\s+/)
+        .map((pair) => {
+          const [name = '', status = ''] = pair.split('=')
+          const serverInfo =
+            status === 'connected' ? { name: `${name}-session`, version: '2.0.0' } : null
+          return { name, status, serverInfo }
+        })
+      this.mcpSessions.set(context.threadId, statuses)
+      await handlers.onEvent({ type: 'text_delta', delta: 'MCP servers seen.' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'MCP servers seen.' })
       return
     }
 
@@ -1400,6 +1424,10 @@ export class MockRuntime implements ClaudeRuntime {
 
   async reloadMcpServers(): Promise<void> {
     this.mcpReloads += 1
+  }
+
+  async mcpServerStatuses(threadId: string): Promise<RuntimeMcpServerStatus[] | null> {
+    return this.mcpSessions.get(threadId) ?? null
   }
 
   private scheduleBackgroundReport(

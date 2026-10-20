@@ -13,6 +13,7 @@ import type {
   RuntimeBackgroundListener,
   RuntimeHandlers,
   RuntimeLiveTask,
+  RuntimeMcpServerStatus,
   RuntimeSteerOptions,
   RuntimeTurnContext,
   RuntimeTurnSettings,
@@ -156,6 +157,15 @@ class SelectableRuntime implements ClaudeRuntime {
     await Promise.allSettled(
       [...this.runtimes.values()].map((runtime) => runtime.reloadMcpServers?.()),
     )
+  }
+
+  // The first backend whose live session for the thread can say.
+  async mcpServerStatuses(threadId: string): Promise<RuntimeMcpServerStatus[] | null> {
+    for (const runtime of this.runtimes.values()) {
+      const statuses = await runtime.mcpServerStatuses?.(threadId)
+      if (statuses) return statuses
+    }
+    return null
   }
 
   private runtimeFor(type: RuntimeBackendType): ClaudeRuntime {

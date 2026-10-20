@@ -886,6 +886,15 @@ export interface RuntimeLiveTask {
   toolUseId: string | null
 }
 
+// An MCP server as a live Claude session sees it: its connection state
+// (connected, failed, needs-auth, pending or disabled) and, once connected,
+// the name and version the server gave.
+export interface RuntimeMcpServerStatus {
+  name: string
+  status: string
+  serverInfo: { name: string; version: string } | null
+}
+
 export interface ClaudeRuntime {
   runTurn(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void>
   // false: no running turn took the message. true: delivered, and
@@ -931,4 +940,7 @@ export interface ClaudeRuntime {
   // that failed or wait for a sign-in; a session opened later reads the
   // config itself. Never rejects.
   reloadMcpServers?(): Promise<void>
+  // The MCP servers of the thread's live session, as Claude Code sees them;
+  // null when no live session can say. Never rejects.
+  mcpServerStatuses?(threadId: string): Promise<RuntimeMcpServerStatus[] | null>
 }

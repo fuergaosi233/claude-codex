@@ -87,6 +87,7 @@ import type {
   RuntimeBackgroundListener,
   RuntimeHandlers,
   RuntimeLiveTask,
+  RuntimeMcpServerStatus,
   RuntimeSteerOptions,
   RuntimeTaskUsage,
   RuntimeTurnContext,
@@ -525,6 +526,28 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   async reloadMcpServers(): Promise<void> {
     const open = [...this.sessions.values()].filter((live) => !live.closed)
     await Promise.all(open.map((live) => this.retryMcpServers(live)))
+  }
+
+  // Asks the thread's open session; a session that does not answer in time
+  // says nothing.
+  async mcpServerStatuses(threadId: string): Promise<RuntimeMcpServerStatus[] | null> {
+    const live = this.sessions.get(threadId)
+    if (!live || live.closed) return null
+    const query = live.query as Query & {
+      mcpServerStatus?: () => Promise<Array<Record<string, unknown>>>
+    }
+    if (typeof query.mcpServerStatus !== 'function') return null
+    let statuses: RuntimeMcpServerStatus[] | null = null
+    await settlesWithin(
+      query.mcpServerStatus().then(
+        (found) => {
+          statuses = Array.isArray(found) ? found.flatMap(runtimeMcpServerStatus) : null
+        },
+        () => {},
+      ),
+      SESSION_CONTROL_TIMEOUT_MS,
+    )
+    return statuses
   }
 
   async stop(): Promise<void> {
@@ -2986,6 +3009,18 @@ async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Prom
   } finally {
     if (timer) clearTimeout(timer)
   }
+}
+
+// One entry of the SDK's mcpServerStatus(); an entry without a name or a
+// state is left out.
+function runtimeMcpServerStatus(raw: Record<string, unknown>): RuntimeMcpServerStatus[] {
+  if (typeof raw?.name !== 'string' || typeof raw.status !== 'string') return []
+  const info = raw.serverInfo as Record<string, unknown> | null | undefined
+  const serverInfo =
+    info && typeof info.name === 'string'
+      ? { name: info.name, version: typeof info.version === 'string' ? info.version : '' }
+      : null
+  return [{ name: raw.name, status: raw.status, serverInfo }]
 }
 
 // A control request whose failure the caller reports.

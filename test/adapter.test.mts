@@ -516,12 +516,36 @@ test('mcpServerStatus/list and startup notifications use conformant Codex v2 sha
     const list = await reader.nextResponse(2)
     const entry = list.result.data[0]
     assert.equal(entry.name, 'github')
-    // McpServerStatus = { name, tools: map, resources: [], resourceTemplates: [], authStatus }
+    // Every field McpServerStatus requires, in 0.159 and 0.163 alike, plus
+    // the toolListMeta 0.164 adds: the nullable ones are present as null.
+    assert.deepEqual(Object.keys(entry).sort(), [
+      'authStatus',
+      'httpOrigin',
+      'name',
+      'pluginId',
+      'resourceTemplates',
+      'resources',
+      'runtimeStatus',
+      'serverCapabilities',
+      'serverInfo',
+      'toolListMeta',
+      'tools',
+      'toolsError',
+    ])
     assert.deepEqual(entry.tools, {})
     assert.deepEqual(entry.resources, [])
     assert.deepEqual(entry.resourceTemplates, [])
     assert.ok(['unsupported', 'notLoggedIn', 'bearerToken', 'oAuth'].includes(entry.authStatus))
     assert.ok(!('status' in entry), 'McpServerStatus has no startup status field')
+    // The server's command does not exist: nothing started, so the tool
+    // catalog failed and nothing else is known.
+    assert.match(entry.toolsError, /ENOENT/)
+    assert.equal(entry.runtimeStatus, null)
+    assert.equal(entry.serverInfo, null)
+    assert.equal(entry.serverCapabilities, null)
+    assert.equal(entry.toolListMeta, null)
+    assert.equal(entry.pluginId, null)
+    assert.equal(entry.httpOrigin, null)
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -9340,8 +9364,142 @@ test('mcpServerStatus/list enumerates tools and resources from the server', asyn
     assert.equal(entry.tools.echo._meta.ui.resourceUri, 'ui://fixture/view.html')
     assert.equal(entry.resources[0].uri, 'fixture://resource')
     assert.ok(['unsupported', 'notLoggedIn', 'bearerToken', 'oAuth'].includes(entry.authStatus))
+    // What the server's initialize reply and tool catalog said of it.
+    assert.deepEqual(entry.serverInfo, {
+      name: 'fixture',
+      title: null,
+      version: '1.0.0',
+      description: null,
+      icons: null,
+      websiteUrl: null,
+    })
+    assert.deepEqual(entry.serverCapabilities, { tools: {}, resources: {} })
+    assert.deepEqual(entry.toolListMeta, { 'fixture/catalog': 'v1' })
+    assert.equal(entry.toolsError, null)
+    // A stdio server has no HTTP origin, and no thread asked: no session state.
+    assert.equal(entry.httpOrigin, null)
+    assert.equal(entry.runtimeStatus, null)
+    assert.equal(entry.pluginId, null)
   } finally {
     proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('mcpServerStatus/list says which servers failed and how a live session sees them', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const fixture = resolve('test/fixtures/mcp-stdio-server.mjs')
+  // A remote server that wants a sign-in the adapter does not have.
+  const signIn = http.createServer((_req, res) => {
+    res.statusCode = 401
+    res.end('sign in first')
+  })
+  await new Promise<void>((resolve) => signIn.listen(0, '127.0.0.1', resolve))
+  const address = signIn.address()
+  const port = address && typeof address === 'object' ? address.port : 0
+  const stdio = (env: Record<string, string> = {}) => ({
+    type: 'stdio',
+    command: process.execPath,
+    args: [fixture],
+    env,
+  })
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      CODEX_HOME: home,
+      CLAUDE_CODEX_MOCK: '1',
+      CLAUDE_CODEX_MCP_SERVERS: JSON.stringify({
+        fixture: stdio(),
+        broken: stdio({ MCP_FIXTURE_EXIT: '3' }),
+        catalog: stdio({ MCP_FIXTURE_TOOLS_ERROR: '1' }),
+        missing: { type: 'stdio', command: join(home, 'no-such-server') },
+        remote: { type: 'sse', url: 'https://user:secret@mcp.example.com:8443/sse?team=1' },
+        guarded: { type: 'http', url: `http://127.0.0.1:${port}/mcp` },
+      }),
+      NODE_NO_WARNINGS: '1',
+    },
+  })
+  const reader = new JsonLineReader(proc)
+  const byName = (data: any[]) => Object.fromEntries(data.map((entry) => [entry.name, entry]))
+  try {
+    proc.stdin.write(json({ id: 1, method: 'mcpServerStatus/list', params: {} }))
+    const listed = byName((await reader.nextResponse(1)).result.data)
+
+    // A server that exits before it answers, and one that never starts.
+    assert.match(listed.broken.toolsError, /exited with code 3/)
+    assert.equal(listed.broken.serverInfo, null)
+    assert.match(listed.missing.toolsError, /ENOENT/)
+    // A server that started but could not list its tools: what it said of
+    // itself stays, and its resources are still listed.
+    assert.match(listed.catalog.toolsError, /tool catalog unavailable/)
+    assert.equal(listed.catalog.serverInfo.name, 'fixture')
+    assert.deepEqual(listed.catalog.tools, {})
+    assert.equal(listed.catalog.toolListMeta, null)
+    assert.equal(listed.catalog.resources[0].uri, 'fixture://resource')
+    // Servers the adapter cannot reach on its own are not failed ones: one
+    // over a transport it does not speak, and one that wants a sign-in.
+    // Their HTTP origin is known all the same, without credentials or path.
+    assert.equal(listed.remote.toolsError, null)
+    assert.equal(listed.remote.serverInfo, null)
+    assert.equal(listed.remote.httpOrigin, 'https://mcp.example.com:8443')
+    assert.equal(listed.guarded.toolsError, null)
+    assert.equal(listed.guarded.httpOrigin, `http://127.0.0.1:${port}`)
+    assert.equal(listed.fixture.toolsError, null)
+    // Without a thread, no connection state is claimed for any of them.
+    for (const entry of Object.values(listed) as any[]) assert.equal(entry.runtimeStatus, null)
+
+    // A Claude thread whose session sees its servers.
+    proc.stdin.write(json({ id: 2, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const threadId = (await reader.nextResponse(2)).result.thread.id
+    const prompt =
+      'mcp session fixture=connected remote=connected broken=failed missing=needs-auth catalog=pending guarded=disabled'
+    proc.stdin.write(
+      json({
+        id: 3,
+        method: 'turn/start',
+        params: { threadId, input: [{ type: 'text', text: prompt, text_elements: [] }] },
+      }),
+    )
+    for (let i = 0; i < 200; i += 1) {
+      if ((await reader.next()).method === 'turn/completed') break
+    }
+    proc.stdin.write(json({ id: 4, method: 'mcpServerStatus/list', params: { threadId } }))
+    const seen = byName((await reader.nextResponse(4)).result.data)
+    assert.deepEqual(
+      Object.fromEntries(
+        Object.values(seen).map((entry: any) => [entry.name, entry.runtimeStatus]),
+      ),
+      {
+        fixture: 'connected',
+        broken: 'failed',
+        catalog: 'starting',
+        missing: 'authenticationRequired',
+        remote: 'connected',
+        guarded: 'disabled',
+      },
+    )
+    // What the server told the adapter wins; the session names a server the
+    // adapter could not reach.
+    assert.equal(seen.fixture.serverInfo.name, 'fixture')
+    assert.deepEqual(seen.remote.serverInfo, {
+      name: 'remote-session',
+      title: null,
+      version: '2.0.0',
+      description: null,
+      icons: null,
+      websiteUrl: null,
+    })
+    // The rest is the adapter's own finding, as before.
+    assert.match(seen.catalog.toolsError, /tool catalog unavailable/)
+
+    // A thread-less list right after still claims no connection state.
+    proc.stdin.write(json({ id: 5, method: 'mcpServerStatus/list', params: {} }))
+    const again = (await reader.nextResponse(5)).result.data
+    for (const entry of again) assert.equal(entry.runtimeStatus, null)
+  } finally {
+    proc.kill()
+    signIn.close()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })

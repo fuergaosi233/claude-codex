@@ -193,6 +193,7 @@ import type {
   RpcPeer,
   RuntimeEvent,
   RuntimeLiveTask,
+  RuntimeMcpServerStatus,
   RuntimeSteerOptions,
   RuntimeTaskEvent,
   RuntimeTaskUsage,
@@ -966,12 +967,15 @@ export class CodexClaudeAppServer {
       case 'mcpServer/event/stream/stop':
         return {}
       case 'mcpServerStatus/list': {
-        // serverName limits discovery to one server.
+        // serverName limits discovery to one server. With a Claude thread
+        // whose session is live, runtimeStatus is that session's view.
         const serverName = nullIfEmpty(stringOr(asRecord(params).serverName, ''))
-        return listMcpServerStatuses(this.mcpScope(params)).then((data) => ({
-          data: serverName == null ? data : data.filter((server) => server.name === serverName),
-          nextCursor: null,
-        }))
+        return this.mcpSessionStatuses(params)
+          .then((session) => listMcpServerStatuses(this.mcpScope(params), session))
+          .then((data) => ({
+            data: serverName == null ? data : data.filter((server) => server.name === serverName),
+            nextCursor: null,
+          }))
       }
       case 'mcpServer/resource/read':
         // originCallId comes back only when a hosted app scoped the read;
@@ -8259,6 +8263,15 @@ export class CodexClaudeAppServer {
       cwd: thread && thread.runtimeBackend !== 'codex' ? thread.cwd : null,
       appPlugins: this.installedAppPlugins,
     }
+  }
+
+  // What the live Claude session of the thread a request names says of its
+  // MCP servers; null without one.
+  private async mcpSessionStatuses(params: unknown): Promise<RuntimeMcpServerStatus[] | null> {
+    const threadId = stringOr(asRecord(params).threadId, '')
+    const thread = threadId ? this.store.getThread(threadId) : null
+    if (!thread || thread.runtimeBackend === 'codex') return null
+    return (await this.runtime.mcpServerStatuses?.(threadId)) ?? null
   }
 
   // Codex ends a review turn with an exitedReviewMode item holding the review,

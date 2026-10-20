@@ -220,6 +220,15 @@ versioning or publishing metadata.
   SDK sessions since Claude Code 2.1.285, or the call's own `timeout` up to 2
   hours). `CLAUDE_CODEX_COMMAND_OUTPUT_POLL_MS=0` shows the output only when
   the command finishes, as before.
+- `mcpServerStatus/list` entries carry every field of Codex's
+  `McpServerStatus`: `serverInfo` and `serverCapabilities` from the server's
+  `initialize` reply, `toolsError` when the server failed to start or to list
+  its tools, `toolListMeta` from the first `tools/list` page, `httpOrigin` for
+  HTTP servers and `pluginId` for plugin servers, each `null` when unknown.
+  With a `threadId` whose Claude session is open, `runtimeStatus` is the
+  state that session reports for each server; otherwise it is `null`, as
+  Codex answers without a thread. The App uses these to show server names and
+  logos and a tool discovery error, and to retry a plugin's servers.
 
 ### Provider and multi-agent boundaries
 
