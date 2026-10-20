@@ -13,6 +13,7 @@ import {
   setAppPluginConfigOverrides,
 } from '../src/app-plugin-mcp.mjs'
 import { appMarketplacePlugin } from '../src/claude-capabilities.mjs'
+import { toolCallMeta } from '../src/mcp.mjs'
 
 const adapter = resolve('dist/src/adapter.mjs')
 const fixture = resolve('test/fixtures/mcp-stdio-server.mjs')
@@ -232,13 +233,45 @@ interface AdapterClient {
   request(method: string, params: Record<string, unknown>): Promise<any>
 }
 
+interface AdapterOptions {
+  args?: string[]
+  env?: Record<string, string>
+}
+
+// run gets an adapter on a fresh home, and a function that starts another
+// one on the same home.
 async function withAdapter(
-  options: { args?: string[]; env?: Record<string, string> },
-  run: (client: AdapterClient, directory: string, manifest: string) => Promise<void>,
+  options: AdapterOptions,
+  run: (
+    client: AdapterClient,
+    directory: string,
+    manifest: string,
+    restart: () => AdapterClient,
+  ) => Promise<void>,
 ): Promise<void> {
   const directory = await mkdtemp(join(tmpdir(), 'claude-app-plugin-mcp-'))
   const manifest = await bundledMarketplace(join(directory, 'bundled'))
   await mkdir(join(directory, 'codex-home'))
+  const clients: AdapterClient[] = []
+  const start = () => {
+    const client = startAdapter(directory, options)
+    clients.push(client)
+    return client
+  }
+  try {
+    await run(start(), directory, manifest, start)
+  } finally {
+    for (const { proc } of clients) {
+      if (proc.exitCode == null && proc.signalCode == null) {
+        proc.kill()
+        await once(proc, 'exit')
+      }
+    }
+    await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+}
+
+function startAdapter(directory: string, options: AdapterOptions): AdapterClient {
   const env: Record<string, string | undefined> = {
     ...process.env,
     CODEX_HOME: join(directory, 'codex-home'),
@@ -271,22 +304,13 @@ async function withAdapter(
     }
   })
   let nextId = 1
-  const client: AdapterClient = {
+  return {
     proc,
     request(method, params) {
       const id = nextId++
       proc.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`)
       return new Promise((resolve) => waiting.set(id, resolve))
     },
-  }
-  try {
-    await run(client, directory, manifest)
-  } finally {
-    if (proc.exitCode == null) {
-      proc.kill()
-      await once(proc, 'exit')
-    }
-    await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 }
 
@@ -329,7 +353,13 @@ test('the App reaches its code-review plugin server through a Claude host', asyn
       assert.equal(entry.runtimeStatus, 'connected')
       assert.equal(entry.serverInfo.name, 'fixture')
       assert.equal(entry.toolsError, null)
-      assert.ok(entry.tools.echo)
+      // The App finds the plugin's views and entry points in a tool's _meta.
+      assert.deepEqual(entry.tools.echo.annotations, { readOnlyHint: true })
+      assert.equal(entry.tools.echo.icons.length, 1)
+      assert.deepEqual(entry.tools.echo._meta, {
+        ui: { resourceUri: 'ui://fixture/view.html', visibility: ['app'] },
+        'openai/ui': { entrypoints: [{ type: 'global' }] },
+      })
       assert.equal(entry.resources[0].uri, 'fixture://resource')
 
       const call = (tool: string, args: Record<string, unknown> = {}) =>
@@ -351,6 +381,23 @@ test('the App reaches its code-review plugin server through a Claude host', asyn
       assert.deepEqual(first.result.structuredContent.meta, {
         thread_id: 'thread-1',
         threadId: 'thread-1',
+      })
+      // As in Codex, the call's thread id is set in the _meta, made for a call
+      // that has none.
+      const metaOf = async (meta: Record<string, unknown>) =>
+        (
+          await client.request('mcpServer/tool/call', {
+            threadId: 'thread-1',
+            server: 'code-review',
+            tool: 'process',
+            arguments: {},
+            ...meta,
+          })
+        ).result.structuredContent.meta
+      assert.deepEqual(await metaOf({}), { threadId: 'thread-1' })
+      assert.deepEqual(await metaOf({ _meta: { threadId: 'thread-2', other: 1 } }), {
+        threadId: 'thread-1',
+        other: 1,
       })
       const env = async (name: string) =>
         (await call('env', { value: name })).result.content[0].text
@@ -380,6 +427,40 @@ test('the App reaches its code-review plugin server through a Claude host', asyn
   assert.equal(alive(serverPid), false)
 })
 
+test('the code-review plugin server comes back after it exits and after an adapter restart', async () => {
+  const options = { args: enableCodeReview, env: { CLAUDE_CODEX_APP_PLUGIN_MCP: '1' } }
+  await withAdapter(options, async (client, _directory, manifest, restart) => {
+    await client.request('plugin/install', { marketplacePath: manifest, pluginName: 'code-review' })
+    const pidOf = async (adapterClient: AdapterClient): Promise<number | null> => {
+      const call = await adapterClient.request('mcpServer/tool/call', {
+        threadId: 'thread-1',
+        server: 'code-review',
+        tool: 'process',
+        arguments: {},
+      })
+      return call.result?.structuredContent?.pid ?? null
+    }
+    const first = await pidOf(client)
+    assert.ok(first)
+    process.kill(first)
+    let next: number | null = null
+    for (let attempt = 0; attempt < 50 && (next == null || next === first); attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      next = await pidOf(client)
+    }
+    assert.ok(next && next !== first, 'expected a new server process')
+
+    // The next adapter knows the installed plugin from its config.
+    client.proc.kill()
+    await once(client.proc, 'exit')
+    const restarted = restart()
+    const status = await restarted.request('mcpServerStatus/list', { serverName: 'code-review' })
+    assert.equal(status.result.data.length, 1)
+    assert.equal(status.result.data[0].pluginId, 'code-review@test-market')
+    assert.equal(status.result.data[0].runtimeStatus, 'connected')
+  })
+})
+
 test('the code-review plugin server stays off without the switch or the App setting', async () => {
   for (const options of [
     { args: enableCodeReview },
@@ -400,6 +481,20 @@ test('the code-review plugin server stays off without the switch or the App sett
       assert.match(call.error.message, /unknown MCP server: code-review/)
     })
   }
+})
+
+test('a tool call carries its thread id in the _meta as in Codex', () => {
+  assert.deepEqual(toolCallMeta(null, 'thread-1'), { threadId: 'thread-1' })
+  assert.deepEqual(toolCallMeta(undefined, 'thread-1'), { threadId: 'thread-1' })
+  assert.deepEqual(toolCallMeta({ thread_id: 'thread-1', threadId: 'old' }, 'thread-1'), {
+    thread_id: 'thread-1',
+    threadId: 'thread-1',
+  })
+  // A _meta that is not an object, and a call without a thread, stay as sent.
+  assert.equal(toolCallMeta('text', 'thread-1'), 'text')
+  assert.deepEqual(toolCallMeta([1], 'thread-1'), [1])
+  assert.deepEqual(toolCallMeta({ a: 1 }, ''), { a: 1 })
+  assert.equal(toolCallMeta(undefined, ''), null)
 })
 
 test('an App plugin server cannot start a second app-server', async () => {

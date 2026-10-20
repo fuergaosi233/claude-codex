@@ -37,6 +37,7 @@ import {
   type McpConfigScope,
   readMcpConfig,
   readMcpResource,
+  toolCallMeta,
 } from './mcp.mjs'
 import { projectInstructions } from './project-instructions.mjs'
 import { projectProviderLoopConfig } from './provider-loop-config.mjs'
@@ -532,9 +533,10 @@ export class CodexClaudeAppServer {
       this.finalizeBackgroundSubagents(null, 'server stopped')
       this.completeActiveTurns('interrupted', { message: 'server stopped' })
     } finally {
+      // The App plugin servers go with the adapter.
+      stopAppPluginServers()
       // A store that can no longer be written must not keep the Claude
       // processes running.
-      stopAppPluginServers()
       try {
         await this.runtime.stop()
       } finally {
@@ -902,7 +904,7 @@ export class CodexClaudeAppServer {
           stringOr(asRecord(params).tool, ''),
           asRecord(params).arguments ?? {},
           this.mcpScope(params),
-          asRecord(params)._meta ?? null,
+          toolCallMeta(asRecord(params)._meta, stringOr(asRecord(params).threadId, '')),
         )
       case 'windowsSandbox/setupStart':
         return { started: false }

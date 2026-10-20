@@ -99,8 +99,10 @@ which meets the location rule. A fragment that breaks a rule does not render.
 The App's Pull Requests panel is drawn by its bundled `code-review` plugin. The
 App turns the plugin's MCP server on with a `-c` setting when it starts the
 app-server, then calls it on server `code-review` with `mcpServerStatus/list`,
-`mcpServer/tool/call` and `mcpServer/resource/read`. A Codex app-server runs
-that server itself; the adapter does so only when asked:
+`mcpServer/tool/call` and `mcpServer/resource/read`, and finds the panel's
+entry points in the `_meta` of the tools the server lists. The App does this
+only for an app-server it starts on the same machine, not for a remote host. A
+Codex app-server runs that server itself; the adapter does so only when asked:
 
 ```bash
 export CLAUDE_CODEX_APP_PLUGIN_MCP=1

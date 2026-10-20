@@ -29,6 +29,12 @@ rl.on('line', (line) => {
           name: 'echo',
           description: 'Echo back the provided value',
           inputSchema: { type: 'object', properties: { value: { type: 'string' } } },
+          annotations: { readOnlyHint: true },
+          icons: [{ src: 'data:image/svg+xml,%3Csvg%2F%3E', mimeType: 'image/svg+xml' }],
+          _meta: {
+            ui: { resourceUri: 'ui://fixture/view.html', visibility: ['app'] },
+            'openai/ui': { entrypoints: [{ type: 'global' }] },
+          },
         },
       ],
     })

@@ -198,6 +198,8 @@ async function enumerateServerStatus(
   return base
 }
 
+// The tools as Codex lists them, annotations, icons and _meta included: the
+// App finds a plugin's views and entry points in a tool's _meta.
 function toolMap(tools: unknown[]): Record<string, Record<string, unknown>> {
   const entries = tools
     .map((raw) => asRecord(raw))
@@ -212,6 +214,9 @@ function toolMap(tools: unknown[]): Record<string, Record<string, unknown>> {
         ...(typeof tool.description === 'string' ? { description: tool.description } : {}),
         inputSchema: tool.inputSchema ?? {},
         ...(tool.outputSchema ? { outputSchema: tool.outputSchema } : {}),
+        ...(isObject(tool.annotations) ? { annotations: tool.annotations } : {}),
+        ...(Array.isArray(tool.icons) ? { icons: tool.icons } : {}),
+        ...(isObject(tool._meta) ? { _meta: tool._meta } : {}),
       },
     ])
   return Object.fromEntries(entries)
@@ -232,8 +237,16 @@ async function safeMcpList(
   return Array.isArray(value) ? value : []
 }
 
-// meta is the request's _meta, the thread's id among it, which Codex hands
-// the server with the call.
+// The _meta Codex hands the server with a client's tool call: the client's
+// own, with the thread's id set in it. A _meta that is not an object stays
+// as it is.
+export function toolCallMeta(meta: unknown, threadId: string): unknown {
+  if (!threadId) return meta ?? null
+  if (meta == null) return { threadId }
+  return isObject(meta) ? { ...meta, threadId } : meta
+}
+
+// meta is the _meta the server gets with the call, see toolCallMeta.
 export async function callMcpTool(
   serverName: string,
   toolName: string,
@@ -509,6 +522,10 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : {}
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return value != null && typeof value === 'object' && !Array.isArray(value)
 }
 
 function stringOr(value: unknown, fallback: string): string {
