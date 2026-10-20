@@ -122,9 +122,7 @@ versioning or publishing metadata.
   modal; `thread/attachmentOwner/list` lists the threads holding a worktree,
   by thread id and with the `archived` filter; and a request the adapter has
   no case for fails with JSON-RPC `-32601` (method not found), the code the
-  App treats as unsupported, instead of the generic `-32000`. The advertised
-  app-server version stays the Codex build of App 26.930, which leaves a few
-  newer 26.1013 gates off; `docs/reference/app-compat.md` lists them.
+  App treats as unsupported, instead of the generic `-32000`.
 - `npm run check:app-upgrade` also takes an `app.asar` or an extracted App,
   reads the protocol from a codex checkout with `--protocol-source` or skips
   it with `--bundle-only`, and lists every request the App's scripts name that

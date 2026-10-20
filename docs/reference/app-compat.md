@@ -89,8 +89,8 @@ and prints:
   added and removed. A client request the adapter has no `case` for, or a
   `case` that only throws `methodNotFound`, is answered with the JSON-RPC
   error `-32601` (`method not found: <method>`), which the App takes as "not
-  supported here"; the report lists every such method. A method the adapter sends that the schema dropped is a problem.
-  `--bundle-only` skips this part.
+  supported here"; the report lists every such method. A method the adapter
+  sends that the schema dropped is a problem. `--bundle-only` skips this part.
 - **Methods the App names** — the method-shaped strings in the App's scripts:
   the client requests among them, and the names in a protocol namespace that
   the protocol does not have (methods of the App's other hosts, MIME types
@@ -102,9 +102,9 @@ and prints:
   version the adapter reports, with new, changed and removed gates, and the
   minimum app-server version the App accepts. A gate that is on while the
   adapter answers one of its methods in `GATED_METHODS` with `-32601` is a
-  problem; a new gate that is
-  on and not in `GATED_METHODS` gets a note to find its methods and add them
-  there (an empty list for a gate that needs none).
+  problem; a new gate that is on and not in `GATED_METHODS` gets a note to
+  find its methods and add them there (an empty list for a gate that needs
+  none).
 - **clientInfo names** — the names the App sends in `initialize`.
 - **App rules** — the checklist above, to go through by hand with the App
   connected to the adapter.
