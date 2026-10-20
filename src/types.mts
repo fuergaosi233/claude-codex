@@ -475,6 +475,10 @@ export interface ClaudeCheckpoint {
   messageUuid: string
 }
 
+// Where a thread's Claude context starts over after a rewind or a fork: a
+// checkpoint, or 'new' for a new session that remembers nothing.
+export type ClaudeResumePoint = ClaudeCheckpoint | 'new'
+
 export type RuntimeEvent =
   | { type: 'session'; claudeSessionId: string }
   // Claude wrote a top-level transcript entry; the newest one of a turn is

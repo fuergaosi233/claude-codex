@@ -3,6 +3,7 @@ import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import type {
   ClaudeCheckpoint,
+  ClaudeResumePoint,
   ImportHistoryRecord,
   ProjectRecord,
   QueuedSubmission,
@@ -199,6 +200,7 @@ export class SessionStore {
     this.ensureColumn('threads', 'claude_resume_at', 'TEXT')
     this.ensureColumn('threads', 'claude_fork_session_id', 'TEXT')
     this.ensureColumn('threads', 'claude_fork_message_uuid', 'TEXT')
+    this.ensureColumn('threads', 'claude_fork_new_session', 'INTEGER NOT NULL DEFAULT 0')
     this.ensureColumn('turns', 'claude_session_id', 'TEXT')
     this.ensureColumn('turns', 'claude_message_uuid', 'TEXT')
     // Project membership; written only by setThreadProject and deleteProject.
@@ -1149,21 +1151,35 @@ export class SessionStore {
   }
 
   // Where a forked thread branched off its parent's Claude session; a rewind
-  // past the thread's own first turn returns there.
-  setForkCheckpoint(threadId: string, checkpoint: ClaudeCheckpoint | null): void {
+  // past the thread's own first turn returns there. A fork taken before
+  // anything Claude remembers starts at 'new'.
+  setForkCheckpoint(threadId: string, point: ClaudeResumePoint | null): void {
+    const checkpoint = point === 'new' ? null : point
     this.db
       .prepare(
-        'UPDATE threads SET claude_fork_session_id = ?, claude_fork_message_uuid = ? WHERE id = ?',
+        'UPDATE threads SET claude_fork_session_id = ?, claude_fork_message_uuid = ?, claude_fork_new_session = ? WHERE id = ?',
       )
-      .run(checkpoint?.sessionId ?? null, checkpoint?.messageUuid ?? null, threadId)
+      .run(
+        checkpoint?.sessionId ?? null,
+        checkpoint?.messageUuid ?? null,
+        point === 'new' ? 1 : 0,
+        threadId,
+      )
   }
 
-  forkCheckpoint(threadId: string): ClaudeCheckpoint | null {
+  forkCheckpoint(threadId: string): ClaudeResumePoint | null {
     const row = this.db
-      .prepare('SELECT claude_fork_session_id, claude_fork_message_uuid FROM threads WHERE id = ?')
+      .prepare(
+        'SELECT claude_fork_session_id, claude_fork_message_uuid, claude_fork_new_session FROM threads WHERE id = ?',
+      )
       .get(threadId) as
-      | { claude_fork_session_id?: unknown; claude_fork_message_uuid?: unknown }
+      | {
+          claude_fork_session_id?: unknown
+          claude_fork_message_uuid?: unknown
+          claude_fork_new_session?: unknown
+        }
       | undefined
+    if (Number(row?.claude_fork_new_session) === 1) return 'new'
     return checkpointFrom(row?.claude_fork_session_id, row?.claude_fork_message_uuid)
   }
 

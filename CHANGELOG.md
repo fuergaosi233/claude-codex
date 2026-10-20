@@ -129,6 +129,15 @@ versioning or publishing metadata.
   reads the protocol from a codex checkout with `--protocol-source` or skips
   it with `--bundle-only`, and lists every request the App's scripts name that
   the adapter would answer with method not found.
+- `thread/fork` honours `lastTurnId` (fork through that turn) and
+  `beforeTurnId` (fork before it), which the App sends to fork a chat from one
+  of its turns. The fork's history stops there, and so does Claude's context:
+  its first turn resumes at the newest kept turn's checkpoint, or where the
+  chat began when the fork keeps no turn, so the forked chat no longer
+  remembers what came after. As in Codex, the two ids together, an unknown
+  turn and a `lastTurnId` that is still running are rejected. When the kept
+  turns predate checkpoints, the fork keeps Claude's whole session, as before,
+  and a `configWarning` says so.
 
 ### Provider and multi-agent boundaries
 

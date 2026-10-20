@@ -1,6 +1,7 @@
 // Codex's paged views of a thread's history: thread/turns/list,
-// thread/items/list, thread/timeline/list and the two searches. A thread's
-// turns come from the store whole, so cursors are positions in them.
+// thread/items/list, thread/timeline/list, the two searches and the turns a
+// fork keeps. A thread's turns come from the store whole, so cursors are
+// positions in them.
 
 import { stripQuietTurnHeartbeat } from './quiet-turns.mjs'
 import type { ThreadItem, TurnRecord } from './types.mjs'
@@ -47,6 +48,33 @@ export function pageTurns(
     nextCursor: ordered[end]?.id ?? null,
     backwardsCursor: data[0]?.id ?? null,
   }
+}
+
+// The turns a thread/fork keeps: those through `lastTurnId`, or those before
+// `beforeTurnId`; null when it names neither and keeps them all. As in Codex,
+// the two do not combine, and the last turn kept cannot still be running.
+export function forkTurns(
+  turns: TurnRecord[],
+  params: { lastTurnId?: unknown; beforeTurnId?: unknown },
+): TurnRecord[] | null {
+  const lastTurnId = typeof params.lastTurnId === 'string' ? params.lastTurnId : null
+  const beforeTurnId = typeof params.beforeTurnId === 'string' ? params.beforeTurnId : null
+  if (lastTurnId !== null && beforeTurnId !== null)
+    throw new Error('`beforeTurnId` cannot be combined with `lastTurnId`')
+  if (lastTurnId !== null) {
+    const index = turns.findIndex((turn) => turn.id === lastTurnId)
+    if (index < 0) throw new Error(`lastTurnId '${lastTurnId}' was not found in the source thread`)
+    if (turns[index]?.status === 'inProgress')
+      throw new Error(`lastTurnId '${lastTurnId}' identifies an in-progress turn`)
+    return turns.slice(0, index + 1)
+  }
+  if (beforeTurnId !== null) {
+    const index = turns.findIndex((turn) => turn.id === beforeTurnId)
+    if (index < 0)
+      throw new Error(`beforeTurnId '${beforeTurnId}' was not found in the source thread`)
+    return turns.slice(0, index)
+  }
+  return null
 }
 
 export interface ThreadItemEntry {

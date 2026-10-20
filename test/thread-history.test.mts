@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   findOccurrences,
+  forkTurns,
   offsetCursor,
   pageItems,
   pageLimit,
@@ -65,6 +66,26 @@ test('pageTurns pages either way from an inclusive turn cursor', () => {
     () => pageTurns(turns, { cursor: 'gone', limit: 1, sortDirection: 'asc' }),
     /invalid turn cursor: gone/,
   )
+})
+
+test('forkTurns keeps the turns through lastTurnId or before beforeTurnId', () => {
+  const turns = [turn('t1', []), turn('t2', []), turn('t3', [], 'inProgress')]
+  const kept = (params: { lastTurnId?: unknown; beforeTurnId?: unknown }) =>
+    forkTurns(turns, params)?.map((entry) => entry.id) ?? null
+  assert.equal(kept({}), null)
+  assert.equal(kept({ lastTurnId: null, beforeTurnId: 7 }), null)
+  assert.deepEqual(kept({ lastTurnId: 't1' }), ['t1'])
+  assert.deepEqual(kept({ lastTurnId: 't2' }), ['t1', 't2'])
+  assert.deepEqual(kept({ beforeTurnId: 't1' }), [])
+  // A fork may stop short of a running turn, but not keep it.
+  assert.deepEqual(kept({ beforeTurnId: 't3' }), ['t1', 't2'])
+  assert.throws(() => kept({ lastTurnId: 't3' }), /lastTurnId 't3' identifies an in-progress turn/)
+  assert.throws(
+    () => kept({ lastTurnId: 't1', beforeTurnId: 't2' }),
+    /`beforeTurnId` cannot be combined with `lastTurnId`/,
+  )
+  assert.throws(() => kept({ lastTurnId: 'gone' }), /lastTurnId 'gone' was not found/)
+  assert.throws(() => kept({ beforeTurnId: 'gone' }), /beforeTurnId 'gone' was not found/)
 })
 
 test('pageItems pages a thread or one turn, with offset and item anchors', () => {

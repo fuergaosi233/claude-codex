@@ -940,6 +940,162 @@ test('a fork resumes at its fork point, and a full rollback returns there', asyn
   })
 })
 
+test('a fork from a turn keeps the turns up to it, and Claude resumes there', async () => {
+  await withServer(async (server) => {
+    const parent = await server.startThread()
+    const turns: string[] = []
+    for (const text of ['one', 'two', 'three']) turns.push(await server.runTurn(parent, text))
+
+    // lastTurnId keeps its turn; beforeTurnId stops short of it.
+    const forks: string[] = []
+    for (const cutoff of [{ lastTurnId: turns[0] }, { beforeTurnId: turns[1] }]) {
+      const { thread: fork } = await server.request('thread/fork', { threadId: parent, ...cutoff })
+      assert.deepEqual(ids({ data: fork.turns }), turns.slice(0, 1))
+      const check = await server.runTurn(fork.id, 'rewind check')
+      assert.equal(
+        await server.reply(fork.id, check),
+        `resumed mock-${parent} at ${turns[0]}-entry after 0 resets`,
+      )
+      forks.push(fork.id)
+    }
+
+    // excludeTurns still leaves the turns out of the response.
+    const { thread: bare } = await server.request('thread/fork', {
+      threadId: parent,
+      lastTurnId: turns[1],
+      excludeTurns: true,
+    })
+    assert.deepEqual(bare.turns, [])
+    const bareCheck = await server.runTurn(bare.id, 'rewind check')
+    assert.equal(
+      await server.reply(bare.id, bareCheck),
+      `resumed mock-${parent} at ${turns[1]}-entry after 0 resets`,
+    )
+
+    // A fork of a fork from before its own first turn branches where it did.
+    const [early] = forks
+    const [own] = ids(await server.request('thread/turns/list', { threadId: early }))
+    const { thread: inner } = await server.request('thread/fork', {
+      threadId: early,
+      beforeTurnId: own,
+    })
+    assert.deepEqual(inner.turns, [])
+    const innerCheck = await server.runTurn(inner.id, 'rewind check')
+    assert.equal(
+      await server.reply(inner.id, innerCheck),
+      `resumed mock-${parent} at ${turns[0]}-entry after 0 resets`,
+    )
+
+    // The parent keeps its turns and its whole session.
+    assert.deepEqual(
+      ids(await server.request('thread/turns/list', { threadId: parent, sortDirection: 'asc' })),
+      turns,
+    )
+    const parentCheck = await server.runTurn(parent, 'rewind check')
+    assert.equal(
+      await server.reply(parent, parentCheck),
+      `resumed mock-${parent} at end after 0 resets`,
+    )
+  })
+})
+
+test("a fork before a thread's first turn starts Claude over, and so does its full rollback", async () => {
+  await withServer(async (server) => {
+    const parent = await server.startThread()
+    const first = await server.runTurn(parent, 'one')
+    await server.runTurn(parent, 'two')
+    const { thread: fork } = await server.request('thread/fork', {
+      threadId: parent,
+      beforeTurnId: first,
+    })
+    assert.deepEqual(fork.turns, [])
+
+    const check = await server.runTurn(fork.id, 'rewind check')
+    assert.equal(await server.reply(fork.id, check), 'resumed nothing at end after 0 resets')
+    // Not the parent's session, which remembers the turns the fork left out.
+    await server.request('thread/rollback', { threadId: fork.id, numTurns: 1 })
+    const again = await server.runTurn(fork.id, 'rewind check')
+    assert.equal(await server.reply(fork.id, again), 'resumed nothing at end after 1 resets')
+  })
+})
+
+test('thread/fork rejects a fork point it cannot honor', async () => {
+  await withServer(async (server) => {
+    const parent = await server.startThread()
+    const done = await server.runTurn(parent, 'one')
+    for (const model of [undefined, 'gpt-5.4-mini']) {
+      const fork = (params: Record<string, unknown>) =>
+        server.request('thread/fork', { threadId: parent, model, ...params })
+      await assert.rejects(
+        fork({ lastTurnId: done, beforeTurnId: done }),
+        /`beforeTurnId` cannot be combined with `lastTurnId`/,
+      )
+      await assert.rejects(
+        fork({ lastTurnId: 'nope' }),
+        /lastTurnId 'nope' was not found in the source thread/,
+      )
+      await assert.rejects(
+        fork({ beforeTurnId: 'nope' }),
+        /beforeTurnId 'nope' was not found in the source thread/,
+      )
+    }
+
+    const from = server.mark()
+    const { turn } = await server.startTurn(parent, `busy ${'x'.repeat(300)}`)
+    await assert.rejects(
+      server.request('thread/fork', { threadId: parent, lastTurnId: turn.id }),
+      new RegExp(`lastTurnId '${turn.id}' identifies an in-progress turn`),
+    )
+    // A fork from before the running turn leaves it out.
+    const { thread: fork } = await server.request('thread/fork', {
+      threadId: parent,
+      beforeTurnId: turn.id,
+    })
+    assert.deepEqual(ids({ data: fork.turns }), [done])
+    await server.waitFor('turn/completed', (params) => params.turn.id === turn.id, from)
+    // The rejected forks made no threads.
+    assert.deepEqual(
+      ids(await server.request('thread/list')).toSorted(),
+      [parent, fork.id].toSorted(),
+    )
+  })
+})
+
+test('a fork from turns without checkpoints keeps all of Claude context and warns', async () => {
+  await withServer(async (server) => {
+    const parent = await server.startThread()
+    const turns: string[] = []
+    for (const text of ['no checkpoint one', 'no checkpoint two'])
+      turns.push(await server.runTurn(parent, text))
+
+    let from = server.mark()
+    const { thread: fork } = await server.request('thread/fork', {
+      threadId: parent,
+      lastTurnId: turns[0],
+    })
+    assert.deepEqual(ids({ data: fork.turns }), turns.slice(0, 1))
+    const warnings = server.notified('configWarning', from)
+    assert.equal(warnings.length, 1)
+    assert.match(warnings[0].summary, /remembers the turns after the fork point/)
+    assert.match(warnings[0].details, new RegExp(`${parent}.*${fork.id}`))
+    const check = await server.runTurn(fork.id, 'rewind check')
+    assert.equal(await server.reply(fork.id, check), `resumed mock-${parent} at end after 0 resets`)
+
+    // No warning when the fork leaves nothing out, or Claude has nothing to
+    // forget: a fork onto a Codex model starts its own session.
+    from = server.mark()
+    await server.request('thread/fork', { threadId: parent, lastTurnId: turns[1] })
+    await server.request('thread/fork', { threadId: parent })
+    const { thread: codexFork } = await server.request('thread/fork', {
+      threadId: parent,
+      beforeTurnId: turns[1],
+      model: 'gpt-5.4-mini',
+    })
+    assert.deepEqual(ids({ data: codexFork.turns }), turns.slice(0, 1))
+    assert.deepEqual(server.notified('configWarning', from), [])
+  })
+})
+
 test("a fork's Claude session leaves the parent what it scheduled before the fork", async () => {
   await withServer(async (server) => {
     const parent = await server.startThread()

@@ -71,11 +71,13 @@ export class MockRuntime implements ClaudeRuntime {
         ? `${context.claudeSessionId}~${context.turnId}`
         : (context.claudeSessionId ?? `mock-${context.threadId}`)
     await handlers.onEvent({ type: 'session', claudeSessionId: sessionId })
-    await handlers.onEvent({
-      type: 'checkpoint',
-      claudeSessionId: sessionId,
-      messageUuid: `${context.turnId}-entry`,
-    })
+    // A turn from before the adapter kept checkpoints left none.
+    if (!/no checkpoint/i.test(context.prompt))
+      await handlers.onEvent({
+        type: 'checkpoint',
+        claudeSessionId: sessionId,
+        messageUuid: `${context.turnId}-entry`,
+      })
 
     if (/rewind check/i.test(context.prompt)) {
       const text = `resumed ${context.claudeSessionId ?? 'nothing'} at ${context.resumeSessionAt ?? 'end'} after ${this.resets.get(context.threadId) ?? 0} resets`

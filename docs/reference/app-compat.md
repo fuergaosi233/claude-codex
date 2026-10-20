@@ -188,7 +188,7 @@ answers in a particular way:
 | `serviceTierForTurn`, `turnTrigger` | add fields to the heartbeat's `turn/start` | ignores them |
 | `threadAttachments` | records a chat's managed worktrees as thread attachments, cleans them up when it is archived, and offers worktree tools | keeps the attachments; see below |
 | `threadAttachmentOwners` | asks `thread/attachmentOwner/list` which chats hold a worktree before it removes the worktree with an archived chat, and in the worktree settings | lists the threads holding the attachment by thread id, filtered by `archived` and paged by `cursor` and `limit` (25 by default) |
-| `threadForkBeforeTurn` | forks a chat from before one of its turns with `thread/fork` and `beforeTurnId`, instead of forking it whole and calling `thread/rollback` | forks the whole chat; `beforeTurnId` is not applied yet |
+| `threadForkBeforeTurn` | forks a chat from before one of its turns with `thread/fork` and `beforeTurnId`, instead of forking it whole and calling `thread/rollback` | forks the chat up to that turn: the fork's history and Claude's context stop before it (see Thread lifecycle in the capability matrix) |
 | `threadItemAnchors` | pages a turn's items with `thread/items/list` from an `{ itemId }` cursor | pages from that item; an unknown item is an error, as in Codex |
 | `audioInputs` | sends an attached audio file as `localAudio` input when `model/list` says the model takes audio | lists text and image input for every model, so the App sends no audio |
 | `searchMcpClient` | reads `config/read`, `account/read` and `configRequirements/read` as a thread starts, to set up its search MCP for a `gpt-` model on a ChatGPT account | answers them as always; no thread here qualifies |

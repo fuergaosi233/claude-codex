@@ -128,6 +128,7 @@ import {
 import { PINNED_SECTION_ID, type SessionStore, settledTurn } from './store.mjs'
 import {
   findOccurrences,
+  forkTurns,
   offsetCursor,
   pageItems,
   pageLimit,
@@ -137,7 +138,7 @@ import {
   threadSnippet,
 } from './thread-history.mjs'
 import type {
-  ClaudeCheckpoint,
+  ClaudeResumePoint,
   ClaudeRuntime,
   ElicitationRequest,
   ElicitationResponse,
@@ -1173,6 +1174,10 @@ export class CodexClaudeAppServer {
     const parentId = stringOr(params.threadId, '')
     const parent = this.store.getThread(parentId)
     if (!parent) throw new Error(`unknown thread: ${parentId}`)
+    // A fork from one of the parent's turns keeps the history up to it, and
+    // Claude's context with it.
+    const parentTurns = this.store.listTurns(parent.id)
+    const kept = forkTurns(parentTurns, params)
     const now = nowSeconds()
     const id = newThreadId()
     const requestedModel = modelFromParams(params, parent.model)
@@ -1194,7 +1199,15 @@ export class CodexClaudeAppServer {
       : 'claude'
     const requestedCwd = stringOr(params.cwd, parent.cwd)
     const cwd = maybeCreateThreadWorktree(id, requestedCwd).cwd
-    const forkPoint = runtimeBackend === 'claude' ? this.forkPointOf(parent) : null
+    let forkPoint = runtimeBackend === 'claude' ? this.forkPointOf(parent, kept) : null
+    // Turns from before checkpoints give Claude's context no place to stop
+    // at the fork point: the fork keeps all of it, as a whole fork does.
+    const uncut =
+      kept !== null &&
+      forkPoint === null &&
+      runtimeBackend === 'claude' &&
+      parent.runtimeBackend !== 'codex'
+    if (uncut) forkPoint = this.forkPointOf(parent, null)
     const thread: ThreadRecord = {
       ...parent,
       id,
@@ -1208,7 +1221,8 @@ export class CodexClaudeAppServer {
       cwd,
       model: forkModel,
       reasoningEffort: reasoningEffortFromParams(params, parent.reasoningEffort),
-      claudeSessionId: forkPoint?.sessionId ?? parent.claudeSessionId,
+      claudeSessionId:
+        forkPoint === 'new' ? null : (forkPoint?.sessionId ?? parent.claudeSessionId),
       createdAt: now,
       updatedAt: now,
       status: { type: 'idle' },
@@ -1260,7 +1274,7 @@ export class CodexClaudeAppServer {
     if (parent.projectId) this.store.setThreadProject(id, parent.projectId)
     if (forkPoint) {
       this.store.setForkCheckpoint(id, forkPoint)
-      this.store.rewindClaudeSession(id, forkPoint.sessionId, forkPoint.messageUuid)
+      this.resumeClaudeAt(id, forkPoint)
     }
     recordRunEvent('thread.forked', {
       threadId: thread.id,
@@ -1270,20 +1284,31 @@ export class CodexClaudeAppServer {
       runtimeBackend: thread.runtimeBackend,
       threadSource: thread.threadSource,
       ephemeral: thread.ephemeral,
+      keptTurns: kept?.length ?? null,
     })
     this.activePeerByThread.set(id, peer)
     this.notify(peer, { method: 'thread/started', params: { thread: this.toThread(thread, []) } })
-    return this.threadEnvelope(
-      thread,
-      params.excludeTurns === true ? [] : this.store.listTurns(parent.id),
-    )
+    // App rule: config-warnings
+    if (uncut && kept.length < parentTurns.length) {
+      this.notify(peer, {
+        method: 'configWarning',
+        params: {
+          summary: 'Claude in a forked chat still remembers the turns after the fork point',
+          details: `Thread ${parent.id} has no Claude checkpoint up to the turn it was forked at (its turns predate checkpoints), so its fork ${id} resumes the whole Claude session, later turns included.`,
+        },
+      })
+    }
+    return this.threadEnvelope(thread, params.excludeTurns === true ? [] : (kept ?? parentTurns))
   }
 
-  // Where a fork of `thread` picks up Claude's context: the checkpoint the
-  // thread itself resumes at next if it was just rewound, else the end of its
-  // newest settled turn. Null for legacy threads, which fork the whole session.
-  private forkPointOf(thread: ThreadRecord): ClaudeCheckpoint | null {
+  // Where a fork of `thread` picks up Claude's context. A fork that keeps
+  // only `kept`, the thread's turns up to some turn, takes the context after
+  // them. A whole fork takes the checkpoint the thread itself resumes at next
+  // if it was just rewound, else the end of its newest settled turn. Null when
+  // the turns predate checkpoints; a whole fork then resumes the whole session.
+  private forkPointOf(thread: ThreadRecord, kept: TurnRecord[] | null): ClaudeResumePoint | null {
     if (thread.runtimeBackend === 'codex') return null
+    if (kept) return this.claudeContextAfter(thread, kept)
     const resumeAt = this.store.claudeResumeAt(thread.id)
     if (thread.claudeSessionId && resumeAt)
       return { sessionId: thread.claudeSessionId, messageUuid: resumeAt }
@@ -2489,27 +2514,40 @@ export class CodexClaudeAppServer {
       return dropped
     }
     this.runtime.resetSession?.(thread.id)
-    for (const turn of remaining.toReversed()) {
-      const checkpoint = this.store.turnCheckpoint(turn.id)
-      if (checkpoint) {
-        this.store.rewindClaudeSession(thread.id, checkpoint.sessionId, checkpoint.messageUuid)
-        return dropped
-      }
+    const point = this.claudeContextAfter(thread, remaining)
+    if (point) {
+      this.resumeClaudeAt(thread.id, point)
+      return dropped
     }
     if (remaining.length === 0) {
-      // Back to where the thread began: its fork point, or a new session.
-      const fork = this.store.forkCheckpoint(thread.id)
+      // A fork from before fork points goes back to its parent's session.
       const parent = thread.forkedFromId ? this.store.getThread(thread.forkedFromId) : null
-      this.store.rewindClaudeSession(
-        thread.id,
-        fork?.sessionId ?? parent?.claudeSessionId ?? null,
-        fork?.messageUuid ?? null,
-      )
+      this.store.rewindClaudeSession(thread.id, parent?.claudeSessionId ?? null, null)
       return dropped
     }
     // The remaining turns predate checkpoints: Claude keeps its context.
     debugLog('thread.rewind.unanchored', { threadId: thread.id, dropped })
     return dropped
+  }
+
+  // Where Claude's context stands once a thread has run `turns`, its first
+  // turns: the newest of their checkpoints, or with no turns, where the thread
+  // began (its fork point, or a new session). Null when the turns, or the fork
+  // they start from, predate checkpoints.
+  private claudeContextAfter(thread: ThreadRecord, turns: TurnRecord[]): ClaudeResumePoint | null {
+    for (const turn of turns.toReversed()) {
+      const checkpoint = this.store.turnCheckpoint(turn.id)
+      if (checkpoint) return checkpoint
+    }
+    if (turns.length > 0) return null
+    return thread.forkedFromId ? this.store.forkCheckpoint(thread.id) : 'new'
+  }
+
+  // Points a thread's next turn at `point`: a forked session resumed there,
+  // or a new session.
+  private resumeClaudeAt(threadId: string, point: ClaudeResumePoint): void {
+    if (point === 'new') this.store.rewindClaudeSession(threadId, null, null)
+    else this.store.rewindClaudeSession(threadId, point.sessionId, point.messageUuid)
   }
 
   // thread/delete removes a thread for good: its turns, goal and queue, and

@@ -42,7 +42,8 @@ export const APP_RULES: readonly AppRule[] = [
   {
     id: 'config-warnings',
     app: 'Lists configWarning notifications under Settings > Agent > Configuration, keeping the last 20 per host.',
-    adapter: 'Reports an App build missing from VERIFIED_APP_VERSIONS there.',
+    adapter:
+      "Reports an App build missing from VERIFIED_APP_VERSIONS there, and a fork from one of a chat's turns whose Claude context keeps the later turns because they predate checkpoints.",
     verify:
       'Connect an App build that is not listed and look for the warning in that settings page.',
   },
