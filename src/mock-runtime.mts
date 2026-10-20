@@ -319,6 +319,42 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    // Leader tools: every `leader <tool> <json input>` line calls that tool,
+    // in order, and the answer lists the results. Answered before the keyword
+    // branches below, which the prompts for the led chats would trip.
+    if (/^leader (tools check|thread_)/m.test(context.prompt)) {
+      const lines: string[] = []
+      if (/^leader tools check$/m.test(context.prompt))
+        lines.push(`leader tools: ${context.leaderTools ? 'on' : 'off'}`)
+      let call = 0
+      for (const [, tool = '', json = '{}'] of context.prompt.matchAll(
+        /^leader (thread_\w+) (.*)$/gm,
+      )) {
+        const toolUseId = `leader-${context.turnId}-${(call += 1)}`
+        const input = JSON.parse(json)
+        await handlers.onEvent({
+          type: 'tool_use',
+          toolUseId,
+          toolName: `mcp__codex_leader__${tool}`,
+          input,
+        })
+        let content: string
+        let isError = false
+        try {
+          content = await callLeaderTool(context, tool, input)
+        } catch (error) {
+          content = error instanceof Error ? error.message : String(error)
+          isError = true
+        }
+        await handlers.onEvent({ type: 'tool_result', toolUseId, content, isError })
+        lines.push(`${tool} => ${isError ? 'error: ' : ''}${content}`)
+      }
+      const text = lines.join('\n')
+      await handlers.onEvent({ type: 'text_delta', delta: text })
+      await handlers.onEvent({ type: 'completed', success: true, result: text })
+      return
+    }
+
     // A Write whose input streams in before the finished call, as the native
     // runtime reports it. With "approval first" the permission request
     // overtakes the finished call; with "abandoned" a first response breaks
@@ -1383,4 +1419,27 @@ function fileChangeFromPrompt(context: RuntimeTurnContext): {
       /with exactly this content(?: and no extra whitespace)?:\s*([^\n]+)/i,
     )?.[1] ?? 'changed by mock runtime\n'
   return { name, path: join(context.cwd, name), content }
+}
+
+function callLeaderTool(
+  context: RuntimeTurnContext,
+  tool: string,
+  input: Record<string, unknown>,
+): Promise<string> {
+  const leader = context.leaderTools
+  if (!leader) throw new Error('leader tools are off')
+  switch (tool) {
+    case 'thread_list':
+      return leader.list(input as Parameters<typeof leader.list>[0])
+    case 'thread_start':
+      return leader.start(input as Parameters<typeof leader.start>[0])
+    case 'thread_prompt':
+      return leader.prompt(input as Parameters<typeof leader.prompt>[0])
+    case 'thread_wait':
+      return leader.wait(input as Parameters<typeof leader.wait>[0])
+    case 'thread_read':
+      return leader.read(input as Parameters<typeof leader.read>[0])
+    default:
+      throw new Error(`unknown leader tool: ${tool}`)
+  }
 }

@@ -174,6 +174,14 @@ export class SessionStore {
         successes_json TEXT NOT NULL,
         failures_json TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS leader_threads (
+        thread_id TEXT PRIMARY KEY,
+        leader_thread_id TEXT NOT NULL,
+        seen_turn_id TEXT,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_leader_threads_leader
+        ON leader_threads(leader_thread_id, created_at);
     `)
     this.ensureColumn('threads', 'is_pinned', 'INTEGER NOT NULL DEFAULT 0')
     this.ensureColumn('threads', 'section_id', 'TEXT')
@@ -1149,6 +1157,17 @@ export class SessionStore {
     return row ? this.rowToTurn(row) : null
   }
 
+  // Id and status of the thread's newest turn, also without decoding items.
+  lastTurnRef(threadId: string): { id: string; status: TurnRecord['status'] } | null {
+    const row = this.db
+      .prepare(
+        'SELECT id, status FROM turns WHERE thread_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1',
+      )
+      .get(threadId) as { id?: unknown; status?: unknown } | undefined
+    if (typeof row?.id !== 'string' || typeof row.status !== 'string') return null
+    return { id: row.id, status: row.status as TurnRecord['status'] }
+  }
+
   // Used by thread/rollback to drop the N most recent turns from a thread's
   // history. Codex App's rewind UI calls this when the user wants to redo a
   // turn — without it our handler used to no-op and the App's "Rewind" button
@@ -1272,6 +1291,9 @@ export class SessionStore {
       this.db.prepare('DELETE FROM thread_queues WHERE thread_id = ?').run(id)
       this.db.prepare('DELETE FROM thread_dynamic_tools WHERE thread_id = ?').run(id)
       this.db.prepare('DELETE FROM thread_attachments WHERE thread_id = ?').run(id)
+      // Only the thread's own link: threads it led keep theirs, so they
+      // stay below the depth limit after their leader is gone.
+      this.db.prepare('DELETE FROM leader_threads WHERE thread_id = ?').run(id)
       this.db.prepare('DELETE FROM threads WHERE id = ?').run(id)
     }
     return ids
@@ -1505,6 +1527,44 @@ export class SessionStore {
   deleteGoal(threadId: string): boolean {
     const result = this.db.prepare('DELETE FROM thread_goals WHERE thread_id = ?').run(threadId)
     return Number(result.changes) > 0
+  }
+
+  // Threads another thread started with the leader tools. The link decides
+  // who may prompt and wait on a thread and keeps a led thread from leading
+  // in turn; seen_turn_id is the last finished turn its leader has read.
+  addLeaderThread(threadId: string, leaderThreadId: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO leader_threads (thread_id, leader_thread_id, seen_turn_id, created_at)
+         VALUES (?, ?, NULL, ?)
+         ON CONFLICT(thread_id) DO UPDATE SET leader_thread_id = excluded.leader_thread_id`,
+      )
+      .run(threadId, leaderThreadId, nowSeconds())
+  }
+
+  leaderOf(threadId: string): string | null {
+    const row = this.db
+      .prepare('SELECT leader_thread_id FROM leader_threads WHERE thread_id = ?')
+      .get(threadId) as { leader_thread_id: string } | undefined
+    return row?.leader_thread_id ?? null
+  }
+
+  listLeaderThreads(
+    leaderThreadId: string,
+  ): Array<{ threadId: string; seenTurnId: string | null }> {
+    const rows = this.db
+      .prepare(
+        `SELECT thread_id, seen_turn_id FROM leader_threads
+         WHERE leader_thread_id = ? ORDER BY created_at, rowid`,
+      )
+      .all(leaderThreadId) as Array<{ thread_id: string; seen_turn_id: string | null }>
+    return rows.map((row) => ({ threadId: row.thread_id, seenTurnId: row.seen_turn_id }))
+  }
+
+  markLeaderSeen(threadId: string, turnId: string): void {
+    this.db
+      .prepare('UPDATE leader_threads SET seen_turn_id = ? WHERE thread_id = ?')
+      .run(turnId, threadId)
   }
 
   listQueue(threadId: string): QueuedSubmission[] {

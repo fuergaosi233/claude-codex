@@ -182,8 +182,10 @@ otherwise keep every later turn quiet.
 
 To do this the adapter ends the quiet turn's last message with the Codex App's
 own `<heartbeat>` block deciding `DONT_NOTIFY`. The App hides the block; Claude
-never sees it. Other clients, such as the Codex CLI, show it as text. A turn
-with no message from Claude still lights the dot. Set
+never sees it, not even through a leader's `thread_wait` or `thread_read` (see
+[Leader chats](#leader-chats)), which mark such a turn `backgroundWorkRunning`
+instead. Other clients, such as the Codex CLI, show it as text. A turn with no
+message from Claude still lights the dot. Set
 `CLAUDE_CODEX_QUIET_BACKGROUND_TURNS=0` to mark every finished turn unread.
 
 ## Memories
@@ -256,6 +258,47 @@ the App. With it on:
   other deferred MCP tools. A tool whose `mcp__<namespace>__<tool>` name would
   pass Claude's 64-character limit is left out, and so is a namespace named like
   an MCP server Claude already has.
+
+## Leader chats
+
+With `CLAUDE_CODEX_LEADER_TOOLS=1` in the adapter's environment (off by default),
+Claude in a chat you started can start other Claude chats and drive them: ask it
+to "start three chats, one per service, and tell me when they are done". Each
+one is an ordinary chat in the Codex App sidebar, which you can open, approve
+requests in and keep talking to. The tools, in the `codex_leader` MCP server,
+need the default native Claude Agent SDK backend:
+
+| Tool | What it does |
+| --- | --- |
+| `thread_start` | Starts a chat with a first prompt; `cwd` and `model` default to the leader's. Returns at once, with a `::created-thread` line for Claude to repeat in its reply. |
+| `thread_list` | The chats this one started, each `working`, `blocked` (waiting on you), `done-unread` (finished a turn the leader has not read) or `idle`. `scope: "all"` adds your other recent chats. |
+| `thread_wait` | Waits until `any` (default) or `all` of the given chats finish their turn or get blocked, then returns each one's status and last agent message, truncated. |
+| `thread_prompt` | Sends a chat a message, as you would: into its running turn while it works (the App's default for follow-ups), otherwise as a new turn. `wait: true` also waits for that turn. |
+| `thread_read` | A chat's transcript as structured items in pages of bounded size, with a cursor for reading only what is new. |
+
+When Claude's reply repeats the `::created-thread{threadId="…"}` line, the
+Codex App shows a card for the new chat in the reply, as it does for chats Codex
+starts with its own thread tools. These tools come from the adapter, not from
+the App's thread tools, and are named differently.
+
+Limits that always apply:
+
+- Only chats you start get the tools. Chats a leader starts, their forks,
+  subagents and ephemeral chats do not, so no chain of chats fans out on its own.
+- A leader has at most `CLAUDE_CODEX_LEADER_MAX_RUNNING` (default 4) of its chats
+  working at once; `thread_start` and `thread_prompt` refuse past that.
+- A leader never answers approvals or questions. A chat that waits on one shows as
+  `blocked`, `thread_prompt` refuses it, and Claude is told to send you there.
+- Started chats inherit the leader's approval policy, sandbox and permissions, and
+  ask for their own approvals. A leader with no policy set asks before tools run,
+  and so do the chats it starts. They are Claude chats only for now, and
+  `thread_start` refuses while new chats run on the Codex proxy backend.
+- In plan mode a leader can only list, wait for and read its chats.
+- Which chat leads which is stored with the threads, so it survives restarts.
+
+For research, review or splitting up one task, Claude's own Agent tool is faster
+and cheaper: the tool descriptions steer Claude to use the leader tools only when
+you want separate chats.
 
 ## Localhost GUI testing on macOS
 
