@@ -117,14 +117,19 @@ Codex remembers across chats with memories it distills from earlier ones.
 Claude Code has auto-memory instead: notes it keeps for each project in a
 memory folder under its config folder (by default
 `~/.claude/projects/<project>/memory/`), loads when a session starts and
-updates as it works. The App's memories switches decide whether a Claude chat
-uses it.
+updates as it works.
+
+By default the adapter leaves auto-memory to Claude Code's own settings: the
+App shows no Memories settings and no `/memories` command, and a Claude chat
+remembers exactly as Claude Code in a terminal would. Start the adapter with
+`CLAUDE_CODEX_MEMORIES=1` to let the App's memories switches decide instead:
 
 - **Off until you turn it on.** As in Codex, Memories is a beta feature that
   starts off. Turn it on under **Settings > Personalization**; `/memories` then
   shows in the composer. While it is off, every Claude chat runs with
   auto-memory switched off (`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`), even where
-  Claude Code would otherwise use it.
+  Claude Code would otherwise use it. That is why the switch exists: turning it
+  on stops auto-memory in every App chat until you turn Memories on.
 - **Per chat.** A new chat follows the switches in Settings, or its own when
   you set them before sending; `/memories` turns memories on or off for the
   chat you are in. Claude reads and writes its memory under one switch, so a
@@ -144,6 +149,9 @@ uses it.
 The default backend and `claude-p` follow the switches. The `agent-http` and
 `agentapi` backends run Claude outside the adapter, so Claude Code's own
 setting decides there.
+
+With or without `CLAUDE_CODEX_MEMORIES`, the adapter refuses `memory/reset`
+rather than delete Claude Code's notes.
 
 ## Localhost GUI testing on macOS
 

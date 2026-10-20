@@ -32,11 +32,19 @@ class AppServer {
   private nextId = 1
   private buffer = ''
 
-  constructor(home: string) {
+  // env adds to or, with undefined values, removes from the adapter's
+  // environment.
+  constructor(home: string, env: NodeJS.ProcessEnv = {}) {
     this.home = home
     this.proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+      env: {
+        ...process.env,
+        CODEX_HOME: home,
+        CLAUDE_CODEX_MOCK: '1',
+        NODE_NO_WARNINGS: '1',
+        ...env,
+      },
     })
     this.proc.stderr.resume()
     this.proc.stdout.setEncoding('utf8')
@@ -126,8 +134,11 @@ class AppServer {
   }
 }
 
-async function withServer(run: (server: AppServer) => Promise<void>): Promise<void> {
-  const server = new AppServer(await mkdtemp(join(tmpdir(), 'claude-codex-app-methods-')))
+async function withServer(
+  run: (server: AppServer) => Promise<void>,
+  env: NodeJS.ProcessEnv = {},
+): Promise<void> {
+  const server = new AppServer(await mkdtemp(join(tmpdir(), 'claude-codex-app-methods-')), env)
   try {
     await run(server)
   } finally {
@@ -657,123 +668,184 @@ test('host methods answer truthfully: empty, disabled or unavailable', async () 
   })
 })
 
-test("the App's memories switches decide which threads run with Claude auto-memory", async () => {
-  await withServer(async (server) => {
-    const memories = async (params: Record<string, unknown> = {}) => {
-      const list = await server.request('experimentalFeature/list', params)
-      assert.equal(list.nextCursor, null)
-      assert.deepEqual(
-        list.data.map((feature: any) => feature.name),
-        ['memories'],
-      )
-      return list.data[0]
-    }
-    const autoMemory = async (threadId: string) =>
-      server.reply(threadId, await server.runTurn(threadId, 'auto memory check'))
-    const write = (edits: Array<[string, unknown]>) =>
-      server.request('config/batchWrite', {
-        edits: edits.map(([keyPath, value]) => ({ keyPath, value, mergeStrategy: 'upsert' })),
+test('without CLAUDE_CODEX_MEMORIES the memories settings stay hidden and inert', async () => {
+  await withServer(
+    async (server) => {
+      const autoMemory = async (threadId: string) =>
+        server.reply(threadId, await server.runTurn(threadId, 'auto memory check'))
+      const unlisted = async (params: Record<string, unknown> = {}) =>
+        assert.deepEqual(await server.request('experimentalFeature/list', params), {
+          data: [],
+          nextCursor: null,
+        })
+
+      // No feature is listed, so the App hides its Memories settings, and
+      // turns leave auto-memory to Claude Code's own settings.
+      await unlisted()
+      const thread = await server.startThread({
+        config: { 'memories.generate_memories': true, 'memories.use_memories': true },
       })
+      assert.equal(await autoMemory(thread), 'autoMemory=unset')
 
-    // Off until the user turns it on, as in Codex.
-    const feature = await memories()
-    assert.equal(feature.stage, 'beta')
-    assert.equal(feature.enabled, false)
-    assert.equal(feature.defaultEnabled, false)
-    assert.deepEqual(await server.request('experimentalFeature/list', { cursor: '1' }), {
-      data: [],
-      nextCursor: null,
-    })
-    await assert.rejects(
-      server.request('experimentalFeature/list', { cursor: '2' }),
-      /cursor 2 exceeds total feature flags 1/,
-    )
-    await assert.rejects(
-      server.request('experimentalFeature/list', { cursor: 'next' }),
-      /invalid cursor: next/,
-    )
-    await assert.rejects(
-      server.request('experimentalFeature/list', { threadId: 'missing' }),
-      /thread not found: missing/,
-    )
-    const first = await server.startThread()
-    assert.equal(await autoMemory(first), 'autoMemory=false')
-    assert.equal((await memories({ threadId: first })).enabled, false)
+      // Neither the connection's enablement nor the config turns it on.
+      assert.deepEqual(
+        await server.request('experimentalFeature/enablement/set', {
+          enablement: { memories: true },
+        }),
+        { enablement: { memories: true } },
+      )
+      await server.request('config/batchWrite', {
+        edits: [
+          { keyPath: 'features.memories', value: true, mergeStrategy: 'upsert' },
+          { keyPath: 'memories.generate_memories', value: true, mergeStrategy: 'upsert' },
+        ],
+      })
+      await unlisted({ threadId: thread })
+      const { config } = await server.request('config/read', {})
+      assert.equal('memories' in config, false)
+      assert.deepEqual(
+        await server.request('thread/memoryMode/set', { threadId: thread, mode: 'enabled' }),
+        {},
+      )
+      assert.deepEqual(
+        await server.request('thread/memoryMode/set', { threadId: 'missing', mode: 'polluted' }),
+        {},
+      )
+      assert.equal(await autoMemory(thread), 'autoMemory=unset')
+      const { thread: fork } = await server.request('thread/fork', { threadId: thread })
+      assert.equal(await autoMemory(fork.id), 'autoMemory=unset')
 
-    // The App sets its defaults for the connection; the user's config wins.
-    assert.deepEqual(
-      await server.request('experimentalFeature/enablement/set', {
-        enablement: { memories: true, apps: false },
-      }),
-      { enablement: { memories: true, apps: false } },
-    )
-    assert.equal((await memories()).enabled, true)
-    await write([['features.memories', false]])
-    assert.equal((await memories()).enabled, false)
-    assert.equal(await autoMemory(first), 'autoMemory=false')
+      // memory/reset and memory/status answer as they do with the switch.
+      await assert.rejects(
+        server.request('memory/status', { minConsolidatedThreads: 4097 }),
+        /minConsolidatedThreads must be between 1 and 4096/,
+      )
+      await assert.rejects(server.request('memory/reset'), /memory\/reset is not supported/)
+    },
+    { CLAUDE_CODEX_MEMORIES: undefined },
+  )
+})
 
-    // Settings > Personalization turns it on and reads its switches back.
-    await write([
-      ['features.memories', true],
-      ['memories.generate_memories', true],
-      ['memories.use_memories', true],
-    ])
-    assert.equal((await memories()).enabled, true)
-    const { config } = await server.request('config/read', {})
-    assert.deepEqual(config.memories, { generate_memories: true, use_memories: true })
-    assert.equal(await autoMemory(first), 'autoMemory=true')
+test("with CLAUDE_CODEX_MEMORIES the App's switches decide which threads get auto-memory", async () => {
+  await withServer(
+    async (server) => {
+      const memories = async (params: Record<string, unknown> = {}) => {
+        const list = await server.request('experimentalFeature/list', params)
+        assert.equal(list.nextCursor, null)
+        assert.deepEqual(
+          list.data.map((feature: any) => feature.name),
+          ['memories'],
+        )
+        return list.data[0]
+      }
+      const autoMemory = async (threadId: string) =>
+        server.reply(threadId, await server.runTurn(threadId, 'auto memory check'))
+      const write = (edits: Array<[string, unknown]>) =>
+        server.request('config/batchWrite', {
+          edits: edits.map(([keyPath, value]) => ({ keyPath, value, mergeStrategy: 'upsert' })),
+        })
 
-    // A chat started with its own switch off, then turned on with /memories.
-    const optedOut = await server.startThread({ config: { 'memories.generate_memories': false } })
-    assert.equal(await autoMemory(optedOut), 'autoMemory=false')
-    assert.deepEqual(
-      await server.request('thread/memoryMode/set', { threadId: optedOut, mode: 'enabled' }),
-      {},
-    )
-    assert.equal(await autoMemory(optedOut), 'autoMemory=true')
-    await server.request('thread/memoryMode/set', { threadId: first, mode: 'disabled' })
-    assert.equal(await autoMemory(first), 'autoMemory=false')
-    await assert.rejects(
-      server.request('thread/memoryMode/set', { threadId: first, mode: 'polluted' }),
-      /invalid memory mode: polluted/,
-    )
-    await assert.rejects(
-      server.request('thread/memoryMode/set', { threadId: 'missing', mode: 'enabled' }),
-      /unknown thread: missing/,
-    )
+      // Off until the user turns it on, as in Codex.
+      const feature = await memories()
+      assert.equal(feature.stage, 'beta')
+      assert.equal(feature.enabled, false)
+      assert.equal(feature.defaultEnabled, false)
+      assert.deepEqual(await server.request('experimentalFeature/list', { cursor: '1' }), {
+        data: [],
+        nextCursor: null,
+      })
+      await assert.rejects(
+        server.request('experimentalFeature/list', { cursor: '2' }),
+        /cursor 2 exceeds total feature flags 1/,
+      )
+      await assert.rejects(
+        server.request('experimentalFeature/list', { cursor: 'next' }),
+        /invalid cursor: next/,
+      )
+      await assert.rejects(
+        server.request('experimentalFeature/list', { threadId: 'missing' }),
+        /thread not found: missing/,
+      )
+      const first = await server.startThread()
+      assert.equal(await autoMemory(first), 'autoMemory=false')
+      assert.equal((await memories({ threadId: first })).enabled, false)
 
-    // A fork remembers like its parent; the ephemeral one the App describes a
-    // chat with never does.
-    const { thread: fork } = await server.request('thread/fork', { threadId: optedOut })
-    assert.equal(await autoMemory(fork.id), 'autoMemory=true')
-    const { thread: helper } = await server.request('thread/fork', {
-      threadId: optedOut,
-      ephemeral: true,
-      threadSource: 'thread_description',
-    })
-    assert.equal(await autoMemory(helper.id), 'autoMemory=false')
+      // The App sets its defaults for the connection; the user's config wins.
+      assert.deepEqual(
+        await server.request('experimentalFeature/enablement/set', {
+          enablement: { memories: true, apps: false },
+        }),
+        { enablement: { memories: true, apps: false } },
+      )
+      assert.equal((await memories()).enabled, true)
+      await write([['features.memories', false]])
+      assert.equal((await memories()).enabled, false)
+      assert.equal(await autoMemory(first), 'autoMemory=false')
 
-    // Claude Code reads and writes its memory as one switch: a new chat gets
-    // it only while both generating and using memories are on.
-    await write([['memories.use_memories', false]])
-    assert.equal(await autoMemory(await server.startThread()), 'autoMemory=false')
+      // Settings > Personalization turns it on and reads its switches back.
+      await write([
+        ['features.memories', true],
+        ['memories.generate_memories', true],
+        ['memories.use_memories', true],
+      ])
+      assert.equal((await memories()).enabled, true)
+      const { config } = await server.request('config/read', {})
+      assert.deepEqual(config.memories, { generate_memories: true, use_memories: true })
+      assert.equal(await autoMemory(first), 'autoMemory=true')
 
-    // Turning the feature off stops it everywhere.
-    await write([['features.memories', false]])
-    assert.equal(await autoMemory(optedOut), 'autoMemory=false')
+      // A chat started with its own switch off, then turned on with /memories.
+      const optedOut = await server.startThread({ config: { 'memories.generate_memories': false } })
+      assert.equal(await autoMemory(optedOut), 'autoMemory=false')
+      assert.deepEqual(
+        await server.request('thread/memoryMode/set', { threadId: optedOut, mode: 'enabled' }),
+        {},
+      )
+      assert.equal(await autoMemory(optedOut), 'autoMemory=true')
+      await server.request('thread/memoryMode/set', { threadId: first, mode: 'disabled' })
+      assert.equal(await autoMemory(first), 'autoMemory=false')
+      await assert.rejects(
+        server.request('thread/memoryMode/set', { threadId: first, mode: 'polluted' }),
+        /invalid memory mode: polluted/,
+      )
+      await assert.rejects(
+        server.request('thread/memoryMode/set', { threadId: 'missing', mode: 'enabled' }),
+        /unknown thread: missing/,
+      )
 
-    // memory/status keeps Codex's bounds and reports nothing consolidated;
-    // memory/reset leaves Claude Code's memory folders alone and says so.
-    assert.deepEqual(await server.request('memory/status', { minConsolidatedThreads: 4096 }), {
-      v2ConsolidatedThreads: 0,
-      v2Ready: false,
-    })
-    await assert.rejects(
-      server.request('memory/status', { minConsolidatedThreads: 0 }),
-      /minConsolidatedThreads must be between 1 and 4096/,
-    )
-    await assert.rejects(server.request('memory/reset'), /memory\/reset is not supported/)
-  })
+      // A fork remembers like its parent; the ephemeral one the App describes a
+      // chat with never does.
+      const { thread: fork } = await server.request('thread/fork', { threadId: optedOut })
+      assert.equal(await autoMemory(fork.id), 'autoMemory=true')
+      const { thread: helper } = await server.request('thread/fork', {
+        threadId: optedOut,
+        ephemeral: true,
+        threadSource: 'thread_description',
+      })
+      assert.equal(await autoMemory(helper.id), 'autoMemory=false')
+
+      // Claude Code reads and writes its memory as one switch: a new chat gets
+      // it only while both generating and using memories are on.
+      await write([['memories.use_memories', false]])
+      assert.equal(await autoMemory(await server.startThread()), 'autoMemory=false')
+
+      // Turning the feature off stops it everywhere.
+      await write([['features.memories', false]])
+      assert.equal(await autoMemory(optedOut), 'autoMemory=false')
+
+      // memory/status keeps Codex's bounds and reports nothing consolidated;
+      // memory/reset leaves Claude Code's memory folders alone and says so.
+      assert.deepEqual(await server.request('memory/status', { minConsolidatedThreads: 4096 }), {
+        v2ConsolidatedThreads: 0,
+        v2Ready: false,
+      })
+      await assert.rejects(
+        server.request('memory/status', { minConsolidatedThreads: 0 }),
+        /minConsolidatedThreads must be between 1 and 4096/,
+      )
+      await assert.rejects(server.request('memory/reset'), /memory\/reset is not supported/)
+    },
+    { CLAUDE_CODEX_MEMORIES: '1' },
+  )
 })
 
 test('account/usage/read reports turn history and no token counts', async () => {

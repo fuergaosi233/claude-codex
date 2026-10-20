@@ -453,9 +453,11 @@ export interface RuntimeTurnContext {
   // The thread has a goal: expose Codex's goal tools (get_goal, create_goal,
   // update_goal) to Claude. Backends without in-process tools ignore it.
   goalTools?: GoalToolHandlers | null
-  // Let Claude Code's auto-memory read and write its memory folder. True only
-  // when the user turned memories on in the App and the thread's memory mode
-  // is enabled; otherwise the runtime switches auto-memory off.
+  // Let Claude Code's auto-memory read and write its memory folder. Set only
+  // with the memories mapping on (CLAUDE_CODEX_MEMORIES=1): true when the user
+  // turned memories on in the App and the thread's memory mode is enabled,
+  // false to have the runtime switch auto-memory off. Unset leaves it to
+  // Claude Code's own settings.
   autoMemory?: boolean
 }
 

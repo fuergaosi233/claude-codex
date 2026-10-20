@@ -41,6 +41,7 @@ import {
   MEMORIES_FEATURE,
   memoriesConfigTable,
   memoriesEnabled,
+  memoriesMappingEnabled,
   memoryStatus,
   newThreadMemoryMode,
   parseMemoryMode,
@@ -1080,10 +1081,13 @@ export class CodexClaudeAppServer {
       ),
       personality: normalizePersonality(params.personality),
       // The App's per-chat memories switches arrive as memories.* config.
-      // Helper threads never remember.
-      memoryMode: isTitleOrHelper
-        ? 'disabled'
-        : newThreadMemoryMode(asRecord(params.config), this.configOverrides),
+      // Helper threads never remember. Without the memories mapping no mode
+      // is kept.
+      memoryMode: !memoriesMappingEnabled()
+        ? null
+        : isTitleOrHelper
+          ? 'disabled'
+          : newThreadMemoryMode(asRecord(params.config), this.configOverrides),
       // Pick the runtime backend from the chosen model — picking gpt-* in
       // the App's model dropdown flips the new thread to runtimeBackend
       // 'codex' so turns get forwarded to `codex exec`. Default 'claude'.
@@ -3723,7 +3727,11 @@ export class CodexClaudeAppServer {
           process.env.CLAUDE_CODEX_GOAL_TOOLS !== '0'
             ? this.goalToolsFor(thread.id)
             : null,
-        autoMemory: !isCodexThread && this.autoMemoryFor(thread),
+        // Without the memories mapping the runtime leaves auto-memory to
+        // Claude Code's own settings.
+        ...(memoriesMappingEnabled()
+          ? { autoMemory: !isCodexThread && this.autoMemoryFor(thread) }
+          : {}),
         ...(continuation ? { continuation: true } : {}),
       },
       {
@@ -5999,8 +6007,11 @@ export class CodexClaudeAppServer {
         analytics: this.configOverrides.analytics ?? null,
         apps: this.configOverrides.apps ?? null,
         // The App reads its memories switches from the table; the adapter
-        // keeps the key paths it writes flat.
-        memories: memoriesConfigTable(this.configOverrides),
+        // keeps the key paths it writes flat. Only the memories mapping
+        // gathers them.
+        ...(memoriesMappingEnabled()
+          ? { memories: memoriesConfigTable(this.configOverrides) }
+          : {}),
         model_providers: this.exposedModelProviders(),
         provider_loop_config: projectProviderLoopConfig(
           undefined,
@@ -6056,6 +6067,9 @@ export class CodexClaudeAppServer {
   }
 
   private experimentalFeatureList(params: Record<string, unknown>): unknown {
+    // Without the memories mapping no feature has anything to switch, so
+    // none is listed and the App hides its memories settings.
+    if (!memoriesMappingEnabled()) return { data: [], nextCursor: null }
     // Codex reads the flags of a thread's own config; every thread here has
     // the global ones.
     const threadId = stringOr(params.threadId, '')
@@ -6073,7 +6087,10 @@ export class CodexClaudeAppServer {
     return { enablement }
   }
 
+  // Without the memories mapping /memories has nothing to switch, and the
+  // call is acknowledged without effect.
   private threadMemoryModeSet(params: Record<string, unknown>): unknown {
+    if (!memoriesMappingEnabled()) return {}
     const threadId = stringOr(params.threadId, '')
     const mode = parseMemoryMode(params.mode)
     if (!mode) throw new Error(`invalid memory mode: ${String(params.mode)}`)

@@ -37,6 +37,16 @@ versioning or publishing metadata.
 
 ### App-server and protocol compatibility
 
+- Opt-in Memories: with `CLAUDE_CODEX_MEMORIES=1`, the App's Memories
+  settings (Settings > Personalization) and `/memories` decide whether Claude
+  threads run with Claude Code's auto-memory, and while Memories is off in the
+  App they run with `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`. Without the switch
+  nothing changes: the App shows no Memories settings and Claude Code's own
+  settings decide.
+- `memory/reset` is refused instead of reporting success, since Claude Code's
+  memory folders are shared with Claude Code outside the App and the adapter
+  deletes nothing, and `memory/status` checks `minConsolidatedThreads` against
+  Codex's bounds (1 to 4096).
 - The model picker reads the Codex model catalog from `CODEX_HOME` instead of
   `~/.codex`, so an App with its own home lists its catalog rather than the
   built-in fallback models.

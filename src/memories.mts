@@ -1,12 +1,21 @@
 // Codex memories on Claude threads. Codex distills past chats into memories
 // of its own; Claude Code has auto-memory instead: notes it keeps per project
 // under its config folder, reads when a session starts and updates as it
-// works. The App's memories switches drive that. As in Codex, the feature is
-// off until the user turns it on (Settings > Personalization), and each thread
-// carries its own mode, which picks whether its sessions run with auto-memory.
+// works. With CLAUDE_CODEX_MEMORIES=1 the App's memories switches drive that.
+// As in Codex, the feature is then off until the user turns it on (Settings >
+// Personalization), and each thread carries its own mode, which picks whether
+// its sessions run with auto-memory. Without the switch the adapter lists no
+// memories feature and leaves auto-memory to Claude Code's own settings.
 // App rule: memories-settings
 
 export const MEMORIES_FEATURE = 'memories'
+
+// Whether the App's memories settings drive Claude Code's auto-memory. Off
+// unless CLAUDE_CODEX_MEMORIES=1, because turning the mapping on changes what
+// every App chat remembers: the App sets the feature off when it connects.
+export function memoriesMappingEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.CLAUDE_CODEX_MEMORIES === '1'
+}
 
 export type MemoryMode = 'enabled' | 'disabled'
 
@@ -122,11 +131,12 @@ export function parseMemoryMode(value: unknown): MemoryMode | null {
 }
 
 // The CLI environment for a session. Auto-memory is on in Claude Code unless
-// something turns it off, so a session without it gets
+// something turns it off, so a session the mapping keeps from it gets
 // CLAUDE_CODE_DISABLE_AUTO_MEMORY=1, even over a value the user exported. This
-// avoids --settings, which pinned launchers reject. A session with it adds
-// nothing, so Claude Code's own autoMemoryEnabled setting, or the variable set
-// to turn it off, still wins.
-export function autoMemoryEnv(autoMemory: boolean): Record<string, string> {
-  return autoMemory ? {} : { CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1' }
+// avoids --settings, which pinned launchers reject. A session with it, or one
+// the mapping has no say over (undefined: the switch is off), adds nothing, so
+// Claude Code's own autoMemoryEnabled setting, or the variable set to turn it
+// off, still wins.
+export function autoMemoryEnv(autoMemory: boolean | undefined): Record<string, string> {
+  return autoMemory === false ? { CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1' } : {}
 }

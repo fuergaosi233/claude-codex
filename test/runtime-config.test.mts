@@ -148,7 +148,7 @@ test('native SDK runtime maps manual /workflows prompts to the human workflow tr
   )
 })
 
-test('native SDK runtime runs Claude Code with auto-memory only for threads that ask for it', () => {
+test('native SDK runtime switches auto-memory off only for threads the memories mapping keeps from it', () => {
   const runtime = new NativeClaudeRuntime()
   const buildOptions = Reflect.get(runtime, 'buildOptions')
   const envFor = (overrides: Partial<RuntimeTurnContext>) => {
@@ -160,18 +160,24 @@ test('native SDK runtime runs Claude Code with auto-memory only for threads that
   const previous = process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY
   try {
     delete process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY
-    // Off unless the thread turns it on: no --settings, the CLI's own switch.
-    assert.equal(envFor({}).CLAUDE_CODE_DISABLE_AUTO_MEMORY, '1')
+    // Without the memories mapping (no autoMemory) the launch adds nothing,
+    // and Claude Code's own settings decide.
+    assert.equal(envFor({}).CLAUDE_CODE_DISABLE_AUTO_MEMORY, undefined)
+    assert.equal(envFor({}).CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS, '1')
+    // With it, a thread kept from auto-memory gets the CLI's own switch, not
+    // --settings.
     assert.equal(envFor({ autoMemory: false }).CLAUDE_CODE_DISABLE_AUTO_MEMORY, '1')
     assert.equal(envFor({ autoMemory: true }).CLAUDE_CODE_DISABLE_AUTO_MEMORY, undefined)
-    assert.equal(envFor({}).CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS, '1')
 
-    // A value the user exported to force auto-memory on does not override a
-    // thread without memories, and one that turns it off still does.
+    // A value the user exported passes through without the mapping. With it,
+    // one that forces auto-memory on does not override a thread without
+    // memories, and one that turns it off still wins.
     process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = '0'
+    assert.equal(envFor({}).CLAUDE_CODE_DISABLE_AUTO_MEMORY, '0')
     assert.equal(envFor({ autoMemory: false }).CLAUDE_CODE_DISABLE_AUTO_MEMORY, '1')
     assert.equal(envFor({ autoMemory: true }).CLAUDE_CODE_DISABLE_AUTO_MEMORY, '0')
     process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = '1'
+    assert.equal(envFor({}).CLAUDE_CODE_DISABLE_AUTO_MEMORY, '1')
     assert.equal(envFor({ autoMemory: true }).CLAUDE_CODE_DISABLE_AUTO_MEMORY, '1')
   } finally {
     if (previous === undefined) delete process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY
@@ -2278,7 +2284,7 @@ test('claude-p runtime runs each turn in its own cwd', async () => {
   }
 })
 
-test('claude-p runtime turns auto-memory off unless the thread asks for it', async () => {
+test('claude-p runtime turns auto-memory off only for threads the memories mapping keeps from it', async () => {
   const tmp = await mkdtemp(join(tmpdir(), 'claude-codex-claude-p-memory-test-'))
   const command = join(tmp, 'fake-claude-p.mjs')
   await writeFile(
@@ -2317,8 +2323,9 @@ test('claude-p runtime turns auto-memory off unless the thread asks for it', asy
   const previous = process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY
   delete process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY
   try {
+    // Without the mapping (undefined) the CLI gets nothing extra.
     assert.deepEqual(await Promise.all([run(undefined), run(false), run(true)]), [
-      '1',
+      'unset',
       '1',
       'unset',
     ])

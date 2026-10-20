@@ -394,7 +394,7 @@ export class MockRuntime implements ClaudeRuntime {
     if (/auto memory check/i.test(context.prompt)) {
       await handlers.onEvent({
         type: 'text_delta',
-        delta: `autoMemory=${context.autoMemory === true}`,
+        delta: `autoMemory=${context.autoMemory ?? 'unset'}`,
       })
       await handlers.onEvent({ type: 'completed', success: true, result: 'auto memory check' })
       return

@@ -40,8 +40,9 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
       }
 
       const args = this.argsForContext(context, inputFile)
-      // Auto-memory only for threads the user turned memories on for.
-      const env = { ...process.env, ...autoMemoryEnv(context.autoMemory === true) }
+      // With the memories mapping on, auto-memory only for threads the user
+      // turned memories on for.
+      const env = { ...process.env, ...autoMemoryEnv(context.autoMemory) }
       const result = await this.runProcessWithRetry(
         context.threadId,
         args,
