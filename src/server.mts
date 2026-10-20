@@ -1049,6 +1049,9 @@ export class CodexClaudeAppServer {
       cwd,
       model,
       reasoningEffort,
+      // Never openai: the App would fork a Claude thread for its composer
+      // predictions.
+      // App rule: prediction-provider
       modelProvider: 'claude-code',
       claudeSessionId: null,
       // v2 SessionSource is camelCase; the old `app_server` falls through to
@@ -3167,6 +3170,9 @@ export class CodexClaudeAppServer {
     // thread, filtered from listings), so the short-circuit was just forcing a
     // hardcoded "处理X" string instead of the real model output. Now every turn
     // — including the structured title turn on Claude Haiku — runs end-to-end.
+    // Work started on behalf of another turn names that turn's root; as in
+    // Codex, without one (or with a blank one) the turn is its own root.
+    const rootTurnId = stringOr(params.rootTurnId, '')
     const turn: TurnRecord = {
       id: turnId,
       threadId,
@@ -3177,6 +3183,7 @@ export class CodexClaudeAppServer {
       items: initialItems,
       diff: '',
       error: null,
+      rootTurnId: rootTurnId.trim() ? rootTurnId : null,
     }
     this.store.upsertTurn(turn)
     recordRunEvent('turn.started', {
@@ -3915,6 +3922,8 @@ export class CodexClaudeAppServer {
               ],
               diff: '',
               error: null,
+              // A spawned agent works for the turn that spawned it, as in Codex.
+              rootTurnId: turn.rootTurnId ?? turn.id,
             }
             this.store.upsertTurn(childTurn)
             this.notify(peer, {
@@ -5518,14 +5527,17 @@ export class CodexClaudeAppServer {
       this.settleBackgroundSubagent(entry, 'interrupted', 'Stopped by the parent agent.', null)
       return
     }
-    this.resumeBackgroundChild(entry, pending.message, event.toolUseId)
+    this.resumeBackgroundChild(entry, pending.message, event.toolUseId, turn.rootTurnId ?? turn.id)
     this.emitSubagentActivity(peer, thread.id, turn.id, entry.context, 'interacted')
   }
 
+  // rootTurnId: the root of the parent turn that sent the message, which a
+  // turn it starts in the child works for, as in Codex.
   private resumeBackgroundChild(
     entry: BackgroundSubagent,
     message: string,
     sendToolUseId: string,
+    rootTurnId: string,
   ): void {
     const { context } = entry
     const peer = this.peerForThread(context.childThreadId)
@@ -5550,6 +5562,7 @@ export class CodexClaudeAppServer {
         items: [userItem],
         diff: '',
         error: null,
+        rootTurnId,
       }
       this.store.upsertTurn(turn)
       this.setThreadStatus(peer, context.childThreadId, { type: 'active', activeFlags: [] })
@@ -7161,10 +7174,13 @@ export class CodexClaudeAppServer {
 
   // Full turn payload for history reads (thread/read, turns/list) — carries the
   // loaded items. The Codex v2 `Turn` schema has no api/cost metadata fields, so
-  // the adapter's internal metrics are not serialized onto the wire.
+  // the adapter's internal metrics are not serialized onto the wire. Every
+  // payload carries rootTurnId (0.163), the turn itself unless it was started
+  // for another turn's work.
   private toTurn(turn: TurnRecord): unknown {
     return {
       id: turn.id,
+      rootTurnId: turn.rootTurnId ?? turn.id,
       items: turn.items,
       itemsView: 'full',
       status: turn.status,
@@ -7187,6 +7203,7 @@ export class CodexClaudeAppServer {
     if (lastAgent && lastAgent.id !== firstUser?.id) items.push(lastAgent)
     return {
       id: turn.id,
+      rootTurnId: turn.rootTurnId ?? turn.id,
       items,
       itemsView: 'summary',
       status: turn.status,
@@ -7203,6 +7220,7 @@ export class CodexClaudeAppServer {
   private toLifecycleTurn(turn: TurnRecord, items: ThreadItem[] = []): unknown {
     return {
       id: turn.id,
+      rootTurnId: turn.rootTurnId ?? turn.id,
       items,
       itemsView: 'notLoaded',
       status: turn.status,
@@ -7223,6 +7241,7 @@ export class CodexClaudeAppServer {
         : undefined
     return {
       id: turn.id,
+      rootTurnId: turn.rootTurnId ?? turn.id,
       items: lastAgent ? [lastAgent] : [],
       itemsView: lastAgent ? 'summary' : 'notLoaded',
       status: turn.status,

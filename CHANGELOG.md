@@ -138,6 +138,20 @@ versioning or publishing metadata.
   turn and a `lastTurnId` that is still running are rejected. When the kept
   turns predate checkpoints, the fork keeps Claude's whole session, as before,
   and a `configWarning` says so.
+- The adapter advertises app-server `0.163.0-alpha.10.2`, the Codex build of
+  Codex App 26.1013, instead of `0.159.0-alpha.12.1`, so every feature gate of
+  26.1013 is on as well; App 26.930 turns on the same features as before.
+  Codex `0.163.0` has the same app-server protocol. `CLAUDE_CODEX_COMPAT_VERSION`
+  still overrides it. The App's composer predictions, which that version turns
+  on, fork only a thread whose `modelProvider` is `openai`, so they leave
+  Claude threads (`claude-code`) alone.
+- Every turn carries `rootTurnId`, new in that protocol: the root a
+  `turn/start` names for work it starts on behalf of another turn, else the
+  turn's own id. A subagent's turn takes the root of the turn that spawned it,
+  and input that joins a running turn keeps that turn's root, as in Codex.
+- CI checks the Rust protocol fixtures against `@openai/codex@0.163.0`, and
+  the `turn/started` and `turn/completed` fixtures must carry exactly the
+  fields of the generated `Turn`.
 
 ### Provider and multi-agent boundaries
 

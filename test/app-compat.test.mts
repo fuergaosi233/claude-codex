@@ -117,6 +117,24 @@ test('the codex shim reports the same compat version as the adapter', () => {
   }
 })
 
+test('the adapter reports the Codex version of the baseline App', () => {
+  // So every gate the baseline App knows is on; check:app-upgrade checks
+  // what each one needs.
+  const baseline = JSON.parse(readFileSync(new URL('scripts/app-baseline.json', root), 'utf8'))
+  const saved = {
+    CLAUDE_CODEX_COMPAT_VERSION: process.env.CLAUDE_CODEX_COMPAT_VERSION,
+    CODEX_SHIM_COMPAT_VERSION: process.env.CODEX_SHIM_COMPAT_VERSION,
+  }
+  delete process.env.CLAUDE_CODEX_COMPAT_VERSION
+  delete process.env.CODEX_SHIM_COMPAT_VERSION
+  try {
+    assert.equal(`codex-cli ${codexCompatVersion()}`, baseline.codexVersion)
+  } finally {
+    for (const [name, value] of Object.entries(saved))
+      if (value !== undefined) process.env[name] = value
+  }
+})
+
 test('unverifiedAppWarning only speaks up for an unlisted desktop build', () => {
   const verified = VERIFIED_APP_VERSIONS[0] as string
   assert.equal(unverifiedAppWarning({ name: DESKTOP_CLIENT_NAME, version: verified }), null)

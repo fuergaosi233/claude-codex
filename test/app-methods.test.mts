@@ -670,6 +670,112 @@ test('toolOutput sent while a turn runs joins that turn as its input', async () 
   })
 })
 
+test('a turn reports the rootTurnId turn/start names, else its own id', async () => {
+  await withServer(async (server) => {
+    const threadId = await server.startThread()
+
+    // A turn the user starts is its own root, in every turn payload.
+    let from = server.mark()
+    const { turn: own } = await server.startTurn(threadId, 'first')
+    assert.equal(own.rootTurnId, own.id)
+    assert.equal(
+      (await server.waitFor('turn/started', (params) => params.turn.id === own.id, from)).turn
+        .rootTurnId,
+      own.id,
+    )
+    assert.equal(
+      (await server.waitFor('turn/completed', (params) => params.turn.id === own.id, from)).turn
+        .rootTurnId,
+      own.id,
+    )
+
+    // Work started for another turn reports that turn's root, and so does
+    // the agent it spawns.
+    from = server.mark()
+    const { turn: linked } = await server.request('turn/start', {
+      threadId,
+      input: [{ type: 'text', text: 'subagent check', text_elements: [] }],
+      parentTurnId: 'turn-in-another-thread',
+      rootTurnId: 'root-of-the-chain',
+    })
+    assert.equal(linked.rootTurnId, 'root-of-the-chain')
+    const completed = await server.waitFor(
+      'turn/completed',
+      (params) => params.turn.id === linked.id,
+      from,
+    )
+    assert.equal(completed.turn.rootTurnId, 'root-of-the-chain')
+    const child = server
+      .notified('turn/started', from)
+      .find((params) => params.threadId !== threadId)
+    assert.equal(child.turn.rootTurnId, 'root-of-the-chain')
+    const { thread: childThread } = await server.request('thread/read', {
+      threadId: child.threadId,
+      includeTurns: true,
+    })
+    assert.deepEqual(
+      childThread.turns.map((turn: any) => turn.rootTurnId),
+      ['root-of-the-chain'],
+    )
+
+    // History keeps it, in full and in summary.
+    const { thread } = await server.request('thread/read', { threadId, includeTurns: true })
+    assert.deepEqual(
+      thread.turns.map((turn: any) => turn.rootTurnId),
+      [own.id, 'root-of-the-chain'],
+    )
+    const summary = await server.request('thread/turns/list', { threadId, itemsView: 'summary' })
+    assert.deepEqual(
+      summary.data.map((turn: any) => turn.rootTurnId),
+      ['root-of-the-chain', own.id],
+    )
+
+    // A blank root names nothing.
+    const { turn: blank } = await server.request('turn/start', {
+      threadId,
+      input: [{ type: 'text', text: 'third', text_elements: [] }],
+      rootTurnId: ' ',
+    })
+    assert.equal(blank.rootTurnId, blank.id)
+    await server.waitFor('turn/completed', (params) => params.turn.id === blank.id, from)
+
+    // Input that joins a running turn keeps that turn's root, as in Codex.
+    from = server.mark()
+    const { turn: held } = await server.startTurn(threadId, 'hold this turn until released')
+    await server.waitFor('item/agentMessage/delta', (params) => params.turnId === held.id, from)
+    const joined = await server.request('turn/start', {
+      threadId,
+      input: [{ type: 'text', text: 'release', text_elements: [] }],
+      rootTurnId: 'root-of-the-chain',
+    })
+    assert.equal(joined.turn.id, held.id)
+    assert.equal(joined.turn.rootTurnId, held.id)
+    await server.waitFor('turn/completed', (params) => params.turn.id === held.id, from)
+  })
+})
+
+test('Claude threads report the claude-code model provider', async () => {
+  await withServer(async (server) => {
+    // The App runs composer predictions (a thread/fork with
+    // experimentalPredictionMode) only for threads whose modelProvider is
+    // openai, so a Claude thread must never claim it.
+    const started = await server.request('thread/start', { cwd: server.home })
+    assert.equal(started.modelProvider, 'claude-code')
+    assert.equal(started.thread.modelProvider, 'claude-code')
+    const threadId = started.thread.id
+    await server.runTurn(threadId, 'first')
+
+    const resumed = await server.request('thread/resume', { threadId })
+    assert.equal(resumed.modelProvider, 'claude-code')
+    assert.equal(resumed.thread.modelProvider, 'claude-code')
+    const { thread } = await server.request('thread/read', { threadId })
+    assert.equal(thread.modelProvider, 'claude-code')
+    const forked = await server.request('thread/fork', { threadId })
+    assert.equal(forked.modelProvider, 'claude-code')
+    assert.equal(forked.thread.modelProvider, 'claude-code')
+  })
+})
+
 test('host methods answer truthfully: empty, disabled or unavailable', async () => {
   await withServer(async (server) => {
     // The App treats -32601 as "not supported here" and falls back quietly;

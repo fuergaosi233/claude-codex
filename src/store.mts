@@ -203,6 +203,8 @@ export class SessionStore {
     this.ensureColumn('threads', 'claude_fork_new_session', 'INTEGER NOT NULL DEFAULT 0')
     this.ensureColumn('turns', 'claude_session_id', 'TEXT')
     this.ensureColumn('turns', 'claude_message_uuid', 'TEXT')
+    // TurnRecord.rootTurnId; NULL when the turn is its own root.
+    this.ensureColumn('turns', 'root_turn_id', 'TEXT')
     // Project membership; written only by setThreadProject and deleteProject.
     this.ensureColumn('threads', 'project_id', 'TEXT')
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_threads_project ON threads(project_id)')
@@ -1050,8 +1052,8 @@ export class SessionStore {
   upsertTurn(turn: TurnRecord): void {
     this.db
       .prepare(`
-        INSERT INTO turns (id, thread_id, status, started_at, completed_at, duration_ms, items_json, diff, error_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO turns (id, thread_id, status, started_at, completed_at, duration_ms, items_json, diff, error_json, root_turn_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           status=excluded.status,
           started_at=excluded.started_at,
@@ -1059,7 +1061,8 @@ export class SessionStore {
           duration_ms=excluded.duration_ms,
           items_json=excluded.items_json,
           diff=excluded.diff,
-          error_json=excluded.error_json
+          error_json=excluded.error_json,
+          root_turn_id=COALESCE(excluded.root_turn_id, turns.root_turn_id)
       `)
       .run(
         turn.id,
@@ -1071,6 +1074,7 @@ export class SessionStore {
         JSON.stringify(turn.items),
         turn.diff,
         turn.error == null ? null : JSON.stringify(turn.error),
+        turn.rootTurnId ?? null,
       )
   }
 
@@ -1581,6 +1585,7 @@ export class SessionStore {
       items: JSON.parse(String(row.items_json)),
       diff: String(row.diff ?? ''),
       error: row.error_json == null ? null : JSON.parse(String(row.error_json)),
+      rootTurnId: row.root_turn_id == null ? null : String(row.root_turn_id),
     }
   }
 }

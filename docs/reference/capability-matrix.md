@@ -91,22 +91,23 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 
 ## Protocol version
 
-The adapter advertises codex app-server protocol **v2 @ 0.159.0-alpha.12.1**
+The adapter advertises codex app-server protocol **v2 @ 0.163.0-alpha.10.2**
 (via `codex --version` and the `initialize` userAgent; override with
-`CLAUDE_CODEX_COMPAT_VERSION`), the Codex build of App 26.930. The App turns
-its feature gates on by this version, so every gate that build knows is on;
-App 26.1013 leaves a few newer ones off.
+`CLAUDE_CODEX_COMPAT_VERSION`), the Codex build of App 26.1013; Codex
+`0.163.0` has the same app-server protocol. The App turns its feature gates on
+by this version, so every gate App 26.1013 and App 26.930 know is on.
 [Codex App compatibility](/reference/app-compat#feature-gates-and-claude-codex-compat-version)
-lists what they change. Every client request Codex App 26.1013 sends has a
-handler; where Claude Code has no equivalent it answers with an empty,
-disabled or `unavailable` result rather than an error. A request it does not
-know gets the JSON-RPC error `-32601` (method not found), and so do three
-requests of the 26.1013 protocol that the App never sends. Regenerate the
-reference schema under `generated/` with `npm run generate:schema` (needs a
-matching `codex` on PATH).
+lists what they change. Every turn carries the protocol's `rootTurnId`: the
+one its `turn/start` named, else its own id. Every client request Codex App
+26.1013 sends has a handler; where Claude Code has no equivalent it answers
+with an empty, disabled or `unavailable` result rather than an error. A
+request it does not know gets the JSON-RPC error `-32601` (method not found),
+and so do three requests of the 26.1013 protocol that the App never sends.
+Regenerate the reference schema under `generated/` with
+`npm run generate:schema` (needs a matching `codex` on PATH).
 
 Because the adapter reports the same version as a real `codex`, it appends a
-distinguishing suffix: `codex --version` prints `codex-cli 0.159.0-alpha.12.1
+distinguishing suffix: `codex --version` prints `codex-cli 0.163.0-alpha.10.2
 (claude-codex)` and the `initialize` userAgent carries `claude-codex` in its
 originator field. The version number stays first so the App's semver probe still
 parses it. Set `CLAUDE_CODEX_VERSION_SUFFIX=""` to behave exactly like upstream

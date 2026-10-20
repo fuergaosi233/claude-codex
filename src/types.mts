@@ -181,6 +181,10 @@ export interface TurnRecord {
   items: ThreadItem[]
   diff: string
   error: unknown | null
+  // The first turn in the chain of work that led to this one, when that is
+  // another turn: the rootTurnId of turn/start, or for a subagent's turn the
+  // root of the turn that spawned it. Null or absent: the turn is its own root.
+  rootTurnId?: string | null
   // Claude Agent SDK ResultMessage metrics. Surface them in turn/completed
   // so Codex App's status bar can show real timing + cost instead of blanks.
   apiDurationMs?: number | null

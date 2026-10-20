@@ -20,6 +20,7 @@ line a rule touches.
 | --- | --- | --- |
 | `client-info` | identifies itself in `initialize` as `clientInfo.name` `codex_desktop`, with its build as the version | `check:app-upgrade` finds the name |
 | `feature-gates` | turns features on by the app-server version in the `initialize` userAgent, and rejects one below its minimum | `check:app-upgrade` lists the gates |
+| `prediction-provider` | from 26.1013, predicts the next composer message by forking the thread with `thread/fork` and `experimentalPredictionMode`, only when its `modelProvider` is `openai` | the bundle's prediction path still stops with `unsupported_provider` for another provider |
 | `config-warnings` | lists `configWarning` notifications under Settings > Agent > Configuration | an unlisted build shows the warning there |
 | `bedrock-account` | filters the model picker through its OpenAI allowlist unless `account/read` returns a Bedrock account | the picker lists the Claude models |
 | `bedrock-govcloud` | from 26.1013, checks a Bedrock account with `account/bedrock/checkGovCloudRequirements` at startup and shows an "AWS GovCloud guidance" modal until it is acknowledged, unless the answer has `isGovCloud: false`; an error shows it too | an App that never acknowledged the guidance starts without the modal |
@@ -123,29 +124,36 @@ is clean and the rules hold:
 
 The App decides which features to use from the app-server version in the
 `initialize` userAgent, which the adapter takes from
-`CLAUDE_CODEX_COMPAT_VERSION`. The default, `0.159.0-alpha.12.1`, is the Codex
-build of App 26.930, so every gate that build knows is on. The baseline App,
-26.1013, bundles `0.163.0-alpha.10.2` (`codexVersion` in
-`scripts/app-baseline.json`); at the default it leaves these gates off:
+`CLAUDE_CODEX_COMPAT_VERSION`. The default, `0.163.0-alpha.10.2`, is the Codex
+build of the baseline App, 26.1013 (`codexVersion` in
+`scripts/app-baseline.json`), so every gate that build knows is on. Codex
+`0.163.0` has the same app-server protocol. Every gate App 26.930 knows needs
+`0.159.0-alpha.12.1`, its own Codex build, or less, so it turns the same
+features on as before. Against the previous default, `0.159.0-alpha.12.1`,
+these gates of App 26.1013 are newly on:
 
 - `threadAttachmentOwners`: before removing the worktree of a chat it
   archives, the App asks `thread/attachmentOwner/list` whether another chat
-  still holds it. The adapter answers it already.
-- `turnLineage`: `parentTurnId` and `rootTurnId` on `turn/start`, which the
-  adapter ignores.
+  still holds it. The adapter answers it.
+- `turnLineage`: `parentTurnId` and `rootTurnId` on `turn/start`, and
+  `rootTurnId` on every turn. The adapter keeps the root a `turn/start`
+  names and reports it back (see the table below).
 - `experimentalPredictionForkMode` and `misalignmentReviewTarget`, which no
-  Claude thread reaches (see their entries in `GATED_METHODS`).
+  Claude thread reaches (see their entries in `GATED_METHODS`). Composer
+  predictions fork only a thread whose `modelProvider` is `openai`; every
+  thread here reports `claude-code`, and a test pins that.
 - `asyncCompaction`, `guardianV2DecisionsComparison`, `incrementalTools`,
   `instantInterrupt`, `outputTokenReplay` and `preserveForkPrefix`, which only
   let a Codex feature key through in the config the App sends.
 
 On macOS the App's LaTeX preview, a separate app-server client, needs
 `0.149.0-alpha.4` or newer, and `0.162.0-alpha.20` for a project under `/tmp`
-or `/var/tmp`; below that it says LaTeX previews need a newer Codex. Raising
-the default to the baseline's version changes `DEFAULT_CODEX_COMPAT_VERSION`
-in `src/util.mts` and the matching default in `scripts/codex-shim` (a test
-keeps the two equal); every gate of the baseline App then has the cases it
-needs.
+or `/var/tmp`; below that it says LaTeX previews need a newer Codex. The
+default meets both. Raising the default for a newer App changes
+`DEFAULT_CODEX_COMPAT_VERSION` in `src/util.mts` and the matching default in
+`scripts/codex-shim`; tests keep the two equal and the default at the
+baseline's `codexVersion`, and check:app-upgrade lists what each gate it
+turns on needs.
 
 `GATED_METHODS` in `src/app-compat.mts` maps each gate to the requests it adds
 or changes, and `test/app-compat.test.mts` checks that the adapter answers
@@ -188,6 +196,7 @@ answers in a particular way:
 | `serviceTierForTurn`, `turnTrigger` | add fields to the heartbeat's `turn/start` | ignores them |
 | `threadAttachments` | records a chat's managed worktrees as thread attachments, cleans them up when it is archived, and offers worktree tools | keeps the attachments; see below |
 | `threadAttachmentOwners` | asks `thread/attachmentOwner/list` which chats hold a worktree before it removes the worktree with an archived chat, and in the worktree settings | lists the threads holding the attachment by thread id, filtered by `archived` and paged by `cursor` and `limit` (25 by default) |
+| `turnLineage` | passes `rootTurnId` (and `parentTurnId`) on `turn/start` when it starts work for another turn, and reads `rootTurnId` on every turn | reports on every turn payload the `rootTurnId` the `turn/start` named, or the turn's own id; a blank one names nothing, input that joins a running turn keeps that turn's root, and a subagent's turn takes the root of the turn that spawned it. `parentTurnId` is accepted and not kept |
 | `threadForkBeforeTurn` | forks a chat from before one of its turns with `thread/fork` and `beforeTurnId`, instead of forking it whole and calling `thread/rollback` | forks the chat up to that turn: the fork's history and Claude's context stop before it (see Thread lifecycle in the capability matrix) |
 | `threadItemAnchors` | pages a turn's items with `thread/items/list` from an `{ itemId }` cursor | pages from that item; an unknown item is an error, as in Codex |
 | `audioInputs` | sends an attached audio file as `localAudio` input when `model/list` says the model takes audio | lists text and image input for every model, so the App sends no audio |

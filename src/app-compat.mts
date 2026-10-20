@@ -40,6 +40,14 @@ export const APP_RULES: readonly AppRule[] = [
       'check:app-upgrade lists the gate table and the minimum next to the version the adapter reports.',
   },
   {
+    id: 'prediction-provider',
+    app: 'From 26.1013, with experimentalPredictionForkMode on, predicts the next composer message in a thread/fork with experimentalPredictionMode, only for a thread whose modelProvider is openai.',
+    adapter:
+      'Reports modelProvider claude-code for every thread, so the App never forks a Claude thread for a prediction.',
+    verify:
+      'In the bundle, the prediction path still gives up with unsupported_provider before its thread/fork when modelProvider is not openai.',
+  },
+  {
     id: 'config-warnings',
     app: 'Lists configWarning notifications under Settings > Agent > Configuration, keeping the last 20 per host.',
     adapter:
@@ -294,7 +302,8 @@ export const GATED_METHODS: Readonly<Record<string, readonly string[]>> = {
   threadRevert: ['thread/revert'],
   threadTimeline: ['thread/timeline/list'],
   turnApprovalsReviewer: ['turn/settings/update'],
-  // parentTurnId and rootTurnId on turn/start.
+  // parentTurnId and rootTurnId on turn/start; the turn reports its
+  // rootTurnId back.
   turnLineage: ['turn/start'],
   turnToolOutput: ['turn/start'],
 }
