@@ -144,6 +144,33 @@ test('native presentation keeps streamed progress and a later unstreamed final a
   )
 })
 
+// Claude Code sends a `ping` every 30 seconds while it streams, and can close
+// a cut-short reply late or not at all; neither changes what the turn shows.
+test('native presentation ignores stream pings and a late or missing message_stop', async () => {
+  const messages: Record<string, unknown>[] = [
+    start('cut'),
+    stream({ type: 'ping' }),
+    delta('text', 'Cut short', 0),
+    assistant('cut', [text('Cut short')]),
+    stream({ type: 'ping' }),
+    start('answer'),
+    // The cut-short reply's, arriving after the next one started.
+    stream({ type: 'message_stop' }),
+    delta('text', 'Done.', 0),
+    stream({ type: 'ping' }),
+    assistant('answer', [text('Done.')]),
+  ]
+  const quiet = messages.filter((message) => {
+    const type = (message.event as Record<string, unknown> | undefined)?.type
+    return type !== 'ping' && type !== 'message_stop'
+  })
+  const shape = (events: RuntimeEvent[]) =>
+    events.map((event) => (event.type === 'text_delta' ? `text:${event.delta}` : event.type))
+  const events = shape(await collect(messages))
+  assert.deepEqual(events, shape(await collect(quiet)))
+  assert.deepEqual(events, ['message_boundary', 'text:Cut short', 'message_boundary', 'text:Done.'])
+})
+
 test('native presentation deduplicates per content block without losing adjacent unstreamed blocks', async () => {
   const events = await collect([
     start('answer'),
