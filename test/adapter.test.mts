@@ -6442,6 +6442,65 @@ test('the first of two foreground agents to finish does not end the other in the
   }
 })
 
+test("the spawn card shows an agent's own model and effort, and a fork's parent settings", async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json(codex930Initialize(0)))
+    await reader.nextResponse(0)
+    proc.stdin.write(
+      json({ id: 1, method: 'thread/start', params: { cwd: process.cwd(), effort: 'medium' } }),
+    )
+    const start = (await reader.nextResponse(1)).result
+    const threadId = start.thread.id
+    assert.equal(start.reasoningEffort, 'medium')
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'subagent effort check', text_elements: [] }],
+        },
+      }),
+    )
+    await reader.nextResponse(2)
+    const turn = await readUntil(
+      reader,
+      (m) => m.method === 'turn/completed' && m.params.threadId === threadId,
+    )
+    const spawned = (prompt: string) =>
+      turn.find(
+        (m) =>
+          m.method === 'item/completed' &&
+          m.params.item.tool === 'spawnAgent' &&
+          m.params.item.prompt === prompt,
+      )?.params.item
+    const own = spawned('own agent')
+    assert.equal(own?.model, 'opus')
+    // Claude's max effort is past the App's scale; its top is xhigh.
+    assert.equal(own?.reasoningEffort, 'xhigh')
+    const fork = spawned('fork agent')
+    assert.equal(fork?.model, start.model, "a fork runs on its parent's model")
+    assert.notEqual(fork?.model, 'haiku')
+    assert.equal(fork?.reasoningEffort, 'medium', "a fork runs at its parent's effort")
+    // Claude matches the agent type ignoring case.
+    assert.equal(spawned('named fork')?.model, start.model)
+
+    proc.stdin.write(
+      json({ id: 3, method: 'thread/read', params: { threadId: fork?.receiverThreadIds[0] } }),
+    )
+    assert.equal((await reader.nextResponse(3)).result.thread.agentRole, 'fork')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('initialize reports an unverified desktop App build as a config warning', async () => {
   const warningsFor = async (version: string): Promise<any[]> => {
     const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))

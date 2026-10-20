@@ -208,6 +208,18 @@ versioning or publishing metadata.
   Codex refuses fail `thread/start` with its messages, and a chat keeps its
   tools across restarts, resumes and forks. Off by default, since the App's
   tools act on the desktop without an approval prompt.
+- The Claude Agent SDK is 0.3.304, which bundles Claude Code 2.1.304. The
+  adapter always passes a permission mode, so the CLI's changed default for
+  SDK sessions without one does not reach Claude threads.
+- Claude's Bash commands stream their output into the App's command item
+  while they run, read about once a second through the SDK's
+  `get_task_output` request: a foreground command once Claude Code makes it a
+  task, about two seconds in, and a background shell after its call returned,
+  also after the turn ended, followed by Claude Code's note when it was
+  stopped, failed or reached its background time limit (30 minutes in Agent
+  SDK sessions since Claude Code 2.1.285, or the call's own `timeout` up to 2
+  hours). `CLAUDE_CODEX_COMMAND_OUTPUT_POLL_MS=0` shows the output only when
+  the command finishes, as before.
 
 ### Provider and multi-agent boundaries
 
@@ -238,6 +250,11 @@ versioning or publishing metadata.
   children as Codex does, `SendMessage` / `TaskStop` map to agent calls, the
   CLI 2.1.283 hand-back report and usage trailer are parsed, and a finishing
   child no longer clears its still-running siblings from the roster.
+- A subagent's spawn card and thread show the effort Claude Code 2.1.290+
+  runs it at when the Agent call sets one (`max` shows as `xhigh`, the top of
+  the App's scale). A fork subagent, on by default in Agent SDK sessions since
+  Claude Code 2.1.302, shows its parent's model and effort, since Claude
+  ignores the Agent call's `model` and `effort` for it.
 - Deleting a thread ends its running background agents first, so each child
   turn completes as interrupted; stopping a turn no longer wakes the thread to
   acknowledge the background agents Claude Code stopped with it; and
@@ -311,6 +328,5 @@ versioning or publishing metadata.
   browser cookie/session-token reuse, private provider endpoints, or provider
   bypass behavior.
 - The App's dynamic tools (the worktree tools of its `threadAttachments`
-  gate), MCP tool-call progress, incremental Bash output, and Claude Code
-  plugin skills in the "/" popup are not included. Hook runs are shown live
-  but not kept in history.
+  gate), MCP tool-call progress, and Claude Code plugin skills in the "/"
+  popup are not included. Hook runs are shown live but not kept in history.

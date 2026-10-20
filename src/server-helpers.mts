@@ -496,6 +496,13 @@ export function normalizeReasoningEffortEnum(
   return null
 }
 
+// The Agent tool's `effort` input on the Codex effort scale. Claude's `max`
+// sits above that scale, whose top is `xhigh`.
+export function subagentEffortFromInput(value: unknown): string | null {
+  if (value === 'max') return 'xhigh'
+  return typeof value === 'string' ? normalizeReasoningEffortEnum(value) : null
+}
+
 // Codex App's settings sheet writes the persistent reasoning-effort default
 // under `params.config.model_reasoning_effort` (the same shape as the Codex
 // CLI's `config.toml`). turn/start's top-level `effort` is only set when the

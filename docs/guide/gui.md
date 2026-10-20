@@ -177,8 +177,9 @@ run does not mark the chat unread or send a desktop notification, because its
 answer is usually only "started, I'll report back". When the work finishes,
 Claude answers in a new turn, and that turn lights the unread dot as usual
 (unless other work is still running then). Backgrounded Bash commands do not
-count: a dev server or a watcher can run for the rest of the chat and would
-otherwise keep every later turn quiet.
+count: a dev server or a watcher can run for hours (see
+[Background commands](#background-commands)) and would otherwise keep every
+later turn quiet.
 
 To do this the adapter ends the quiet turn's last message with the Codex App's
 own `<heartbeat>` block deciding `DONT_NOTIFY`. The App hides the block; Claude
@@ -299,6 +300,21 @@ Limits that always apply:
 For research, review or splitting up one task, Claude's own Agent tool is faster
 and cheaper: the tool descriptions steer Claude to use the leader tools only when
 you want separate chats.
+
+## Background commands
+
+A Bash command Claude runs in the background, such as a dev server, a watcher
+or a long build, keeps showing its output in the command item of the Bash call
+that started it, also after the turn has ended. Stopping the App's background
+terminals stops these commands too.
+
+Claude Code 2.1.285 and later stops a background command in an Agent SDK
+session, which is how the adapter runs Claude, after a time limit: 30 minutes,
+or the `timeout` Claude gave the command, up to 2 hours. Commands started from
+Claude Code in a terminal have no such limit. A command that was stopped,
+failed or reached its time limit ends its item with Claude Code's note on how
+it ended, for example
+`[Background command "npm run dev" was stopped after reaching its background time limit]`.
 
 ## Localhost GUI testing on macOS
 

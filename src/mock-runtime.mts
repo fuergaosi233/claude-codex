@@ -954,7 +954,9 @@ export class MockRuntime implements ClaudeRuntime {
 
     if (/background shell check/i.test(context.prompt)) {
       // A Bash call Claude runs in the background: the call returns at once
-      // and the shell stays live until it is stopped.
+      // and the shell stays live until it is stopped. "With output" has it
+      // print a line after the turn ended.
+      const withOutput = /with output/i.test(context.prompt)
       const toolUseId = `shell-${Date.now()}`
       const taskId = `bash-${this.shells.size + 1}`
       await handlers.onEvent({
@@ -971,6 +973,17 @@ export class MockRuntime implements ClaudeRuntime {
       })
       await handlers.onEvent({ type: 'text_delta', delta: 'dev server started' })
       await handlers.onEvent({ type: 'completed', success: true, result: 'started' })
+      if (withOutput) {
+        const { threadId } = context
+        setTimeout(() => {
+          void this.listener?.onTaskEvent(threadId, {
+            type: 'task_output',
+            taskId,
+            toolUseId,
+            delta: '\nready on :3000\n',
+          })
+        }, 50)
+      }
       return
     }
 
@@ -1105,6 +1118,29 @@ export class MockRuntime implements ClaudeRuntime {
       await handlers.onEvent({ type: 'tool_result', toolUseId, content: 'review done' })
       await handlers.onEvent({ type: 'text_delta', delta: 'workflow finished' })
       await handlers.onEvent({ type: 'completed', success: true, result: 'workflow finished' })
+      return
+    }
+
+    if (/subagent effort check/i.test(context.prompt)) {
+      // An agent asked to run on its own model and effort, and a fork asked
+      // the same: Claude ignores both inputs for a fork.
+      const ownId = `task-own-${Date.now()}`
+      const forkId = `task-fork-${Date.now()}`
+      const namedForkId = `task-named-fork-${Date.now()}`
+      for (const [toolUseId, input] of [
+        [ownId, { prompt: 'own agent', subagent_type: 'reviewer', model: 'opus', effort: 'max' }],
+        [forkId, { prompt: 'fork agent', subagent_type: 'fork', model: 'haiku', effort: 'low' }],
+        [namedForkId, { prompt: 'named fork', subagent_type: 'Fork', model: 'haiku' }],
+      ] as const) {
+        await handlers.onEvent({ type: 'tool_use', toolUseId, toolName: 'Agent', input })
+        await handlers.onEvent({
+          type: 'tool_result',
+          toolUseId,
+          content: `${input.prompt} report`,
+        })
+      }
+      await handlers.onEvent({ type: 'text_delta', delta: 'both agents reported' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'efforts' })
       return
     }
 

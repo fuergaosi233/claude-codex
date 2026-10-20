@@ -271,6 +271,14 @@ export const APP_RULES: readonly AppRule[] = [
     verify:
       'On a remote host with the switch on, start a chat and ask Claude to list the chat artifacts: a dynamic tool call card shows the App tool and its result.',
   },
+  {
+    id: 'command-output-after-completion',
+    app: 'Appends item/commandExecution/outputDelta to the commandExecution item with that id in whichever turn of the thread holds it, completed or not, keeping the last 20000 characters behind an `[output truncated]` line, and drops a delta whose item it cannot find.',
+    adapter:
+      "Streams a background shell's output into the completed item of the Bash call that started it, also after its turn ended, and stores it cut the same way.",
+    verify:
+      'Ask Claude to start a background command that prints a line every second: after the turn ends, its command item keeps showing new lines.',
+  },
 ]
 
 // The methods the App starts calling, or sends new parameters to, once the

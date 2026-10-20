@@ -108,18 +108,35 @@ class FakeQuery implements AsyncIterable<Record<string, unknown>> {
   }
 }
 
+// A session whose CLI answers get_task_output with what each task in
+// `outputs` printed so far.
+class ShellQuery extends FakeQuery {
+  readonly outputs = new Map<string, string>()
+  reads = 0
+
+  async getTaskOutput(taskId: string): Promise<unknown> {
+    this.reads += 1
+    const output = this.outputs.get(taskId)
+    if (output === undefined) throw new Error(`No task found with ID: ${taskId}`)
+    return { output, total_bytes: Buffer.byteLength(output), truncated: false }
+  }
+}
+
 interface RecordingListener extends RuntimeBackgroundListener {
   tasks: RuntimeTaskEvent[]
   autonomous: string[]
   released: { threadId: string; liveTaskIds: string[] }[]
 }
 
-function fakeRuntime(): { runtime: NativeClaudeRuntime; queries: FakeQuery[] } {
+function fakeRuntime<Q extends FakeQuery = FakeQuery>(
+  create: (prompt: AsyncIterable<Record<string, unknown>>) => Q = (prompt) =>
+    new FakeQuery(prompt) as Q,
+): { runtime: NativeClaudeRuntime; queries: Q[] } {
   const runtime = new NativeClaudeRuntime()
-  const queries: FakeQuery[] = []
+  const queries: Q[] = []
   Reflect.set(runtime, 'sdk', {
     query: ({ prompt }: { prompt: AsyncIterable<Record<string, unknown>> }) => {
-      const query = new FakeQuery(prompt)
+      const query = create(prompt)
       queries.push(query)
       return query
     },
@@ -1320,4 +1337,246 @@ test('native turn the session no longer holds as current ends when the session d
   await waitFor(() => listener.released.length === 1, 'session release')
   await turn
   await runtime.stop()
+})
+
+function withCommandOutputPollMs<T>(ms: number, run: () => Promise<T>): Promise<T> {
+  const previous = process.env.CLAUDE_CODEX_COMMAND_OUTPUT_POLL_MS
+  process.env.CLAUDE_CODEX_COMMAND_OUTPUT_POLL_MS = String(ms)
+  return run().finally(() => {
+    if (previous === undefined) delete process.env.CLAUDE_CODEX_COMMAND_OUTPUT_POLL_MS
+    else process.env.CLAUDE_CODEX_COMMAND_OUTPUT_POLL_MS = previous
+  })
+}
+
+function bash(id: string, command: string, background = false) {
+  return {
+    type: 'tool_use',
+    id,
+    name: 'Bash',
+    input: { command, ...(background ? { run_in_background: true } : {}) },
+  }
+}
+
+// The CLI made the Bash call `toolUseId` a task: at once in the background,
+// after about two seconds in the foreground.
+function bashTask(taskId: string, toolUseId: string, backgrounded: boolean) {
+  return {
+    type: 'system',
+    subtype: 'task_started',
+    task_id: taskId,
+    tool_use_id: toolUseId,
+    task_type: 'local_bash',
+    description: 'command',
+    is_backgrounded: backgrounded,
+  }
+}
+
+function toolResult(toolUseId: string, content: string, parent: string | null = null) {
+  return {
+    type: 'user',
+    parent_tool_use_id: parent,
+    message: { content: [{ type: 'tool_result', tool_use_id: toolUseId, content }] },
+  }
+}
+
+function outputDeltas(events: RuntimeEvent[], toolUseId: string): string[] {
+  return events.flatMap((event) =>
+    event.type === 'tool_output_delta' && event.toolUseId === toolUseId ? [event.delta] : [],
+  )
+}
+
+test('native streams the output of each running Bash command to its own call', async () => {
+  await withCommandOutputPollMs(5, async () => {
+    const { runtime, queries } = fakeRuntime((prompt) => new ShellQuery(prompt))
+    const events: RuntimeEvent[] = []
+    const turn = runtime.runTurn(context, handlers(events))
+    const query = await waitFor(() => queries[0], 'session')
+    query.outputs.set('t1', 'compiling\n')
+    query.outputs.set('t2', 'testing\n')
+    query.outputs.set('t3', 'inner\n')
+    query.push(
+      assistant('m1', [
+        { type: 'tool_use', id: 'agent-1', name: 'Agent', input: { prompt: 'look' } },
+        bash('bash-a', 'make'),
+        bash('bash-b', 'npm test'),
+      ]),
+      {
+        type: 'assistant',
+        parent_tool_use_id: 'agent-1',
+        message: { id: 'sub-1', content: [bash('bash-inner', 'ls')] },
+      },
+      bashTask('t1', 'bash-a', false),
+      bashTask('t2', 'bash-b', false),
+      bashTask('t3', 'bash-inner', false),
+    )
+    await waitFor(
+      () => outputDeltas(events, 'bash-a').length === 1 && outputDeltas(events, 'bash-b').length,
+      'first output',
+    )
+    query.outputs.set('t1', 'compiling\nlinking\n')
+    await waitFor(() => outputDeltas(events, 'bash-a').length === 2, 'more output')
+    query.push(
+      toolResult('bash-a', 'compiling\nlinking\n'),
+      toolResult('bash-b', 'testing\n'),
+      toolResult('bash-inner', 'inner\n', 'agent-1'),
+      toolResult('agent-1', 'report'),
+      assistant('m2', [text('done')]),
+      { type: 'result', subtype: 'success', result: 'done' },
+    )
+    await turn
+
+    assert.deepEqual(outputDeltas(events, 'bash-a'), ['compiling\n', 'linking\n'])
+    assert.deepEqual(outputDeltas(events, 'bash-b'), ['testing\n'])
+    // A subagent's own commands stay inside it.
+    assert.deepEqual(outputDeltas(events, 'bash-inner'), [])
+    const order = events.flatMap((event) =>
+      event.type === 'tool_output_delta' || event.type === 'tool_result'
+        ? [`${event.type}:${event.toolUseId}`]
+        : [],
+    )
+    assert.ok(
+      order.lastIndexOf('tool_output_delta:bash-a') < order.indexOf('tool_result:bash-a'),
+      'output streams before the result',
+    )
+    await runtime.stop()
+  })
+})
+
+test('native without get_task_output shows Bash output only with the result', async () => {
+  await withCommandOutputPollMs(5, async () => {
+    const { runtime, queries } = fakeRuntime()
+    const events: RuntimeEvent[] = []
+    const turn = runtime.runTurn(context, handlers(events))
+    const query = await waitFor(() => queries[0], 'session')
+    query.push(assistant('m1', [bash('bash-a', 'make')]), bashTask('t1', 'bash-a', false))
+    await sleep(30)
+    query.push(toolResult('bash-a', 'built\n'), assistant('m2', [text('done')]), {
+      type: 'result',
+      subtype: 'success',
+      result: 'done',
+    })
+    await turn
+    assert.deepEqual(
+      events.filter((event) => event.type === 'tool_output_delta'),
+      [],
+    )
+    await runtime.stop()
+  })
+})
+
+test('native background shell reports its output to the thread after its call returned, and how it ended', async () => {
+  await withCommandOutputPollMs(5, async () => {
+    const { runtime, queries } = fakeRuntime((prompt) => new ShellQuery(prompt))
+    const listener = recordingListener()
+    runtime.setBackgroundListener(listener)
+    const events: RuntimeEvent[] = []
+    const turn = runtime.runTurn(context, handlers(events))
+    const query = await waitFor(() => queries[0], 'session')
+    query.outputs.set('b1', '')
+    query.push(
+      assistant('m1', [bash('bash-bg', 'npm run dev', true)]),
+      bashTask('b1', 'bash-bg', true),
+      toolResult('bash-bg', 'Command running in background with ID: b1'),
+      assistant('m2', [text('started')]),
+      { type: 'result', subtype: 'success', result: 'started' },
+    )
+    await turn
+    assert.equal(runtime.hasBackgroundWork(), true)
+
+    const shellOutput = () =>
+      listener.tasks.flatMap((event) => (event.type === 'task_output' ? [event] : []))
+    query.outputs.set('b1', 'ready on :3000\n')
+    await waitFor(() => shellOutput().length === 1, 'shell output')
+    assert.deepEqual(shellOutput(), [
+      { type: 'task_output', taskId: 'b1', toolUseId: 'bash-bg', delta: '\nready on :3000\n' },
+    ])
+
+    const limit =
+      'Background command "npm run dev" was stopped after reaching its background time limit'
+    query.push({
+      type: 'system',
+      subtype: 'task_notification',
+      task_id: 'b1',
+      status: 'stopped',
+      summary: limit,
+    })
+    await waitFor(() => shellOutput().length === 2, 'end note')
+    assert.equal(shellOutput()[1]?.delta, `[${limit}]\n`)
+    // None of it went to the turn, which had ended.
+    assert.deepEqual(outputDeltas(events, 'bash-bg'), [])
+    await runtime.stop()
+  })
+})
+
+test('native stops reading a background shell when its idle session closes or the adapter stops', async () => {
+  const previous = process.env.CLAUDE_CODEX_BACKGROUND_IDLE_MS
+  process.env.CLAUDE_CODEX_BACKGROUND_IDLE_MS = '150'
+  try {
+    await withCommandOutputPollMs(5, async () => {
+      for (const ending of ['idle', 'stop'] as const) {
+        const { runtime, queries } = fakeRuntime((prompt) => new ShellQuery(prompt))
+        const listener = recordingListener()
+        runtime.setBackgroundListener(listener)
+        const turn = runtime.runTurn(context, handlers([]))
+        const query = await waitFor(() => queries[0], 'session')
+        query.outputs.set('b1', 'ready\n')
+        query.push(
+          assistant('m1', [bash('bash-bg', 'npm run dev', true)]),
+          bashTask('b1', 'bash-bg', true),
+          toolResult('bash-bg', 'Command running in background with ID: b1'),
+          { type: 'result', subtype: 'success', result: 'started' },
+        )
+        await turn
+        await waitFor(() => listener.tasks.some((event) => event.type === 'task_output'), 'output')
+        // Reading the shell's output is no activity: the session still
+        // closes once it has been idle for its time.
+        if (ending === 'idle') await waitFor(() => query.closed, 'idle close')
+        else await runtime.stop()
+        await sleep(20)
+        const reads = query.reads
+        await sleep(60)
+        assert.equal(query.reads, reads, `no reads after ${ending}`)
+        await runtime.stop()
+      }
+    })
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_CODEX_BACKGROUND_IDLE_MS
+    else process.env.CLAUDE_CODEX_BACKGROUND_IDLE_MS = previous
+  }
+})
+
+test('native with CLAUDE_CODEX_COMMAND_OUTPUT_POLL_MS=0 never reads command output', async () => {
+  await withCommandOutputPollMs(0, async () => {
+    const { runtime, queries } = fakeRuntime((prompt) => new ShellQuery(prompt))
+    const listener = recordingListener()
+    runtime.setBackgroundListener(listener)
+    const events: RuntimeEvent[] = []
+    const turn = runtime.runTurn(context, handlers(events))
+    const query = await waitFor(() => queries[0], 'session')
+    query.outputs.set('t1', 'compiling\n')
+    query.outputs.set('b1', 'ready\n')
+    query.push(
+      assistant('m1', [bash('bash-a', 'make'), bash('bash-bg', 'npm run dev', true)]),
+      bashTask('t1', 'bash-a', false),
+      bashTask('b1', 'bash-bg', true),
+    )
+    await sleep(30)
+    query.push(
+      toolResult('bash-a', 'compiling\n'),
+      toolResult('bash-bg', 'Command running in background with ID: b1'),
+      { type: 'result', subtype: 'success', result: 'done' },
+    )
+    await turn
+    await sleep(30)
+    assert.equal(query.reads, 0)
+    assert.deepEqual(
+      events.filter((event) => event.type === 'tool_output_delta'),
+      [],
+    )
+    assert.deepEqual(
+      listener.tasks.filter((event) => event.type === 'task_output'),
+      [],
+    )
+    await runtime.stop()
+  })
 })

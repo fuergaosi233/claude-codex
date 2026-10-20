@@ -25,6 +25,7 @@ import {
   reportedClaudeModel,
 } from './claude-models.mjs'
 import { runCodexNotify } from './codex-notify.mjs'
+import { appendCommandOutput } from './command-output.mjs'
 import {
   DYNAMIC_TOOL_CANCELLED,
   DYNAMIC_TOOL_REQUEST_FAILED,
@@ -148,6 +149,7 @@ import {
   simpleDiff,
   stringListFromEnv,
   stringOr,
+  subagentEffortFromInput,
   summarizeInjectedItem,
   summarizeRpcParams,
   threadPermissionProfileId,
@@ -334,6 +336,8 @@ type SubagentActivityKind = 'started' | 'interacted' | 'interrupted' | 'complete
 const DETACHED_PEER: RpcPeer = { id: 'detached', send: () => {}, close: () => {} }
 
 const MAX_TRACKED_TASK_IDS = 512
+// Command items a background shell's later output may still go to.
+const MAX_TRACKED_COMMAND_ITEMS = 512
 const MAX_QUEUED_ACTIVITY = 64
 
 // A hidden goal continuation that does no tool work ends the run of
@@ -451,6 +455,8 @@ export class CodexClaudeAppServer {
   private backgroundSubagents = new Map<string, BackgroundSubagent>()
   // task_started precedes the Agent tool result that backgrounds the task.
   private taskIdByToolUse = new Map<string, string>()
+  // Bash command items by tool use id.
+  private commandItems = new Map<string, { threadId: string; turnId: string; itemId: string }>()
   // SendMessage and TaskStop calls addressed to a known agent, by tool use id.
   private pendingAgentCalls = new Map<
     string,
@@ -4335,8 +4341,17 @@ export class CodexClaudeAppServer {
             const promptText = String(event.input.prompt ?? event.input.description ?? '')
             const subType =
               typeof event.input.subagent_type === 'string' ? event.input.subagent_type : null
+            // A fork runs on its parent's model and effort; Claude ignores
+            // the Agent tool's model and effort inputs for it. Claude matches
+            // the agent type ignoring case.
+            const forkSubagent = subType?.trim().toLowerCase() === 'fork'
             const subagentModel =
-              typeof event.input.model === 'string' ? event.input.model : thread.model
+              !forkSubagent && typeof event.input.model === 'string'
+                ? event.input.model
+                : thread.model
+            const subagentEffort =
+              (forkSubagent ? null : subagentEffortFromInput(event.input.effort)) ??
+              thread.reasoningEffort
             const childThreadId = newThreadId()
             // The id's random tail: its head is a timestamp, shared by agents
             // spawned in the same millisecond.
@@ -4357,7 +4372,7 @@ export class CodexClaudeAppServer {
               archived: false,
               cwd: thread.cwd,
               model: subagentModel,
-              reasoningEffort: thread.reasoningEffort,
+              reasoningEffort: subagentEffort,
               modelProvider: thread.modelProvider,
               claudeSessionId: null,
               source: normalizeSessionSource(thread.source),
@@ -4441,7 +4456,7 @@ export class CodexClaudeAppServer {
             // (strict enum: none|minimal|low|medium|high|xhigh|max). Same Oops trap as
             // threadSource — an empty string from a sloppy resume crashes the App.
             // Normalize here once and reuse for every stage of the lifecycle.
-            const collabEffort = normalizeReasoningEffortEnum(thread.reasoningEffort)
+            const collabEffort = normalizeReasoningEffortEnum(subagentEffort)
             const spawnBegin: ThreadItem = {
               type: 'collabAgentToolCall',
               id: spawnId,
@@ -4826,6 +4841,8 @@ export class CodexClaudeAppServer {
             itemIds.set(event.toolUseId, item.id)
             itemStartedAtMs.set(item.id, nowMillis())
             openToolItems.add(item.id)
+            if (item.type === 'commandExecution')
+              this.rememberCommandItem(event.toolUseId, thread.id, turn.id, item.id)
             this.store.appendItem(turn.id, item)
             this.notify(peer, {
               method: 'item/started',
@@ -4846,11 +4863,15 @@ export class CodexClaudeAppServer {
           }
           if (event.type === 'tool_output_delta') {
             const itemId = itemIds.get(event.toolUseId)
-            if (!itemId) return
+            // Output that comes after the result is not the item's any more.
+            if (!itemId || !openToolItems.has(itemId)) return
             commandOutputSeen.add(itemId)
             this.store.updateItem(turn.id, itemId, (item) => {
               if (item.type === 'commandExecution') {
-                return { ...item, aggregatedOutput: `${item.aggregatedOutput ?? ''}${event.delta}` }
+                return {
+                  ...item,
+                  aggregatedOutput: appendCommandOutput(item.aggregatedOutput, event.delta),
+                }
               }
               return item
             })
@@ -4879,7 +4900,12 @@ export class CodexClaudeAppServer {
                 return {
                   ...item,
                   status: event.isError ? 'failed' : 'completed',
-                  aggregatedOutput: item.aggregatedOutput ?? resultText,
+                  // The result has all of the output, where what streamed in
+                  // may have skipped some.
+                  aggregatedOutput:
+                    commandOutputSeen.has(itemId) && resultText
+                      ? resultText
+                      : (item.aggregatedOutput ?? resultText),
                   exitCode: parsedExitCode,
                   durationMs,
                 }
@@ -5838,7 +5864,47 @@ export class CodexClaudeAppServer {
     }
   }
 
+  private rememberCommandItem(
+    toolUseId: string,
+    threadId: string,
+    turnId: string,
+    itemId: string,
+  ): void {
+    this.commandItems.set(toolUseId, { threadId, turnId, itemId })
+    if (this.commandItems.size > MAX_TRACKED_COMMAND_ITEMS) {
+      const oldest = this.commandItems.keys().next().value
+      if (oldest !== undefined) this.commandItems.delete(oldest)
+    }
+  }
+
+  // A background shell goes on printing after its Bash call returned and the
+  // call's item completed, maybe after its turn ended. The App appends the
+  // output to that item wherever it is.
+  // App rule: command-output-after-completion
+  private appendBackgroundOutput(
+    threadId: string,
+    event: Extract<RuntimeTaskEvent, { type: 'task_output' }>,
+  ): void {
+    const at = this.commandItems.get(event.toolUseId)
+    if (!at || at.threadId !== threadId || !event.delta) return
+    let found = false
+    this.store.updateItem(at.turnId, at.itemId, (item) => {
+      if (item.type !== 'commandExecution') return item
+      found = true
+      return { ...item, aggregatedOutput: appendCommandOutput(item.aggregatedOutput, event.delta) }
+    })
+    if (!found) return
+    this.notify(this.peerForThread(threadId), {
+      method: 'item/commandExecution/outputDelta',
+      params: { threadId, turnId: at.turnId, itemId: at.itemId, delta: event.delta },
+    })
+  }
+
   private handleTaskEvent(threadId: string, event: RuntimeTaskEvent): void {
+    if (event.type === 'task_output') {
+      this.appendBackgroundOutput(threadId, event)
+      return
+    }
     if (event.type === 'task_started') {
       if (!event.toolUseId) return
       const entry = this.findBackgroundSubagent(threadId, { toolUseId: event.toolUseId })
