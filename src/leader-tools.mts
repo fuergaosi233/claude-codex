@@ -25,6 +25,15 @@ export const LEADER_MAX_DEPTH = 1
 
 // The tools that only look. Plan mode allows these and nothing else.
 export const LEADER_READ_ONLY_TOOLS = ['thread_list', 'thread_read', 'thread_wait'] as const
+// The Codex App thread tools the leader tools stand in for (thread_start,
+// thread_list, thread_read, thread_wait and thread_prompt).
+export const LEADER_APP_THREAD_TOOLS = [
+  'create_thread',
+  'list_threads',
+  'read_thread',
+  'wait_threads',
+  'send_message_to_thread',
+] as const
 
 const DEFAULT_MAX_RUNNING = 4
 const DEFAULT_WAIT_SECONDS = 300

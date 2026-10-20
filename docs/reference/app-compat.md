@@ -55,6 +55,11 @@ line a rule touches.
 | `error-codes` | reads `codexErrorInfo`: `serverOverloaded` shows "Server is busy", `usageLimitExceeded` opens a ChatGPT plan upgrade card, `cyberPolicy` a safety notice | a turn the overloaded API ends says the server is busy |
 | `thread-git-info` | shows `gitInfo.branch` in the sidebar, looks the workspace up itself when `thread/start` answers with none, replaces what it knows with the `thread/resume` answer, and sets the branch it creates with `thread/metadata/update` | after an App restart, a Claude chat in a repository still shows its branch in the sidebar |
 | `context-gauge` | fills the context gauge from the latest `thread/tokenUsage/updated` as `last.totalTokens` over `modelContextWindow`, and hides it when either is null | in a chat that has finished a turn, the gauge moves during a long turn instead of jumping at its end |
+| `collaboration-modes` | enables `/plan` and the Plan toggle only when `collaborationMode/list` has a `plan` preset, sends the mode with the picker's model and effort in `collaborationMode.settings` (top-level `model` and `effort` null on `turn/start`), and adopts the mode `thread/settings/updated` and `thread/resume` report | in a Claude chat `/plan` is enabled, and the Plan toggle stays on after a message |
+| `plan-implementation` | asks "Implement this plan?" when a completed turn has a non-empty `plan` item, and sends the plan back as a default-mode turn when accepted | a plan asked for in Plan mode shows as one card, followed by the prompt |
+| `skill-injection` | sends a skill picked in the composer as a `[$name](path)` link, and one picked from a plugin or setup card as a `skill` input item | Claude follows a picked skill without reading its file first; the message shows only the chip |
+| `additional-context` | attaches `additionalContext` entries (`untrusted` or `application`) to `turn/start` and `turn/steer`, for example after connecting a suggested plugin, and keeps them out of the user's message | the turn after connecting a plugin uses the context; the message shows none of it |
+| `app-tool-availability` | writes developer instructions describing its own tools (`create_thread`, `automation_update`, `create_worktree`, …) and gives them to Codex threads only | asked for a new thread or worktree, Claude points to the App; tool names new in the build's instructions are added to the list in `src/turn-context.mts` |
 | `prewarmed-threads` | starts a new chat's thread before anything is sent, hides it from `thread/list` until its first `turn/start`, and forgets it when the connection drops or the App quits; sends the first message there whatever model was picked meanwhile | after an adapter restart, a new chat left empty does not show in the sidebar; a new chat sent on a model of the other backend runs on it |
 | `file-change-preview` | replaces a `fileChange` item's changes with each `item/fileChange/patchUpdated`, adding the item if it has none of that id, and redraws its card while it is in progress; the approval card shows the changes the item holds | a long new file Claude writes shows up and grows while Claude writes it, and the approval shows the whole file |
 | `memories-settings` | shows its Memories settings and `/memories` only while `experimentalFeature/list` lists `memories` enabled; sets `memories: false` for the connection with `experimentalFeature/enablement/set`; writes `features.memories` and the `memories.*` switches with `config/batchWrite` and reads them from `config/read`; sends a chat's switch as `memories.*` config on `thread/start` or as `thread/memoryMode/set`; Delete calls `memory/reset` | with `CLAUDE_CODEX_MEMORIES=1` and Memories turned on in Settings > Personalization, the switch survives a reload and `/memories` shows in a chat; without the switch, no Memories settings show |
@@ -63,6 +68,11 @@ line a rule touches.
 | `explored-commands` | folds command items whose `commandActions` are all `read`, `listFiles` or `search` into one "Explored" row, and shows an item with no actions, an `unknown` one or a declined one as its command | Claude's Read, Grep and Glob calls and a `cat` or `rg` it runs fold into one "Explored" row |
 | `command-approval-actions` | shows a command approval as the commands of its `commandActions` joined with `&&` in place of `command`, and offers its own decisions whatever `availableDecisions` says | with approvals on, the card for `cat README.md && touch x` shows the whole command |
 | `item-completed-replaces` | replaces the item with the same id on `item/completed`, whatever type it started as | an image Read of a missing file shows as the failed Read, not an empty image |
+| `command-approval-card` | draws a command approval from its params alone, but a file change approval only for a `fileChange` item with the request's `itemId` | a WebFetch approval in a Claude chat names the tool and the URL |
+| `command-approval-amendment` | offers "Allow similar commands" on a command approval whenever `proposedExecpolicyAmendment` is an array, whatever `availableDecisions` lists, and answers `acceptWithExecpolicyAmendment` with that array | after "Allow similar commands" for `npm test`, the project's `.claude/settings.local.json` allows `Bash(npm test *)` and the next `npm test` does not ask |
+| `mcp-tool-approval` | draws an `mcpServer/elicitation/request` with `_meta.codex_approval_kind` `mcp_tool_call` as a tool approval card, offering "Allow for this session" and "Always allow" as `_meta.persist` lists them, and answers with `_meta.persist` `session` or `always` | an MCP tool call asks to allow the server to run the tool; after "Allow for this session" the next call does not ask; after "Always allow" the project's `.claude/settings.local.json` allows `mcp__<server>__<tool>` |
+| `declined-tool-items` | shows a `commandExecution` or `fileChange` item with status `declined` as declined, without output or an exit code | a declined command shows as declined and Claude goes on; a cancelled one stops the turn |
+| `auto-review` | sends its auto-review preset as `approvalsReviewer` `guardian_subagent` (`auto_review` in newer builds), sets its picker from the `approvalsReviewer` of thread responses and `thread/settings/updated`, and draws `item/autoApprovalReview/completed` as a review card on the item named by `targetItemId` | on a model with auto mode the picker stays on auto-review and a call Claude's classifier blocks shows as declined with its reason; on one without, the picker goes back to the default with a config warning |
 
 The full text of each rule, including the adapter side, is in
 `src/app-compat.mts`.
@@ -207,7 +217,7 @@ answers in a particular way:
 | Gate | With it on, the App… | The adapter… |
 | --- | --- | --- |
 | `turnToolOutput` | sends a thread handoff or a message from another thread as `turn/start` with empty `input` and the text in `toolOutput` | prompts Claude with it and records a `functionCallOutput` item (rule `tool-output-turns`) |
-| `turnApprovalsReviewer` | follows a permission change during a turn with `turn/settings/update` carrying the new `approvalsReviewer` | accepts `user`, the only reviewer it has; any other is rejected, which the App only logs |
+| `turnApprovalsReviewer` | follows a permission change during a turn with `turn/settings/update` carrying the new `approvalsReviewer` | switches the running session into or out of Claude Code's auto mode, and keeps the reviewer for the thread's later turns (rule `auto-review`) |
 | `threadTimeline` | can read history with `thread/timeline/list`, newest page first | pages from the newest entry back |
 | `mcpServerStatusByName` | passes `serverName` to `mcpServerStatus/list` | lists only that server |
 | `mcpResourceReadOriginCallId` | checks `originCallId` on a resource read from a hosted app | answers `null`; Claude's MCP servers are not hosted apps |
@@ -227,13 +237,18 @@ which the bundle does not show and which can change without an App release:
   on as well. Otherwise the App reads `thread/turns/list`, as before. The
   adapter serves both.
 - **`threadAttachments`** adds the worktree tools (`create_worktree`,
-  `attach_worktree`, `list_artifacts` and others) to `thread/start` as
-  `dynamicTools`. The adapter offers dynamic tools to Claude only with
-  `CLAUDE_CODEX_DYNAMIC_TOOLS=1` (see [App tools](/guide/gui#app-tools)). With
-  one more flag on, the App starts a chat in worktree mode in the local
-  checkout and leaves creating the worktree to the agent's `create_worktree`
-  call, so with Claude and the switch off the task would run in the local
-  checkout. If that happens, turn the switch on or set
+  `attach_worktree`, `get_worktree_creation_status` and others) to the App's
+  own tools for `thread/start`. On a local host it names them in `config`
+  (`enabled_tools` of the bundled `codex_app` MCP server, which Codex runs);
+  only on a remote host does it send them as `dynamicTools`. The adapter offers
+  dynamic tools to Claude only with `CLAUDE_CODEX_DYNAMIC_TOOLS=1` (see
+  [App tools](/guide/gui#app-tools)). The App's developer instructions, which
+  describe these tools, are followed by a note naming the ones Claude lacks
+  (rule `app-tool-availability`). With one
+  more flag on, the App starts a chat in worktree mode in the local checkout
+  and leaves creating the worktree to the agent's `create_worktree` call, so
+  with Claude and the switch off the task would run in the local checkout. If
+  that happens, turn the switch on or set
   `CLAUDE_CODEX_COMPAT_VERSION` below `0.155.0-alpha.2`. Archiving and the
   worktree cleanup do not need a ChatGPT sign-in: the App takes the owner from
   `account/read`, and `requiresOpenaiAuth: false` there is enough.

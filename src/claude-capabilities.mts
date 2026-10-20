@@ -47,12 +47,22 @@ interface HooksListEntry {
   readonly errors: ReadonlyArray<{ readonly path: string; readonly message: string }>
 }
 
+function userSkillDir(): string {
+  return join(bridgedClaudeConfigDir() ?? join(homedir(), '.claude'), 'skills')
+}
+
+function repoSkillDirs(cwd: string): string[] {
+  return claudeSkillFolders(cwd).map((dir) => join(dir, '.claude', 'skills'))
+}
+
+// The folders skills/list reads skills from for `cwd`.
+export function claudeSkillDirs(cwd: string): string[] {
+  return [userSkillDir(), ...repoSkillDirs(cwd)]
+}
+
 export function listClaudeSkills(params: Record<string, unknown>): SkillsListEntry[] {
   const roots = cwdsFromParams(params)
-  const userSkills = readSkillDir(
-    join(bridgedClaudeConfigDir() ?? join(homedir(), '.claude'), 'skills'),
-    'user',
-  )
+  const userSkills = readSkillDir(userSkillDir(), 'user')
   const builtins = listClaudeCommands().map(
     (command): SkillMetadata => ({
       name: command.name,
@@ -64,9 +74,7 @@ export function listClaudeSkills(params: Record<string, unknown>): SkillsListEnt
     }),
   )
   return roots.map((cwd) => {
-    const repo = claudeSkillFolders(cwd).map((dir) =>
-      readSkillDir(join(dir, '.claude', 'skills'), 'repo'),
-    )
+    const repo = repoSkillDirs(cwd).map((dir) => readSkillDir(dir, 'repo'))
     return {
       cwd,
       skills: [...userSkills.skills, ...repo.flatMap((entry) => entry.skills), ...builtins],

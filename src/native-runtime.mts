@@ -78,6 +78,7 @@ import {
 import { autoMemoryEnv } from './memories.mjs'
 import { resolveClaudeModelProcess } from './model-profiles.mjs'
 import { echoedUuids, TurnInput, type TurnInputMessage } from './native-turn-input.mjs'
+import { appliedPermissionUpdates, permissionSuggestions } from './permission-suggestions.mjs'
 import { sdkHooks } from './sdk-hooks.mjs'
 import { readTaskResult } from './task-output.mjs'
 import { ToolInputPreviews } from './tool-input-preview.mjs'
@@ -117,6 +118,29 @@ type Zod = typeof import('zod')
 
 // In-process MCP server carrying Codex's thread-goal tools.
 const GOAL_MCP_SERVER = 'codex_goal'
+// The goal tools by the names Claude calls them, approved without asking.
+// Whole names: a server named `codex_goal__x` has tools that start the same.
+const GOAL_TOOL_NAMES = new Set(
+  ['get_goal', 'create_goal', 'update_goal'].map((tool) => `mcp__${GOAL_MCP_SERVER}__${tool}`),
+)
+// The chats leader tools likewise; a plan may only use the ones that look.
+const leaderToolName = (tool: string) => `mcp__${LEADER_MCP_SERVER}__${tool}`
+const LEADER_TOOL_NAMES = new Set(
+  ['thread_list', 'thread_start', 'thread_prompt', 'thread_wait', 'thread_read'].map(
+    leaderToolName,
+  ),
+)
+const LEADER_PLAN_TOOL_NAMES = new Set(LEADER_READ_ONLY_TOOLS.map(leaderToolName))
+
+// What Claude reads back from ExitPlanMode in plan mode. The App shows the
+// plan as a card and asks the user whether to implement it after the turn
+// ends, so Claude must stop here rather than retry or start the work.
+const PLAN_DELIVERED_MESSAGE =
+  'The plan was delivered to the user, who will decide in the app whether to implement it. ' +
+  'You are still in plan mode: do not call ExitPlanMode again and do not start implementing. ' +
+  'End your turn now, with at most one short sentence.'
+const PLAN_MISSING_MESSAGE =
+  'There is no plan to present yet. Write the plan to the plan file, then call ExitPlanMode again.'
 
 interface PendingTurn {
   context: RuntimeTurnContext
@@ -267,6 +291,9 @@ interface LiveSession {
   // Serializes message routing with turn attachment so a turn never misses
   // or reorders the messages that precede it.
   chain: Promise<void>
+  // Settles once the first prompt is sent, when the session has to switch
+  // permission modes first; a steer must not overtake it.
+  firstPrompt: Promise<void> | null
   closed: boolean
 }
 
@@ -387,6 +414,10 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }
     if (!pending) return false
     const session = pending.session
+    if (session.firstPrompt) {
+      await session.firstPrompt
+      if (session.closed) return false
+    }
     const uuid = this.send(session, this.buildUserMessage(prompt, options.imageInputs ?? []))
     if (!uuid) return false
     // Accepted once the CLI starts consuming it (command_lifecycle `started`)
@@ -422,10 +453,13 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       setModel?: (model?: string) => Promise<void>
       applyFlagSettings?: (settings: { effortLevel?: string | null }) => Promise<void>
     }
+    let modelSwitched = false
     if (settings.model && settings.model !== session.model) {
       if (!query.setModel) throw new Error('this Claude Code cannot switch models mid-turn')
       session.model = settings.model
       await sessionControl(query.setModel(settings.model), 'model switch')
+      forgetPermissionMode(session)
+      modelSwitched = true
     }
     if (settings.effort && settings.effort !== session.effort) {
       if (!query.applyFlagSettings)
@@ -436,6 +470,17 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         'effort change',
       )
     }
+    // The rest of the turn keeps the reviewer it switched to, and the mode is
+    // put back for the model it runs now.
+    // App rule: auto-review
+    if (settings.autoReview != null)
+      pending.context = { ...pending.context, autoReview: settings.autoReview }
+    if (settings.autoReview != null || modelSwitched)
+      await this.applyPermissionMode(
+        session,
+        { ...pending.context, model: session.model },
+        pending.handlers,
+      )
     return true
   }
 
@@ -837,9 +882,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         await end?.('other', budget)
       },
     })
-    let goalServer = false
     if (context.goalTools && this.zod && typeof sdk.createSdkMcpServer === 'function') {
-      goalServer = true
       opts.mcpServers = {
         ...((opts.mcpServers as Record<string, unknown> | undefined) ?? {}),
         [GOAL_MCP_SERVER]: goalToolServer(sdk, this.zod, context.goalTools),
@@ -863,9 +906,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         ),
       }
     }
-    let leaderServer = false
     if (context.leaderTools && this.zod && typeof sdk.createSdkMcpServer === 'function') {
-      leaderServer = true
       opts.mcpServers = {
         ...((opts.mcpServers as Record<string, unknown> | undefined) ?? {}),
         [LEADER_MCP_SERVER]: leaderToolServer(sdk, this.zod, context.leaderTools),
@@ -877,27 +918,13 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     // mode supersedes everything. Relay rejects the SDK's dangerous bypass
     // flag outside a recognized container sandbox, so App-level Full Access
     // stays in default mode and auto-allows through canUseTool below. An
-    // explicit env override can still opt into bypassPermissions.
+    // explicit env override can still opt into bypassPermissions. The mode is
+    // always named: newer Claude Code releases changed the default for SDK
+    // sessions that name none. Auto review switches to 'auto' after launch,
+    // once the model is known to support it.
     const mode = derivePermissionMode(context.approvalPolicy, context.sandboxMode, context.planMode)
     opts.permissionMode = mode
     if (mode === 'bypassPermissions') opts.allowDangerouslySkipPermissions = true
-    // Goal bookkeeping never needs the user's approval. canUseTool allows it
-    // where installed; a bare allowedTools entry there would shadow the
-    // callback and make the SDK warn on every session.
-    if (goalServer && mode === 'plan') {
-      opts.allowedTools = [
-        ...((opts.allowedTools as string[] | undefined) ?? []),
-        `mcp__${GOAL_MCP_SERVER}`,
-      ]
-    }
-    // Leader tools likewise, but a plan only looks: no starting or prompting
-    // other chats.
-    if (leaderServer && mode === 'plan') {
-      opts.allowedTools = [
-        ...((opts.allowedTools as string[] | undefined) ?? []),
-        ...LEADER_READ_ONLY_TOOLS.map((tool) => `mcp__${LEADER_MCP_SERVER}__${tool}`),
-      ]
-    }
 
     // Workflows are on by default except on Pro plans; the env switch turns
     // them on there too. It deliberately avoids --settings, which pinned
@@ -908,9 +935,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
 
     // Per-tool approval round-trip with Codex App. In App-level Full Access,
     // the bridge auto-allows every permission request without surfacing a UI
-    // prompt. Explicit SDK bypass omits the callback because Claude never calls
-    // it in that mode.
-    if (mode !== 'plan' && mode !== 'bypassPermissions') {
+    // prompt. Plan mode needs the callback too: it carries AskUserQuestion and
+    // ExitPlanMode to the App and allows goal bookkeeping (a bare allowedTools
+    // entry would shadow the callback and make the SDK warn on every
+    // session). Explicit SDK bypass omits it because Claude never calls it in
+    // that mode.
+    if (mode !== 'bypassPermissions') {
       opts.canUseTool = this.makeCanUseTool(sessionRef)
     }
     // MCP elicitations go to the App in every mode: they ask the user for
@@ -944,24 +974,53 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     return async (
       toolName: string,
       input: Record<string, unknown>,
-      options: { toolUseID?: string; signal: AbortSignal },
+      options: {
+        toolUseID?: string
+        signal: AbortSignal
+        decisionReason?: string
+        title?: string
+        blockedPath?: string
+        mcpServer?: { name: string; source: string }
+        suppressAlwaysAllowRule?: boolean
+        requiresUserInteraction?: boolean
+        suggestions?: unknown[]
+      },
     ): Promise<
-      { behavior: 'allow'; updatedInput?: unknown } | { behavior: 'deny'; message: string }
+      | { behavior: 'allow'; updatedInput?: unknown; updatedPermissions?: unknown[] }
+      | { behavior: 'deny'; message: string; interrupt?: boolean }
     > => {
-      if (toolName.startsWith(`mcp__${GOAL_MCP_SERVER}__`)) return { behavior: 'allow' }
-      // The chats leader tools start ask for their own approvals.
-      if (toolName.startsWith(`mcp__${LEADER_MCP_SERVER}__`)) return { behavior: 'allow' }
+      if (GOAL_TOOL_NAMES.has(toolName)) return { behavior: 'allow' }
+      const toolUseId = options.toolUseID || `tool-${newId()}`
+      // Claude Code says the user has to answer this ask themselves (the card
+      // is the tool's own interface, or its disclosure only shows locally): no
+      // policy of the thread answers it, in any mode, auto review included.
+      // App rule: auto-review
+      const userOnly = options.requiresUserInteraction === true
       const session = sessionRef()
       // As in Codex, a dynamic tool runs without an approval prompt: the
       // client that registered it answers the call.
       if (session && dynamicToolNames(session.lastContext).has(toolName))
         return { behavior: 'allow' }
-      const toolUseId = options.toolUseID || `tool-${newId()}`
+      // The chats leader tools start ask for their own approvals. A plan only
+      // looks: plan mode turns away starting or prompting another chat.
+      if (
+        LEADER_TOOL_NAMES.has(toolName) &&
+        (LEADER_PLAN_TOOL_NAMES.has(toolName) ||
+          !session ||
+          !plans(session.current?.context ?? session.lastContext))
+      )
+        return { behavior: 'allow' }
       const pending = session?.current
       if (!session || !pending || pending.resolved) {
         // A background task asked between turns. There is no turn to surface
         // an approval in, so only the thread's standing policy can answer.
-        if (session && toolName !== 'AskUserQuestion' && autoAllowsTools(session.lastContext)) {
+        if (
+          session &&
+          !userOnly &&
+          toolName !== 'AskUserQuestion' &&
+          !plans(session.lastContext) &&
+          autoAllowsTools(session.lastContext)
+        ) {
           return { behavior: 'allow' }
         }
         return { behavior: 'deny', message: 'no active turn to ask the user for approval' }
@@ -1000,13 +1059,18 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         }
       }
 
+      if (plans(context))
+        return this.planModeDecision(toolName, input, toolUseId, pending, userOnly)
+
       // Auto-allow when the App has selected Full Access / bypassPermissions —
       // matches the previous behaviour of skipping the canUseTool round-trip
       // entirely for those modes.
-      if (autoAllow) return { behavior: 'allow' }
-      if (readsWithin(toolName, input, context.readableRoots)) return { behavior: 'allow' }
+      if (!userOnly && autoAllow) return { behavior: 'allow' }
+      if (!userOnly && readsWithin(toolName, input, context.readableRoots))
+        return { behavior: 'allow' }
 
       const requestId = `${context.threadId}:${context.turnId}:${toolName}:${toolUseId}`
+      const suggestions = permissionSuggestions(options.suggestions)
       // Subagent-aware approval suppression: when Claude is mid-subagent we
       // still want THIS tool to be approved by the user (otherwise nested
       // tools would silently bypass approval). The server-side already
@@ -1020,6 +1084,13 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
             toolUseId,
             toolName,
             input,
+            reason: options.decisionReason?.trim() || null,
+            title: options.title?.trim() || null,
+            blockedPath: options.blockedPath || null,
+            mcpServer: options.mcpServer?.name || null,
+            ...(options.suppressAlwaysAllowRule ? { suppressSessionApproval: true } : {}),
+            ...(userOnly ? { requiresUser: true } : {}),
+            ...(suggestions.length > 0 ? { suggestions } : {}),
           }),
         ).then((d) => {
           // The handler may resolve synchronously via the App's permission
@@ -1030,9 +1101,53 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       })
 
       if (decision.decision === 'accept' || decision.decision === 'acceptForSession') {
-        return { behavior: 'allow', updatedInput: decision.updatedInput ?? input }
+        // Claude Code applies the permission changes the user chose with the
+        // approval (see permission-suggestions.mts), and writes a rule to
+        // save to the project's local settings itself. A call only the user
+        // may answer grants no more than itself.
+        const updatedPermissions = userOnly
+          ? []
+          : appliedPermissionUpdates(decision.updatedPermissions)
+        return {
+          behavior: 'allow',
+          updatedInput: decision.updatedInput ?? input,
+          ...(updatedPermissions.length > 0 ? { updatedPermissions } : {}),
+        }
       }
-      return { behavior: 'deny', message: 'denied by user' }
+      // Cancel stops the turn, as it does for a Codex thread; decline only
+      // refuses this call and lets Claude go on.
+      if (decision.decision === 'cancel') {
+        return { behavior: 'deny', message: 'cancelled by user', interrupt: true }
+      }
+      return { behavior: 'deny', message: 'declined by user' }
+    }
+  }
+
+  // Plan mode asks the user nothing but questions (above). ExitPlanMode
+  // hands over the finished plan: it becomes the turn's plan card, and the
+  // App asks the user whether to implement it once the turn completes, so
+  // the call is refused without an interrupt to let the turn end normally.
+  // Anything else that needs an approval is refused, as it was before plan
+  // mode had this callback; a read of a readable root needs none, unless only
+  // the user may answer it.
+  private async planModeDecision(
+    toolName: string,
+    input: Record<string, unknown>,
+    toolUseId: string,
+    pending: PendingTurn,
+    userOnly: boolean,
+  ): Promise<{ behavior: 'allow' } | { behavior: 'deny'; message: string }> {
+    if (toolName === 'ExitPlanMode') {
+      const plan = typeof input.plan === 'string' ? input.plan.trim() : ''
+      if (!plan) return { behavior: 'deny', message: PLAN_MISSING_MESSAGE }
+      await pending.handlers.onEvent({ type: 'proposed_plan', toolUseId, text: plan })
+      return { behavior: 'deny', message: PLAN_DELIVERED_MESSAGE }
+    }
+    if (!userOnly && readsWithin(toolName, input, pending.context.readableRoots))
+      return { behavior: 'allow' }
+    return {
+      behavior: 'deny',
+      message: `${toolName} is not available in plan mode. Explore with read-only tools, then present the plan with ExitPlanMode; the user decides whether to implement it.`,
     }
   }
 
@@ -1180,13 +1295,20 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         settleTimer: null,
         idleTimer: null,
         chain: Promise.resolve(),
+        firstPrompt: null,
         closed: false,
       }
       // Without the launch gate the CLI starts right away, else once the
       // session gets the launch slot; the prompt waits in the input meanwhile.
       const gateMs = launchGateMs()
       if (gateMs == null) this.startCli(sdk, opened)
-      this.send(opened, this.buildPromptMessage(context))
+      const launch = gateMs == null ? null : this.launchCli(sdk, opened, gateMs)
+      // A thread that asked for auto review gets Claude Code's auto mode, or
+      // hears why not, before Claude reads the prompt. The session launches
+      // in the policy's mode and switches once it knows its models.
+      // App rule: auto-review
+      const settlesMode = autoModeFor(context) !== 'skip'
+      if (!settlesMode) this.send(opened, this.buildPromptMessage(context))
       const pending = this.createPendingTurn(opened, context, handlers, false, resolve, reject)
       opened.current = pending
       this.turns.set(context.turnId, pending)
@@ -1195,10 +1317,26 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         if (previous && previous !== opened) this.closeSession(previous)
         this.sessions.set(context.threadId, opened)
       }
+      if (settlesMode)
+        opened.firstPrompt = this.serialize(opened, async () => {
+          try {
+            // Only a running Claude Code can say which modes it has.
+            if (launch) await launch
+            if (opened.query) await this.applyPermissionMode(opened, context, handlers)
+          } finally {
+            if (!opened.closed) this.send(opened, this.buildPromptMessage(context))
+            opened.firstPrompt = null
+          }
+        }).catch((error: unknown) => {
+          debugLog('native.session.auto_mode_failed', {
+            threadId: context.threadId,
+            error: error instanceof Error ? error.message : String(error),
+          })
+        })
       // Run the receive loop in the background. runTurn() resolves when this
       // turn's result arrives; the loop itself runs for the session.
-      if (gateMs == null) void this.consumeSession(opened)
-      else void this.launchSession(sdk, opened, gateMs)
+      if (launch) void this.launchSession(opened, launch)
+      else void this.consumeSession(opened)
     })
   }
 
@@ -1222,17 +1360,26 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
 
   // With the launch gate on, a session starts its CLI once it gets the launch
   // slot. One that closed while it waited (interrupted, replaced by a newer
-  // session of the thread, or the adapter stopping) never starts.
-  private async launchSession(sdk: ClaudeSdk, session: LiveSession, gateMs: number): Promise<void> {
-    let failure: Error | null = null
+  // session of the thread, or the adapter stopping) never starts. Resolves with
+  // why it did not, if anything did stop it.
+  private async launchCli(
+    sdk: ClaudeSdk,
+    session: LiveSession,
+    gateMs: number,
+  ): Promise<Error | null> {
     try {
       await this.acquireLaunchSlot(session, gateMs)
       if (session.abort.signal.aborted)
         throw new Error('Claude turn interrupted before Claude Code started')
       if (!session.closed) this.startCli(sdk, session)
+      return null
     } catch (error) {
-      failure = error instanceof Error ? error : new Error(String(error))
+      return error instanceof Error ? error : new Error(String(error))
     }
+  }
+
+  private async launchSession(session: LiveSession, launch: Promise<Error | null>): Promise<void> {
+    const failure = await launch
     if (session.query) return this.consumeSession(session)
     this.releaseLaunchSlot(session)
     await this.serialize(session, () => this.endSession(session, failure))
@@ -1322,7 +1469,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         this.turns.set(context.turnId, pending)
         session.input.beginTurn()
         if (!autonomous) {
-          await this.applySessionSettings(session, context)
+          await this.applySessionSettings(session, context, handlers)
           this.send(session, this.buildPromptMessage(context))
         }
         // Replay what Claude already produced on its own. Anything after the
@@ -1392,11 +1539,11 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   private async applySessionSettings(
     session: LiveSession,
     context: RuntimeTurnContext,
+    handlers: RuntimeHandlers,
   ): Promise<void> {
     if (!session.query) return
     const query = session.query as Query & {
       setModel?: (model?: string) => Promise<void>
-      setPermissionMode?: (mode: string) => Promise<void>
       applyFlagSettings?: (settings: { effortLevel?: string | null }) => Promise<void>
     }
     // A model process profile pins the model with its process (see
@@ -1412,6 +1559,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         query.setModel(context.model).catch(() => {}),
         SESSION_CONTROL_TIMEOUT_MS,
       )
+      forgetPermissionMode(session)
     }
     // Effort is part of the session signature, so only a turn pinned to this
     // session by background work, or one after a mid-turn change, gets here
@@ -1423,6 +1571,33 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         query.applyFlagSettings({ effortLevel: effort }).catch(() => {}),
         SESSION_CONTROL_TIMEOUT_MS,
       )
+    }
+    await this.applyPermissionMode(session, context, handlers)
+  }
+
+  // Puts the session in the permission mode the turn asks for: Claude Code's
+  // auto mode for a thread whose reviewer is auto_review, when the session
+  // can run it (otherwise the turn hears why and the user keeps reviewing),
+  // else the mode the approval policy maps to.
+  // App rule: auto-review
+  private async applyPermissionMode(
+    session: LiveSession,
+    context: RuntimeTurnContext,
+    handlers: RuntimeHandlers,
+  ): Promise<void> {
+    const auto = autoModeFor(context)
+    if (auto !== 'skip') {
+      const reason =
+        auto !== 'enter'
+          ? auto.reason
+          : session.permissionMode === 'auto'
+            ? null
+            : await this.switchToAutoMode(session, context.model)
+      if (!reason) return
+      await handlers.onEvent({ type: 'auto_review_unavailable', reason })
+    }
+    const query = session.query as Query & {
+      setPermissionMode?: (mode: string) => Promise<void>
     }
     const mode = derivePermissionMode(context.approvalPolicy, context.sandboxMode, context.planMode)
     if (
@@ -1437,6 +1612,50 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         SESSION_CONTROL_TIMEOUT_MS,
       )
     }
+  }
+
+  // Switches the session to Claude Code's auto mode, unless the model it runs
+  // says it has none or the CLI refuses. Returns why it did not, or null.
+  private async switchToAutoMode(
+    session: LiveSession,
+    model: string | null,
+  ): Promise<string | null> {
+    const query = session.query as Query & {
+      setPermissionMode?: (mode: string) => Promise<void>
+      supportedModels?: () => Promise<unknown>
+    }
+    if (!query.setPermissionMode) return 'This Claude Code cannot switch permission modes'
+    if (query.supportedModels) {
+      let models: unknown = null
+      await settlesWithin(
+        query.supportedModels().then(
+          (list) => {
+            models = list
+          },
+          () => {},
+        ),
+        SESSION_CONTROL_TIMEOUT_MS,
+      )
+      const info = modelInfoFor(models, model)
+      if (info?.supportsAutoMode === false)
+        return `${stringOrNull(info.displayName) ?? model ?? 'The default model'} does not support auto mode`
+    }
+    let failure: unknown = null
+    const settled = await settlesWithin(
+      query.setPermissionMode('auto').catch((error: unknown) => {
+        failure = error
+      }),
+      SESSION_CONTROL_TIMEOUT_MS,
+    )
+    if (failure != null)
+      return `Claude Code refused auto mode: ${failure instanceof Error ? failure.message : String(failure)}`
+    if (!settled) {
+      // It may still take effect: the caller puts the policy's mode back.
+      session.permissionMode = 'unconfirmed'
+      return 'Claude Code did not confirm auto mode in time'
+    }
+    session.permissionMode = 'auto'
+    return null
   }
 
   private serialize(session: LiveSession, task: () => Promise<void> | void): Promise<void> {
@@ -2310,12 +2529,30 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }
     if (subtype === 'permission_denied') {
       // The SDK auto-denied a tool call (auto-mode classifier, deny rule, etc).
-      // Surface as a notice so the user sees why nothing happened.
-      const toolName = String((message as Record<string, unknown>).tool_name ?? 'tool')
+      // The call's item shows as declined, and a notice says why nothing
+      // happened.
+      const toolName = String(message.tool_name ?? 'tool')
+      const toolUseId = stringOrNull(message.tool_use_id)
+      const reason = stringOrNull(message.decision_reason)?.trim()
+      // The auto-mode classifier's verdict is the review the App shows on the
+      // call's item; the server warns when it has no item for the call.
+      // App rule: auto-review
+      if (message.decision_reason_type === 'classifier' && toolUseId) {
+        await pending.handlers.onEvent({
+          type: 'tool_denied',
+          toolUseId,
+          toolName,
+          autoReview: { rationale: reason || stringOrNull(message.message)?.trim() || null },
+        })
+        return
+      }
+      if (toolUseId) await pending.handlers.onEvent({ type: 'tool_denied', toolUseId })
       await pending.handlers.onEvent({
         type: 'notice',
         level: 'warning',
-        message: `Permission denied for ${toolName}`,
+        message: reason
+          ? `Permission denied for ${toolName}: ${reason}`
+          : `Permission denied for ${toolName}`,
       })
       return
     }
@@ -3420,11 +3657,7 @@ function goalToolServer(sdk: ClaudeSdk, z: Zod, goal: GoalToolHandlers) {
 // The dynamic tool servers a session offers. Plan mode runs no tool that acts,
 // and a configured MCP server keeps its name.
 function registeredDynamicServers(context: RuntimeTurnContext): DynamicToolServer[] {
-  if (!context?.dynamicTools?.length) return []
-  if (
-    derivePermissionMode(context.approvalPolicy, context.sandboxMode, context.planMode) === 'plan'
-  )
-    return []
+  if (!context?.dynamicTools?.length || plans(context)) return []
   const taken = new Set([
     GOAL_MCP_SERVER,
     LEADER_MCP_SERVER,
@@ -3539,6 +3772,13 @@ function leaderToolServer(sdk: ClaudeSdk, z: Zod, leader: LeaderToolHandlers) {
   })
 }
 
+// A turn in Claude's plan mode, by the App's Plan toggle or the env override.
+function plans(context: RuntimeTurnContext): boolean {
+  return (
+    derivePermissionMode(context.approvalPolicy, context.sandboxMode, context.planMode) === 'plan'
+  )
+}
+
 // Codex's approval policy says "never ask" (or the sandbox is wide open) and
 // no explicit permission mode overrides it: tools run without a prompt.
 function autoAllowsTools(context: RuntimeTurnContext): boolean {
@@ -3548,6 +3788,45 @@ function autoAllowsTools(context: RuntimeTurnContext): boolean {
       (context.approvalPolicy === 'never' || context.sandboxMode === 'danger-full-access')) ||
     mode === 'dontAsk'
   )
+}
+
+// Whether a turn whose thread asks for auto review should switch Claude Code
+// to auto mode. Plan mode, a never-ask policy and an env pin to auto already
+// settle every call without the user, so they skip quietly; a read-only
+// sandbox or an env pin to another mode keeps the user as the reviewer and
+// says why.
+// App rule: auto-review
+function autoModeFor(context: RuntimeTurnContext): 'enter' | 'skip' | { reason: string } {
+  if (context.autoReview !== true || plans(context) || autoAllowsTools(context)) return 'skip'
+  const pinned = configuredPermissionMode()
+  if (pinned === 'auto') return 'skip'
+  if (pinned) return { reason: `CLAUDE_CODEX_PERMISSION_MODE pins Claude Code to ${pinned} mode` }
+  if (context.sandboxMode === 'read-only') {
+    return { reason: 'A read-only sandbox keeps every approval with the user' }
+  }
+  return 'enter'
+}
+
+// After a model switch the session's permission mode is no longer known: the
+// CLI may have left it (auto mode exists for some models only), so the next
+// applyPermissionMode sends the turn's mode again. Bypass stays as it is.
+function forgetPermissionMode(session: LiveSession): void {
+  if (session.permissionMode !== 'bypassPermissions') session.permissionMode = 'unconfirmed'
+}
+
+// The entry for `model` in Claude Code's model list; a thread on no explicit
+// model runs the list's default entry.
+function modelInfoFor(models: unknown, model: string | null): Record<string, unknown> | null {
+  if (!Array.isArray(models)) return null
+  const wanted = (model ?? 'default').toLowerCase()
+  for (const entry of models) {
+    const info = recordOrNull(entry)
+    if (!info) continue
+    const value = stringOrNull(info.value)?.toLowerCase()
+    const resolved = stringOrNull(info.resolvedModel)?.toLowerCase()
+    if (value === wanted || resolved === wanted) return info
+  }
+  return null
 }
 
 // A Read of a file inside one of `roots`, after resolving symlinks.

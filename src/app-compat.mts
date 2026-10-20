@@ -297,6 +297,46 @@ export const APP_RULES: readonly AppRule[] = [
       'Ask for a task with many tool calls in a chat that has finished a turn: the context gauge moves while Claude works instead of jumping when the turn ends.',
   },
   {
+    id: 'collaboration-modes',
+    app: "Enables /plan and the composer's Plan toggle only when collaborationMode/list returns a preset with mode plan, and keeps only the plan and default presets. Sends the chosen mode as collaborationMode through thread/settings/update and on turn/start, where it sets the top-level model and effort to null and puts the picker's model and effort in collaborationMode.settings. Adopts the collaborationMode of thread/settings/updated and of the thread/resume response as the composer's mode.",
+    adapter:
+      "Lists a Plan and a Default preset without a model or effort, takes a turn's model and effort from collaborationMode.settings, keeps the mode per thread for turns that name none, also across a restart, and reports the thread's real mode in thread/settings/updated and thread/resume. A fork starts in Default, as a Codex fork does; the App sends the mode it shows for the fork on the fork's turns.",
+    verify:
+      'In a Claude chat, /plan is enabled; turn the Plan toggle on and send a message: the toggle stays on and the model picker keeps its choice.',
+  },
+  {
+    id: 'plan-implementation',
+    app: 'When a turn completes, takes the text of its last plan item and asks "Implement this plan?"; accepting switches the composer to the default mode and sends the plan back as a new turn.',
+    adapter:
+      'In plan mode turns the plan Claude hands to ExitPlanMode into one plan item (started, one delta, completed) and refuses the tool call without an interrupt, so the turn completes; what Claude writes around it stays agent messages.',
+    verify:
+      'Ask for a plan in Plan mode: one plan card shows, "Implement this plan?" follows, and accepting runs the plan outside plan mode.',
+  },
+  {
+    id: 'skill-injection',
+    app: 'Sends a skill picked in the composer as a [$name](path) link to its SKILL.md inside the prompt text, and a skill picked from a plugin or setup card as a skill input item with name and path.',
+    adapter:
+      'Renders a skill item as the same link and, for a SKILL.md under a listed skill folder (64 KiB at most), adds a <skill> block with its content to the prompt Claude reads; for any other SKILL.md it asks Claude to read the file. The userMessage item keeps the input as sent.',
+    verify:
+      'Pick a Claude skill with "$" or "/" and send a message: Claude follows the skill without reading its file first, and the message shows only the chip.',
+  },
+  {
+    id: 'additional-context',
+    app: "Attaches additionalContext ({key: {value, kind}}, kind untrusted or application) to turn/start and turn/steer, for the turn that follows connecting a suggested plugin, an edited page or writing block, and quick chat. It does not show the context in the user's message.",
+    adapter:
+      'Adds each entry to the prompt Claude reads as an <app_context key kind> block, capped at 32 KiB, behind a note that untrusted blocks are data and not instructions; the userMessage item and the chat preview leave it out.',
+    verify:
+      'Connect a suggested plugin from a Claude chat and continue: the reply uses the attached context, and the message shows no context text.',
+  },
+  {
+    id: 'app-tool-availability',
+    app: 'Writes developerInstructions for every local thread that describe its own tools (create_thread, read_thread, automation_update, create_worktree, sidebar tools and others) and the ::created-thread directive, and gives Codex threads those tools.',
+    adapter:
+      'Gives Claude threads none of them, so it appends a short "# Tool availability" section after the developer instructions naming the tools they mention, and asks Claude not to look for them or write their directives and to send the user to the App instead. appToolAvailabilityNote in src/turn-context.mts builds it, and leaves out the tools and the directive advice a thread is given as having.',
+    verify:
+      "In a Claude chat, ask to start a new thread or a worktree: Claude says to do it in the App instead of searching for the tool. Search the new build's thread-start instructions for tool names missing from the list in src/turn-context.mts.",
+  },
+  {
     id: 'prewarmed-threads',
     app: "Starts the thread of a new chat with thread/start before the user sends anything, keeps it out of thread/list and holds back its thread/started until it sends turn/start there, and deletes it with thread/delete once the chat goes unused for 10 minutes. It forgets such threads when the app-server connection drops or the App quits. It sends the chat's first message to that thread whatever model was picked meanwhile, comparing only permissions, instructions and feature overrides.",
     adapter:
@@ -359,6 +399,46 @@ export const APP_RULES: readonly AppRule[] = [
       'Completes an image Read that fails or is stopped as its failed Read command in place of the imageView it started as.',
     verify:
       'Ask Claude to read an image file that does not exist: the turn shows the failed Read, not an empty image.',
+  },
+  {
+    id: 'command-approval-card',
+    app: "Draws an item/commandExecution/requestApproval card from its params alone (command, cwd, reason, availableDecisions), but draws an item/fileChange/requestApproval card only for a fileChange item with the request's itemId; without one the request shows nothing and the turn waits.",
+    adapter:
+      'Asks for an Edit, Write or MultiEdit (a fileChange item) as a file change, and for any other Claude tool as a command: Bash with its command, other tools with their name and what they touch ("WebFetch https://…"). Claude\'s reason for asking is the card\'s reason. "Allow for this session" approves the same command or tool input again, as Codex keys its session approvals; the rules and folders Claude offers for the session go along only with CLAUDE_CODEX_SESSION_SUGGESTIONS=1.',
+    verify:
+      'In a Claude chat in the default permissions mode, have Claude fetch a web page: the approval card names WebFetch and the URL, and approving runs it.',
+  },
+  {
+    id: 'command-approval-amendment',
+    app: 'Offers "Allow similar commands" on a command approval card whenever proposedExecpolicyAmendment is an array whose words, joined with spaces, hold no line break, whatever availableDecisions lists, with a tooltip naming the prefix. It answers {acceptWithExecpolicyAmendment: {execpolicy_amendment}} with that array.',
+    adapter:
+      'Proposes the prefix of the one Bash rule Claude offers to save for the command (`npm test *` or `npm test:*` giving ["npm", "test"], an exact-command rule all its words) and null for anything else, a call without a session choice included. Only that answer with that prefix saves the rule: Claude Code writes it to the project\'s .claude/settings.local.json.',
+    verify:
+      'In a Claude chat in the default permissions mode, have Claude run `npm test`: the card offers "Allow similar commands" for `npm test`; after picking it the project\'s .claude/settings.local.json allows Bash(npm test *) and the next `npm test -- --watch` does not ask.',
+  },
+  {
+    id: 'mcp-tool-approval',
+    app: 'Draws an mcpServer/elicitation/request whose _meta.codex_approval_kind is mcp_tool_call as a tool approval card: the message as its title, _meta.reason, the tool_params, an "Allow for this session" choice when _meta.persist offers session and an "Always allow" button when it offers always (a string, or an array for both). It answers accept, decline or cancel, with _meta.persist "session" or "always" for those choices.',
+    adapter:
+      'Asks for an mcp__<server>__<tool> call with that elicitation, as Codex does for its MCP tools, offering session approval unless Claude offers no "always allow" for the call, and "always" as well when Claude offers to save a rule. "Allow for this session" approves that tool for the rest of the thread in this adapter process; "Always allow" has Claude Code save a rule naming that tool of that server, mcp__<server>__<tool>, to the project\'s .claude/settings.local.json.',
+    verify:
+      'Have Claude call a tool of a configured MCP server: the card asks to allow that server to run the tool, after "Allow for this session" the next call of the tool does not ask, and after "Always allow" the project\'s .claude/settings.local.json allows mcp__<server>__<tool>.',
+  },
+  {
+    id: 'declined-tool-items',
+    app: 'Shows a commandExecution or fileChange item with status declined as declined: no output, no exit code, and a declined patch is not counted as changed files.',
+    adapter:
+      'Ends the item of a call the user declined or cancelled, or Claude refused without asking, as declined, and does not show the refusal text Claude gets as its result. Cancel also ends the turn as interrupted.',
+    verify:
+      'Decline a command approval in a Claude chat: the command shows as declined, not failed, and Claude goes on; cancel one: the turn stops.',
+  },
+  {
+    id: 'auto-review',
+    app: 'Its auto-review permissions preset sends approvalsReviewer guardian_subagent (auto_review in newer builds) on thread/settings/update and turn/start, and on turn/settings/update while a turn runs. Its picker follows the approvalsReviewer of thread responses and thread/settings/updated, and it draws item/autoApprovalReview/completed as a review card on the item named by targetItemId.',
+    adapter:
+      "Stores the reviewer per thread and runs a Claude thread that asks for auto_review in Claude Code's auto permission mode, when its model supports it. Otherwise approvals stay with the user: it stores and echoes 'user' and sends a configWarning saying why. A call the auto-mode classifier denies ends declined, with a denied review naming the classifier's reason; a call Claude Code says only the user may answer always asks, in every mode.",
+    verify:
+      'Pick auto-review in a Claude chat on a model with auto mode and have Claude delete a build folder: the picker stays on auto-review, and a blocked call shows as declined with the review reason. On a model without auto mode the picker returns to the default with a config warning, and approval cards show as before.',
   },
 ]
 

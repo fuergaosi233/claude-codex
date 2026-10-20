@@ -607,11 +607,10 @@ test('turn/settings/update switches model and effort for the running turn only',
     await server.waitFor('item/agentMessage/delta', (params) => params.turnId === turn.id, from)
     const update = (settings: Record<string, unknown>) =>
       server.request('turn/settings/update', { threadId, turnId: turn.id, ...settings })
-    // The user already reviews every approval.
     assert.deepEqual(await update({ approvalsReviewer: 'user' }), { status: 'applied' })
     await assert.rejects(
       update({ approvalsReviewer: 'auto_review', summary: 'detailed' }),
-      /a running Claude turn cannot change approvalsReviewer auto_review, summary/,
+      /a running Claude turn cannot change summary/,
     )
     await assert.rejects(update({ effort: 'extreme' }), /unsupported effort: extreme/)
     await assert.rejects(update({ model: 'claude-opus-9' }), /unknown model: claude-opus-9/)
@@ -621,6 +620,11 @@ test('turn/settings/update switches model and effort for the running turn only',
     // 'none' is the effort of a model that takes none, such as Haiku. It
     // leaves the effort as it was.
     assert.deepEqual(await update({ effort: 'none' }), { status: 'applied' })
+    // The App's auto-review preset reaches the running turn, and the thread
+    // keeps it for later turns.
+    assert.deepEqual(await update({ approvalsReviewer: 'guardian_subagent' }), {
+      status: 'applied',
+    })
     await server.request('turn/steer', {
       threadId,
       expectedTurnId: turn.id,
@@ -629,8 +633,10 @@ test('turn/settings/update switches model and effort for the running turn only',
     await server.waitFor('turn/completed', (params) => params.turn.id === turn.id, from)
     assert.match(
       (await server.reply(threadId, turn.id)) ?? '',
-      /released on model=opus effort=high$/,
+      /released on model=opus effort=high autoReview=true$/,
     )
+    const resumed = await server.request('thread/resume', { threadId })
+    assert.equal(resumed.approvalsReviewer, 'auto_review')
   })
 })
 

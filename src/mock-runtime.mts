@@ -1,7 +1,9 @@
 import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type {
+  ClaudePermissionUpdate,
   ClaudeRuntime,
+  PermissionDecision,
   RuntimeBackgroundListener,
   RuntimeHandlers,
   RuntimeLiveTask,
@@ -427,10 +429,61 @@ export class MockRuntime implements ClaudeRuntime {
       await handlers.onEvent({
         type: 'text_delta',
         delta: settings
-          ? ` released on model=${settings.model ?? 'unchanged'} effort=${settings.effort ?? 'unchanged'}`
+          ? ` released on model=${settings.model ?? 'unchanged'} effort=${settings.effort ?? 'unchanged'}${
+              settings.autoReview != null ? ` autoReview=${settings.autoReview}` : ''
+            }`
           : ' released',
       })
       await handlers.onEvent({ type: 'completed', success: true, result: 'released' })
+      return
+    }
+
+    // Auto review: "check" echoes whether the turn runs it, "unsupported"
+    // has the session refuse it, "denied" has the classifier refuse a command
+    // and "escalated" asks the user about a call that needs them whatever the
+    // mode.
+    const autoReview = /auto review (check|unsupported|denied|escalated)/i.exec(context.prompt)
+    if (autoReview) {
+      const kind = (autoReview[1] ?? '').toLowerCase()
+      if (kind === 'unsupported' && context.autoReview) {
+        await handlers.onEvent({
+          type: 'auto_review_unavailable',
+          reason: 'mock model does not support auto mode',
+        })
+      }
+      if (kind === 'denied' || kind === 'escalated') {
+        const toolUseId = `tool-${Date.now()}`
+        const input = { command: kind === 'denied' ? 'rm -rf build' : 'git push' }
+        await handlers.onEvent({ type: 'tool_use', toolUseId, toolName: 'Bash', input })
+        let allowed = false
+        if (kind === 'denied') {
+          await handlers.onEvent({
+            type: 'tool_denied',
+            toolUseId,
+            toolName: 'Bash',
+            autoReview: { rationale: 'Deleting the build directory was not requested.' },
+          })
+        } else {
+          const decision = await handlers.onPermissionRequest({
+            type: 'permission_request',
+            requestId: `perm-${toolUseId}`,
+            toolUseId,
+            toolName: 'Bash',
+            input,
+            requiresUser: true,
+          })
+          allowed = decision.decision === 'accept' || decision.decision === 'acceptForSession'
+        }
+        await handlers.onEvent({
+          type: 'tool_result',
+          toolUseId,
+          content: allowed ? 'pushed' : 'Permission to use Bash has been denied.',
+          isError: !allowed,
+        })
+      }
+      const text = `autoReview=${context.autoReview === true}`
+      await handlers.onEvent({ type: 'text_delta', delta: text })
+      await handlers.onEvent({ type: 'completed', success: true, result: text })
       return
     }
 
@@ -446,18 +499,24 @@ export class MockRuntime implements ClaudeRuntime {
       // or Full access, skip the permission round-trip and run the tool.
       const autoApprove =
         context.approvalPolicy === 'never' || context.sandboxMode === 'danger-full-access'
-      const decision = autoApprove
-        ? { decision: 'accept' as const }
+      const decision: PermissionDecision = autoApprove
+        ? { decision: 'accept' }
         : await handlers.onPermissionRequest({
             type: 'permission_request',
             requestId: `perm-${toolUseId}`,
             toolUseId,
             toolName: 'Bash',
             input: { command: 'echo mock approval' },
+            reason: 'mock approval reason',
+            ...(/strict/i.test(context.prompt) ? { suppressSessionApproval: true } : {}),
+            ...(/always allow/i.test(context.prompt)
+              ? { suggestions: mockSuggestions('Bash', 'echo mock *') }
+              : {}),
           })
       if (decision.decision === 'accept' || decision.decision === 'acceptForSession') {
         await handlers.onEvent({ type: 'tool_output_delta', toolUseId, delta: 'mock approval\n' })
         await handlers.onEvent({ type: 'tool_result', toolUseId, content: 'mock approval\n' })
+        await reportPermissionUpdates(handlers, decision)
       } else {
         await handlers.onEvent({
           type: 'tool_result',
@@ -499,6 +558,73 @@ export class MockRuntime implements ClaudeRuntime {
           isError: true,
         })
       }
+    }
+
+    // An MCP tool or a tool that is neither a command nor an edit asks for
+    // approval; "denied" has Claude refuse a command without asking.
+    const askTool = /(mcp|fetch|denied) ask check/i.exec(context.prompt)
+    if (askTool) {
+      const kind = (askTool[1] ?? '').toLowerCase()
+      const toolUseId = `tool-${Date.now()}`
+      // "server <name>" names the MCP server, "Docs Server" by default.
+      const server = /\bserver (\S+)/i.exec(context.prompt)?.[1] ?? 'Docs Server'
+      const toolName =
+        kind === 'mcp'
+          ? `mcp__${server.replace(/[^A-Za-z0-9_-]/g, '_')}__lookup`
+          : kind === 'fetch'
+            ? 'WebFetch'
+            : 'Bash'
+      const input: Record<string, unknown> =
+        kind === 'mcp'
+          ? { query: 'claude codex' }
+          : kind === 'fetch'
+            ? { url: 'https://example.com/docs', prompt: 'Summarize the page' }
+            : { command: 'rm -rf build' }
+      await handlers.onEvent({ type: 'tool_use', toolUseId, toolName, input })
+      if (kind === 'denied') {
+        await handlers.onEvent({ type: 'tool_denied', toolUseId })
+        await handlers.onEvent({
+          type: 'notice',
+          level: 'warning',
+          message: 'Permission denied for Bash: matches a deny rule',
+        })
+        await handlers.onEvent({
+          type: 'tool_result',
+          toolUseId,
+          content: 'Permission to use Bash has been denied.',
+          isError: true,
+        })
+      } else {
+        const decision = await handlers.onPermissionRequest({
+          type: 'permission_request',
+          requestId: `perm-${toolUseId}`,
+          toolUseId,
+          toolName,
+          input,
+          reason: 'mock tool reason',
+          ...(kind === 'mcp' ? { mcpServer: server } : {}),
+          ...(/strict/i.test(context.prompt) ? { suppressSessionApproval: true } : {}),
+          ...(/always allow/i.test(context.prompt)
+            ? {
+                suggestions:
+                  kind === 'mcp'
+                    ? mockSuggestions(toolName)
+                    : mockSuggestions(toolName, 'domain:example.com'),
+              }
+            : {}),
+        })
+        const allowed = decision.decision === 'accept' || decision.decision === 'acceptForSession'
+        await handlers.onEvent({
+          type: 'tool_result',
+          toolUseId,
+          content: allowed ? `${toolName} ran` : `${decision.decision} by user`,
+          isError: !allowed,
+        })
+        if (allowed) await reportPermissionUpdates(handlers, decision)
+      }
+      await handlers.onEvent({ type: 'text_delta', delta: `${kind} ask done` })
+      await handlers.onEvent({ type: 'completed', success: true, result: `${kind} ask done` })
+      return
     }
 
     if (/todo|checklist|plan list/i.test(context.prompt)) {
@@ -918,12 +1044,32 @@ export class MockRuntime implements ClaudeRuntime {
     }
 
     if (/plan mode check/i.test(context.prompt)) {
-      // plan mode should never reach the per-tool approval path; mirror that
-      // here by emitting a tool_use *without* invoking onPermissionRequest.
+      // Reports the flag, then, in plan mode, does what the native runtime
+      // does with Claude's ExitPlanMode call: the tool_use streams, the plan
+      // goes out as `proposed_plan`, the call is refused and Claude signs off.
       await handlers.onEvent({
         type: 'text_delta',
         delta: `planMode=${context.planMode}`,
       })
+      if (context.planMode) {
+        const toolUseId = 'mock-exit-plan'
+        const plan = '# Mock plan\n\n1. Inspect the code\n2. Make the change'
+        await handlers.onEvent({ type: 'message_boundary' })
+        await handlers.onEvent({
+          type: 'tool_use',
+          toolUseId,
+          toolName: 'ExitPlanMode',
+          input: { plan, planFilePath: '/tmp/mock-plan.md' },
+        })
+        await handlers.onEvent({ type: 'proposed_plan', toolUseId, text: plan })
+        await handlers.onEvent({
+          type: 'tool_result',
+          toolUseId,
+          content: 'The plan was delivered to the user.',
+          isError: true,
+        })
+        await handlers.onEvent({ type: 'text_delta', delta: 'Plan ready.' })
+      }
       await handlers.onEvent({ type: 'completed', success: true, result: 'plan mode check' })
       return
     }
@@ -1652,4 +1798,31 @@ function callLeaderTool(
     default:
       throw new Error(`unknown leader tool: ${tool}`)
   }
+}
+
+// The permission changes Claude Code offers with a tool's approval when the
+// prompt says "always allow": a rule to save to the project's local
+// settings, and for a web fetch its session choices too, a switch of
+// permission mode among them.
+function mockSuggestions(toolName: string, ruleContent?: string): ClaudePermissionUpdate[] {
+  const rules = [ruleContent ? { toolName, ruleContent } : { toolName }]
+  const saved = { type: 'addRules', rules, behavior: 'allow', destination: 'localSettings' }
+  if (toolName !== 'WebFetch') return [saved]
+  return [
+    saved,
+    { type: 'addRules', rules, behavior: 'allow', destination: 'session' },
+    { type: 'setMode', mode: 'acceptEdits', destination: 'session' },
+  ]
+}
+
+// What an approval has Claude Code apply, as text tests can read.
+async function reportPermissionUpdates(
+  handlers: RuntimeHandlers,
+  decision: PermissionDecision,
+): Promise<void> {
+  if (!decision.updatedPermissions) return
+  await handlers.onEvent({
+    type: 'text_delta',
+    delta: `updatedPermissions=${JSON.stringify(decision.updatedPermissions)}\n`,
+  })
 }

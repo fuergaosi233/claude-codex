@@ -479,24 +479,72 @@ test('retries show as passing Reconnecting errors in chats, not in helper turns'
   assert.equal(helper.messages.filter((message) => message.method === 'error').length, 0)
 })
 
-test('plan output retains its native plan item and complete Markdown', async () => {
-  const { turn, messages } = await present(
+test('plan mode: the ExitPlanMode plan is the one plan item, prose stays agent messages', async () => {
+  const plan = '## Plan\n\n1. Inspect\n2. Implement'
+  const { turn, messages, replay } = await present(
     emit([
       { type: 'message_boundary' },
-      { type: 'text_delta', delta: '## Plan\n\n' },
-      { type: 'text_delta', delta: '1. Inspect\n2. Implement' },
+      { type: 'text_delta', delta: 'I looked around.' },
+      { type: 'tool_use', toolUseId: 'exit-1', toolName: 'ExitPlanMode', input: { plan } },
+      { type: 'proposed_plan', toolUseId: 'exit-1', text: plan },
+      { type: 'tool_result', toolUseId: 'exit-1', content: 'delivered', isError: true },
+      { type: 'text_delta', delta: 'Plan ready.' },
+      { type: 'completed', success: true },
+    ]),
+    { planMode: true },
+  )
+  assert.equal(turn.status, 'completed')
+  const shown = turn.items.filter((item) => item.type !== 'userMessage')
+  assert.deepEqual(
+    shown.map((item) => item.type),
+    ['agentMessage', 'plan', 'agentMessage'],
+    'ExitPlanMode is the card, not a tool item',
+  )
+  assert.deepEqual(
+    shown.map((item) => (item as { text: string }).text),
+    ['I looked around.', plan, 'Plan ready.'],
+  )
+  assert.equal(assistantItems(turn.items).at(-1)?.phase, 'final_answer')
+  const planEvents = messages
+    .filter(
+      (message) => message.params?.item?.type === 'plan' || message.method?.startsWith('item/plan'),
+    )
+    .map((message) => [message.method, message.params.item?.text ?? message.params.delta])
+  assert.deepEqual(planEvents, [
+    ['item/started', ''],
+    ['item/plan/delta', plan],
+    ['item/completed', plan],
+  ])
+  assert.deepEqual(
+    replay.items.filter((item: ThreadItem) => item.type === 'plan').map((item: any) => item.text),
+    [plan],
+  )
+})
+
+test('a plan revised in the same turn replaces its card', async () => {
+  const { turn, messages } = await present(
+    emit([
+      { type: 'proposed_plan', toolUseId: 'exit-1', text: '1. First draft' },
+      { type: 'proposed_plan', toolUseId: 'exit-2', text: '1. Final plan' },
       { type: 'completed', success: true },
     ]),
     { planMode: true },
   )
   const plans = turn.items.filter((item) => item.type === 'plan')
-  assert.equal(plans.length, 1)
-  assert.equal(plans[0]?.text, '## Plan\n\n1. Inspect\n2. Implement')
-  assert.equal(assistantItems(turn.items).length, 0)
-  assert.equal(messages.filter((message) => message.method === 'item/completed').length, 1)
+  assert.deepEqual(
+    plans.map((item) => item.text),
+    ['1. Final plan'],
+  )
+  const completedPlans = messages.filter(
+    (message) => message.method === 'item/completed' && message.params.item.type === 'plan',
+  )
+  assert.equal(new Set(completedPlans.map((message) => message.params.item.id)).size, 1)
+  assert.equal(completedPlans.at(-1)?.params.item.text, '1. Final plan')
 })
 
-test('an interrupt completes the message or plan still streaming before the turn', async () => {
+test('an interrupt completes the message still streaming before the turn', async () => {
+  // Plan mode streams prose as an agent message too; only ExitPlanMode
+  // makes a plan item.
   for (const planMode of [false, true]) {
     const { messages, turn, replay } = await present(
       async (handlers, { interrupt }) => {
@@ -506,17 +554,16 @@ test('an interrupt completes the message or plan still streaming before the turn
       { planMode },
     )
     assert.equal(turn.status, 'interrupted')
-    const type = planMode ? 'plan' : 'agentMessage'
     const order = messages
       .filter(
         (message) => message.method === 'item/completed' || message.method === 'turn/completed',
       )
       .map((message) => message.params.item?.type ?? message.method)
-    assert.deepEqual(order, [type, 'turn/completed'])
+    assert.deepEqual(order, ['agentMessage', 'turn/completed'])
     const live = messages.find((message) => message.method === 'item/completed')?.params.item
     assert.equal(live.text, 'Started the workflow.')
     assert.deepEqual(
-      replay.items.find((item: ThreadItem) => item.type === type),
+      replay.items.find((item: ThreadItem) => item.type === 'agentMessage'),
       live,
     )
   }
@@ -644,7 +691,7 @@ test('an image Read asks about and falls back to its Read command', async () => 
           path: '/elsewhere/chart.png',
         },
       ],
-      availableDecisions: ['accept', 'decline', 'cancel'],
+      availableDecisions: ['accept', 'acceptForSession', 'decline', 'cancel'],
     },
   )
   const completed = messages

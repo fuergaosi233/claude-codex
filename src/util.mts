@@ -222,11 +222,19 @@ export function textFromInput(input: unknown): string {
       if (value.type === 'mention') return `@${value.path ?? value.name ?? ''}`
       if (value.type === 'localImage') return `[local image: ${value.path ?? ''}]`
       if (value.type === 'image') return `[image]`
-      if (value.type === 'skill') return `/${value.name ?? 'skill'}`
+      if (value.type === 'skill') return skillInputText(value)
       return ''
     })
     .filter(Boolean)
     .join('\n')
+}
+
+// A skill input item reads like the link the composer writes for a picked
+// skill, so both reach Claude the same way (see turn-context.mts).
+// App rule: skill-injection
+function skillInputText(item: { name?: string; path?: string }): string {
+  const name = item.name || 'skill'
+  return item.path ? `[$${name}](${item.path})` : `/${name}`
 }
 
 export function turnToolOutputFromParams(value: unknown): TurnToolOutput | null {
@@ -282,7 +290,7 @@ export function extractImageInputs(input: unknown): ImageExtractResult {
     const item = raw as { type?: string; text?: string; path?: string; name?: string; url?: string }
     if (item.type === 'text' && typeof item.text === 'string') texts.push(item.text)
     else if (item.type === 'mention') texts.push(`@${item.path ?? item.name ?? ''}`)
-    else if (item.type === 'skill') texts.push(`/${item.name ?? 'skill'}`)
+    else if (item.type === 'skill') texts.push(skillInputText(item))
     else if (item.type === 'localImage' && typeof item.path === 'string') {
       const img = readLocalImage(item.path)
       if (img) images.push(img)
