@@ -11,8 +11,11 @@ import type { ClaudePermissionUpdate, PermissionDecision } from './types.mjs'
 //   rule naming that tool. Claude Code writes the rule itself, always to the
 //   project's .claude/settings.local.json, whichever settings file it
 //   suggested: nothing goes to the user's settings or the checked-in ones.
-// - "Allow for this session" adds what Claude offers for the session, but
-//   no switch of permission mode, which stays the App's to make.
+// - "Allow for this session" covers what Codex's covers: the adapter asks no
+//   more for that exact command or tool input, or for that MCP tool. With
+//   CLAUDE_CODEX_SESSION_SUGGESTIONS=1 it also adds what Claude offers for
+//   the session, rules and folders that can cover more than the one call,
+//   but no switch of permission mode, which stays the App's to make.
 //
 // Nothing is saved unless the user picks one of the first two.
 
@@ -76,10 +79,10 @@ export function bashRulePrefix(content: string): string[] | null {
   return words.length > 0 ? words : null
 }
 
-// What "Allow for this session" adds: the rules and folders Claude offers for
-// the session. Claude's "allow all edits during this session" switches the
-// session's permission mode instead; the thread's mode is the App's to set,
-// so that one is left out.
+// What "Allow for this session" adds when the suggestions are on: the rules
+// and folders Claude offers for the session. Claude's "allow all edits during
+// this session" switches the session's permission mode instead; the thread's
+// mode is the App's to set, so that one is left out.
 export function sessionPermissionUpdates(
   suggestions: ClaudePermissionUpdate[] | null | undefined,
 ): ClaudePermissionUpdate[] {
@@ -91,11 +94,19 @@ export function sessionPermissionUpdates(
   )
 }
 
-// The answer "Allow for this session" gives Claude Code.
+// Whether "Allow for this session" adds Claude's session suggestions.
+export function sessionSuggestionsEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.CLAUDE_CODEX_SESSION_SUGGESTIONS === '1'
+}
+
+// The answer "Allow for this session" gives Claude Code: Claude's session
+// suggestions only when they are on, as a Codex session approval covers no
+// more than the call it was given for.
 export function sessionApproval(
   suggestions: ClaudePermissionUpdate[] | null | undefined,
+  withSuggestions: boolean,
 ): PermissionDecision {
-  const updatedPermissions = sessionPermissionUpdates(suggestions)
+  const updatedPermissions = withSuggestions ? sessionPermissionUpdates(suggestions) : []
   return updatedPermissions.length > 0
     ? { decision: 'acceptForSession', updatedPermissions }
     : { decision: 'acceptForSession' }

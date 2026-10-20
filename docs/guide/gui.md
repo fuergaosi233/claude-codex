@@ -67,10 +67,12 @@ shows the approval card a Codex chat would:
 
 **Allow for this session** approves the same command, the same tool call, or
 for an MCP tool every call of that tool, for the rest of the thread while the
-adapter runs. For an edit it approves only that edit. It also adds what Claude
-Code offers for the session with the call, such as the folder outside the
-workspace that the call reads or writes in. It never switches the thread's
-permission mode, and it saves nothing.
+adapter runs. For an edit it approves only that edit. With
+`CLAUDE_CODEX_SESSION_SUGGESTIONS=1` it also adds what Claude Code offers for
+the session with the call, such as a rule for every fetch from the same domain
+or the folder outside the workspace that the call reads or writes in; that can
+cover more than a Codex session approval does, so it is off by default. It
+never switches the thread's permission mode, and it saves nothing.
 
 Claude Code sometimes offers to remember an approval: the "don't ask again"
 choice of its own prompt. The card then offers to save a rule:

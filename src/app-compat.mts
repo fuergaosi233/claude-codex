@@ -242,7 +242,7 @@ export const APP_RULES: readonly AppRule[] = [
     id: 'command-approval-card',
     app: "Draws an item/commandExecution/requestApproval card from its params alone (command, cwd, reason, availableDecisions), but draws an item/fileChange/requestApproval card only for a fileChange item with the request's itemId; without one the request shows nothing and the turn waits.",
     adapter:
-      'Asks for an Edit, Write or MultiEdit (a fileChange item) as a file change, and for any other Claude tool as a command: Bash with its command, other tools with their name and what they touch ("WebFetch https://…"). Claude\'s reason for asking is the card\'s reason.',
+      'Asks for an Edit, Write or MultiEdit (a fileChange item) as a file change, and for any other Claude tool as a command: Bash with its command, other tools with their name and what they touch ("WebFetch https://…"). Claude\'s reason for asking is the card\'s reason. "Allow for this session" approves the same command or tool input again, as Codex keys its session approvals; the rules and folders Claude offers for the session go along only with CLAUDE_CODEX_SESSION_SUGGESTIONS=1.',
     verify:
       'In a Claude chat in the default permissions mode, have Claude fetch a web page: the approval card names WebFetch and the URL, and approving runs it.',
   },

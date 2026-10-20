@@ -6583,39 +6583,56 @@ test('"Allow similar commands" saves the Bash rule Claude offers, and only when 
   }
 })
 
-test('"Allow for this session" adds what Claude offers for the session, no mode switch', async () => {
-  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
-  const proc = spawnMockAdapter(home)
-  const reader = new JsonLineReader(proc)
-  try {
-    const threadId = await startAskingThread(reader, proc, 1)
-    sendTurn(proc, 2, threadId, 'fetch ask check always allow')
-    const request = await awaitMessage(
-      reader,
-      (message) => message.method === 'item/commandExecution/requestApproval',
-    )
-    // Only a shell command offers a rule to save.
-    assert.equal(request.params.proposedExecpolicyAmendment, null)
-    assert.deepEqual(request.params.availableDecisions, [
-      'accept',
-      'acceptForSession',
-      'decline',
-      'cancel',
-    ])
-    proc.stdin.write(json({ id: request.id, result: { decision: 'acceptForSession' } }))
-    const seen: any[] = []
-    await awaitMessage(reader, (message) => message.method === 'turn/completed', seen)
-    assert.deepEqual(appliedUpdates(seen), [
-      {
-        type: 'addRules',
-        rules: [{ toolName: 'WebFetch', ruleContent: 'domain:example.com' }],
-        behavior: 'allow',
-        destination: 'session',
-      },
-    ])
-  } finally {
-    await stopProcess(proc)
-    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+test('"Allow for this session" covers the call as in Codex, and adds the session rules Claude offers only when switched on', async () => {
+  // Claude's session rule covers every fetch from the domain, more than the
+  // call the card showed, so it goes on only with the switch; the mode
+  // switch Claude also offers never does.
+  const sessionRule = {
+    type: 'addRules',
+    rules: [{ toolName: 'WebFetch', ruleContent: 'domain:example.com' }],
+    behavior: 'allow',
+    destination: 'session',
+  }
+  for (const [env, updates] of [
+    [{}, null],
+    [{ CLAUDE_CODEX_SESSION_SUGGESTIONS: '1' }, [sessionRule]],
+  ] as const) {
+    const label = JSON.stringify(env)
+    const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+    const proc = spawnMockAdapter(home, env)
+    const reader = new JsonLineReader(proc)
+    try {
+      const threadId = await startAskingThread(reader, proc, 1)
+      sendTurn(proc, 2, threadId, 'fetch ask check always allow')
+      const request = await awaitMessage(
+        reader,
+        (message) => message.method === 'item/commandExecution/requestApproval',
+      )
+      // Only a shell command offers a rule to save.
+      assert.equal(request.params.proposedExecpolicyAmendment, null, label)
+      assert.deepEqual(
+        request.params.availableDecisions,
+        ['accept', 'acceptForSession', 'decline', 'cancel'],
+        label,
+      )
+      proc.stdin.write(json({ id: request.id, result: { decision: 'acceptForSession' } }))
+      const seen: any[] = []
+      await awaitMessage(reader, (message) => message.method === 'turn/completed', seen)
+      assert.deepEqual(appliedUpdates(seen), updates, label)
+
+      // Either way the thread asks no more for that same call.
+      sendTurn(proc, 3, threadId, 'fetch ask check always allow')
+      const again: any[] = []
+      await awaitMessage(reader, (message) => message.method === 'turn/completed', again)
+      assert.equal(
+        again.some((message) => message.method === 'item/commandExecution/requestApproval'),
+        false,
+        label,
+      )
+    } finally {
+      await stopProcess(proc)
+      await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+    }
   }
 })
 

@@ -42,6 +42,7 @@ import {
   savedAllowRules,
   savedCommandPrefix,
   sessionApproval,
+  sessionSuggestionsEnabled,
 } from './permission-suggestions.mjs'
 import { projectInstructions } from './project-instructions.mjs'
 import { projectProviderLoopConfig } from './provider-loop-config.mjs'
@@ -5928,9 +5929,11 @@ export class CodexClaudeAppServer {
           itemId,
           startedAtMs: nowMillis(),
           reason,
-          // The folder outside the workspace the edit asks to write in. "For
-          // this session" adds what Claude offers for the session, such as
-          // that folder, but no mode in which edits stop asking.
+          // The folder outside the workspace the edit asks to write in, which
+          // the App shows the edit's paths relative to. "For this session"
+          // grants that folder only with CLAUDE_CODEX_SESSION_SUGGESTIONS=1
+          // (see sessionApproval), and never a mode in which edits stop
+          // asking.
           grantRoot: blockedPath && isAbsolute(blockedPath) ? dirname(blockedPath) : null,
         }
       : {
@@ -5979,7 +5982,7 @@ export class CodexClaudeAppServer {
     }
     if (decision === 'acceptForSession' && allowSession) {
       if (!isFileChange) this.rememberSessionApproval(threadId, sessionKey)
-      return sessionApproval(event.suggestions)
+      return sessionApproval(event.suggestions, sessionSuggestionsEnabled())
     }
     return { decision }
   }
@@ -6051,7 +6054,7 @@ export class CodexClaudeAppServer {
     }
     if (allowSession && persist === 'session') {
       this.rememberSessionApproval(threadId, sessionKey)
-      return sessionApproval(event.suggestions)
+      return sessionApproval(event.suggestions, sessionSuggestionsEnabled())
     }
     return { decision: 'accept' }
   }

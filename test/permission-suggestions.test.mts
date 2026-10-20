@@ -8,6 +8,7 @@ import {
   savedCommandPrefix,
   sessionApproval,
   sessionPermissionUpdates,
+  sessionSuggestionsEnabled,
 } from '../src/permission-suggestions.mjs'
 import type { ClaudePermissionUpdate } from '../src/types.mjs'
 
@@ -78,7 +79,7 @@ test('the rules Claude offers to save go to the local settings, as one change', 
   assert.equal(savedCommandPrefix(null), null)
 })
 
-test('"for this session" adds the session rules and folders, no mode', () => {
+test('"for this session" adds the session rules and folders only when switched on, no mode', () => {
   const rule: ClaudePermissionUpdate = {
     type: 'addRules',
     rules: [{ toolName: 'Read', ruleContent: '//repo/docs/**' }],
@@ -94,11 +95,16 @@ test('"for this session" adds the session rules and folders, no mode', () => {
     { ...rule, behavior: 'deny' },
   ]
   assert.deepEqual(sessionPermissionUpdates(suggestions), [rule, folder])
-  assert.deepEqual(sessionApproval(suggestions), {
+  assert.deepEqual(sessionApproval(suggestions, true), {
     decision: 'acceptForSession',
     updatedPermissions: [rule, folder],
   })
-  assert.deepEqual(sessionApproval([bash('npm test *')]), { decision: 'acceptForSession' })
+  assert.deepEqual(sessionApproval([bash('npm test *')], true), { decision: 'acceptForSession' })
+  // Off by default: the approval covers the one call, as a Codex one does.
+  assert.deepEqual(sessionApproval(suggestions, false), { decision: 'acceptForSession' })
+  assert.equal(sessionSuggestionsEnabled({}), false)
+  assert.equal(sessionSuggestionsEnabled({ CLAUDE_CODEX_SESSION_SUGGESTIONS: '0' }), false)
+  assert.equal(sessionSuggestionsEnabled({ CLAUDE_CODEX_SESSION_SUGGESTIONS: '1' }), true)
 })
 
 test('an MCP tool rule names the whole server and the tool', () => {
