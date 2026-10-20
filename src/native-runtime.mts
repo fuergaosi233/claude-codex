@@ -164,7 +164,10 @@ interface PendingPermission {
 // Session cron jobs live in the process the same way (see cron-jobs.mts).
 interface LiveSession {
   threadId: string
-  query: Query
+  // Null while the session waits for the launch slot (see acquireLaunchSlot).
+  query: Query | null
+  // Passes the launch slot on; set while the session holds it.
+  releaseLaunch: (() => void) | null
   input: TurnInput
   abort: AbortController
   // Registered for reuse by later turns of the thread. Structured-output,
@@ -253,6 +256,8 @@ const SESSION_CONTROL_TIMEOUT_MS = 5_000
 // How long a new turn waits for an interrupted session to drain before it
 // gives up on the sink and goes ahead.
 const SINK_DRAIN_TIMEOUT_MS = 30_000
+// How long a launch holds the launch slot when its CLI says nothing.
+const LAUNCH_GATE_TIMEOUT_MS = 30_000
 // setTimeout's ceiling (about 24.8 days).
 const MAX_TIMER_MS = 2 ** 31 - 1
 // How long past their budget stopping waits for SessionEnd hooks: a killed
@@ -282,6 +287,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   private sessionEnds = new Map<AbortController, SessionEnd>()
   // The SessionEnd hooks still running, with their budget in seconds.
   private ending = new Map<Promise<void>, number>()
+  // Settles once the last session to queue for the launch slot passes it on.
+  private launchTail: Promise<void> = Promise.resolve()
 
   setBackgroundListener(listener: RuntimeBackgroundListener): void {
     this.listener = listener
@@ -293,7 +300,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     const draining = this.sessions.get(context.threadId)
     if (draining && !draining.closed && draining.sink) await this.drainSink(draining)
     const live = this.sessions.get(context.threadId)
-    if (live && !live.closed && this.isReusable(context)) {
+    // A session still waiting for the launch slot has nothing to reuse yet.
+    if (live && !live.closed && live.query && this.isReusable(context)) {
       if (
         live.signature === sessionSignature(context) ||
         this.hasLiveWork(live) ||
@@ -339,6 +347,17 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (!pending || pending.resolved || pending.context.threadId !== threadId) return false
     const session = pending.session
     if (session.closed) return false
+    if (!session.query) {
+      // Still waiting for the launch slot: the CLI starts with these.
+      session.lastContext = {
+        ...session.lastContext,
+        ...(settings.model ? { model: settings.model } : {}),
+        ...(settings.effort ? { effort: settings.effort } : {}),
+      }
+      if (settings.model) session.model = settings.model
+      if (settings.effort) session.effort = settings.effort
+      return true
+    }
     // Not serialized with turn attachment: a turn waiting on an approval
     // holds that chain. The next turn attaching to this session puts its own
     // settings back (applySessionSettings).
@@ -365,9 +384,13 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
 
   async interrupt(threadId: string): Promise<void> {
     const live = this.sessions.get(threadId)
+    const liveQuery = live?.query
     const soft =
-      live != null && !live.closed && (live.liveTasks.size > 0 || this.holdsCronJobs(live))
-    if (soft && live) {
+      live != null &&
+      !live.closed &&
+      liveQuery != null &&
+      (live.liveTasks.size > 0 || this.holdsCronJobs(live))
+    if (soft && live && liveQuery) {
       // Aborting would kill the process and every background task (and
       // scheduled job) with it. Stop only the running turn; the tasks keep
       // going and report back.
@@ -386,7 +409,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         if (live.cliRunning || cancelled.length > 0)
           this.beginSink(live, cancelled, live.cliRunning)
         await settlesWithin(
-          live.query.interrupt().catch(() => {}),
+          liveQuery.interrupt().catch(() => {}),
           SESSION_CONTROL_TIMEOUT_MS,
         )
         this.maybeRelease(live)
@@ -402,13 +425,13 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       pending.session.steers.clear()
       this.closeSession(pending.session)
       pending.abort.abort()
-      await pending.session.query.interrupt().catch(() => {})
+      await pending.session.query?.interrupt().catch(() => {})
     }
   }
 
   async stopTask(threadId: string, taskId: string): Promise<boolean> {
     const live = this.sessions.get(threadId)
-    if (!live || live.closed) return false
+    if (!live || live.closed || !live.query) return false
     const query = live.query as Query & { stopTask?: (taskId: string) => Promise<void> }
     if (typeof query.stopTask !== 'function') return false
     live.stoppedTasks.add(taskId)
@@ -490,6 +513,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }
     for (const session of this.sessions.values()) {
       this.clearSessionTimers(session)
+      this.releaseLaunchSlot(session)
       session.closed = true
       session.abort.abort()
       session.input.close()
@@ -811,13 +835,10 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       // later turns still reach the CLI.
       const input = new TurnInput()
       const reusable = this.isReusable(context) && this.listener != null
-      // canUseTool reaches the session only once Claude asks for a tool.
-      let session: LiveSession | null = null
-      const options = this.buildOptions(sdk, context, abort, () => session)
-      if (reusable) this.trackCronJobs(context, options)
       const opened: LiveSession = {
         threadId: context.threadId,
-        query: sdk.query({ prompt: input, options }),
+        query: null,
+        releaseLaunch: null,
         input,
         abort,
         reusable,
@@ -851,7 +872,10 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         chain: Promise.resolve(),
         closed: false,
       }
-      session = opened
+      // Without the launch gate the CLI starts right away, else once the
+      // session gets the launch slot; the prompt waits in the input meanwhile.
+      const gateMs = launchGateMs()
+      if (gateMs == null) this.startCli(sdk, opened)
       this.send(opened, this.buildPromptMessage(context))
       const pending = this.createPendingTurn(opened, context, handlers, false, resolve, reject)
       opened.current = pending
@@ -863,8 +887,64 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       }
       // Run the receive loop in the background. runTurn() resolves when this
       // turn's result arrives; the loop itself runs for the session.
-      void this.consumeSession(opened)
+      if (gateMs == null) void this.consumeSession(opened)
+      else void this.launchSession(sdk, opened, gateMs)
     })
+  }
+
+  private startCli(sdk: ClaudeSdk, session: LiveSession): void {
+    const context = session.lastContext
+    const options = this.buildOptions(sdk, context, session.abort, () => session)
+    if (session.reusable) this.trackCronJobs(context, options)
+    session.query = sdk.query({ prompt: session.input, options })
+  }
+
+  // With the launch gate on, a session starts its CLI once it gets the launch
+  // slot. One that closed while it waited (interrupted, replaced by a newer
+  // session of the thread, or the adapter stopping) never starts.
+  private async launchSession(sdk: ClaudeSdk, session: LiveSession, gateMs: number): Promise<void> {
+    let failure: Error | null = null
+    try {
+      await this.acquireLaunchSlot(session, gateMs)
+      if (session.abort.signal.aborted)
+        throw new Error('Claude turn interrupted before Claude Code started')
+      if (!session.closed) this.startCli(sdk, session)
+    } catch (error) {
+      failure = error instanceof Error ? error : new Error(String(error))
+    }
+    if (session.query) return this.consumeSession(session)
+    this.releaseLaunchSlot(session)
+    await this.serialize(session, () => this.endSession(session, failure))
+  }
+
+  // Claude Code launches are serialized: a session gets the launch slot once
+  // the previous launch has produced its first message, or has held the slot
+  // for the gate's timeout without one. Several CLIs starting at the same
+  // moment contend for the user's Claude config. Prompts and steers sent
+  // meanwhile wait in the session's input.
+  private async acquireLaunchSlot(session: LiveSession, timeoutMs: number): Promise<void> {
+    const previous = this.launchTail
+    let release: () => void = () => {}
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    this.launchTail = previous.then(() => held)
+    await previous
+    const timer = setTimeout(() => {
+      debugLog('native.launch.gate_timeout', { threadId: session.threadId, timeoutMs })
+      this.releaseLaunchSlot(session)
+    }, timeoutMs)
+    timer.unref()
+    session.releaseLaunch = () => {
+      clearTimeout(timer)
+      release()
+    }
+  }
+
+  private releaseLaunchSlot(session: LiveSession): void {
+    const release = session.releaseLaunch
+    session.releaseLaunch = null
+    release?.()
   }
 
   private attachContinuation(
@@ -983,6 +1063,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     session: LiveSession,
     context: RuntimeTurnContext,
   ): Promise<void> {
+    if (!session.query) return
     const query = session.query as Query & {
       setModel?: (model?: string) => Promise<void>
       setPermissionMode?: (mode: string) => Promise<void>
@@ -1031,6 +1112,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     let failure: Error | null = null
     try {
       for await (const message of session.query as AsyncIterable<Record<string, unknown>>) {
+        // The CLI is up: the next session may launch.
+        this.releaseLaunchSlot(session)
         await this.serialize(session, () => this.routeMessage(session, message))
         if (session.closed) break
       }
@@ -1232,7 +1315,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
 
   private reinterrupt(session: LiveSession): void {
     // Not awaited: routing must keep draining the stream meanwhile.
-    void session.query.interrupt().catch(() => {})
+    void session.query?.interrupt().catch(() => {})
   }
 
   private async drainSink(session: LiveSession): Promise<void> {
@@ -1404,7 +1487,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     this.clearSessionTimers(session)
     session.input.close()
     try {
-      ;(session.query as Query & { close?: () => void }).close?.()
+      ;(session.query as (Query & { close?: () => void }) | null)?.close?.()
     } catch {}
   }
 
@@ -1417,6 +1500,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
 
   private async endSession(session: LiveSession, failure: Error | null): Promise<void> {
     this.clearSessionTimers(session)
+    // A CLI that exits before it says anything passes the launch slot on.
+    this.releaseLaunchSlot(session)
     session.closed = true
     // A superseded session winds down after its replacement registered; the
     // thread's background work now belongs to the replacement.
@@ -2831,6 +2916,13 @@ function sessionSettleMs(): number {
 
 function backgroundIdleMs(): number {
   return positiveEnvMs('CLAUDE_CODEX_BACKGROUND_IDLE_MS') ?? BACKGROUND_IDLE_MS
+}
+
+// How long a launch may hold the launch slot, or null when Claude Code
+// launches are not serialized (CLAUDE_CODEX_SDK_LAUNCH_GATE unset).
+function launchGateMs(): number | null {
+  if (process.env.CLAUDE_CODEX_SDK_LAUNCH_GATE !== '1') return null
+  return positiveEnvMs('CLAUDE_CODEX_SDK_LAUNCH_GATE_TIMEOUT_MS') ?? LAUNCH_GATE_TIMEOUT_MS
 }
 
 function truthyEnv(value: string | undefined): boolean {

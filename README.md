@@ -73,6 +73,16 @@ its own, in the login shell or `~/.claude-codex/runtime.env`, since the daemon
 and the proxy must agree on it. See
 [Configuration](https://fuergaosi233.github.io/claude-codex/guide/configuration).
 
+Each Claude thread runs its own Claude Code process. Several of them starting at
+the same moment, such as the chats that all resume their Claude sessions right
+after the adapter or the App restarts, write the user's Claude Code config
+(`~/.claude.json`) at once and can corrupt it
+([anthropics/claude-code#28847](https://github.com/anthropics/claude-code/issues/28847)).
+`CLAUDE_CODEX_SDK_LAUNCH_GATE=1` starts them one at a time instead: each waits
+until the one before has sent its first message, or for at most
+`CLAUDE_CODEX_SDK_LAUNCH_GATE_TIMEOUT_MS` (default 30000) when it stays silent.
+Prompts and steers sent meanwhile wait for their process. It is off by default.
+
 ### Desktop conversation and visual explanations
 
 The native Claude Agent SDK backend receives presentation guidance modeled on
