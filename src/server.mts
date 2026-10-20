@@ -2337,9 +2337,10 @@ export class CodexClaudeAppServer {
       if (head) {
         void this.dispatchQueued(peer, threadId, head).catch((error) => {
           debugLog('queue.dispatch.failed', { threadId, error: String(error) })
+          const message = error instanceof Error ? error.message : String(error)
           this.notify(peer, {
             method: 'error',
-            params: { threadId, turnId: null, willRetry: false, error: { message: String(error) } },
+            params: { threadId, turnId: null, willRetry: false, error: { message } },
           })
         })
         return this.activeTurnByThread.has(threadId)

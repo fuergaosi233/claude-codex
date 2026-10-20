@@ -1197,6 +1197,7 @@ async function assertOpensButStartsNothing(
   const { call, contexts, notifications, store } = harness
   const launched = contexts.length
   const pinned = store.getThread(threadId)?.modelProfileFingerprint ?? null
+  const model = store.getThread(threadId)?.model
   const turns = store.listTurns(threadId).length
   assert.ok(turns > 0)
 
@@ -1204,12 +1205,12 @@ async function assertOpensButStartsNothing(
   assert.equal(resumed.error, undefined, resumed.error?.message)
   assert.equal(resumed.result.thread.id, threadId)
   assert.equal(resumed.result.thread.turns.length, turns)
-  // A model the resume names does not re-pin the chat either.
-  const renamed = await call('thread/resume', {
-    threadId,
-    model: store.getThread(threadId)?.model,
-  })
-  assert.equal(renamed.error, undefined, renamed.error?.message)
+  // A model the resume names, its own or another, does not re-pin the chat either.
+  for (const named of [model, 'second-model']) {
+    const renamed = await call('thread/resume', { threadId, model: named })
+    assert.equal(renamed.error, undefined, renamed.error?.message)
+    assert.equal(renamed.result.model, model)
+  }
   const read = await call('thread/read', { threadId, includeTurns: true })
   assert.equal(read.error, undefined, read.error?.message)
   assert.equal(read.result.thread.turns.length, turns)
@@ -1226,8 +1227,11 @@ async function assertOpensButStartsNothing(
   assert.match(compact.error?.message ?? '', refusal)
   const fork = await call('thread/fork', { threadId })
   assert.match(fork.error?.message ?? '', refusal)
+  const moved = await call('thread/metadata/update', { threadId, model: 'second-model' })
+  assert.match(moved.error?.message ?? '', refusal)
 
-  // Turns the adapter starts by itself say why they did not.
+  // Turns the adapter starts by itself say why they did not, in words the App
+  // shows as they are.
   const refused = async (method: string, params: Record<string, unknown>) => {
     const before = notifications.filter((entry) => entry.method === 'error').length
     const response = await call(method, { threadId, ...params })
@@ -1235,7 +1239,9 @@ async function assertOpensButStartsNothing(
     for (let waited = 0; ; waited += 10) {
       const errors = notifications.filter((entry) => entry.method === 'error')
       if (errors.length > before) {
-        assert.match(errors.at(-1)?.params.error.message ?? '', refusal)
+        const message = errors.at(-1)?.params.error.message ?? ''
+        assert.match(message, refusal)
+        assert.doesNotMatch(message, /^Error\b/)
         return response.result
       }
       assert.ok(waited < 5_000, `${method} reported no refusal`)
@@ -1254,6 +1260,7 @@ async function assertOpensButStartsNothing(
 
   assert.equal(contexts.length, launched)
   assert.equal(store.listTurns(threadId).length, turns)
+  assert.equal(store.getThread(threadId)?.model, model)
   assert.equal(store.getThread(threadId)?.modelProfileFingerprint ?? null, pinned)
 }
 
