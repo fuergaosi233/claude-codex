@@ -3901,7 +3901,9 @@ export class CodexClaudeAppServer {
           : null,
       // Without the memories mapping the runtime leaves auto-memory to
       // Claude Code's own settings.
-      ...(memoriesMappingEnabled() ? { autoMemory: !isCodexThread && this.autoMemoryFor(thread) } : {}),
+      ...(memoriesMappingEnabled()
+        ? { autoMemory: !isCodexThread && this.autoMemoryFor(thread) }
+        : {}),
       ...(continuation ? { continuation: true } : {}),
     }
     return { context, isCodexThread, resumeSessionAt, turnCwd }
