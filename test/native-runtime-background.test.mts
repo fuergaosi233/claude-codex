@@ -552,6 +552,74 @@ test('native background level replaces task edges and reports tasks still alive 
   await runtime.stop()
 })
 
+test('native drops the task frames of a run that a resume replaced', async () => {
+  await withSettleMs(40, async () => {
+    const { runtime, queries } = fakeRuntime()
+    const listener = recordingListener()
+    runtime.setBackgroundListener(listener)
+
+    const first = runtime.runTurn(context, handlers([]))
+    const query = await waitFor(() => queries[0], 'session')
+    query.push(
+      ...launchBackgroundAgent('a6').map((message) =>
+        message.type === 'system' ? { ...message, run_id: 'run-1' } : message,
+      ),
+    )
+    await first
+
+    const frame = (subtype: string, fields: Record<string, unknown>) => ({
+      type: 'system',
+      subtype,
+      task_id: 'a6',
+      ...fields,
+    })
+    // SendMessage resumed the agent: same task, a new run. The old run's
+    // notification arrives after that and must not end the new one.
+    query.push(
+      frame('task_started', {
+        run_id: 'run-2',
+        tool_use_id: 'send-use',
+        task_type: 'local_agent',
+        description: 'investigate',
+        is_backgrounded: true,
+      }),
+      frame('task_notification', { run_id: 'run-1', status: 'completed', summary: 'old run' }),
+      frame('task_progress', { run_id: 'run-1', description: 'old run' }),
+      frame('task_progress', { run_id: 'run-2', description: 'new run' }),
+      // A CLI that predates run ids sends none: such frames always count.
+      frame('task_progress', { description: 'no run' }),
+    )
+    await waitFor(
+      () => listener.tasks.filter((event) => event.type === 'task_progress').length === 2,
+      'progress of the current run',
+    )
+    assert.equal(runtime.hasBackgroundWork(), true, 'the old notification ended nothing')
+    query.push(
+      frame('task_notification', { run_id: 'run-2', status: 'failed', summary: 'new run' }),
+    )
+    await waitFor(
+      () => listener.tasks.some((event) => event.type === 'task_notification'),
+      'notification of the current run',
+    )
+    assert.deepEqual(
+      listener.tasks.map((event) =>
+        event.type === 'task_progress' || event.type === 'task_notification'
+          ? `${event.type}:${event.type === 'task_progress' ? event.description : event.summary}`
+          : event.type,
+      ),
+      [
+        'task_started',
+        'task_started',
+        'task_progress:new run',
+        'task_progress:no run',
+        'task_notification:new run',
+      ],
+    )
+    await waitFor(() => listener.released.length === 1, 'session release')
+    await runtime.stop()
+  })
+})
+
 test('native runtime without a background listener keeps closing the session per turn', async () => {
   const { runtime, queries } = fakeRuntime()
   const first = runtime.runTurn(context, handlers([]))
@@ -1420,6 +1488,51 @@ test('the main loop keeps its own tools and text beside an Agent call; only suba
     ),
     ['m1:5', 'm1:30'],
     'only main-loop API calls count toward goal progress',
+  )
+})
+
+test("a subagent's own Agent call names the agent that made it, when the CLI does", async () => {
+  const { runtime, queries } = fakeRuntime()
+  const events: RuntimeEvent[] = []
+  const turn = runtime.runTurn(context, handlers(events))
+  const query = await waitFor(() => queries[0], 'session')
+  const agentCall = (id: string) => ({ type: 'tool_use', id, name: 'Agent', input: { prompt: id } })
+  const nested = (id: string, fields: Record<string, unknown>) => ({
+    type: 'assistant',
+    parent_tool_use_id: 'agent-1',
+    message: { id: `sub-${id}`, content: [agentCall(id)] },
+    ...fields,
+  })
+  const result = (id: string, parent: string | null) => ({
+    type: 'user',
+    parent_tool_use_id: parent,
+    message: { content: [{ type: 'tool_result', tool_use_id: id, content: `${id} report` }] },
+  })
+  query.push(
+    // The main loop's frames carry no agent id, and one there is ignored.
+    { ...assistant('m1', [agentCall('agent-1')]), parent_tool_use_id: null, agent_id: 'stray' },
+    nested('agent-2', { agent_id: 'task-1' }),
+    // An older CLI names no agent.
+    nested('agent-3', {}),
+    result('agent-2', 'agent-1'),
+    result('agent-3', 'agent-1'),
+    result('agent-1', null),
+    assistant('m2', [text('done')]),
+    { type: 'result', subtype: 'success', result: 'done' },
+  )
+  await turn
+
+  assert.deepEqual(
+    events.flatMap((event) =>
+      event.type === 'tool_use'
+        ? [[event.toolUseId, event.agentId ?? null, 'agentId' in event]]
+        : [],
+    ),
+    [
+      ['agent-1', null, false],
+      ['agent-2', 'task-1', true],
+      ['agent-3', null, false],
+    ],
   )
 })
 

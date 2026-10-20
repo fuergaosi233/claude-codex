@@ -6819,6 +6819,234 @@ test('SendMessage to a finished foreground agent reopens it like a background on
   }
 })
 
+// The item/completed notifications that name a child: its collab tool calls
+// and its activity markers.
+function itemsNaming(messages: any[], childThreadId: string): any[] {
+  return messages.filter(
+    (m) =>
+      m.method === 'item/completed' &&
+      (m.params.item.receiverThreadIds?.includes(childThreadId) ||
+        m.params.item.agentThreadId === childThreadId),
+  )
+}
+
+// Where those items went, as `threadId/turnId`.
+function placesOf(messages: any[]): string[] {
+  return [...new Set(messages.map((m) => `${m.params.threadId}/${m.params.turnId}`))]
+}
+
+// The child thread an agent got, found by its prompt.
+function childByPrompt(messages: any[], prompt: string): any {
+  return messages.find((m) => m.method === 'thread/started' && m.params.thread.preview === prompt)
+    ?.params.thread
+}
+
+test("an agent another agent launches hangs off that agent's child thread", async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json(codex930Initialize(0)))
+    await reader.nextResponse(0)
+    const threadId = await startMockThread(reader, proc)
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: textInput('nested subagent check') },
+      }),
+    )
+    const turnId = (await reader.nextResponse(2)).result.turn.id
+    const seen = await readUntil(
+      reader,
+      (m) => m.method === 'turn/completed' && m.params.threadId === threadId,
+    )
+    const outer = childByPrompt(seen, 'plan the work')
+    const inner = childByPrompt(seen, 'check one file')
+    assert.ok(outer && inner)
+    const outerTurnId = seen.find(
+      (m) => m.method === 'turn/started' && m.params.threadId === outer.id,
+    )?.params.turn.id
+    assert.ok(outerTurnId)
+    assert.equal(outer.parentThreadId, threadId)
+    assert.equal(inner.parentThreadId, outer.id)
+    assert.equal(inner.source.subAgent.thread_spawn.parent_thread_id, outer.id)
+    assert.equal(inner.source.subAgent.thread_spawn.depth, 2)
+
+    // The App finds a child through the spawn item of the conversation the
+    // child names as its parent: the inner agent's items live in the outer
+    // child's turn, sent by the outer child.
+    const innerItems = itemsNaming(seen, inner.id)
+    assert.deepEqual(placesOf(innerItems), [`${outer.id}/${outerTurnId}`])
+    const innerCollab = innerItems
+      .map((m) => m.params.item)
+      .filter((item) => item.type === 'collabAgentToolCall')
+    assert.deepEqual(
+      innerCollab.map((item) => [item.tool, item.senderThreadId]),
+      [
+        ['spawnAgent', outer.id],
+        ['wait', outer.id],
+      ],
+    )
+    assert.equal(innerCollab[1].status, 'completed')
+    const innerActivity = innerItems
+      .map((m) => m.params.item)
+      .find((item) => item.type === 'subAgentActivity')
+    assert.match(innerActivity.agentPath, /^\/root\/[^/]+\/[^/]+$/)
+    // The parent turn shows the outer agent only.
+    assert.deepEqual(placesOf(itemsNaming(seen, outer.id)), [`${threadId}/${turnId}`])
+    assert.equal(
+      seen.some(
+        (m) =>
+          m.params?.threadId === threadId &&
+          JSON.stringify(m.params.item ?? null).includes(inner.id),
+      ),
+      false,
+    )
+
+    // History and the topology queries agree.
+    proc.stdin.write(json({ id: 3, method: 'thread/read', params: { threadId: outer.id } }))
+    const outerRead = (await reader.nextResponse(3)).result.thread
+    assert.ok(
+      outerRead.turns[0].items.some(
+        (item: any) => item.tool === 'spawnAgent' && item.receiverThreadIds[0] === inner.id,
+      ),
+    )
+    const list = async (id: number, params: Record<string, unknown>) => {
+      proc.stdin.write(
+        json({
+          id,
+          method: 'thread/list',
+          params: { ...params, sourceKinds: ['subAgentThreadSpawn'], limit: 200 },
+        }),
+      )
+      return (await reader.nextResponse(id)).result.data.map((thread: any) => thread.id).sort()
+    }
+    assert.deepEqual(await list(4, { parentThreadId: threadId }), [outer.id])
+    assert.deepEqual(await list(5, { parentThreadId: outer.id }), [inner.id])
+    assert.deepEqual(await list(6, { ancestorThreadId: threadId }), [outer.id, inner.id].sort())
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('without the agent ids every agent hangs off the parent thread, as before', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json(codex930Initialize(0)))
+    await reader.nextResponse(0)
+    const threadId = await startMockThread(reader, proc)
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: textInput('nested subagent check without ids') },
+      }),
+    )
+    const turnId = (await reader.nextResponse(2)).result.turn.id
+    const seen = await readUntil(
+      reader,
+      (m) => m.method === 'turn/completed' && m.params.threadId === threadId,
+    )
+    for (const prompt of ['plan the work', 'check one file']) {
+      const child = childByPrompt(seen, prompt)
+      assert.equal(child.parentThreadId, threadId)
+      assert.equal(child.source.subAgent.thread_spawn.depth, 1)
+      const items = itemsNaming(seen, child.id)
+      assert.deepEqual(placesOf(items), [`${threadId}/${turnId}`])
+      for (const { params } of items) {
+        if (params.item.type === 'collabAgentToolCall')
+          assert.equal(params.item.senderThreadId, threadId)
+        else assert.match(params.item.agentPath, /^\/root\/[^/]+$/)
+      }
+    }
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('an agent SendMessage resumes keeps its child thread, and the agents it launches hang off it', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  const turnCompleted = (threadId: string) => (message: any) =>
+    message.method === 'turn/completed' && message.params.threadId === threadId
+  try {
+    proc.stdin.write(json(codex930Initialize(0)))
+    await reader.nextResponse(0)
+    const threadId = await startMockThread(reader, proc)
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: textInput('subagent check') },
+      }),
+    )
+    await reader.nextResponse(2)
+    const ran = await readUntil(reader, turnCompleted(threadId))
+    const childThreadId = String(
+      ran.find((m) => m.method === 'item/completed' && m.params.item.tool === 'spawnAgent')?.params
+        .item.receiverThreadIds[0] ?? '',
+    )
+    assert.ok(childThreadId)
+
+    proc.stdin.write(
+      json({
+        id: 3,
+        method: 'turn/start',
+        params: { threadId, input: textInput('foreground message nested check delay=300') },
+      }),
+    )
+    await reader.nextResponse(3)
+    const sent = await readUntil(reader, turnCompleted(threadId))
+    const sendInput = sent.find(
+      (m) => m.method === 'item/completed' && m.params.item.tool === 'sendInput',
+    )?.params.item
+    assert.deepEqual(sendInput?.receiverThreadIds, [childThreadId])
+    const reopened = sent.find(
+      (m) => m.method === 'turn/started' && m.params.threadId === childThreadId,
+    )
+    assert.ok(reopened, 'the message reopens the same child thread')
+    const nested = childByPrompt(sent, 'check one file')
+    assert.equal(nested?.parentThreadId, childThreadId)
+    assert.equal(nested.source.subAgent.thread_spawn.depth, 2)
+    const nestedItems = itemsNaming(sent, nested.id)
+    assert.deepEqual(placesOf(nestedItems), [`${childThreadId}/${reopened.params.turn.id}`])
+    assert.deepEqual(
+      nestedItems
+        .map((m) => m.params.item)
+        .filter((item) => item.type === 'collabAgentToolCall')
+        .map((item) => [item.tool, item.senderThreadId]),
+      [
+        ['spawnAgent', childThreadId],
+        ['wait', childThreadId],
+      ],
+    )
+
+    // The report settles the reopened turn: one child thread throughout.
+    const report = await readUntil(reader, turnCompleted(threadId))
+    assert.equal(report.find(turnCompleted(childThreadId))?.params.turn.id, reopened.params.turn.id)
+    proc.stdin.write(json({ id: 4, method: 'thread/read', params: { threadId: childThreadId } }))
+    const child = (await reader.nextResponse(4)).result.thread
+    assert.deepEqual(
+      child.turns.map((turn: any) => turn.status),
+      ['completed', 'completed'],
+    )
+    assert.ok(
+      child.turns[1].items.some(
+        (item: any) => item.tool === 'spawnAgent' && item.receiverThreadIds[0] === nested.id,
+      ),
+    )
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('TaskStop on a background agent is a closeAgent that ends the child as interrupted', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawnMockAdapter(home)

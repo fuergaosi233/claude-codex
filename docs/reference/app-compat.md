@@ -41,6 +41,7 @@ line a rule touches.
 | `agent-states` | shows `interrupted` as done and `errored` as failed | a stopped subagent shows as done |
 | `subagent-read` | reads a child with `includeTurns: false` and shows one without turns as loading | a finished subagent opens with its prompt and reply |
 | `child-prompt` | creates the child conversation from `thread/started` with an empty turn | a running subagent shows its prompt |
+| `nested-subagent` | finds a child through the `spawnAgent` item of the conversation its `parentThreadId` names | a subagent's own subagent opens from the outer subagent's conversation, at depth 2 |
 | `rate-limit-banner` | shows a banner for every `account/rateLimits/updated` | no banner after an ordinary reply |
 | `projects` | holds project writes until `project/list` answers, and matches the `project not found` and deleted-key error texts | a project and a chat moved into it survive an App restart |
 | `delete-missing-rollout` | retries `thread/delete` with `missingRolloutRecovery` after `no rollout found for thread id <id>` | deleting all archived chats empties the list |

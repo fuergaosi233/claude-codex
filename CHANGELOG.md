@@ -340,6 +340,14 @@ versioning or publishing metadata.
   `CLAUDE_CODE_FORK_SUBAGENT` from the adapter's environment, so `0` there
   turns forks off; a model process profile passes it on only when its
   `inheritEnv` names it or its `env` sets it.
+- An agent another agent launches hangs off that agent's child thread, one
+  level deeper, with its spawn and wait cards in that agent's conversation,
+  when Claude Code names the agent behind each frame (`agent_id`, newer
+  Claude Code versions); without the ids every agent still hangs off the
+  parent thread. An agent `SendMessage` resumes keeps its child
+  thread, and the agents it launches hang off it. Task frames still arriving
+  from the run a resume replaced (`run_id`) are dropped instead of being
+  counted against the new run.
 - Deleting a thread ends its running background agents first, so each child
   turn completes as interrupted; stopping a turn no longer wakes the thread to
   acknowledge the background agents Claude Code stopped with it; and

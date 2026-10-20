@@ -188,6 +188,14 @@ export const APP_RULES: readonly AppRule[] = [
     verify: 'Open a running subagent before it answers: its prompt shows.',
   },
   {
+    id: 'nested-subagent',
+    app: "Finds a child through the spawnAgent item of the conversation the child names as its parent (parentThreadId), and nests the child under that conversation's subagents.",
+    adapter:
+      "Gives an agent another agent launched that agent's child thread as its parent, and puts its spawn, wait and activity items in that child's turn.",
+    verify:
+      "Have a subagent launch a subagent of its own: the inner one opens from the outer one's conversation and shows at depth 2.",
+  },
+  {
     id: 'rate-limit-banner',
     app: 'Shows a rate-limit banner for every account/rateLimits/updated notification.',
     adapter: 'Sends none per turn; account/rateLimits/read answers the snapshot.',

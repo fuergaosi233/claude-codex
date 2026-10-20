@@ -651,7 +651,17 @@ export type RuntimeEvent =
   | { type: 'message_boundary' }
   | { type: 'text_delta'; delta: string }
   | { type: 'reasoning_delta'; delta: string }
-  | { type: 'tool_use'; toolUseId: string; toolName: string; input: Record<string, unknown> }
+  | {
+      type: 'tool_use'
+      toolUseId: string
+      toolName: string
+      input: Record<string, unknown>
+      // A subagent's own call: the task id of the agent that made it, which
+      // stays the same when the agent is resumed. Only Agent calls of a
+      // subagent reach the server; absent for the main loop and on CLIs
+      // that do not report it.
+      agentId?: string
+    }
   // The input of a file tool call (Edit, Write, MultiEdit) as far as the
   // model has written it; the finished call follows as `tool_use`.
   | {
@@ -884,6 +894,9 @@ export type RuntimeTaskEvent =
       subagentType: string | null
       prompt: string | null
       backgrounded: boolean | null
+      // The task id of the subagent whose agent launched this task. Absent
+      // when the main loop launched it, and on CLIs that do not report it.
+      parentTaskId?: string
     }
   | {
       type: 'task_progress'

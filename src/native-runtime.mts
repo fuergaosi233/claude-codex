@@ -246,6 +246,9 @@ interface LiveSession {
   liveTasks: Set<string>
   levelSeen: boolean
   tasks: Map<string, SessionTask>
+  // The latest run of each task, by task id. A resumed task keeps its id and
+  // starts a new run; a task_* frame naming an earlier run is late.
+  taskRuns: Map<string, string>
   // A task ended and Claude may still start a turn to answer it.
   unsettled: boolean
   settleObservedRunning: boolean
@@ -1182,6 +1185,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         liveTasks: new Set(),
         levelSeen: false,
         tasks: new Map(),
+        taskRuns: new Map(),
         unsettled: false,
         settleObservedRunning: false,
         cliState: null,
@@ -1522,7 +1526,18 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       this.maybeRelease(session)
       return
     }
-    if (type === 'system') await this.trackSessionSystem(session, message)
+    if (type === 'system' && (await this.trackSessionSystem(session, message)) === 'late') {
+      // A frame of a task run that has since been resumed: it says nothing
+      // about the run now going, neither to the thread nor to a turn.
+      debugLog('native.task.late_frame', {
+        threadId: session.threadId,
+        subtype: String(message.subtype ?? ''),
+        taskId: stringOrNull(message.task_id),
+        runId: stringOrNull(message.run_id),
+      })
+      this.maybeRelease(session)
+      return
+    }
     const init = type === 'system' && message.subtype === 'init' && !message.parent_tool_use_id
     const result = type === 'result'
     let endedWhileIdle: string[] = []
@@ -1999,10 +2014,11 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   // Background task bookkeeping. Every system frame passes through here
   // before the current turn (if any) sees it; workflow tasks keep their own
   // projection in handleSystem and are only counted for liveness here.
+  // `late` marks a task frame of an earlier run, which nothing else sees.
   private async trackSessionSystem(
     session: LiveSession,
     message: Record<string, unknown>,
-  ): Promise<void> {
+  ): Promise<'late' | undefined> {
     const subtype = String(message.subtype ?? '')
     if (subtype === 'session_state_changed') {
       const state = String(message.state ?? '')
@@ -2040,6 +2056,14 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       return
     const taskId = stringOrNull(message.task_id)
     if (!taskId) return
+    // Run ids of one task sort in the order the runs opened. Frames without
+    // one (older CLIs) all count as the current run.
+    const runId = stringOrNull(message.run_id)
+    if (runId) {
+      const latest = session.taskRuns.get(taskId)
+      if (latest !== undefined && runId < latest) return 'late'
+      session.taskRuns.set(taskId, runId)
+    }
     const known = session.tasks.get(taskId)
     const toolUseId = stringOrNull(message.tool_use_id) ?? known?.toolUseId ?? null
     const taskType = stringOrNull(message.task_type) ?? known?.taskType ?? null
@@ -2055,6 +2079,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         session.liveTasks.add(taskId)
       if (taskType === 'local_bash')
         session.commandOutputs.taskStarted(taskId, toolUseId, backgrounded)
+      const parentTaskId = stringOrNull(message.parent_task_id)
       await listener?.onTaskEvent(session.threadId, {
         type: 'task_started',
         taskId,
@@ -2064,6 +2089,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         subagentType: stringOrNull(message.subagent_type),
         prompt: stringOrNull(message.prompt),
         backgrounded,
+        ...(parentTaskId ? { parentTaskId } : {}),
       })
       return
     }
@@ -2687,6 +2713,9 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     const inner = message.message as Record<string, unknown> | undefined
     if (!inner) return
     const nestedMessage = Boolean(message.parent_tool_use_id)
+    // The subagent that wrote a nested frame, by its task id (newer CLIs;
+    // the same id after a resume). Its Agent calls launch agents of its own.
+    const agentId = nestedMessage ? stringOrNull(message.agent_id) : null
     if (!nestedMessage) {
       await this.beginAssistantMessage(pending, stringOrNull(inner.id))
       pending.model = stringOrNull(inner.model) ?? pending.model
@@ -2741,7 +2770,13 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         // The server draws a dynamic tool call as a dynamicToolCall item
         // when it runs (onDynamicToolCall).
         if (dynamicToolNames(pending.context).has(name)) continue
-        await pending.handlers.onEvent({ type: 'tool_use', toolUseId: id, toolName: name, input })
+        await pending.handlers.onEvent({
+          type: 'tool_use',
+          toolUseId: id,
+          toolName: name,
+          input,
+          ...(agentId ? { agentId } : {}),
+        })
         if (isWorkflowTool(name)) pending.workflowToolUseIds.add(id)
         if (name === 'Bash' && !nestedMessage)
           pending.session.commandOutputs.call(id, this.commandOutputSink(pending, id))

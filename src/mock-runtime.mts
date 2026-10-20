@@ -1237,9 +1237,10 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
-    if (/(background|foreground) message check/i.test(context.prompt)) {
+    if (/(background|foreground) message (nested )?check/i.test(context.prompt)) {
       // A foreground agent is the one `subagent check` ran; the CLI resumes
-      // it in the background just the same.
+      // it in the background just the same. "nested" has the resumed agent
+      // launch an agent of its own before the turn ends.
       const toolUseId = `send-${Date.now()}`
       const agentId = /foreground/i.test(context.prompt)
         ? MOCK_FOREGROUND_AGENT_ID
@@ -1265,6 +1266,22 @@ export class MockRuntime implements ClaudeRuntime {
         toolUseId,
         content: `Agent "${agentId}" was resumed in the background.`,
       })
+      if (/message nested check/i.test(context.prompt)) {
+        // The agent keeps its task id across the resume; its frames carry it.
+        const nestedUseId = `task-nested-${Date.now()}`
+        await handlers.onEvent({
+          type: 'tool_use',
+          toolUseId: nestedUseId,
+          toolName: 'Agent',
+          input: { description: 'mock nested agent', prompt: 'check one file' },
+          agentId,
+        })
+        await handlers.onEvent({
+          type: 'tool_result',
+          toolUseId: nestedUseId,
+          content: 'nested report',
+        })
+      }
       this.scheduleBackgroundReport(
         context.threadId,
         agentId,
@@ -1332,6 +1349,63 @@ export class MockRuntime implements ClaudeRuntime {
       }
       await handlers.onEvent({ type: 'text_delta', delta: 'both agents reported' })
       await handlers.onEvent({ type: 'completed', success: true, result: 'efforts' })
+      return
+    }
+
+    if (/nested subagent check/i.test(context.prompt)) {
+      // An agent launches an agent of its own. Newer CLIs name the agent
+      // behind a subagent's frame (agent_id) and the agent that launched a
+      // task (parent_task_id); "without ids" plays a CLI that sends neither.
+      const withIds = !/without ids/i.test(context.prompt)
+      const parentUseId = `task-parent-${Date.now()}`
+      const nestedUseId = `task-nested-${Date.now()}`
+      const parentTaskId = 'mock-parent-task'
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId: parentUseId,
+        toolName: 'Agent',
+        input: { description: 'mock parent agent', prompt: 'plan the work' },
+      })
+      await this.listener?.onTaskEvent(context.threadId, {
+        type: 'task_started',
+        taskId: parentTaskId,
+        toolUseId: parentUseId,
+        taskType: 'local_agent',
+        description: 'mock parent agent',
+        subagentType: null,
+        prompt: 'plan the work',
+        backgrounded: false,
+      })
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId: nestedUseId,
+        toolName: 'Agent',
+        input: { description: 'mock nested agent', prompt: 'check one file' },
+        ...(withIds ? { agentId: parentTaskId } : {}),
+      })
+      await this.listener?.onTaskEvent(context.threadId, {
+        type: 'task_started',
+        taskId: 'mock-nested-task',
+        toolUseId: nestedUseId,
+        taskType: 'local_agent',
+        description: 'mock nested agent',
+        subagentType: null,
+        prompt: 'check one file',
+        backgrounded: false,
+        ...(withIds ? { parentTaskId } : {}),
+      })
+      await handlers.onEvent({
+        type: 'tool_result',
+        toolUseId: nestedUseId,
+        content: 'nested report',
+      })
+      await handlers.onEvent({
+        type: 'tool_result',
+        toolUseId: parentUseId,
+        content: 'parent report',
+      })
+      await handlers.onEvent({ type: 'text_delta', delta: 'nested agents reported' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'nested agents reported' })
       return
     }
 
