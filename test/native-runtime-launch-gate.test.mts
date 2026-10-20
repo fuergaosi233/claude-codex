@@ -180,14 +180,18 @@ function promptText(message: Record<string, unknown> | undefined): unknown {
 }
 
 test('without the launch gate every Claude Code starts at once', async () => {
-  await withEnv({}, async () => {
-    const { runtime, queries } = fakeRuntime()
-    const runs = ['a', 'b', 'c'].map((name) => runtime.runTurn(turn(name), handlers()))
-    await waitFor(() => queries.length === 3, 'three launches')
-    for (const query of queries) query.push(init, result)
-    await Promise.all(runs)
-    await runtime.stop()
-  })
+  // Unset, and switched off explicitly.
+  for (const env of [{}, { CLAUDE_CODEX_SDK_LAUNCH_GATE: '0' }]) {
+    await withEnv(env, async () => {
+      const { runtime, queries } = fakeRuntime()
+      const runs = ['a', 'b', 'c'].map((name) => runtime.runTurn(turn(name), handlers()))
+      // Each CLI starts as its turn opens, before any of them says anything.
+      await waitFor(() => queries.length === 3, 'three launches')
+      for (const query of queries) query.push(init, result)
+      await Promise.all(runs)
+      await runtime.stop()
+    })
+  }
 })
 
 test('the launch gate starts the next Claude Code once the previous one says something', async () => {
@@ -216,6 +220,31 @@ test('the launch gate starts the next Claude Code once the previous one says som
       assert.ok(turnEvents.some((event) => event.type === 'completed'))
     await runtime.stop()
   })
+})
+
+test('a SessionStart hook a Claude Code runs does not hold the launch gate', async () => {
+  await withGate(async () => {
+    const { runtime, queries } = fakeRuntime()
+    const hooked = runtime.runTurn(turn('a'), handlers())
+    const first = await waitFor(() => queries[0], 'first launch')
+    const next = runtime.runTurn(turn('b'), handlers())
+    await sleep(20)
+    assert.equal(queries.length, 1, 'the second launch waits for the first')
+    // The CLI reports the hook as it starts it, before its init: however long
+    // the hook runs, the next launch goes ahead well within the timeout.
+    const hook = { type: 'system', hook_id: 'hook-1', hook_event: 'SessionStart' }
+    first.push({ ...hook, subtype: 'hook_started', hook_name: 'SessionStart:startup' })
+    const second = await waitFor(() => queries[1], 'second launch during the hook', 1_000)
+    second.push(init, result)
+    await next
+    first.push(
+      { ...hook, subtype: 'hook_response', outcome: 'success', exit_code: 0 },
+      init,
+      result,
+    )
+    await hooked
+    await runtime.stop()
+  }, 60_000)
 })
 
 test('the launch gate moves on when a Claude Code says nothing for its timeout', async () => {

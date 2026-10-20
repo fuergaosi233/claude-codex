@@ -956,7 +956,10 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   // the previous launch has produced its first message, or has held the slot
   // for the gate's timeout without one. Several CLIs starting at the same
   // moment contend for the user's Claude config. Prompts and steers sent
-  // meanwhile wait in the session's input.
+  // meanwhile wait in the session's input. Sessions take hook events
+  // (includeHookEvents), so a CLI that runs a SessionStart or Setup hook while
+  // it loads reports the hook as it starts it: the hook's run time never
+  // counts against the timeout, and a slow hook holds no one back.
   private async acquireLaunchSlot(session: LiveSession, timeoutMs: number): Promise<void> {
     const previous = this.launchTail
     let release: () => void = () => {}
