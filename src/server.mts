@@ -33,9 +33,12 @@ import {
   callMcpTool,
   listMcpServerStatuses,
   type McpConfigScope,
+  mcpOauthUnavailable,
   readMcpConfig,
   readMcpResource,
+  resetMcpStatusCache,
 } from './mcp.mjs'
+import { memoryCitation } from './memory-citations.mjs'
 import { projectInstructions } from './project-instructions.mjs'
 import { projectProviderLoopConfig } from './provider-loop-config.mjs'
 import {
@@ -99,6 +102,7 @@ import {
   projectMetadata,
   projectName,
   projectRoots,
+  REVIEW_FALLBACK,
   readConfigReasoningEffort,
   reasoningEffortFromParams,
   reviewLabel,
@@ -144,6 +148,7 @@ import type {
   PermissionDecision,
   ProjectRecord,
   QueuedSubmission,
+  RecalledMemory,
   RpcPeer,
   RuntimeEvent,
   RuntimeLiveTask,
@@ -864,11 +869,25 @@ export class CodexClaudeAppServer {
       case 'app/list':
         return { data: [], nextCursor: null }
       case 'mcpServer/oauth/login':
-        return {
-          authorizationUrl: `https://localhost.invalid/claude-codex/mcp-oauth/${encodeURIComponent(stringOr(asRecord(params).name, 'server'))}`,
+        // The Agent SDK has no call that starts an MCP server's OAuth flow, so
+        // there is no authorization URL to hand the App. Say where to sign in
+        // instead of returning a link that leads nowhere.
+        throw new Error(mcpOauthUnavailable(stringOr(asRecord(params).name, '')))
+      case 'config/mcpServer/reload': {
+        // Every turn hands Claude Code the MCP config as it is then. What a
+        // reload adds: the server list is read afresh, sessions kept open by
+        // background work retry the servers that failed or wait for a
+        // sign-in, and every App window hears the servers configured now.
+        resetMcpStatusCache()
+        void this.runtime.reloadMcpServers?.()
+        for (const status of readMcpConfig().startupStatuses) {
+          this.notifyAll({
+            method: 'mcpServer/startupStatus/updated',
+            params: { name: status.name, status: status.status, error: status.error ?? null },
+          })
         }
-      case 'config/mcpServer/reload':
         return {}
+      }
       // Event streams feed MCP app widgets. This server forwards no MCP
       // events, so a subscription stays silent until the App stops it.
       case 'mcpServer/event/stream/start':
@@ -2779,6 +2798,11 @@ export class CodexClaudeAppServer {
         method: 'item/started',
         params: { threadId, turnId, item: entered, startedAtMs: nowMillis() },
       })
+      // The marker is complete once the review is under way, as in Codex.
+      this.notify(peer, {
+        method: 'item/completed',
+        params: { threadId, turnId, item: entered, completedAtMs: nowMillis() },
+      })
       void this.runRuntimeTurn(peer, thread, turn, prompt, {
         model: thread.model,
         effort: thread.reasoningEffort,
@@ -3341,6 +3365,8 @@ export class CodexClaudeAppServer {
     // (interrupt, error, watchdog) drops the late result, so these are closed
     // as failed before the turn completes.
     const openToolItems = new Set<string>()
+    // What Claude's auto-memory recalled for the turn's prompts.
+    const recalledMemories: RecalledMemory[] = []
     // Mutable holder rather than `let collectedMetrics`: TS's control-flow
     // analysis doesn't see writes from inside the onEvent callback, so a bare
     // `let` would still be inferred as `null` outside the closure.
@@ -3426,12 +3452,19 @@ export class CodexClaudeAppServer {
     }
     const completeAgentItem = (phase: 'commentary' | 'final_answer'): void => {
       if (!agentItemId) return
+      // The answer cites the memories Claude recalled during the turn.
+      const citation = phase === 'final_answer' ? memoryCitation(recalledMemories) : null
       // Visualize lines get their marks here and not in the deltas: the App
       // shows the completed text in place of what streamed.
       // App rule: visualize-line
       const updated = this.store.updateItem(turn.id, agentItemId, (item) =>
         item.type === 'agentMessage'
-          ? { ...item, phase, text: markVisualizeLines(item.text) }
+          ? {
+              ...item,
+              phase,
+              text: markVisualizeLines(item.text),
+              ...(citation ? { memoryCitation: citation } : {}),
+            }
           : item,
       )
       const item = updated?.items.find((item) => item.id === agentItemId)
@@ -4442,6 +4475,10 @@ export class CodexClaudeAppServer {
             }
             return
           }
+          if (event.type === 'memory_recall') {
+            recalledMemories.push(...event.memories)
+            return
+          }
           if (event.type === 'notice') {
             debugLog('turn.runtime.notice', { threadId: thread.id, turnId: turn.id, ...event })
             // Runtime status is not assistant prose. Keep genuine warnings
@@ -4782,6 +4819,7 @@ export class CodexClaudeAppServer {
     this.quietTurnIfWorkRuns(peer, thread, turn.id, params, agentItemId)
     completeMessage('final_answer')
     completePlanItem()
+    this.exitReviewMode(peer, thread.id, turn.id)
     const completed: TurnRecord = this.store.completeTurn(turn.id, 'completed') ?? turn
     recordRunEvent('turn.completed', {
       threadId: thread.id,
@@ -5923,6 +5961,7 @@ export class CodexClaudeAppServer {
           )
           this.subagentStateByTurn.delete(turnId)
         }
+        this.exitReviewMode(peer, threadId, turnId)
         const completed =
           this.store.completeTurn(turnId, 'interrupted', { message: 'interrupted' }) ?? turn
         this.notify(peer, {
@@ -7441,7 +7480,45 @@ export class CodexClaudeAppServer {
   // write too; the usual cause is another connection holding the state
   // database past its busy timeout. Returns false for a turn that had already
   // ended, e.g. through turn/interrupt.
+  // Codex ends a review turn with an exitedReviewMode item holding the review,
+  // or a fallback text when the reviewer gave no answer (an interrupted or
+  // failed review). Before the turn completes, as there.
+  private exitReviewMode(peer: RpcPeer, threadId: string, turnId: string): void {
+    const turn = this.store.getTurn(turnId)
+    if (turn?.status !== 'inProgress') return
+    if (!turn.items.some((item) => item.type === 'enteredReviewMode')) return
+    if (turn.items.some((item) => item.type === 'exitedReviewMode')) return
+    const answer = turn.items.findLast(
+      (item) => item.type === 'agentMessage' && item.phase === 'final_answer',
+    )
+    const text = answer?.type === 'agentMessage' ? answer.text.trim() : ''
+    const item: ThreadItem = {
+      type: 'exitedReviewMode',
+      id: newId(),
+      review: text || REVIEW_FALLBACK,
+    }
+    try {
+      this.store.appendItem(turnId, item)
+    } catch (error) {
+      debugLog('review.exit_failed', {
+        threadId,
+        turnId,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      return
+    }
+    this.notify(peer, {
+      method: 'item/started',
+      params: { threadId, turnId, item, startedAtMs: nowMillis() },
+    })
+    this.notify(peer, {
+      method: 'item/completed',
+      params: { threadId, turnId, item, completedAtMs: nowMillis() },
+    })
+  }
+
   private failTurn(peer: RpcPeer, threadId: string, turn: TurnRecord, error: Error): boolean {
+    this.exitReviewMode(peer, threadId, turn.id)
     const completed = this.endTurn(turn, 'failed', { message: error.message })
     if (!completed) {
       // Its end was recorded, but whatever ended it never let go of the

@@ -56,15 +56,16 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 | Ephemeral / threadSource | Supported | `ephemeral: true` threads (title-gen, memory-consolidation, subagents, and the forks the App describes a thread in) persist but are excluded from `thread/list` unless `includeEphemeral: true`. `threadSource` round-trips. |
 | Claude side events | Supported | rate_limit / subagent / compaction events summarized into structured notice lines. A switch to a fallback model after a refusal is reported as `model/rerouted` when Claude names a cyber-safety refusal and as a `warning` otherwise; a refusal with no fallback is a `warning`. Text Claude streamed before a fallback stays in the transcript. |
 | Hook runs | Supported | Claude Code's hook runs → `hook/started` / `hook/completed` with the Codex event name, the settings file that configures the event, and its outcome: exit code 2, a `block` decision or `continue: false` is `blocked`, with the reason as an entry. The App folds them into the turn's hook summary. Live only: history does not keep them. |
+| Memory citations | Supported | The memories Claude Code's auto-memory recalls for a turn are cited on the turn's answer as `memoryCitation`, which the App lists under it: each memory once, its file's lines, and its description (else its first line) as the note. A summary Claude was given in place of files is cited by its marker path. `threadIds` stays empty: there are no Codex rollouts to name. |
 | MCP elicitation | Supported | An MCP server asking the user for input → `mcpServer/elicitation/request`, as a form from its schema or a link to open; the App's accept, decline or cancel goes back to the server. A request outside a turn (from background work) is declined. |
-| Review mode | Supported (text) | `review/start` creates an in-progress review turn and routes the prompt through Claude. No native guardian finding items. |
+| Review mode | Supported (text) | `review/start` creates an in-progress review turn and routes the prompt through Claude. The turn opens with an `enteredReviewMode` item and ends with `exitedReviewMode`, which carries Claude's answer (Codex's "Reviewer failed to output a response." when there is none), also when the review is interrupted or fails. No native guardian finding items. |
 | Context compaction | Supported (summary) | `thread/compact/start` routes the summary prompt and emits contextCompaction items. No native persisted rollout compaction. |
 
 ## Utilities
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| MCP config/status/tools | Supported | Reads Claude MCP config, passes servers into turns, calls stdio/HTTP tools directly. `mcpServerStatus/list` enumerates real `tools`/`resources`/`resourceTemplates` per server (10s cache, graceful empty fallback on spawn/timeout), or one server's with `serverName`. `mcpServer/resource/read` answers `originCallId: null`: no hosted app scopes the read. |
+| MCP config/status/tools | Supported | Reads Claude MCP config, passes servers into turns, calls stdio/HTTP tools directly. `mcpServerStatus/list` enumerates real `tools`/`resources`/`resourceTemplates` per server (10s cache, graceful empty fallback on spawn/timeout), or one server's with `serverName`. `mcpServer/resource/read` answers `originCallId: null`: no hosted app scopes the read. `config/mcpServer/reload` reads the server list afresh and sends every window each server's startup status again; a session kept open by background work retries its servers that failed or wait for a sign-in (every new session reads the config itself). `mcpServer/oauth/login` fails with an error that says to sign in with `/mcp` in Claude Code: Claude Code signs in to MCP servers itself, and the SDK cannot start that sign-in. |
 | Turn-item paging | Supported | `thread/turns/list` honors `itemsView` — `summary` (default: first userMessage + final agentMessage), `full`, and `notLoaded` — instead of always shipping every item. |
 | Inline visualizations | Supported | The App's bundled `visualize` skill, remembered from `plugin/install`, is listed in the desktop prompt of threads with a UUIDv7 id, with the `::codex-inline-vis{path="…"}` line the App renders and the thread's visualization folder; Claude reads the skill and that folder without an approval prompt. A plain `visualize{…}` line written without the App's invisible marks gets them when the message completes and in history reads. Threads created before the adapter issued UUIDv7 ids cannot render them. See [Using the Codex App](/guide/gui#inline-visualizations). |
 | Skills & hooks | Supported | `skills/list` reads `.claude/skills/*/SKILL.md` (user+repo scope) and offers the CLI's built-in skills (`/simplify`, `/code-review`, …) as system skills that run as slash commands; `hooks/list` reads `settings.json` hooks, mapping Claude events to Codex `HookEventName` (unmappable events dropped). |
@@ -119,7 +120,8 @@ codex.
 - The user message is recorded in turn history but, like the real app-server, is
   not surfaced as a `userMessage` `item/*` event during a turn (including
   `turn/steer`). `review/start`'s response carries the synthesized `userMessage`
-  (itemsView `notLoaded`); `enteredReviewMode` arrives via `item/started`.
+  (itemsView `notLoaded`); `enteredReviewMode` arrives via `item/started` and
+  `item/completed`, and `exitedReviewMode` is the review turn's last item.
   Uploaded images are surfaced live as `imageView` `item/*` events.
 - MCP boot status uses `mcpServer/startupStatus/updated` with a valid
   `McpServerStartupState`; `mcpServerStatus/list` returns conformant

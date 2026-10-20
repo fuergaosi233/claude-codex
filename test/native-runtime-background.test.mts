@@ -42,6 +42,10 @@ class FakeQuery implements AsyncIterable<Record<string, unknown>> {
   interrupts = 0
   stoppedTasks: string[] = []
   closed = false
+  // What mcpServerStatus answers; null makes it fail.
+  mcpStatuses: { name: string; status: string }[] | null = []
+  reconnects: string[] = []
+  failingReconnects = new Set<string>()
   private queue: Record<string, unknown>[] = []
   private wake: (() => void) | null = null
 
@@ -62,6 +66,16 @@ class FakeQuery implements AsyncIterable<Record<string, unknown>> {
 
   async stopTask(taskId: string): Promise<void> {
     this.stoppedTasks.push(taskId)
+  }
+
+  async mcpServerStatus(): Promise<{ name: string; status: string }[]> {
+    if (!this.mcpStatuses) throw new Error('control request failed')
+    return this.mcpStatuses
+  }
+
+  async reconnectMcpServer(name: string): Promise<void> {
+    this.reconnects.push(name)
+    if (this.failingReconnects.has(name)) throw new Error(`${name} is unreachable`)
   }
 
   async setModel(): Promise<void> {}
@@ -529,6 +543,82 @@ test('native runtime without a background listener keeps closing the session per
   await first
   await waitFor(() => query.closed, 'session close')
   assert.equal(runtime.hasBackgroundWork(), false)
+  await runtime.stop()
+})
+
+test('native MCP reload retries only the servers an open session could not reach', async () => {
+  const { runtime, queries } = fakeRuntime()
+  const listener = recordingListener()
+  runtime.setBackgroundListener(listener)
+
+  const first = runtime.runTurn(context, handlers([]))
+  const query = await waitFor(() => queries[0], 'session')
+  query.push(...launchBackgroundAgent('a7'))
+  await first
+  assert.equal(query.closed, false)
+
+  query.mcpStatuses = [
+    { name: 'github', status: 'connected' },
+    { name: 'docs', status: 'needs-auth' },
+    { name: 'search', status: 'failed' },
+    { name: 'local', status: 'pending' },
+    { name: 'retired', status: 'disabled' },
+  ]
+  // A server that still cannot be reached does not stop the others.
+  query.failingReconnects.add('docs')
+  await runtime.reloadMcpServers()
+  assert.deepEqual(query.reconnects, ['docs', 'search'])
+  assert.equal(query.closed, false, 'a reload leaves the session open')
+
+  // A session that cannot report its servers is left as it is.
+  query.mcpStatuses = null
+  await runtime.reloadMcpServers()
+  assert.deepEqual(query.reconnects, ['docs', 'search'])
+
+  // A session that has ended is not asked.
+  query.mcpStatuses = [{ name: 'search', status: 'failed' }]
+  query.close()
+  await waitFor(() => listener.released.length === 1, 'session release')
+  await runtime.reloadMcpServers()
+  assert.deepEqual(query.reconnects, ['docs', 'search'])
+  await runtime.stop()
+})
+
+test('native memory recall reaches the turn as the memories Claude was given', async () => {
+  const { runtime, queries } = fakeRuntime()
+  const events: RuntimeEvent[] = []
+  const turn = runtime.runTurn(context, handlers(events))
+  const query = await waitFor(() => queries[0], 'session')
+  query.push(
+    {
+      type: 'system',
+      subtype: 'memory_recall',
+      mode: 'select',
+      memories: [
+        { path: '/memories/short-answers.md', scope: 'personal' },
+        { path: '<synthesis:/memories>', scope: 'team', content: 'The team ships on Fridays.' },
+        { scope: 'personal', content: 'a memory with no path' },
+      ],
+    },
+    // A recall that found nothing says nothing.
+    { type: 'system', subtype: 'memory_recall', mode: 'synthesize', memories: [] },
+    assistant('answer', [text('Short answer.')]),
+    { type: 'result', subtype: 'success', result: 'Short answer.' },
+  )
+  await turn
+  assert.deepEqual(
+    events.filter((event) => event.type === 'memory_recall'),
+    [
+      {
+        type: 'memory_recall',
+        memories: [
+          { path: '/memories/short-answers.md', scope: 'personal', content: null },
+          { path: '<synthesis:/memories>', scope: 'team', content: 'The team ships on Fridays.' },
+        ],
+      },
+    ],
+  )
+  assert.deepEqual(textDeltas(events), ['Short answer.'])
   await runtime.stop()
 })
 

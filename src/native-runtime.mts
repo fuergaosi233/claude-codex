@@ -63,6 +63,7 @@ import type {
   HookRunStatus,
   ImageInput,
   PermissionDecision,
+  RecalledMemory,
   RuntimeBackgroundListener,
   RuntimeHandlers,
   RuntimeLiveTask,
@@ -487,6 +488,15 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     this.cronJobs.delete(threadId)
   }
 
+  // Each turn hands Claude Code the MCP config as it is then, so only the
+  // sessions still open hold an older one. Those retry the servers that failed
+  // or wait for a sign-in, which picks up a sign-in made since. A connected
+  // server is left alone: no call to it is cut off.
+  async reloadMcpServers(): Promise<void> {
+    const open = [...this.sessions.values()].filter((live) => !live.closed)
+    await Promise.all(open.map((live) => this.retryMcpServers(live)))
+  }
+
   async stop(): Promise<void> {
     for (const pending of this.turns.values()) {
       await this.stopWorkflowTasks(pending)
@@ -515,6 +525,45 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   }
 
   // ── private ──
+
+  private async retryMcpServers(live: LiveSession): Promise<void> {
+    const query = live.query as Query & {
+      mcpServerStatus?: () => Promise<Array<{ name: string; status: string }>>
+      reconnectMcpServer?: (serverName: string) => Promise<void>
+    }
+    if (typeof query.mcpServerStatus !== 'function') return
+    if (typeof query.reconnectMcpServer !== 'function') return
+    let statuses: Array<{ name: string; status: string }> = []
+    await settlesWithin(
+      query.mcpServerStatus().then(
+        (found) => {
+          statuses = Array.isArray(found) ? found : []
+        },
+        () => {},
+      ),
+      SESSION_CONTROL_TIMEOUT_MS,
+    )
+    const retry = statuses.filter(
+      (server) => server.status === 'failed' || server.status === 'needs-auth',
+    )
+    for (const server of retry) {
+      if (live.closed) return
+      let failure: string | null = null
+      const settled = await settlesWithin(
+        query.reconnectMcpServer(server.name).catch((error: unknown) => {
+          failure = error instanceof Error ? error.message : String(error)
+        }),
+        SESSION_CONTROL_TIMEOUT_MS,
+      )
+      debugLog('native.mcp.reconnect', {
+        threadId: live.threadId,
+        server: server.name,
+        status: server.status,
+        settled,
+        failure,
+      })
+    }
+  }
 
   private async loadSdk(): Promise<ClaudeSdk> {
     if (this.sdk) return this.sdk
@@ -1750,6 +1799,11 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       })
       return
     }
+    if (subtype === 'memory_recall') {
+      const memories = recalledMemories(message.memories)
+      if (memories.length > 0) await pending.handlers.onEvent({ type: 'memory_recall', memories })
+      return
+    }
     if (subtype === 'task_started' && isWorkflowBackgroundTask(message)) {
       const taskId = String(message.task_id ?? '')
       if (!taskId) return
@@ -2564,6 +2618,24 @@ function hookRunOutcome(message: Record<string, unknown>): {
     return { status: 'blocked', entries }
   }
   return { status: 'completed', entries }
+}
+
+// memory_recall's memories: a file path with its text left out, or the text
+// itself under a `<synthesis:DIR>` marker or a URL.
+function recalledMemories(value: unknown): RecalledMemory[] {
+  if (!Array.isArray(value)) return []
+  return value.flatMap((raw) => {
+    const memory = recordOrNull(raw)
+    const path = stringOrNull(memory?.path)
+    if (!memory || !path) return []
+    return [
+      {
+        path,
+        scope: stringOrNull(memory.scope),
+        content: typeof memory.content === 'string' ? memory.content : null,
+      },
+    ]
+  })
 }
 
 function parseHookOutput(value: unknown): Record<string, unknown> {

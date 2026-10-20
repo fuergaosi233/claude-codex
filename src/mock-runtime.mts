@@ -33,6 +33,8 @@ export class MockRuntime implements ClaudeRuntime {
   private nestedFiltered = new Set<string>()
   // resetSession calls per thread, echoed by the rewind check scenario.
   private resets = new Map<string, number>()
+  // reloadMcpServers calls, echoed by the mcp reload check scenario.
+  private mcpReloads = 0
   // Background Bash shells by task id.
   private shells = new Map<string, { threadId: string; toolUseId: string }>()
   // Background workflows: task id to thread id.
@@ -81,6 +83,40 @@ export class MockRuntime implements ClaudeRuntime {
       const text = `resumed ${context.claudeSessionId ?? 'nothing'} at ${context.resumeSessionAt ?? 'end'} after ${this.resets.get(context.threadId) ?? 0} resets`
       await handlers.onEvent({ type: 'text_delta', delta: text })
       await handlers.onEvent({ type: 'completed', success: true, result: text })
+      return
+    }
+
+    if (/mcp reload check/i.test(context.prompt)) {
+      const text = `${this.mcpReloads} MCP reloads`
+      await handlers.onEvent({ type: 'text_delta', delta: text })
+      await handlers.onEvent({ type: 'completed', success: true, result: text })
+      return
+    }
+
+    // "memory recall check <file>": Claude recalls that memory file twice and
+    // a synthesized summary, remarks on it, then answers.
+    const recall = /memory recall check (\S+)/i.exec(context.prompt)
+    if (recall) {
+      const path = recall[1] ?? ''
+      await handlers.onEvent({
+        type: 'memory_recall',
+        memories: [
+          { path, scope: 'personal', content: null },
+          {
+            path: '<synthesis:/memories>',
+            scope: 'team',
+            content: 'The team ships on Fridays.\nReleases need a changelog.',
+          },
+        ],
+      })
+      await handlers.onEvent({ type: 'text_delta', delta: 'Checking what I remember.' })
+      await handlers.onEvent({ type: 'message_boundary' })
+      await handlers.onEvent({
+        type: 'memory_recall',
+        memories: [{ path, scope: 'personal', content: null }],
+      })
+      await handlers.onEvent({ type: 'text_delta', delta: 'You prefer short answers.' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'memory recall check' })
       return
     }
 
@@ -1149,6 +1185,10 @@ export class MockRuntime implements ClaudeRuntime {
 
   resetSession(threadId: string): void {
     this.resets.set(threadId, (this.resets.get(threadId) ?? 0) + 1)
+  }
+
+  async reloadMcpServers(): Promise<void> {
+    this.mcpReloads += 1
   }
 
   private scheduleBackgroundReport(

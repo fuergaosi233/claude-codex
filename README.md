@@ -146,7 +146,10 @@ written, `${...}` included, as Codex passes them. A server with
 to a tool outside `enabled_tools` is refused, and `tool_timeout_sec` becomes the
 server's tool-call timeout. Codex OAuth logins, `startup_timeout_sec`,
 `required`, per-tool approval settings and the servers plugins bring are not
-carried over.
+carried over. Claude Code signs in to MCP servers itself, and the Agent SDK
+cannot start that sign-in, so the App's sign-in button for a server fails with
+an error that says to sign in with `/mcp` in a Claude Code session; reloading
+the App's MCP servers afterwards lets a session that is still open reconnect.
 
 With `CLAUDE_CODEX_CLAUDE_CONFIG_DIR` set and
 `CLAUDE_CODEX_CLAUDE_MCP_SERVERS=1`, Claude threads start the Claude Code
