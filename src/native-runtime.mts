@@ -3040,7 +3040,7 @@ function stringOrNull(value: unknown): string | null {
 // a custom CLI such as a model router, the router config dir named after
 // `model`. When the newest copy of the transcript is elsewhere (the session
 // ran on another model or router), it is copied into that one config dir,
-// unless an up-to-date copy is there already. A profile's transcripts are only
+// unless the copy there is as new or longer. A profile's transcripts are only
 // resumed from its own config dir and never copied in from another one.
 export function sdkResumeSessionId(
   value: string | null,
@@ -3153,16 +3153,21 @@ function regularFileStat(path: string): Stats | null {
   }
 }
 
-// Puts `source` at `target` unless an up-to-date copy is there. A transcript
-// holds the whole conversation, with what each request sent: the copy keeps
-// the source's (owner-only) mode, is a clone where the file system has them
-// (APFS, Btrfs, XFS) and replaces the target in one step. Not a hard link: the
-// CLI appends to the copy in the run root, which must not change the
-// transcript in the other config dir.
+// Puts `source` at `target` unless the copy there stays (see
+// keepTranscriptCopy). A transcript holds the whole conversation, with what
+// each request sent: the copy keeps the source's (owner-only) mode, is a clone
+// where the file system has them (APFS, Btrfs, XFS) and replaces the target in
+// one step. Not a hard link: the CLI appends to the copy in the run root, which
+// must not change the transcript in the other config dir.
 function mirrorTranscript(sessionId: string, source: TranscriptCopy, target: string): void {
   if (target === source.file) return
   const existing = regularFileStat(target)
-  if (existing && transcriptUpToDate(existing, source.stat)) return
+  if (existing && keepTranscriptCopy(existing, source.stat)) {
+    if (existing.size > source.stat.size) {
+      debugLog('native.transcript.kept_longer', { sessionId, from: source.file, to: target })
+    }
+    return
+  }
   const temp = `${target}.${newId()}.tmp`
   try {
     mkdirSync(dirname(target), { recursive: true, mode: 0o700 })
@@ -3182,10 +3187,13 @@ function mirrorTranscript(sessionId: string, source: TranscriptCopy, target: str
   }
 }
 
-// A copy carries its source's mtime, which utimes keeps to about a
-// microsecond.
-function transcriptUpToDate(copy: Stats, source: Stats): boolean {
-  if (copy.mtimeMs > source.mtimeMs) return true
+// Whether the copy already at the target stays. A copy carries its source's
+// mtime, which utimes keeps to about a microsecond. The CLI only appends to a
+// transcript, so a shorter source is no later state of a longer copy, however
+// new its mtime (another file system's clock, a stale copy touched since):
+// replacing the copy would drop the turns only it has.
+function keepTranscriptCopy(copy: Stats, source: Stats): boolean {
+  if (copy.mtimeMs > source.mtimeMs || copy.size > source.size) return true
   return copy.size === source.size && source.mtimeMs - copy.mtimeMs < 1
 }
 

@@ -176,6 +176,15 @@ test('a resumed transcript is copied only into the config dir its session runs f
     assert.equal((await stat(transcript(ownRoot))).ino, refreshed.ino)
     assert.equal(await readFile(transcript(routerRoot), 'utf8'), '{"n":1}\n{"n":2}\n')
 
+    // Nor does a shorter copy replace it, however new its mtime (another file
+    // system's clock, a stale copy touched since): that would drop turns.
+    const skewed = new Date(Date.now() + 120_000)
+    await utimes(transcript(routerRoot), skewed, skewed)
+    assert.equal(sdkResumeSessionId('session', cwd, undefined, 'router-model'), 'session')
+    assert.equal((await stat(transcript(ownRoot))).ino, refreshed.ino)
+    assert.equal(await readFile(transcript(ownRoot), 'utf8'), '{"n":1}\n{"n":2}\n{"n":3}\n')
+    await utimes(transcript(routerRoot), sourceTime, sourceTime)
+
     // A custom Claude Code, such as a model router, runs a model from the
     // router config dir named after it.
     process.env.CLAUDE_CODEX_CLI = join(root, 'router-claude')

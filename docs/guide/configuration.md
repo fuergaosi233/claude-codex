@@ -92,7 +92,9 @@ resumes and the newest copy of its session transcript is in another config
 folder, say because it ran on another model, the adapter copies it into the one
 folder this turn's Claude Code runs from: `CLAUDE_CONFIG_DIR`, else
 `~/.claude`, or, with `CLAUDE_CODEX_CLI` set, the router folder named after the
-model when there is one. An up-to-date copy is left alone. Since a transcript
+model when there is one. A copy there that is as new, or longer, is left
+alone: a transcript only grows, so a shorter one is never a later state of it,
+whatever its modification time says. Since a transcript
 holds the whole conversation, the copy keeps the transcript's file mode, and it
 is a clone where the file system supports it.
 
