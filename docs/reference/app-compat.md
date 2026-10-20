@@ -43,6 +43,7 @@ line a rule touches.
 | `quiet-turn-heartbeat` | leaves a thread read and sends no notification when the turn's last agent message ends with a `<heartbeat>` block deciding `DONT_NOTIFY`, and hides the block once the message completes | a turn that leaves a background agent running ends without an unread dot or visible block; the agent's report lights the dot |
 | `helper-thread-model` | generates titles, descriptions and turn summaries in ephemeral helper threads on its own OpenAI model, accepting another one, with `model: null` and an `outputSchema` declaring JSON Schema draft 2020-12 on `turn/start`, waiting 30 seconds for the answer; keeps the first words as the title when that fails | with Codex routing off, a new chat gets a generated title |
 | `prewarmed-threads` | starts a new chat's thread before anything is sent, hides it from `thread/list` until its first `turn/start`, and forgets it when the connection drops or the App quits | after an adapter restart, a new chat left empty does not show in the sidebar |
+| `dynamic-tools` | registers its own tools as `thread/start` `dynamicTools` only on hosts that do not use its desktop MCP server, such as remote ones, and runs an `item/tool/call` request only while the turn it names is in progress | on a remote host with `CLAUDE_CODEX_DYNAMIC_TOOLS=1`, a tool call Claude makes to the App shows as a dynamic tool call card with its result |
 
 The full text of each rule, including the adapter side, is in
 `src/app-compat.mts`.
@@ -149,10 +150,12 @@ which the bundle does not show and which can change without an App release:
   adapter serves both.
 - **`threadAttachments`** adds the worktree tools (`create_worktree`,
   `attach_worktree`, `list_artifacts` and others) to `thread/start` as
-  `dynamicTools`. The adapter does not offer dynamic tools to Claude. With one
-  more flag on, the App starts a chat in worktree mode in the local checkout
-  and leaves creating the worktree to the agent's `create_worktree` call, so
-  with Claude the task would run in the local checkout. If that happens, set
+  `dynamicTools`. The adapter offers dynamic tools to Claude only with
+  `CLAUDE_CODEX_DYNAMIC_TOOLS=1` (see [App tools](/guide/gui#app-tools)). With
+  one more flag on, the App starts a chat in worktree mode in the local
+  checkout and leaves creating the worktree to the agent's `create_worktree`
+  call, so with Claude and the switch off the task would run in the local
+  checkout. If that happens, turn the switch on or set
   `CLAUDE_CODEX_COMPAT_VERSION` below `0.155.0-alpha.2`. Archiving and the
   worktree cleanup do not need a ChatGPT sign-in: the App takes the owner from
   `account/read`, and `requiresOpenaiAuth: false` there is enough.

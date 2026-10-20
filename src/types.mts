@@ -355,10 +355,11 @@ export type ThreadItem =
       agentThreadId: string
       agentPath: string
     }
-  // Codex's native dynamic tool call item — used to surface AskUserQuestion as
-  // a structured choice card the App renders inline (paired with the
-  // item/tool/requestUserInput reverse RPC). The contentItems array carries
-  // the user's free-form answer text (Codex `DynamicToolCallOutputContentItem`).
+  // Codex's native dynamic tool call item: a call to a tool the client
+  // registered on thread/start (answered through item/tool/call), and
+  // AskUserQuestion shown as a structured choice card (paired with the
+  // item/tool/requestUserInput reverse RPC). contentItems is the tool result
+  // (Codex `DynamicToolCallOutputContentItem`).
   | {
       type: 'dynamicToolCall'
       id: string
@@ -366,12 +367,63 @@ export type ThreadItem =
       tool: string
       arguments: unknown
       status: 'inProgress' | 'completed' | 'failed'
-      contentItems: Array<
-        { type: 'inputText'; text: string } | { type: 'inputImage'; imageUrl: string }
-      > | null
+      contentItems: DynamicToolContentItem[] | null
       success: boolean | null
       durationMs: number | null
     }
+
+// Codex's DynamicToolCallOutputContentItem.
+export type DynamicToolContentItem =
+  | { type: 'inputText'; text: string }
+  | { type: 'inputImage'; imageUrl: string }
+  | { type: 'inputAudio'; audioUrl: string }
+
+// A dynamic tool as the client registers it on thread/start, in Codex's
+// canonical DynamicToolSpec form (a lone function or a namespace of them).
+export interface DynamicToolFunctionSpec {
+  type: 'function'
+  name: string
+  description: string
+  inputSchema: unknown
+  deferLoading?: boolean
+}
+
+export type DynamicToolSpec =
+  | DynamicToolFunctionSpec
+  | {
+      type: 'namespace'
+      name: string
+      description: string
+      tools: DynamicToolFunctionSpec[]
+    }
+
+// The dynamic tools of one namespace (or the ones without a namespace), as
+// one in-process MCP server Claude sees as mcp__<server>__<tool>.
+export interface DynamicToolServer {
+  server: string
+  namespace: string | null
+  description: string
+  tools: Array<{
+    name: string
+    description: string
+    inputSchema: Record<string, unknown>
+    deferLoading: boolean
+  }>
+}
+
+// Claude called a dynamic tool: the item/tool/call request without the
+// thread and turn, which the server knows.
+export interface DynamicToolCallRequest {
+  callId: string
+  namespace: string | null
+  tool: string
+  arguments: unknown
+}
+
+export interface DynamicToolCallResponse {
+  contentItems: DynamicToolContentItem[]
+  success: boolean
+}
 
 export interface FileUpdateChange {
   path: string
@@ -448,6 +500,10 @@ export interface RuntimeTurnContext {
   // The thread has a goal: expose Codex's goal tools (get_goal, create_goal,
   // update_goal) to Claude. Backends without in-process tools ignore it.
   goalTools?: GoalToolHandlers | null
+  // Tools the client registered on thread/start, one MCP server per
+  // namespace. Claude's calls reach RuntimeHandlers.onDynamicToolCall of the
+  // turn in flight. Backends without in-process tools ignore it.
+  dynamicTools?: DynamicToolServer[] | null
 }
 
 // Each handler returns the text of the tool result; a thrown Error becomes an
@@ -632,6 +688,13 @@ export interface RuntimeHandlers {
     request: ElicitationRequest,
     signal: AbortSignal,
   ): Promise<ElicitationResponse>
+  // Routed when Claude calls one of RuntimeTurnContext.dynamicTools. The
+  // server bridges it to Codex's `item/tool/call`; `signal` aborts when
+  // Claude cancels the call. When absent the runtime returns an error result.
+  onDynamicToolCall?(
+    request: DynamicToolCallRequest,
+    signal: AbortSignal,
+  ): Promise<DynamicToolCallResponse>
 }
 
 export interface RuntimeTaskUsage {

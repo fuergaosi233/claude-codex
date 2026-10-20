@@ -176,6 +176,38 @@ test('structured output remains a single deduplicated result', async () => {
   )
 })
 
+test('a dynamic tool call leaves no generic tool item: the server draws its own', async () => {
+  const dynamicTools = [
+    {
+      server: 'codex_app',
+      namespace: 'codex_app',
+      description: '',
+      tools: [
+        {
+          name: 'list_artifacts',
+          description: '',
+          inputSchema: { type: 'object' },
+          deferLoading: false,
+        },
+      ],
+    },
+  ]
+  const calls = [
+    { type: 'tool_use', id: 'dynamic', name: 'mcp__codex_app__list_artifacts', input: {} },
+    { type: 'tool_use', id: 'mcp', name: 'mcp__github__search', input: { q: 'x' } },
+  ]
+  const toolUses = (events: RuntimeEvent[]) =>
+    events.flatMap((event) => (event.type === 'tool_use' ? [event.toolName] : []))
+  assert.deepEqual(toolUses(await collect([assistant('a', calls)], { dynamicTools })), [
+    'mcp__github__search',
+  ])
+  // In plan mode the tools are not offered, so the name is someone else's.
+  assert.deepEqual(
+    toolUses(await collect([assistant('a', calls)], { dynamicTools, planMode: true })),
+    ['mcp__codex_app__list_artifacts', 'mcp__github__search'],
+  )
+})
+
 test('ordinary subscription limit updates are quiet and real warnings retain context', async () => {
   const events = await collect([
     { type: 'rate_limit_event', rate_limit_info: { status: 'allowed', utilization: 0.2 } },

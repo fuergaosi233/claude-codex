@@ -18,6 +18,15 @@ import {
 import { onClaudeCommandsChanged, skillLinksToCommand } from './claude-commands.mjs'
 import { runCodexNotify } from './codex-notify.mjs'
 import {
+  DYNAMIC_TOOL_CANCELLED,
+  DYNAMIC_TOOL_REQUEST_FAILED,
+  dynamicToolFailure,
+  dynamicToolResponse,
+  dynamicToolServers,
+  dynamicToolsEnabled,
+  parseDynamicTools,
+} from './dynamic-tools.mjs'
+import {
   continuePrompt,
   goalBudgetExhausted,
   goalBudgetLimitPrompt,
@@ -133,6 +142,8 @@ import {
 import type {
   ClaudeCheckpoint,
   ClaudeRuntime,
+  DynamicToolCallRequest,
+  DynamicToolCallResponse,
   ElicitationRequest,
   ElicitationResponse,
   FileUpdateChange,
@@ -997,6 +1008,10 @@ export class CodexClaudeAppServer {
   }
 
   private threadStart(peer: RpcPeer, params: Record<string, unknown>): unknown {
+    // Specs Codex would reject fail the request, as they do there. With the
+    // switch off they are ignored.
+    // App rule: dynamic-tools
+    const dynamicTools = dynamicToolsEnabled() ? parseDynamicTools(params.dynamicTools) : []
     const id = newThreadId()
     const now = nowSeconds()
     const projectId = stringOr(params.projectId, '') || null
@@ -1075,6 +1090,7 @@ export class CodexClaudeAppServer {
     }
     this.store.upsertThread(thread)
     if (projectId) this.store.setThreadProject(id, projectId)
+    this.store.putDynamicTools(id, dynamicTools)
     recordRunEvent('thread.started', {
       threadId: thread.id,
       cwd: thread.cwd,
@@ -1241,8 +1257,10 @@ export class CodexClaudeAppServer {
       codexSessionId: null,
     }
     this.store.upsertThread(thread)
-    // A fork stays in its parent's project.
+    // A fork stays in its parent's project, and keeps its dynamic tools:
+    // thread/fork does not carry them.
     if (parent.projectId) this.store.setThreadProject(id, parent.projectId)
+    this.store.putDynamicTools(id, this.store.getDynamicTools(parent.id))
     if (forkPoint) {
       this.store.setForkCheckpoint(id, forkPoint)
       this.store.rewindClaudeSession(id, forkPoint.sessionId, forkPoint.messageUuid)
@@ -3341,6 +3359,8 @@ export class CodexClaudeAppServer {
     // (interrupt, error, watchdog) drops the late result, so these are closed
     // as failed before the turn completes.
     const openToolItems = new Set<string>()
+    // The item/tool/call requests of dynamic tool items still open, by item.
+    const dynamicToolCalls = new Map<string, AbortController>()
     // Mutable holder rather than `let collectedMetrics`: TS's control-flow
     // analysis doesn't see writes from inside the onEvent callback, so a bare
     // `let` would still be inferred as `null` outside the closure.
@@ -3464,6 +3484,9 @@ export class CodexClaudeAppServer {
           if (item.type === 'fileChange') return { ...item, status: 'failed' }
           if (item.type === 'mcpToolCall')
             return { ...item, status: 'failed', error: { message }, durationMs }
+          // Codex's shape for a call cancelled before the client answered.
+          if (item.type === 'dynamicToolCall')
+            return { ...item, status: 'failed', contentItems: [], success: false, durationMs }
           return item
         })
         const item = updated?.items.find((candidate) => candidate.id === itemId)
@@ -3472,6 +3495,7 @@ export class CodexClaudeAppServer {
             method: 'item/completed',
             params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
           })
+        dynamicToolCalls.get(itemId)?.abort()
       }
       openToolItems.clear()
     }
@@ -3653,6 +3677,11 @@ export class CodexClaudeAppServer {
     const inheritConfig = desktopPresentation && !isCodexThread
     const mcp = readMcpConfig({ cwd: turnCwd, inherit: inheritConfig })
     const permissionRules = inheritConfig ? inheritedPermissionRules(turnCwd) : null
+    // The tools the client registered when it started the thread.
+    const dynamicTools =
+      turnPurpose === 'normal' && !isCodexThread && !thread.ephemeral && dynamicToolsEnabled()
+        ? dynamicToolServers(this.store.getDynamicTools(thread.id))
+        : []
     const runtimeTurn = this.runtime.runTurn(
       {
         threadId: thread.id,
@@ -3699,6 +3728,7 @@ export class CodexClaudeAppServer {
           process.env.CLAUDE_CODEX_GOAL_TOOLS !== '0'
             ? this.goalToolsFor(thread.id)
             : null,
+        dynamicTools: dynamicTools.length > 0 ? dynamicTools : null,
         ...(continuation ? { continuation: true } : {}),
       },
       {
@@ -4594,6 +4624,65 @@ export class CodexClaudeAppServer {
           if (!turnIsActive()) return { action: 'cancel' }
           completeMessage()
           return this.requestElicitation(peer, thread.id, turn.id, request, signal)
+        },
+        // Claude called one of the client's dynamic tools: a dynamicToolCall
+        // item around the item/tool/call request, as Codex records it.
+        onDynamicToolCall: async (request, signal) => {
+          if (!turnIsActive()) return dynamicToolFailure(DYNAMIC_TOOL_CANCELLED)
+          completeMessage()
+          const item: ThreadItem = {
+            type: 'dynamicToolCall',
+            id: request.callId,
+            namespace: request.namespace,
+            tool: request.tool,
+            arguments: request.arguments,
+            status: 'inProgress',
+            contentItems: null,
+            success: null,
+            durationMs: null,
+          }
+          const startedAt = nowMillis()
+          itemStartedAtMs.set(item.id, startedAt)
+          openToolItems.add(item.id)
+          this.store.appendItem(turn.id, item)
+          this.notify(peer, {
+            method: 'item/started',
+            params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: startedAt },
+          })
+          const abort = new AbortController()
+          dynamicToolCalls.set(item.id, abort)
+          const response = await this.requestDynamicTool(
+            peer,
+            thread.id,
+            turn.id,
+            request,
+            AbortSignal.any([signal, abort.signal]),
+          )
+          dynamicToolCalls.delete(item.id)
+          // An interrupt or the end of the turn closed the item already.
+          if (!openToolItems.delete(item.id))
+            return response ?? dynamicToolFailure(DYNAMIC_TOOL_CANCELLED)
+          const durationMs = Math.max(0, nowMillis() - startedAt)
+          const completedItem: ThreadItem = response
+            ? {
+                ...item,
+                status: response.success ? 'completed' : 'failed',
+                contentItems: response.contentItems,
+                success: response.success,
+                durationMs,
+              }
+            : { ...item, status: 'failed', contentItems: [], success: false, durationMs }
+          this.store.updateItem(turn.id, item.id, () => completedItem)
+          this.notify(peer, {
+            method: 'item/completed',
+            params: {
+              threadId: thread.id,
+              turnId: turn.id,
+              item: completedItem,
+              completedAtMs: nowMillis(),
+            },
+          })
+          return response ?? dynamicToolFailure(DYNAMIC_TOOL_CANCELLED)
         },
       },
     )
@@ -5802,6 +5891,44 @@ export class CodexClaudeAppServer {
     return action === 'accept' && content && typeof content === 'object' && !Array.isArray(content)
       ? { action, content: content as Record<string, unknown> }
       : { action }
+  }
+
+  // A dynamic tool call as Codex's item/tool/call: the client runs the tool
+  // while the turn is in progress. Null when `signal` cancelled the call; a
+  // client error becomes a failed call, as in Codex.
+  // App rule: dynamic-tools
+  private async requestDynamicTool(
+    peer: RpcPeer,
+    threadId: string,
+    turnId: string,
+    request: DynamicToolCallRequest,
+    signal: AbortSignal,
+  ): Promise<DynamicToolCallResponse | null> {
+    const requestId = newId()
+    const params = {
+      threadId,
+      turnId,
+      callId: request.callId,
+      namespace: request.namespace,
+      tool: request.tool,
+      arguments: request.arguments,
+    }
+    try {
+      return dynamicToolResponse(
+        await this.sendServerRequest(peer, 'item/tool/call', requestId, params, signal),
+      )
+    } catch (error) {
+      if (signal.aborted) return null
+      debugLog('dynamicTools.callFailed', {
+        threadId,
+        turnId,
+        callId: request.callId,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      return dynamicToolFailure(DYNAMIC_TOOL_REQUEST_FAILED)
+    } finally {
+      this.notify(peer, { method: 'serverRequest/resolved', params: { threadId, requestId } })
+    }
   }
 
   private async turnInterrupt(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {

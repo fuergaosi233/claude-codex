@@ -3,6 +3,7 @@ import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import type {
   ClaudeCheckpoint,
+  DynamicToolSpec,
   ImportHistoryRecord,
   ProjectRecord,
   QueuedSubmission,
@@ -138,6 +139,10 @@ export class SessionStore {
       CREATE TABLE IF NOT EXISTS thread_queues (
         thread_id TEXT PRIMARY KEY,
         items_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS thread_dynamic_tools (
+        thread_id TEXT PRIMARY KEY,
+        tools_json TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS projects (
         id TEXT PRIMARY KEY,
@@ -1185,6 +1190,7 @@ export class SessionStore {
       this.db.prepare('DELETE FROM turns WHERE thread_id = ?').run(id)
       this.db.prepare('DELETE FROM thread_goals WHERE thread_id = ?').run(id)
       this.db.prepare('DELETE FROM thread_queues WHERE thread_id = ?').run(id)
+      this.db.prepare('DELETE FROM thread_dynamic_tools WHERE thread_id = ?').run(id)
       this.db.prepare('DELETE FROM thread_attachments WHERE thread_id = ?').run(id)
       this.db.prepare('DELETE FROM threads WHERE id = ?').run(id)
     }
@@ -1439,6 +1445,28 @@ export class SessionStore {
          ON CONFLICT(thread_id) DO UPDATE SET items_json = excluded.items_json`,
       )
       .run(threadId, JSON.stringify(items))
+  }
+
+  // The dynamic tools the client registered on thread/start. Codex keeps them
+  // in the session meta, so a resumed or restarted thread still has them.
+  getDynamicTools(threadId: string): DynamicToolSpec[] {
+    const row = this.db
+      .prepare('SELECT tools_json FROM thread_dynamic_tools WHERE thread_id = ?')
+      .get(threadId) as { tools_json: string } | undefined
+    return row ? (JSON.parse(row.tools_json) as DynamicToolSpec[]) : []
+  }
+
+  putDynamicTools(threadId: string, tools: DynamicToolSpec[]): void {
+    if (tools.length === 0) {
+      this.db.prepare('DELETE FROM thread_dynamic_tools WHERE thread_id = ?').run(threadId)
+      return
+    }
+    this.db
+      .prepare(
+        `INSERT INTO thread_dynamic_tools (thread_id, tools_json) VALUES (?, ?)
+         ON CONFLICT(thread_id) DO UPDATE SET tools_json = excluded.tools_json`,
+      )
+      .run(threadId, JSON.stringify(tools))
   }
 
   close(): void {

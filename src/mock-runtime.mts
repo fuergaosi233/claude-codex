@@ -444,6 +444,35 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    // Lists the dynamic tools the turn offers, then calls the first one the
+    // way Claude would.
+    if (/dynamic tool check/i.test(context.prompt)) {
+      const servers = context.dynamicTools ?? []
+      const offered = servers.map(
+        (server) => `${server.server}:${server.tools.map((tool) => tool.name).join(',')}`,
+      )
+      await handlers.onEvent({ type: 'text_delta', delta: `tools=${offered.join(';') || 'none'}` })
+      const server = servers[0]
+      const tool = server?.tools[0]
+      if (server && tool && handlers.onDynamicToolCall) {
+        const response = await handlers.onDynamicToolCall(
+          {
+            callId: `call-${context.turnId}`,
+            namespace: server.namespace,
+            tool: tool.name,
+            arguments: { query: 'mock' },
+          },
+          new AbortController().signal,
+        )
+        await handlers.onEvent({
+          type: 'text_delta',
+          delta: ` dynamic=${JSON.stringify(response)}`,
+        })
+      }
+      await handlers.onEvent({ type: 'completed', success: true, result: 'dynamic tool check' })
+      return
+    }
+
     if (/summarizing a Codex \/ Claude Code conversation/i.test(context.prompt)) {
       // Compaction turn — produce a fixed marker so tests can prove the
       // summary came from the runtime rather than the local fallback text.

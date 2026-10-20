@@ -111,6 +111,35 @@ never sees it. Other clients, such as the Codex CLI, show it as text. A turn
 with no message from Claude still lights the dot. Set
 `CLAUDE_CODEX_QUIET_BACKGROUND_TURNS=0` to mark every finished turn unread.
 
+## App tools
+
+On a remote connection the Codex App registers tools of its own when it starts
+a chat, in its `codex_app` namespace (`list_artifacts`, and the worktree tools
+when its worktree features are on). Codex calls them by asking the App with
+`item/tool/call`. Set `CLAUDE_CODEX_DYNAMIC_TOOLS=1` and Claude gets them too:
+each namespace becomes an in-process MCP server of the same name (tools without
+a namespace share one named `dynamic_tools`), so Claude sees
+`mcp__codex_app__list_artifacts`. A call goes to the App with the running turn,
+shows as a dynamic tool call card, and its result goes back to Claude. As in
+Codex, the calls run without an approval prompt.
+
+The switch is off by default because these tools act on your desktop through
+the App. With it on:
+
+- The tools belong to the chat. They are stored with the thread, so the chat
+  keeps them when it is resumed (also after an adapter restart) and a fork
+  gets its parent's. Chats started while the switch was off have none.
+- The App checks the turn a call names and cancels a call that arrives after
+  the turn ended. Interrupting a turn cancels the calls still waiting for the
+  App.
+- Plan mode does not offer them. A subagent's calls show in the parent chat.
+- Claude reads the text of a result and inline PNG, JPEG, GIF and WebP images.
+  Audio and other images reach it as a placeholder.
+- A tool the App marks `deferLoading` waits for Claude Code's tool search, like
+  other deferred MCP tools. A tool whose `mcp__<namespace>__<tool>` name would
+  pass Claude's 64-character limit is left out, and so is a namespace named like
+  an MCP server Claude already has.
+
 ## Localhost GUI testing on macOS
 
 For localhost GUI testing, the adapter is launched by SSH and the in-process TS
