@@ -116,8 +116,8 @@ with no message from Claude still lights the dot. Set
 
 A Bash command Claude runs in the background, such as a dev server, a watcher
 or a long build, keeps showing its output in the command item of the Bash call
-that started it, also after the turn has ended. The App's background terminals
-panel lists the commands still running and can stop them.
+that started it, also after the turn has ended. Stopping the App's background
+terminals stops these commands too.
 
 Claude Code 2.1.285 and later stops a background command in an Agent SDK
 session, which is how the adapter runs Claude, after a time limit: 30 minutes,
