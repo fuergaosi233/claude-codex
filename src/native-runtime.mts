@@ -49,6 +49,7 @@ if (!process.env.ANTHROPIC_BETAS) {
 // installed via optionalDependencies.
 
 import type { Query } from '@anthropic-ai/claude-agent-sdk'
+import { autoCompactWindowEnv } from './auto-compact.mjs'
 import { noteClaudeCommands } from './claude-commands.mjs'
 import { noteClaudeModels } from './claude-models.mjs'
 import { removeCliMcpConfig, writeCliMcpConfig } from './cli-mcp-config.mjs'
@@ -97,6 +98,7 @@ import type {
   RuntimeFailure,
   RuntimeHandlers,
   RuntimeLiveTask,
+  RuntimeMcpServerStatus,
   RuntimeSteerOptions,
   RuntimeTaskUsage,
   RuntimeTurnContext,
@@ -333,6 +335,9 @@ const SESSION_SETTLE_MS = 15_000
 // How long an idle session keeps background tasks alive without any message.
 const BACKGROUND_IDLE_MS = 2 * 60 * 60 * 1000
 const SESSION_CONTROL_TIMEOUT_MS = 5_000
+// How long mcpServerStatus/list waits for a session to say how its MCP
+// servers are; the App waits five seconds for a thread's list.
+const MCP_STATUS_TIMEOUT_MS = 2_000
 // How long a new turn waits for an interrupted session to drain before it
 // gives up on the sink and goes ahead.
 const SINK_DRAIN_TIMEOUT_MS = 30_000
@@ -685,6 +690,28 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     await Promise.all(open.map((live) => this.retryMcpServers(live)))
   }
 
+  // Asks the thread's open session; a session that does not answer in time
+  // says nothing.
+  async mcpServerStatuses(threadId: string): Promise<RuntimeMcpServerStatus[] | null> {
+    const live = this.sessions.get(threadId)
+    if (!live || live.closed) return null
+    const query = live.query as Query & {
+      mcpServerStatus?: () => Promise<Array<Record<string, unknown>>>
+    }
+    if (typeof query.mcpServerStatus !== 'function') return null
+    let statuses: RuntimeMcpServerStatus[] | null = null
+    await settlesWithin(
+      query.mcpServerStatus().then(
+        (found) => {
+          statuses = Array.isArray(found) ? found.flatMap(runtimeMcpServerStatus) : null
+        },
+        () => {},
+      ),
+      MCP_STATUS_TIMEOUT_MS,
+    )
+    return statuses
+  }
+
   async stop(): Promise<void> {
     for (const pending of this.turns.values()) {
       await this.stopWorkflowTasks(pending)
@@ -842,10 +869,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     // CLI has finished answering everything queued (see maybeRelease).
     // With the memories mapping on, auto-memory runs only for threads the
     // user turned memories on for.
+    // A user who set Codex's compaction limit gets it as the window.
     opts.env = {
       ...((opts.env as NodeJS.ProcessEnv | undefined) ?? process.env),
       CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1',
       ...autoMemoryEnv(context.autoMemory),
+      ...autoCompactWindowEnv(context.autoCompactWindow),
     }
     // A forked thread resumes a transcript that opens with its parent's
     // history. Left alone, the CLI would schedule the parent's session cron
@@ -3565,6 +3594,18 @@ async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Prom
   }
 }
 
+// One entry of the SDK's mcpServerStatus(); an entry without a name or a
+// state is left out.
+function runtimeMcpServerStatus(raw: Record<string, unknown>): RuntimeMcpServerStatus[] {
+  if (typeof raw?.name !== 'string' || typeof raw.status !== 'string') return []
+  const info = raw.serverInfo as Record<string, unknown> | null | undefined
+  const serverInfo =
+    info && typeof info.name === 'string'
+      ? { name: info.name, version: typeof info.version === 'string' ? info.version : '' }
+      : null
+  return [{ name: raw.name, status: raw.status, serverInfo }]
+}
+
 // A control request whose failure the caller reports.
 async function sessionControl(request: Promise<void>, what: string): Promise<void> {
   let failure: unknown = null
@@ -3870,7 +3911,7 @@ function inheritedAllowedTools(context: RuntimeTurnContext): string[] {
 
 // Options a live CLI process cannot change in place. A turn whose signature
 // differs needs a fresh process (unless background work pins the old one).
-function sessionSignature(context: RuntimeTurnContext): string {
+export function sessionSignature(context: RuntimeTurnContext): string {
   return JSON.stringify([
     context.cwd,
     context.effort ?? null,
@@ -3895,6 +3936,7 @@ function sessionSignature(context: RuntimeTurnContext): string {
     context.modelProfileId ?? null,
     context.modelProfileFingerprint ?? null,
     context.thinkingDisplay ?? null,
+    context.autoCompactWindow ?? null,
   ])
 }
 

@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { rendersCompletedSubagentActivity, unverifiedAppWarning } from './app-compat.mjs'
 import { type InstalledAppPlugin, stopAppPluginServers } from './app-plugin-mcp.mjs'
+import { AUTO_COMPACT_KEY, autoCompactTokenLimit, autoCompactWindow } from './auto-compact.mjs'
 import {
   type AppPlugin,
   type AppSkill,
@@ -26,6 +27,7 @@ import {
   reportedClaudeModel,
 } from './claude-models.mjs'
 import { configRequirements } from './cli-probes.mjs'
+import { codexAutoCompactLimit } from './codex-config.mjs'
 import { runCodexNotify } from './codex-notify.mjs'
 import { parseCommandActions } from './command-actions.mjs'
 import { appendCommandOutput } from './command-output.mjs'
@@ -236,6 +238,7 @@ import type {
   RpcPeer,
   RuntimeEvent,
   RuntimeLiveTask,
+  RuntimeMcpServerStatus,
   RuntimeSteerOptions,
   RuntimeTaskEvent,
   RuntimeTaskUsage,
@@ -617,6 +620,9 @@ export class CodexClaudeAppServer {
   // The memories feature as the App last set it with
   // experimentalFeature/enablement/set; features.memories in the config wins.
   private memoriesEnablement: boolean | null = null
+  // model_auto_compact_token_limit from the config a thread was started,
+  // resumed or forked with. As in Codex, it lasts as long as the process.
+  private threadAutoCompactLimits = new Map<string, number>()
   // Codex App plugins whose skills Claude can run, as the App installed them.
   private appPlugins: AppPlugin[] = []
   // Every App plugin the App installed, by its <plugin>@<marketplace> id, for
@@ -982,7 +988,7 @@ export class CodexClaudeAppServer {
       case 'review/start':
         return this.reviewStart(peer, asRecord(params))
       case 'config/read':
-        return this.configRead()
+        return this.configRead(asRecord(params))
       case 'configRequirements/read':
         return configRequirements()
       case 'model/list':
@@ -1094,9 +1100,11 @@ export class CodexClaudeAppServer {
       case 'mcpServer/event/stream/stop':
         return {}
       case 'mcpServerStatus/list': {
-        // serverName limits discovery to one server.
+        // serverName limits discovery to one server. With a Claude thread
+        // whose session is live, runtimeStatus is that session's view.
         const serverName = nullIfEmpty(stringOr(asRecord(params).serverName, ''))
-        return listMcpServerStatuses(this.mcpScope(params)).then((data) => ({
+        const session = this.mcpSessionStatuses(params).catch(() => null)
+        return listMcpServerStatuses(this.mcpScope(params), session).then((data) => ({
           data: serverName == null ? data : data.filter((server) => server.name === serverName),
           nextCursor: null,
         }))
@@ -1328,6 +1336,7 @@ export class CodexClaudeAppServer {
       projectId,
     }
     this.store.upsertThread(thread)
+    this.rememberAutoCompactLimit(id, params.config)
     if (projectId) this.store.setThreadProject(id, projectId)
     this.store.putDynamicTools(id, dynamicTools)
     // Like Codex, thread/start answers without git info; the App looks the
@@ -1491,6 +1500,7 @@ export class CodexClaudeAppServer {
     thread.approvalsReviewer =
       approvalsReviewerFromParams(params) ?? thread.approvalsReviewer ?? null
     this.store.upsertThread(thread)
+    this.rememberAutoCompactLimit(threadId, params.config)
     recordRunEvent('thread.resumed', {
       threadId,
       cwd: thread.cwd,
@@ -1634,6 +1644,10 @@ export class CodexClaudeAppServer {
       gitInfo: cwd === parent.cwd ? (parent.gitInfo ?? null) : null,
     }
     this.store.upsertThread(thread)
+    // A fork compacts like its parent unless its own config says otherwise.
+    const parentLimit = this.threadAutoCompactLimits.get(parent.id)
+    if (parentLimit != null) this.threadAutoCompactLimits.set(id, parentLimit)
+    this.rememberAutoCompactLimit(id, params.config)
     // A fork stays in its parent's project, and keeps its dynamic tools:
     // thread/fork does not carry them.
     if (parent.projectId) this.store.setThreadProject(id, parent.projectId)
@@ -4301,6 +4315,10 @@ export class CodexClaudeAppServer {
       ...(memoriesMappingEnabled()
         ? { autoMemory: !isCodexThread && this.autoMemoryFor(thread) }
         : {}),
+      // Only a user who set Codex's compaction limit changes Claude's window.
+      ...(isCodexThread
+        ? {}
+        : { autoCompactWindow: this.autoCompactWindowFor(thread.id, turnCwd) }),
       ...(continuation ? { continuation: true } : {}),
     }
     return { context, isCodexThread, resumeSessionAt, turnCwd }
@@ -7542,7 +7560,7 @@ export class CodexClaudeAppServer {
     this.failTurn(this.peerForThread(threadId), threadId, turn, error)
   }
 
-  private configRead(): unknown {
+  private configRead(params: Record<string, unknown>): unknown {
     // Base config = our typed defaults; overrides (whatever the App's
     // settings sheet has written previously via config/value/write) are
     // layered on top so the user sees their last-saved values instead of
@@ -7557,7 +7575,12 @@ export class CodexClaudeAppServer {
         // Codex reports a window here only when config.toml sets one; the App
         // takes the window from thread/tokenUsage/updated.
         model_context_window: null,
-        model_auto_compact_token_limit: null,
+        // The window Claude threads compact at, for the folder asked about:
+        // null unless the user set the limit.
+        model_auto_compact_token_limit: this.autoCompactWindowFor(
+          null,
+          nullIfEmpty(stringOr(params.cwd, '')),
+        ),
         model_provider: 'claude-code',
         approval_policy: this.configOverrides.approval_policy ?? 'on-request',
         approvals_reviewer: this.configOverrides.approvals_reviewer ?? 'user',
@@ -7787,6 +7810,25 @@ export class CodexClaudeAppServer {
     if (thread.ephemeral || !this.memoriesOn()) return false
     const mode = this.store.getThread(thread.id)?.memoryMode ?? thread.memoryMode
     return (mode ?? newThreadMemoryMode({}, this.configOverrides)) === 'enabled'
+  }
+
+  // A model_auto_compact_token_limit in the config a thread came with.
+  private rememberAutoCompactLimit(threadId: string, config: unknown): void {
+    const limit = autoCompactTokenLimit(asRecord(config)[AUTO_COMPACT_KEY])
+    if (limit != null) this.threadAutoCompactLimits.set(threadId, limit)
+  }
+
+  // The auto-compact window of a thread's Claude sessions, from the first to
+  // set model_auto_compact_token_limit of: the config the thread came with,
+  // what a client wrote with config/value/write, and, when the user asks for
+  // it, the Codex config files for its folder. Null when none does, and
+  // Claude Code keeps its own window.
+  private autoCompactWindowFor(threadId: string | null, cwd: string | null): number | null {
+    return autoCompactWindow(
+      threadId ? this.threadAutoCompactLimits.get(threadId) : undefined,
+      this.configOverrides[AUTO_COMPACT_KEY],
+      codexAutoCompactLimit(cwd),
+    )
   }
 
   // Build the model_providers map served by config/read. Always exposes
@@ -9376,6 +9418,15 @@ export class CodexClaudeAppServer {
       cwd: thread && thread.runtimeBackend !== 'codex' ? thread.cwd : null,
       appPlugins: this.installedAppPlugins,
     }
+  }
+
+  // What the live Claude session of the thread a request names says of its
+  // MCP servers; null without one.
+  private async mcpSessionStatuses(params: unknown): Promise<RuntimeMcpServerStatus[] | null> {
+    const threadId = stringOr(asRecord(params).threadId, '')
+    const thread = threadId ? this.store.getThread(threadId) : null
+    if (!thread || thread.runtimeBackend === 'codex') return null
+    return (await this.runtime.mcpServerStatuses?.(threadId)) ?? null
   }
 
   // Codex ends a review turn with an exitedReviewMode item holding the review,

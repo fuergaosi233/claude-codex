@@ -27,7 +27,11 @@ import {
   hasAgentapiTrustPrompt,
   sanitizeAgentapiTerminalContent,
 } from '../src/http-agent-runtime.mjs'
-import { NativeClaudeRuntime, sdkResumeSessionId } from '../src/native-runtime.mjs'
+import {
+  NativeClaudeRuntime,
+  sdkResumeSessionId,
+  sessionSignature,
+} from '../src/native-runtime.mjs'
 import { TurnInput } from '../src/native-turn-input.mjs'
 import { resolveRuntimeConfig } from '../src/runtime-config.mjs'
 import { buildSystemPromptAddendum } from '../src/server-helpers.mjs'
@@ -287,6 +291,43 @@ test('native SDK runtime switches auto-memory off only for threads the memories 
     if (previous === undefined) delete process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY
     else process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = previous
   }
+})
+
+test('native SDK runtime sets the auto-compact window only when the thread has one', () => {
+  const runtime = new NativeClaudeRuntime()
+  const buildOptions = Reflect.get(runtime, 'buildOptions')
+  const envFor = (overrides: Partial<RuntimeTurnContext>) => {
+    const context = nativeTurnContext(overrides)
+    const session = { current: { context, handlers: {}, resolved: false }, lastContext: context }
+    return buildOptions.call(runtime, {}, context, new AbortController(), () => session)
+      .env as NodeJS.ProcessEnv
+  }
+  const previous = process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW
+  try {
+    delete process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW
+    // Without Codex's limit the launch adds nothing: Claude Code's own window.
+    assert.equal(envFor({}).CLAUDE_CODE_AUTO_COMPACT_WINDOW, undefined)
+    assert.equal(envFor({ autoCompactWindow: null }).CLAUDE_CODE_AUTO_COMPACT_WINDOW, undefined)
+    assert.equal(envFor({ autoCompactWindow: 250_000 }).CLAUDE_CODE_AUTO_COMPACT_WINDOW, '250000')
+    // A window the user exported stays unless the thread has its own.
+    process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = '400000'
+    assert.equal(envFor({}).CLAUDE_CODE_AUTO_COMPACT_WINDOW, '400000')
+    assert.equal(envFor({ autoCompactWindow: 250_000 }).CLAUDE_CODE_AUTO_COMPACT_WINDOW, '250000')
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW
+    else process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = previous
+  }
+})
+
+test('a new auto-compact window starts a new native session', () => {
+  // The window is fixed when the CLI starts, so a session started with
+  // another one cannot carry the turn.
+  const base = sessionSignature(nativeTurnContext())
+  assert.equal(sessionSignature(nativeTurnContext({ autoCompactWindow: null })), base)
+  const window = sessionSignature(nativeTurnContext({ autoCompactWindow: 300_000 }))
+  assert.notEqual(window, base)
+  assert.equal(sessionSignature(nativeTurnContext({ autoCompactWindow: 300_000 })), window)
+  assert.notEqual(sessionSignature(nativeTurnContext({ autoCompactWindow: 500_000 })), window)
 })
 
 test('native SDK runtime approves goal tools without shadowing canUseTool', async () => {
@@ -3083,6 +3124,53 @@ test('claude-p runtime turns auto-memory off only for threads the memories mappi
   } finally {
     if (previous === undefined) delete process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY
     else process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = previous
+    await rm(tmp, { recursive: true, force: true })
+  }
+})
+
+test('claude-p runtime passes the auto-compact window only when the thread has one', async () => {
+  const tmp = await mkdtemp(join(tmpdir(), 'claude-codex-claude-p-compact-test-'))
+  const command = join(tmp, 'fake-claude-p.mjs')
+  await writeFile(
+    command,
+    [
+      '#!/usr/bin/env node',
+      'const value = process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW ?? "unset";',
+      'console.log(JSON.stringify({ result: value, session_id: null, is_error: false }));',
+    ].join('\n'),
+  )
+  await chmod(command, 0o755)
+  const runtime = new ClaudePTranscriptRuntime({
+    command,
+    extraArgs: [],
+    timeoutMs: 20_000,
+    skipPermissions: false,
+    resume: false,
+  })
+  const run = async (autoCompactWindow: number | null): Promise<string> => {
+    let text = ''
+    await runtime.runTurn(
+      nativeTurnContext({
+        threadId: `thread-${String(autoCompactWindow)}`,
+        cwd: tmp,
+        autoCompactWindow,
+      }),
+      {
+        onEvent: (event) => {
+          if (event.type === 'text_delta') text += event.delta
+        },
+        onPermissionRequest: async () => ({ decision: 'accept' }),
+      },
+    )
+    return text
+  }
+  const previous = process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW
+  delete process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW
+  try {
+    assert.deepEqual(await Promise.all([run(null), run(180_000)]), ['unset', '180000'])
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW
+    else process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = previous
     await rm(tmp, { recursive: true, force: true })
   }
 })

@@ -287,7 +287,29 @@ versioning or publishing metadata.
   an image is an `imageView`, WebFetch a `webSearch` item opening the page,
   and an MCP tool names its server, split by the turn's configured server
   names. A Read, Grep, Glob or LS call Claude Code asks about asks on the
-  command card, and only a Bash command can be allowed for the session.
+  command card, and "Allow for this session" covers the same call.
+- `mcpServerStatus/list` entries carry every field of Codex's
+  `McpServerStatus`: `serverInfo` and `serverCapabilities` from the server's
+  `initialize` reply, `toolsError` when the server failed to start or to list
+  its tools, `toolListMeta` from the first `tools/list` page, `httpOrigin` for
+  HTTP servers and `pluginId` for plugin servers, each `null` when unknown.
+  With a `threadId` whose Claude session is open, `runtimeStatus` is the
+  state that session reports for each server; otherwise it is `null`, as
+  Codex answers without a thread. The App uses these to show server names and
+  logos and a tool discovery error, and to retry a plugin's servers. Lists
+  asked for at once share one look at the servers; HTTP servers are spoken to
+  as streamable HTTP (event-stream replies, sessions) and, like stdio ones,
+  given up on after 20 seconds (`CLAUDE_CODEX_MCP_TIMEOUT_MS`). An error
+  carries only the end of a server's stderr and never a url's credentials.
+- Codex's `model_auto_compact_token_limit` now sets the compaction window of
+  Claude threads: from the config a thread starts, resumes or forks with, or
+  `config/value/write`, it reaches the Claude CLI as
+  `CLAUDE_CODE_AUTO_COMPACT_WINDOW` (kept within 100,000 to 1,000,000
+  tokens), and `config/read` reports it instead of `null`. The user's and
+  trusted projects' `config.toml` count only with
+  `CLAUDE_CODEX_CODEX_AUTO_COMPACT=1`, since users set the key there for Codex
+  models. Without the key nothing changes. Bridged Claude Code subagents keep
+  their `autoCompactWindow` frontmatter, which used to be dropped.
 
 ### Provider and multi-agent boundaries
 

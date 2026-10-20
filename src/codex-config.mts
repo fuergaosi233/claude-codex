@@ -6,7 +6,8 @@ import { parseToml } from './toml.mjs'
 import { codexHome, debugLog } from './util.mjs'
 
 // The parts of the Codex config file Claude threads can take over when the
-// user asks for them: its MCP servers and its `notify` program. The file is
+// user asks for them: its MCP servers, its `notify` program and its
+// model_auto_compact_token_limit. The file is
 // read the way Codex reads it (codex-rs config/): $CODEX_HOME/config.toml,
 // then, for a project the user trusts, each .codex/config.toml from the
 // project root down to the thread's folder, later files overriding earlier
@@ -170,6 +171,26 @@ function configLayers(cwd: string | null): ConfigLayer[] {
     if (table) layers.push({ path, table })
   }
   return layers
+}
+
+// A top-level setting of the Codex config for a thread's folder: the last
+// file that sets it wins. Undefined when none does.
+function codexConfigValue(cwd: string | null, key: string): unknown {
+  let value: unknown
+  for (const layer of configLayers(cwd)) {
+    if (Object.hasOwn(layer.table, key)) value = layer.table[key]
+  }
+  return value
+}
+
+// model_auto_compact_token_limit from the config files, only with
+// CLAUDE_CODEX_CODEX_AUTO_COMPACT=1: users set it for Codex models, as a
+// token count Codex caps at 90% of the model's context window, and it would
+// otherwise replace the auto-compact window of their own Claude Code
+// settings on every Claude thread.
+export function codexAutoCompactLimit(cwd: string | null): unknown {
+  if (process.env.CLAUDE_CODEX_CODEX_AUTO_COMPACT !== '1') return undefined
+  return codexConfigValue(cwd, 'model_auto_compact_token_limit')
 }
 
 // The enabled [mcp_servers.<name>] entries, as SDK server configs, only with

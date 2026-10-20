@@ -517,12 +517,36 @@ test('mcpServerStatus/list and startup notifications use conformant Codex v2 sha
     const list = await reader.nextResponse(2)
     const entry = list.result.data[0]
     assert.equal(entry.name, 'github')
-    // McpServerStatus = { name, tools: map, resources: [], resourceTemplates: [], authStatus }
+    // Every field McpServerStatus requires, in 0.159 and 0.163 alike, plus
+    // the toolListMeta 0.164 adds: the nullable ones are present as null.
+    assert.deepEqual(Object.keys(entry).sort(), [
+      'authStatus',
+      'httpOrigin',
+      'name',
+      'pluginId',
+      'resourceTemplates',
+      'resources',
+      'runtimeStatus',
+      'serverCapabilities',
+      'serverInfo',
+      'toolListMeta',
+      'tools',
+      'toolsError',
+    ])
     assert.deepEqual(entry.tools, {})
     assert.deepEqual(entry.resources, [])
     assert.deepEqual(entry.resourceTemplates, [])
     assert.ok(['unsupported', 'notLoggedIn', 'bearerToken', 'oAuth'].includes(entry.authStatus))
     assert.ok(!('status' in entry), 'McpServerStatus has no startup status field')
+    // The server's command does not exist: nothing started, so the tool
+    // catalog failed and nothing else is known.
+    assert.match(entry.toolsError, /ENOENT/)
+    assert.equal(entry.runtimeStatus, null)
+    assert.equal(entry.serverInfo, null)
+    assert.equal(entry.serverCapabilities, null)
+    assert.equal(entry.toolListMeta, null)
+    assert.equal(entry.pluginId, null)
+    assert.equal(entry.httpOrigin, null)
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -11903,8 +11927,316 @@ test('mcpServerStatus/list enumerates tools and resources from the server', asyn
     assert.equal(entry.tools.echo._meta.ui.resourceUri, 'ui://fixture/view.html')
     assert.equal(entry.resources[0].uri, 'fixture://resource')
     assert.ok(['unsupported', 'notLoggedIn', 'bearerToken', 'oAuth'].includes(entry.authStatus))
+    // What the server's initialize reply and tool catalog said of it.
+    assert.deepEqual(entry.serverInfo, {
+      name: 'fixture',
+      title: null,
+      version: '1.0.0',
+      description: null,
+      icons: null,
+      websiteUrl: null,
+    })
+    assert.deepEqual(entry.serverCapabilities, { tools: {}, resources: {} })
+    assert.deepEqual(entry.toolListMeta, { 'fixture/catalog': 'v1' })
+    assert.equal(entry.toolsError, null)
+    // A stdio server has no HTTP origin, and no thread asked: no session state.
+    assert.equal(entry.httpOrigin, null)
+    assert.equal(entry.runtimeStatus, null)
+    assert.equal(entry.pluginId, null)
   } finally {
     proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('mcpServerStatus/list says which servers failed and how a live session sees them', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const fixture = resolve('test/fixtures/mcp-stdio-server.mjs')
+  // A remote server that wants a sign-in the adapter does not have.
+  const signIn = http.createServer((_req, res) => {
+    res.statusCode = 401
+    res.end('sign in first')
+  })
+  await new Promise<void>((resolve) => signIn.listen(0, '127.0.0.1', resolve))
+  const address = signIn.address()
+  const port = address && typeof address === 'object' ? address.port : 0
+  const stdio = (env: Record<string, string> = {}) => ({
+    type: 'stdio',
+    command: process.execPath,
+    args: [fixture],
+    env,
+  })
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      CODEX_HOME: home,
+      CLAUDE_CODEX_MOCK: '1',
+      CLAUDE_CODEX_MCP_SERVERS: JSON.stringify({
+        fixture: stdio(),
+        broken: stdio({ MCP_FIXTURE_EXIT: '3' }),
+        catalog: stdio({ MCP_FIXTURE_TOOLS_ERROR: '1' }),
+        missing: { type: 'stdio', command: join(home, 'no-such-server') },
+        remote: { type: 'sse', url: 'https://user:secret@mcp.example.com:8443/sse?team=1' },
+        guarded: { type: 'http', url: `http://127.0.0.1:${port}/mcp` },
+      }),
+      NODE_NO_WARNINGS: '1',
+    },
+  })
+  const reader = new JsonLineReader(proc)
+  const byName = (data: any[]) => Object.fromEntries(data.map((entry) => [entry.name, entry]))
+  try {
+    proc.stdin.write(json({ id: 1, method: 'mcpServerStatus/list', params: {} }))
+    const listed = byName((await reader.nextResponse(1)).result.data)
+
+    // A server that exits before it answers, and one that never starts.
+    assert.match(listed.broken.toolsError, /exited with code 3/)
+    assert.equal(listed.broken.serverInfo, null)
+    assert.match(listed.missing.toolsError, /ENOENT/)
+    // A server that started but could not list its tools: what it said of
+    // itself stays, and its resources are still listed.
+    assert.match(listed.catalog.toolsError, /tool catalog unavailable/)
+    assert.equal(listed.catalog.serverInfo.name, 'fixture')
+    assert.deepEqual(listed.catalog.tools, {})
+    assert.equal(listed.catalog.toolListMeta, null)
+    assert.equal(listed.catalog.resources[0].uri, 'fixture://resource')
+    // Servers the adapter cannot reach on its own are not failed ones: one
+    // over a transport it does not speak, and one that wants a sign-in.
+    // Their HTTP origin is known all the same, without credentials or path.
+    assert.equal(listed.remote.toolsError, null)
+    assert.equal(listed.remote.serverInfo, null)
+    assert.equal(listed.remote.httpOrigin, 'https://mcp.example.com:8443')
+    assert.equal(listed.guarded.toolsError, null)
+    assert.equal(listed.guarded.httpOrigin, `http://127.0.0.1:${port}`)
+    assert.equal(listed.fixture.toolsError, null)
+    // Without a thread, no connection state is claimed for any of them.
+    for (const entry of Object.values(listed) as any[]) assert.equal(entry.runtimeStatus, null)
+
+    // A Claude thread whose session sees its servers.
+    proc.stdin.write(json({ id: 2, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const threadId = (await reader.nextResponse(2)).result.thread.id
+    const prompt =
+      'mcp session fixture=connected remote=connected broken=failed missing=needs-auth catalog=pending guarded=disabled'
+    proc.stdin.write(
+      json({
+        id: 3,
+        method: 'turn/start',
+        params: { threadId, input: [{ type: 'text', text: prompt, text_elements: [] }] },
+      }),
+    )
+    for (let i = 0; i < 200; i += 1) {
+      if ((await reader.next()).method === 'turn/completed') break
+    }
+    proc.stdin.write(json({ id: 4, method: 'mcpServerStatus/list', params: { threadId } }))
+    const seen = byName((await reader.nextResponse(4)).result.data)
+    assert.deepEqual(
+      Object.fromEntries(
+        Object.values(seen).map((entry: any) => [entry.name, entry.runtimeStatus]),
+      ),
+      {
+        fixture: 'connected',
+        broken: 'failed',
+        catalog: 'starting',
+        missing: 'authenticationRequired',
+        remote: 'connected',
+        guarded: 'disabled',
+      },
+    )
+    // What the server told the adapter wins; the session names a server the
+    // adapter could not reach.
+    assert.equal(seen.fixture.serverInfo.name, 'fixture')
+    assert.deepEqual(seen.remote.serverInfo, {
+      name: 'remote-session',
+      title: null,
+      version: '2.0.0',
+      description: null,
+      icons: null,
+      websiteUrl: null,
+    })
+    // The rest is the adapter's own finding, as before.
+    assert.match(seen.catalog.toolsError, /tool catalog unavailable/)
+
+    // A thread-less list right after still claims no connection state.
+    proc.stdin.write(json({ id: 5, method: 'mcpServerStatus/list', params: {} }))
+    const again = (await reader.nextResponse(5)).result.data
+    for (const entry of again) assert.equal(entry.runtimeStatus, null)
+  } finally {
+    proc.kill()
+    signIn.close()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('mcpServerStatus/list looks at servers once, within a deadline, and keeps secrets out', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const fixture = resolve('test/fixtures/mcp-stdio-server.mjs')
+  const starts = join(home, 'starts.log')
+  // A streamable HTTP server as the MCP SDKs serve one: it takes clients that
+  // accept an event stream, keeps a session, and answers tools/list as a
+  // stream that logs before it replies.
+  const seen: string[] = []
+  const streamable = http.createServer((req, res) => {
+    let body = ''
+    req.setEncoding('utf8')
+    req.on('data', (chunk) => {
+      body += chunk
+    })
+    req.on('end', () => {
+      const session = req.headers['mcp-session-id']
+      if (req.method === 'DELETE') {
+        seen.push(`DELETE ${session}`)
+        res.end()
+        return
+      }
+      if (!String(req.headers.accept).includes('text/event-stream')) {
+        res.statusCode = 406
+        res.end('Not Acceptable: Client must accept both application/json and text/event-stream')
+        return
+      }
+      const message = JSON.parse(body)
+      seen.push(`${message.method} ${session ?? '-'}`)
+      if (message.method === 'initialize') {
+        res.setHeader('content-type', 'application/json')
+        res.setHeader('mcp-session-id', 'session-1')
+        res.end(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: message.id,
+            result: {
+              protocolVersion: '2024-11-05',
+              capabilities: { tools: {} },
+              serverInfo: { name: 'streamable', version: '3.0.0' },
+            },
+          }),
+        )
+        return
+      }
+      if (session !== 'session-1') {
+        res.statusCode = 400
+        res.end('Bad Request: Mcp-Session-Id header is required')
+        return
+      }
+      if (message.id == null) {
+        res.statusCode = 202
+        res.end()
+        return
+      }
+      res.setHeader('content-type', 'text/event-stream')
+      const log = { jsonrpc: '2.0', method: 'notifications/message', params: { data: 'listing' } }
+      const reply =
+        message.method === 'tools/list'
+          ? { jsonrpc: '2.0', id: message.id, result: { tools: [{ name: 'lookup' }] } }
+          : { jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'no such method' } }
+      res.end(
+        `event: message\ndata: ${JSON.stringify(log)}\n\nevent: message\ndata: ${JSON.stringify(reply)}\n\n`,
+      )
+    })
+  })
+  // A server that never answers.
+  const stalled = http.createServer(() => {})
+  const listen = async (server: http.Server) => {
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const address = server.address()
+    return address && typeof address === 'object' ? address.port : 0
+  }
+  const streamablePort = await listen(streamable)
+  const stalledPort = await listen(stalled)
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      CODEX_HOME: home,
+      CLAUDE_CODEX_MOCK: '1',
+      CLAUDE_CODEX_MCP_TIMEOUT_MS: '2000',
+      CLAUDE_CODEX_MCP_SERVERS: JSON.stringify({
+        counted: {
+          type: 'stdio',
+          command: process.execPath,
+          args: [fixture],
+          env: { MCP_FIXTURE_STARTS: starts },
+        },
+        noisy: {
+          type: 'stdio',
+          command: process.execPath,
+          args: [fixture],
+          env: { MCP_FIXTURE_EXIT: '4', MCP_FIXTURE_STDERR: `${'noise '.repeat(1500)}last words` },
+        },
+        streamable: { type: 'http', url: `http://127.0.0.1:${streamablePort}/mcp` },
+        stalled: { type: 'http', url: `http://127.0.0.1:${stalledPort}/mcp` },
+        leaky: {
+          type: 'http',
+          url: `http://user:secret@127.0.0.1:${streamablePort}/mcp?token=hidden`,
+        },
+      }),
+      NODE_NO_WARNINGS: '1',
+    },
+  })
+  const reader = new JsonLineReader(proc)
+  const byName = (data: any[]) => Object.fromEntries(data.map((entry) => [entry.name, entry]))
+  const startCount = async () => (await readFile(starts, 'utf8')).split('\n').filter(Boolean).length
+  try {
+    // Two lists asked for at once share one look at the servers.
+    const asked = Date.now()
+    proc.stdin.write(json({ id: 1, method: 'mcpServerStatus/list', params: {} }))
+    proc.stdin.write(
+      json({ id: 2, method: 'mcpServerStatus/list', params: { serverName: 'counted' } }),
+    )
+    const responses = new Map<number, any>()
+    while (responses.size < 2) {
+      const message = await reader.next()
+      if (message.method == null && (message.id === 1 || message.id === 2)) {
+        responses.set(message.id, message)
+      }
+    }
+    const waited = Date.now() - asked
+    assert.equal(await startCount(), 1)
+    assert.deepEqual(
+      responses.get(2).result.data.map((entry: any) => entry.name),
+      ['counted'],
+    )
+    const listed = byName(responses.get(1).result.data)
+    assert.equal(listed.counted.toolsError, null)
+
+    // The server that never answers is given up on at the deadline, and the
+    // list does not wait any longer for it.
+    assert.match(listed.stalled.toolsError, /timed out/)
+    assert.ok(waited < 10_000, `the list took ${waited} ms`)
+
+    // The streamable server is spoken to as its SDK expects: with its
+    // session, a stream reply read past the log before it, and the session
+    // ended afterwards.
+    assert.equal(listed.streamable.toolsError, null)
+    assert.equal(listed.streamable.serverInfo.name, 'streamable')
+    assert.deepEqual(Object.keys(listed.streamable.tools), ['lookup'])
+    for (let i = 0; i < 100 && !seen.includes('DELETE session-1'); i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    assert.deepEqual(seen.slice(0, 2), ['initialize -', 'notifications/initialized session-1'])
+    assert.deepEqual(seen.slice(2, -1).sort(), [
+      'resources/list session-1',
+      'resources/templates/list session-1',
+      'tools/list session-1',
+    ])
+    assert.equal(seen.at(-1), 'DELETE session-1')
+
+    // An error says why a server failed without what its url or stderr
+    // would spill: credentials and query stay out, and only the end of a
+    // long stderr comes along.
+    assert.match(listed.leaky.toolsError, /credentials/)
+    assert.doesNotMatch(listed.leaky.toolsError, /secret|hidden/)
+    assert.equal(listed.leaky.httpOrigin, `http://127.0.0.1:${streamablePort}`)
+    assert.match(listed.noisy.toolsError, /exited with code 4: .*noise last words$/)
+    assert.ok(listed.noisy.toolsError.length < 2_100, `${listed.noisy.toolsError.length} chars`)
+
+    // A list asked for again soon after is answered from that look.
+    proc.stdin.write(json({ id: 3, method: 'mcpServerStatus/list', params: {} }))
+    assert.equal(byName((await reader.nextResponse(3)).result.data).counted.toolsError, null)
+    assert.equal(await startCount(), 1)
+  } finally {
+    proc.kill()
+    streamable.close()
+    stalled.closeAllConnections()
+    stalled.close()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })

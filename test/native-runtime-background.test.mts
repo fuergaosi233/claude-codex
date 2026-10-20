@@ -42,8 +42,9 @@ class FakeQuery implements AsyncIterable<Record<string, unknown>> {
   interrupts = 0
   stoppedTasks: string[] = []
   closed = false
-  // What mcpServerStatus answers; null makes it fail.
-  mcpStatuses: { name: string; status: string }[] | null = []
+  // What mcpServerStatus answers; null makes it fail, and 'hang' never
+  // answers, as a wedged session does.
+  mcpStatuses: Record<string, unknown>[] | null | 'hang' = []
   reconnects: string[] = []
   failingReconnects = new Set<string>()
   // The permission modes the runtime switched to, each with the number of
@@ -74,7 +75,8 @@ class FakeQuery implements AsyncIterable<Record<string, unknown>> {
     this.stoppedTasks.push(taskId)
   }
 
-  async mcpServerStatus(): Promise<{ name: string; status: string }[]> {
+  async mcpServerStatus(): Promise<Record<string, unknown>[]> {
+    if (this.mcpStatuses === 'hang') return new Promise(() => {})
     if (!this.mcpStatuses) throw new Error('control request failed')
     return this.mcpStatuses
   }
@@ -615,6 +617,51 @@ test('native MCP reload retries only the servers an open session could not reach
   await waitFor(() => listener.released.length === 1, 'session release')
   await runtime.reloadMcpServers()
   assert.deepEqual(query.reconnects, ['docs', 'search'])
+  await runtime.stop()
+})
+
+test('native MCP statuses are what the open session says of its servers', async () => {
+  const { runtime, queries } = fakeRuntime()
+  const listener = recordingListener()
+  runtime.setBackgroundListener(listener)
+  // No session yet: nothing to say.
+  assert.equal(await runtime.mcpServerStatuses('thread'), null)
+
+  const first = runtime.runTurn(context, handlers([]))
+  const query = await waitFor(() => queries[0], 'session')
+  query.push(...launchBackgroundAgent('a8'))
+  await first
+
+  query.mcpStatuses = [
+    { name: 'github', status: 'connected', serverInfo: { name: 'GitHub', version: '1.2.0' } },
+    { name: 'docs', status: 'needs-auth', error: 'sign in first' },
+    // Entries without a name or a state are left out.
+    { status: 'connected' },
+    { name: 'odd' },
+  ]
+  assert.deepEqual(await runtime.mcpServerStatuses('thread'), [
+    { name: 'github', status: 'connected', serverInfo: { name: 'GitHub', version: '1.2.0' } },
+    { name: 'docs', status: 'needs-auth', serverInfo: null },
+  ])
+  assert.equal(await runtime.mcpServerStatuses('other-thread'), null)
+
+  // A session that cannot answer says nothing.
+  query.mcpStatuses = null
+  assert.equal(await runtime.mcpServerStatuses('thread'), null)
+
+  // Nor does a wedged one, in time for the App, which waits five seconds for
+  // the whole list.
+  query.mcpStatuses = 'hang'
+  const asked = Date.now()
+  assert.equal(await runtime.mcpServerStatuses('thread'), null)
+  const waited = Date.now() - asked
+  assert.ok(waited >= 1_500 && waited < 4_000, `waited ${waited} ms`)
+
+  // Nor does one that has ended.
+  query.mcpStatuses = [{ name: 'github', status: 'connected' }]
+  query.close()
+  await waitFor(() => listener.released.length === 1, 'session release')
+  assert.equal(await runtime.mcpServerStatuses('thread'), null)
   await runtime.stop()
 })
 
