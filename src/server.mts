@@ -1302,10 +1302,9 @@ export class CodexClaudeAppServer {
       projectId: leader.projectId,
       threadSource: 'user',
     })
+    // No App follows the leader right now: threadStart subscribes no one, and
+    // the chat finds its followers when an App opens it.
     const threadId = stringOr(asRecord(asRecord(started).thread).id, '')
-    // No App follows the leader right now: let the chat find its peer when
-    // the App opens it, instead of pinning it to nobody.
-    if (peer === DETACHED_PEER) this.activePeerByThread.delete(threadId)
     // Linked before its turn starts, so that turn already gets no leader tools.
     this.store.addLeaderThread(threadId, leader.id)
     if (options.title) this.threadNameSet({ threadId, name: options.title })
@@ -1327,7 +1326,7 @@ export class CodexClaudeAppServer {
     const running = this.activeTurnByThread.get(threadId) ?? null
     const leaderId = this.store.leaderOf(threadId)
     const peer =
-      this.activePeerByThread.get(threadId) ??
+      this.subscribersOf(threadId).at(-1) ??
       (leaderId ? this.peerForThread(leaderId) : DETACHED_PEER)
     const result = await this.turnStart(peer, {
       threadId,
@@ -3186,7 +3185,7 @@ export class CodexClaudeAppServer {
     const thread = this.store.getThread(threadId)
     if (!thread) throw new Error(`unknown thread: ${threadId}`)
     this.checkModelProfileBinding(thread)
-    this.activePeerByThread.set(threadId, peer)
+    this.subscribe(threadId, peer)
     const turnId = newId()
     const compactItem: ThreadItem = { type: 'contextCompaction', id: newId() }
     const turn: TurnRecord = {
