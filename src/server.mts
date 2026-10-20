@@ -17,6 +17,7 @@ import {
 } from './claude-capabilities.mjs'
 import { onClaudeCommandsChanged, skillLinksToCommand } from './claude-commands.mjs'
 import { runCodexNotify } from './codex-notify.mjs'
+import { appendCommandOutput } from './command-output.mjs'
 import {
   continuePrompt,
   goalBudgetExhausted,
@@ -289,6 +290,8 @@ type SubagentActivityKind = 'started' | 'interacted' | 'interrupted' | 'complete
 const DETACHED_PEER: RpcPeer = { id: 'detached', send: () => {}, close: () => {} }
 
 const MAX_TRACKED_TASK_IDS = 512
+// Command items a background shell's later output may still go to.
+const MAX_TRACKED_COMMAND_ITEMS = 512
 const MAX_QUEUED_ACTIVITY = 64
 
 // A hidden goal continuation that does no tool work ends the run of
@@ -404,6 +407,8 @@ export class CodexClaudeAppServer {
   private backgroundSubagents = new Map<string, BackgroundSubagent>()
   // task_started precedes the Agent tool result that backgrounds the task.
   private taskIdByToolUse = new Map<string, string>()
+  // Bash command items by tool use id.
+  private commandItems = new Map<string, { threadId: string; turnId: string; itemId: string }>()
   // SendMessage and TaskStop calls addressed to a known agent, by tool use id.
   private pendingAgentCalls = new Map<
     string,
@@ -4268,6 +4273,8 @@ export class CodexClaudeAppServer {
             itemIds.set(event.toolUseId, item.id)
             itemStartedAtMs.set(item.id, nowMillis())
             openToolItems.add(item.id)
+            if (item.type === 'commandExecution')
+              this.rememberCommandItem(event.toolUseId, thread.id, turn.id, item.id)
             this.store.appendItem(turn.id, item)
             this.notify(peer, {
               method: 'item/started',
@@ -4288,11 +4295,15 @@ export class CodexClaudeAppServer {
           }
           if (event.type === 'tool_output_delta') {
             const itemId = itemIds.get(event.toolUseId)
-            if (!itemId) return
+            // Output that comes after the result is not the item's any more.
+            if (!itemId || !openToolItems.has(itemId)) return
             commandOutputSeen.add(itemId)
             this.store.updateItem(turn.id, itemId, (item) => {
               if (item.type === 'commandExecution') {
-                return { ...item, aggregatedOutput: `${item.aggregatedOutput ?? ''}${event.delta}` }
+                return {
+                  ...item,
+                  aggregatedOutput: appendCommandOutput(item.aggregatedOutput, event.delta),
+                }
               }
               return item
             })
@@ -4321,7 +4332,12 @@ export class CodexClaudeAppServer {
                 return {
                   ...item,
                   status: event.isError ? 'failed' : 'completed',
-                  aggregatedOutput: item.aggregatedOutput ?? resultText,
+                  // The result has all of the output, where what streamed in
+                  // may have skipped some.
+                  aggregatedOutput:
+                    commandOutputSeen.has(itemId) && resultText
+                      ? resultText
+                      : (item.aggregatedOutput ?? resultText),
                   exitCode: parsedExitCode,
                   durationMs,
                 }
@@ -5192,7 +5208,47 @@ export class CodexClaudeAppServer {
     }
   }
 
+  private rememberCommandItem(
+    toolUseId: string,
+    threadId: string,
+    turnId: string,
+    itemId: string,
+  ): void {
+    this.commandItems.set(toolUseId, { threadId, turnId, itemId })
+    if (this.commandItems.size > MAX_TRACKED_COMMAND_ITEMS) {
+      const oldest = this.commandItems.keys().next().value
+      if (oldest !== undefined) this.commandItems.delete(oldest)
+    }
+  }
+
+  // A background shell goes on printing after its Bash call returned and the
+  // call's item completed, maybe after its turn ended. The App appends the
+  // output to that item wherever it is.
+  // App rule: command-output-after-completion
+  private appendBackgroundOutput(
+    threadId: string,
+    event: Extract<RuntimeTaskEvent, { type: 'task_output' }>,
+  ): void {
+    const at = this.commandItems.get(event.toolUseId)
+    if (!at || at.threadId !== threadId || !event.delta) return
+    let found = false
+    this.store.updateItem(at.turnId, at.itemId, (item) => {
+      if (item.type !== 'commandExecution') return item
+      found = true
+      return { ...item, aggregatedOutput: appendCommandOutput(item.aggregatedOutput, event.delta) }
+    })
+    if (!found) return
+    this.notify(this.peerForThread(threadId), {
+      method: 'item/commandExecution/outputDelta',
+      params: { threadId, turnId: at.turnId, itemId: at.itemId, delta: event.delta },
+    })
+  }
+
   private handleTaskEvent(threadId: string, event: RuntimeTaskEvent): void {
+    if (event.type === 'task_output') {
+      this.appendBackgroundOutput(threadId, event)
+      return
+    }
     if (event.type === 'task_started') {
       if (!event.toolUseId) return
       const entry = this.findBackgroundSubagent(threadId, { toolUseId: event.toolUseId })

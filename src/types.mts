@@ -681,6 +681,15 @@ export type RuntimeTaskEvent =
       result: string | null
       usage: RuntimeTaskUsage | null
     }
+  | {
+      // Output of a background shell, after the Bash call that started it
+      // returned (a call still waiting for its result streams through its
+      // turn as tool_output_delta).
+      type: 'task_output'
+      taskId: string
+      toolUseId: string
+      delta: string
+    }
 
 export interface RuntimeBackgroundListener {
   onTaskEvent(threadId: string, event: RuntimeTaskEvent): Promise<void> | void

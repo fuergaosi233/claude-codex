@@ -693,7 +693,9 @@ export class MockRuntime implements ClaudeRuntime {
 
     if (/background shell check/i.test(context.prompt)) {
       // A Bash call Claude runs in the background: the call returns at once
-      // and the shell stays live until it is stopped.
+      // and the shell stays live until it is stopped. "With output" has it
+      // print a line after the turn ended.
+      const withOutput = /with output/i.test(context.prompt)
       const toolUseId = `shell-${Date.now()}`
       const taskId = `bash-${this.shells.size + 1}`
       await handlers.onEvent({
@@ -710,6 +712,17 @@ export class MockRuntime implements ClaudeRuntime {
       })
       await handlers.onEvent({ type: 'text_delta', delta: 'dev server started' })
       await handlers.onEvent({ type: 'completed', success: true, result: 'started' })
+      if (withOutput) {
+        const { threadId } = context
+        setTimeout(() => {
+          void this.listener?.onTaskEvent(threadId, {
+            type: 'task_output',
+            taskId,
+            toolUseId,
+            delta: '\nready on :3000\n',
+          })
+        }, 50)
+      }
       return
     }
 

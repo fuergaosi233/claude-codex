@@ -198,6 +198,14 @@ export const APP_RULES: readonly AppRule[] = [
     verify:
       'Open a new chat without sending anything, restart the adapter and reload the App: no empty chat shows in the sidebar.',
   },
+  {
+    id: 'command-output-after-completion',
+    app: 'Appends item/commandExecution/outputDelta to the commandExecution item with that id in whichever turn of the thread holds it, completed or not, keeping the last 20000 characters behind an `[output truncated]` line, and drops a delta whose item it cannot find.',
+    adapter:
+      "Streams a background shell's output into the completed item of the Bash call that started it, also after its turn ended, and stores it cut the same way.",
+    verify:
+      'Ask Claude to start a background command that prints a line every second: after the turn ends, its command item keeps showing new lines.',
+  },
 ]
 
 // The methods the App starts calling, or sends new parameters to, once the

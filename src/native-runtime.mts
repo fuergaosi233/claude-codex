@@ -45,6 +45,12 @@ import type { Query } from '@anthropic-ai/claude-agent-sdk'
 import { noteClaudeCommands } from './claude-commands.mjs'
 import { removeCliMcpConfig, writeCliMcpConfig } from './cli-mcp-config.mjs'
 import { recordCliChildren } from './cli-orphans.mjs'
+import {
+  type BackgroundSink,
+  COMMAND_OUTPUT_POLL_MS,
+  CommandOutputs,
+  type OutputSink,
+} from './command-output.mjs'
 import { CronJobs } from './cron-jobs.mjs'
 import {
   CREATE_GOAL_DESCRIPTION,
@@ -204,6 +210,8 @@ interface LiveSession {
   // stopped every one of them.
   stoppedTasks: Set<string>
   endedWhileIdle: string[]
+  // Live output of the Bash commands the main loop runs.
+  commandOutputs: CommandOutputs
   // Interrupted while the process stays alive (see SessionSink).
   sink: SessionSink | null
   settleTimer: NodeJS.Timeout | null
@@ -815,9 +823,10 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       let session: LiveSession | null = null
       const options = this.buildOptions(sdk, context, abort, () => session)
       if (reusable) this.trackCronJobs(context, options)
+      const query = sdk.query({ prompt: input, options })
       const opened: LiveSession = {
         threadId: context.threadId,
-        query: sdk.query({ prompt: input, options }),
+        query,
         input,
         abort,
         reusable,
@@ -845,6 +854,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         steers: new Map(),
         stoppedTasks: new Set(),
         endedWhileIdle: [],
+        commandOutputs: new CommandOutputs(taskOutputReader(query), commandOutputPollMs()),
         sink: null,
         settleTimer: null,
         idleTimer: null,
@@ -1402,6 +1412,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (session.closed) return
     session.closed = true
     this.clearSessionTimers(session)
+    session.commandOutputs.close()
     session.input.close()
     try {
       ;(session.query as Query & { close?: () => void }).close?.()
@@ -1418,6 +1429,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   private async endSession(session: LiveSession, failure: Error | null): Promise<void> {
     this.clearSessionTimers(session)
     session.closed = true
+    session.commandOutputs.close()
     // A superseded session winds down after its replacement registered; the
     // thread's background work now belongs to the replacement.
     const registered = this.sessions.get(session.threadId)
@@ -1540,7 +1552,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         const taskId = stringOrNull(task?.task_id)
         if (taskId && task?.ambient !== true) next.add(taskId)
       }
-      for (const taskId of session.liveTasks) if (!next.has(taskId)) this.markTaskEnded(session)
+      for (const taskId of session.liveTasks) {
+        if (next.has(taskId)) continue
+        this.markTaskEnded(session)
+        session.commandOutputs.taskEnded(taskId)
+      }
+      for (const taskId of next) session.commandOutputs.taskBackgrounded(taskId)
       session.liveTasks = next
       session.levelSeen = true
       return
@@ -1566,6 +1583,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         typeof message.is_backgrounded === 'boolean' ? message.is_backgrounded : null
       if (!session.levelSeen && backgrounded === true && message.ambient !== true)
         session.liveTasks.add(taskId)
+      if (taskType === 'local_bash')
+        session.commandOutputs.taskStarted(taskId, toolUseId, backgrounded)
       await listener?.onTaskEvent(session.threadId, {
         type: 'task_started',
         taskId,
@@ -1594,6 +1613,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       const patch = recordOrNull(message.patch) ?? {}
       const status = stringOrNull(patch.status)
       const backgrounded = typeof patch.is_backgrounded === 'boolean' ? patch.is_backgrounded : null
+      if (status && TERMINAL_TASK_STATUSES.has(status)) session.commandOutputs.taskEnded(taskId)
+      else if (backgrounded === true) session.commandOutputs.taskBackgrounded(taskId)
       if (!session.levelSeen) {
         if (status && IDLE_TASK_STATUSES.has(status)) {
           if (session.liveTasks.delete(taskId)) this.markTaskEnded(session)
@@ -1619,6 +1640,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     // Interrupting a turn also stops the background agents it launched. Like
     // a stop from the user, that is no news to wake the thread with.
     if (status === 'stopped') session.stoppedTasks.add(taskId)
+    // A shell that did not complete says how it ended after its output (a
+    // stop, its background time limit, a failed exit).
+    session.commandOutputs.taskNotified(
+      taskId,
+      status === 'completed' ? null : stringOrNull(message.summary),
+    )
     // An interrupted turn answers nothing more: what ends while it drains is
     // left for the turn after it, same as when the CLI is idle.
     if (!session.cliRunning || session.sink) session.endedWhileIdle.push(taskId)
@@ -2090,8 +2117,39 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         }
         await pending.handlers.onEvent({ type: 'tool_use', toolUseId: id, toolName: name, input })
         if (isWorkflowTool(name)) pending.workflowToolUseIds.add(id)
+        if (name === 'Bash' && !nestedMessage)
+          pending.session.commandOutputs.call(id, this.commandOutputSink(pending, id))
       }
     }
+  }
+
+  // A running Bash command's output goes to its item in the turn.
+  private commandOutputSink(pending: PendingTurn, toolUseId: string): OutputSink {
+    return {
+      live: () => !pending.resolved && !pending.session.closed,
+      emit: (delta) => pending.handlers.onEvent({ type: 'tool_output_delta', toolUseId, delta }),
+    }
+  }
+
+  // The Bash call returned. A shell it left running in the background goes on
+  // reporting its output to the thread.
+  private endCommandOutput(session: LiveSession, toolUseId: string): void {
+    const listener = session.reusable ? this.listener : null
+    const background: BackgroundSink | null = listener
+      ? (taskId) => ({
+          live: () => !session.closed,
+          emit: (delta) =>
+            listener.onTaskEvent(session.threadId, {
+              type: 'task_output',
+              taskId,
+              toolUseId,
+              delta,
+            }),
+        })
+      : null
+    session.commandOutputs.callEnded(toolUseId, background, (taskId) =>
+      session.liveTasks.has(taskId),
+    )
   }
 
   private async handleUser(pending: PendingTurn, message: Record<string, unknown>): Promise<void> {
@@ -2127,6 +2185,9 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         isError,
         ...(structured ? { structured } : {}),
       })
+      // After the result, which replaces what the command's item showed.
+      if (!message.parent_tool_use_id && pending.session)
+        this.endCommandOutput(pending.session, toolUseId)
       if (!workflowLaunchAttached && isWorkflowLaunch && toolResultCount === 1) {
         workflowLaunchAttached = true
         this.attachWorkflowJournal(pending, workflowLaunchResult, toolUseId)
@@ -2831,6 +2892,22 @@ function sessionSettleMs(): number {
 
 function backgroundIdleMs(): number {
   return positiveEnvMs('CLAUDE_CODEX_BACKGROUND_IDLE_MS') ?? BACKGROUND_IDLE_MS
+}
+
+// 0 turns live command output off.
+function commandOutputPollMs(): number {
+  const raw = process.env.CLAUDE_CODEX_COMMAND_OUTPUT_POLL_MS
+  const value = raw ? Number(raw) : Number.NaN
+  return Number.isFinite(value) && value >= 0 ? value : COMMAND_OUTPUT_POLL_MS
+}
+
+// The SDK's get_task_output request, which Query implements without declaring
+// it. Older SDKs lack it, and commands then show their output when they end.
+function taskOutputReader(query: Query): ((taskId: string) => Promise<unknown>) | null {
+  const read = (query as Query & { getTaskOutput?: (taskId: string) => Promise<unknown> })
+    .getTaskOutput
+  if (typeof read !== 'function') return null
+  return (taskId) => read.call(query, taskId)
 }
 
 function truthyEnv(value: string | undefined): boolean {

@@ -460,6 +460,41 @@ test('background shells are listed and stopped as background terminals', async (
   })
 })
 
+test("a background shell's output streams into its command item after the turn ended", async () => {
+  await withServer(async (server) => {
+    const threadId = await server.startThread()
+    const from = server.mark()
+    const turnId = await server.runTurn(threadId, 'background shell check with output')
+    const completed = server
+      .notified('item/completed', from)
+      .find((params) => params.item.type === 'commandExecution')
+    assert.ok(completed)
+    const itemId = completed.item.id
+    const delta = await server.waitFor(
+      'item/commandExecution/outputDelta',
+      (params) => params.itemId === itemId && params.delta.includes('ready'),
+      from,
+    )
+    assert.deepEqual(delta, { threadId, turnId, itemId, delta: '\nready on :3000\n' })
+    const at = (method: string, match: (params: any) => boolean) =>
+      server.notifications.findIndex((entry) => entry.method === method && match(entry.params))
+    assert.ok(
+      at('item/commandExecution/outputDelta', (params) => params.delta.includes('ready')) >
+        at('turn/completed', (params) => params.turn.id === turnId),
+    )
+
+    const { thread } = await server.request('thread/read', { threadId, includeTurns: true })
+    const item = thread.turns
+      .find((turn: any) => turn.id === turnId)
+      .items.find((entry: any) => entry.id === itemId)
+    assert.equal(item.status, 'completed')
+    assert.match(
+      item.aggregatedOutput,
+      /^Command running in background with ID: \S+\nready on :3000\n$/,
+    )
+  })
+})
+
 test('turn/settings/update switches model and effort for the running turn only', async () => {
   await withServer(async (server) => {
     const threadId = await server.startThread()
