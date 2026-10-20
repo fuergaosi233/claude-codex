@@ -923,6 +923,48 @@ test('native turn reports progress of the agents it waits on, not of those it ha
   await runtime.stop()
 })
 
+test('native turn keeps reporting agent progress after the wall clock is set back', async () => {
+  const wallClock = Date.now
+  try {
+    const { runtime, queries } = fakeRuntime()
+    const events: RuntimeEvent[] = []
+    const turn = runtime.runTurn(context, handlers(events))
+    const query = await waitFor(() => queries[0], 'session')
+    const heartbeat = (seconds: number) => ({
+      type: 'tool_progress',
+      tool_use_id: 'agent-1',
+      tool_name: 'Agent',
+      parent_tool_use_id: null,
+      elapsed_time_seconds: seconds,
+    })
+    query.push(
+      init,
+      assistant('m1', [
+        { type: 'tool_use', id: 'agent-1', name: 'Agent', input: { prompt: 'check the build' } },
+      ]),
+      heartbeat(1),
+    )
+    await waitFor(() => subagentProgress(events).length === 1, 'first progress report')
+    // An hour back: the agent's next heartbeat must still reach the server.
+    Date.now = () => wallClock() - 3_600_000
+    await sleep(300)
+    query.push(heartbeat(2))
+    await waitFor(() => subagentProgress(events).length === 2, 'progress after the clock change')
+    query.push(
+      {
+        type: 'user',
+        parent_tool_use_id: null,
+        message: { content: [{ type: 'tool_result', tool_use_id: 'agent-1', content: 'built' }] },
+      },
+      { type: 'result', subtype: 'success', result: 'Built.' },
+    )
+    await turn
+    await runtime.stop()
+  } finally {
+    Date.now = wallClock
+  }
+})
+
 test('native workflow progress reports the Workflow call it belongs to', async () => {
   const { runtime, queries } = fakeRuntime()
   runtime.setBackgroundListener(recordingListener())

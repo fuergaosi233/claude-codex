@@ -3598,6 +3598,8 @@ export class CodexClaudeAppServer {
     // When the turn last heard from the subagents or workflow it waits on.
     // A busy child reports many times a second, so progress only moves this
     // mark; a timer that comes due early waits out the rest of the window.
+    // It is read off the monotonic clock the timer runs on, so a jump of the
+    // wall clock (a laptop waking from sleep) neither fails nor stretches it.
     let lastProgressAtMs = 0
     const watchdogTimeoutMs = subagentWatchdogTimeoutMs()
     const watchdogPromise =
@@ -3611,12 +3613,12 @@ export class CodexClaudeAppServer {
       watchdogTimer = null
     }
     const noteProgress = (): void => {
-      lastProgressAtMs = nowMillis()
+      lastProgressAtMs = performance.now()
     }
     const scheduleWatchdog = (delayMs: number): void => {
       watchdogTimer = setTimeout(() => {
         watchdogTimer = null
-        const idleMs = nowMillis() - lastProgressAtMs
+        const idleMs = performance.now() - lastProgressAtMs
         if (idleMs < watchdogTimeoutMs) {
           scheduleWatchdog(watchdogTimeoutMs - idleMs)
           return

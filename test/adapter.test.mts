@@ -7613,8 +7613,9 @@ test('workflow watchdog disarms when the original Workflow tool result arrives',
 
 // Runs `body` in a child process whose subagent watchdog waits `windowMs`.
 // The body builds a server on `store` with the runtime it needs; it gets the
-// peer's messages (`receivedAt` holds when each arrived) and helpers to start
-// a turn, find its turn/completed and read a child agent's status by prompt.
+// peer's messages (`receivedAt` holds when each arrived, on the monotonic
+// clock) and helpers to start a turn, find its turn/completed and read a
+// child agent's status by prompt.
 async function runWatchdogScript(windowMs: number, body: string): Promise<void> {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   try {
@@ -7642,7 +7643,7 @@ async function runWatchdogScript(windowMs: number, body: string): Promise<void> 
         id: 'peer',
         send: (message) => {
           messages.push(message)
-          receivedAt.set(message, Date.now())
+          receivedAt.set(message, performance.now())
         },
         close() {},
       }
@@ -7652,8 +7653,8 @@ async function runWatchdogScript(windowMs: number, body: string): Promise<void> 
           (message) => message.method === 'turn/completed' && message.params.turn.id === turnId,
         )
       const waitFor = async (probe, label) => {
-        const deadline = Date.now() + 5000
-        while (Date.now() < deadline) {
+        const deadline = performance.now() + 5000
+        while (performance.now() < deadline) {
           const value = probe()
           if (value) return value
           await sleep(10)
@@ -7747,6 +7748,50 @@ test('subagent watchdog waits as long as a foreground agent keeps reporting prog
   )
 })
 
+test('subagent watchdog does not take a jump of the wall clock for a quiet agent', async () => {
+  await runWatchdogScript(
+    300,
+    `
+      const interrupted = []
+      const wallClock = Date.now
+      let jumpedMs = 0
+      Date.now = () => wallClock() + jumpedMs
+      const server = new CodexClaudeAppServer(store, {
+        async runTurn(context, handlers) {
+          const toolUseId = 'busy-' + context.turnId
+          await handlers.onEvent({
+            type: 'tool_use',
+            toolUseId,
+            toolName: 'Task',
+            input: { description: 'long check', prompt: 'run the long check' },
+          })
+          // The wall clock leaps an hour ahead after every report, as when a
+          // laptop wakes from sleep; the agent itself never goes quiet.
+          for (let beat = 0; beat < 6; beat += 1) {
+            await sleep(100)
+            await handlers.onEvent({ type: 'subagent_progress', toolUseId })
+            jumpedMs += 3_600_000
+          }
+          await handlers.onEvent({ type: 'tool_result', toolUseId, content: 'all checks passed' })
+          await handlers.onEvent({ type: 'completed', success: true, result: 'checked' })
+        },
+        async steer() {},
+        async interrupt(threadId) {
+          interrupted.push(threadId)
+        },
+        async stop() {},
+      })
+      const { turnId } = await startTurn(server, 'check everything')
+      const completed = await waitFor(() => completion(turnId), 'turn completion')
+      assert.equal(completed.params.turn.status, 'completed')
+      assert.equal(completed.params.turn.error, null)
+      assert.deepEqual(interrupted, [])
+      await server.stop()
+      Date.now = wallClock
+    `,
+  )
+})
+
 test('workflow watchdog waits while overlapping workflow agents keep starting and finishing', async () => {
   await runWatchdogScript(
     300,
@@ -7826,7 +7871,7 @@ test('subagent watchdog fails a turn whose agent goes quiet for a whole window',
           for (let beat = 0; beat < 4; beat += 1) {
             await sleep(100)
             await handlers.onEvent({ type: 'subagent_progress', toolUseId })
-            lastProgressAt = Date.now()
+            lastProgressAt = performance.now()
           }
           return new Promise(() => {})
         },
@@ -7834,14 +7879,14 @@ test('subagent watchdog fails a turn whose agent goes quiet for a whole window',
         async interrupt(threadId) {
           interrupted.push(threadId)
         },
-        // Nothing else runs in the session: the backend leaves it to an interrupt.
+        // The turn handed nothing off: the backend leaves it to an interrupt.
         async abandonTurn(_threadId, turnId) {
           abandoned.push(turnId)
           return false
         },
         async stop() {},
       })
-      const startedAt = Date.now()
+      const startedAt = performance.now()
       const { threadId, turnId } = await startTurn(server, 'check, then hang')
       const completed = await waitFor(() => completion(turnId), 'watchdog')
       const failedAt = receivedAt.get(completed)

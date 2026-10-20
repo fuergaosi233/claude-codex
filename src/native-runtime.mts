@@ -134,7 +134,8 @@ interface PendingTurn {
   // The model behind the main loop's latest response.
   model: string | null
   // When the server was last told a subagent or workflow of the turn is
-  // still working (see noteSubagentProgress).
+  // still working (see noteSubagentProgress), on the monotonic clock: a wall
+  // clock set back must not hold the reports back for as long.
   progressReportedAtMs: number
 }
 
@@ -1048,7 +1049,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       deferredResult: null,
       workflowFailure: null,
       model: null,
-      progressReportedAtMs: 0,
+      progressReportedAtMs: Number.NEGATIVE_INFINITY,
     }
   }
 
@@ -1769,7 +1770,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   ): Promise<void> {
     const toolUseId = this.progressToolUseId(pending, type, message)
     if (!toolUseId) return
-    const now = Date.now()
+    const now = performance.now()
     if (now - pending.progressReportedAtMs < SUBAGENT_PROGRESS_INTERVAL_MS) return
     pending.progressReportedAtMs = now
     await pending.handlers.onEvent({ type: 'subagent_progress', toolUseId })
