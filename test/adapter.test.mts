@@ -2931,6 +2931,100 @@ test('review/start and thread/compact/start emit real turn items', async () => {
   }
 })
 
+test('a review cut off by an interrupt or by the adapter stopping still exits review mode', {
+  timeout: 30_000,
+}, async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const launch = () => {
+    const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+    })
+    t.signal.addEventListener('abort', () => proc.kill('SIGKILL'))
+    return { proc, reader: new JsonLineReader(proc) }
+  }
+  const first = launch()
+  let second: ReturnType<typeof launch> | null = null
+  try {
+    const { proc, reader } = first
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false },
+      }),
+    )
+    const threadId = (await reader.nextResponse(1)).result.thread.id
+    // A review Claude is still answering when it is cut off.
+    const heldReview = async (id: number): Promise<string> => {
+      proc.stdin.write(
+        json({
+          id,
+          method: 'review/start',
+          params: {
+            threadId,
+            delivery: 'inline',
+            target: { type: 'custom', instructions: 'hold this turn until released' },
+          },
+        }),
+      )
+      const turnId = (await reader.nextResponse(id)).result.turn.id
+      await nextNotification(reader, 'item/agentMessage/delta')
+      return turnId
+    }
+
+    // Interrupted: the exited marker, holding the fallback rather than the
+    // unfinished text, goes out before the turn ends.
+    const interruptedId = await heldReview(2)
+    proc.stdin.write(
+      json({ id: 3, method: 'turn/interrupt', params: { threadId, turnId: interruptedId } }),
+    )
+    const markers: string[] = []
+    let exited: any = null
+    let completed: any = null
+    for (let i = 0; i < 500 && !completed; i += 1) {
+      const message = await reader.next()
+      const item = message.params?.item
+      if (/^item\/(started|completed)$/.test(message.method) && /ReviewMode$/.test(item.type)) {
+        markers.push(`${message.method} ${item.type}`)
+        exited = item
+      }
+      if (message.method === 'turn/completed') completed = message.params.turn
+    }
+    assert.deepEqual(markers, ['item/started exitedReviewMode', 'item/completed exitedReviewMode'])
+    assert.equal(exited.review, 'Reviewer failed to output a response.')
+    assert.equal(completed.id, interruptedId)
+    assert.equal(completed.status, 'interrupted')
+
+    // Stopped: the adapter records the marker as it ends the turn, so the
+    // thread reads the same after a restart.
+    const stoppedId = await heldReview(4)
+    proc.kill('SIGTERM')
+    assert.equal(await waitForExit(proc, 20_000), 0)
+    second = launch()
+    second.proc.stdin.write(
+      json({ id: 1, method: 'thread/read', params: { threadId, includeTurns: true } }),
+    )
+    const read = await second.reader.nextResponse(1)
+    const turns = read.result.thread.turns
+    for (const turnId of [interruptedId, stoppedId]) {
+      const turn = turns.find((candidate: any) => candidate.id === turnId)
+      assert.equal(turn.status, 'interrupted')
+      const reviewItems = turn.items.filter((item: any) => /ReviewMode$/.test(item.type))
+      assert.deepEqual(
+        reviewItems.map((item: any) => item.type),
+        ['enteredReviewMode', 'exitedReviewMode'],
+      )
+      assert.equal(turn.items.at(-1).type, 'exitedReviewMode')
+      assert.equal(turn.items.at(-1).review, 'Reviewer failed to output a response.')
+    }
+  } finally {
+    first.proc.kill()
+    second?.proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('Claude thinking maps to Codex reasoning content without a duplicate summary', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {

@@ -7405,6 +7405,8 @@ export class CodexClaudeAppServer {
     for (const [threadId, turnId] of this.activeTurnByThread.entries()) {
       const turn = this.store.getTurn(turnId)
       if (turn?.status === 'inProgress') {
+        // A review the stop cuts off still closes in the thread's history.
+        this.exitReviewMode(null, threadId, turnId)
         this.store.completeTurn(turnId, status, error)
       }
       this.store.updateThreadStatus(threadId, { type: 'idle' })
@@ -7475,29 +7477,23 @@ export class CodexClaudeAppServer {
     return { cwd: thread && thread.runtimeBackend !== 'codex' ? thread.cwd : null }
   }
 
-  // Ends a turn whose runtime run failed. The client leaves its running state
-  // only on turn/completed, so that goes out even when the store refuses the
-  // write too; the usual cause is another connection holding the state
-  // database past its busy timeout. Returns false for a turn that had already
-  // ended, e.g. through turn/interrupt.
   // Codex ends a review turn with an exitedReviewMode item holding the review,
   // or a fallback text when the reviewer gave no answer (an interrupted or
-  // failed review). Before the turn completes, as there.
-  private exitReviewMode(peer: RpcPeer, threadId: string, turnId: string): void {
-    const turn = this.store.getTurn(turnId)
-    if (turn?.status !== 'inProgress') return
-    if (!turn.items.some((item) => item.type === 'enteredReviewMode')) return
-    if (turn.items.some((item) => item.type === 'exitedReviewMode')) return
-    const answer = turn.items.findLast(
-      (item) => item.type === 'agentMessage' && item.phase === 'final_answer',
-    )
-    const text = answer?.type === 'agentMessage' ? answer.text.trim() : ''
-    const item: ThreadItem = {
-      type: 'exitedReviewMode',
-      id: newId(),
-      review: text || REVIEW_FALLBACK,
-    }
+  // failed review). Before the turn completes, as there. Without a peer the
+  // item is only recorded: the adapter is stopping and tells no client. A
+  // store that refuses the item must not keep the turn from ending.
+  private exitReviewMode(peer: RpcPeer | null, threadId: string, turnId: string): void {
+    let item: ThreadItem
     try {
+      const turn = this.store.getTurn(turnId)
+      if (turn?.status !== 'inProgress') return
+      if (!turn.items.some((item) => item.type === 'enteredReviewMode')) return
+      if (turn.items.some((item) => item.type === 'exitedReviewMode')) return
+      const answer = turn.items.findLast(
+        (item) => item.type === 'agentMessage' && item.phase === 'final_answer',
+      )
+      const text = answer?.type === 'agentMessage' ? answer.text.trim() : ''
+      item = { type: 'exitedReviewMode', id: newId(), review: text || REVIEW_FALLBACK }
       this.store.appendItem(turnId, item)
     } catch (error) {
       debugLog('review.exit_failed', {
@@ -7507,6 +7503,7 @@ export class CodexClaudeAppServer {
       })
       return
     }
+    if (!peer) return
     this.notify(peer, {
       method: 'item/started',
       params: { threadId, turnId, item, startedAtMs: nowMillis() },
@@ -7517,6 +7514,11 @@ export class CodexClaudeAppServer {
     })
   }
 
+  // Ends a turn whose runtime run failed. The client leaves its running state
+  // only on turn/completed, so that goes out even when the store refuses the
+  // write too; the usual cause is another connection holding the state
+  // database past its busy timeout. Returns false for a turn that had already
+  // ended, e.g. through turn/interrupt.
   private failTurn(peer: RpcPeer, threadId: string, turn: TurnRecord, error: Error): boolean {
     this.exitReviewMode(peer, threadId, turn.id)
     const completed = this.endTurn(turn, 'failed', { message: error.message })
