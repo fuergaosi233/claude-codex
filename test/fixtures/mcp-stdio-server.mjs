@@ -2,9 +2,17 @@
 import readline from 'node:readline'
 
 const rl = readline.createInterface({ input: process.stdin })
+// The tool call waiting for the client to answer the server's ping.
+let pingCall = null
 rl.on('line', (line) => {
   if (!line.trim()) return
   const request = JSON.parse(line)
+  if (request.id === 'server-ping' && !request.method) {
+    respond(pingCall, {
+      content: [{ type: 'text', text: `pong:${JSON.stringify(request.result)}` }],
+    })
+    return
+  }
   if (request.method === 'notifications/initialized') return
   if (request.method === 'initialize') {
     respond(request.id, {
@@ -21,6 +29,12 @@ rl.on('line', (line) => {
           name: 'echo',
           description: 'Echo back the provided value',
           inputSchema: { type: 'object', properties: { value: { type: 'string' } } },
+          annotations: { readOnlyHint: true },
+          icons: [{ src: 'data:image/svg+xml,%3Csvg%2F%3E', mimeType: 'image/svg+xml' }],
+          _meta: {
+            ui: { resourceUri: 'ui://fixture/view.html', visibility: ['app'] },
+            'openai/ui': { entrypoints: [{ type: 'global' }] },
+          },
         },
       ],
     })
@@ -36,6 +50,27 @@ rl.on('line', (line) => {
     // The value of the environment variable named by `value`.
     const value = process.env[request.params.arguments?.value ?? ''] ?? ''
     respond(request.id, { content: [{ type: 'text', text: `env:${value}` }], isError: false })
+    return
+  }
+  if (request.method === 'tools/call' && request.params.name === 'process') {
+    // Which process answers, where it runs, and the _meta the call carried.
+    respond(request.id, {
+      content: [{ type: 'text', text: `pid:${process.pid}` }],
+      structuredContent: {
+        pid: process.pid,
+        cwd: process.cwd(),
+        meta: request.params._meta ?? null,
+      },
+      isError: false,
+    })
+    return
+  }
+  if (request.method === 'tools/call' && request.params.name === 'ping') {
+    // Asks the client for a ping before it answers.
+    pingCall = request.id
+    process.stdout.write(
+      `${JSON.stringify({ jsonrpc: '2.0', id: 'server-ping', method: 'ping' })}\n`,
+    )
     return
   }
   if (request.method === 'tools/call') {

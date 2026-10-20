@@ -199,6 +199,14 @@ export const APP_RULES: readonly AppRule[] = [
       'Have a reply name a visualization as a plain visualize{…} line: it shows rendered once the message completes, and again after the chat is reopened.',
   },
   {
+    id: 'code-review-plugin-server',
+    app: "Starts a local app-server with -c plugins.code-review@openai-bundled.mcp_servers.code-review.enabled=true and CODEX_MCP_NODE_PATH set to its bundled Node, installs the code-review plugin with plugin/install, and drives its Pull Requests panel, PR search, PR view and code-review settings through mcpServer/tool/call (server code-review, pull_requests.* tools, _meta with the thread id), mcpServer/resource/read (ui://pull-requests/*) and mcpServerStatus/list, which counts the server as started when serverInfo is set and finds the panel entry points in the tools' _meta (ui.resourceUri, openai/ui entrypoints).",
+    adapter:
+      "With CLAUDE_CODEX_APP_PLUGIN_MCP=1, remembers the plugins plugin/install names, reads the -c settings and the Codex config's [plugins] tables, and runs the code-review plugin's .mcp.json server as one long-lived process in the plugin's folder, with Codex's default variables and the ones the entry lists, credentials left out. Lists it with pluginId, serverInfo, runtimeStatus and its tools as the server lists them, _meta included, and sets the thread id in a call's _meta as Codex does. Refuses to start an app-server from inside a plugin server.",
+    verify:
+      'With the switch on and gh signed in, open the Pull Requests panel: it lists pull requests and a PR opens; mcpServerStatus/list shows code-review connected.',
+  },
+  {
     id: 'quiet-turn-heartbeat',
     app: "On turn/completed reads the turn's last agentMessage, and when it ends with a <heartbeat> block deciding DONT_NOTIFY neither marks the thread unread nor sends a desktop notification. Shows a completed message without the block, and a streaming one raw.",
     adapter:

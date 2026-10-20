@@ -9214,6 +9214,10 @@ test('mcpServerStatus/list enumerates tools and resources from the server', asyn
     assert.ok(entry.tools.echo, 'expected the echo tool enumerated into the map')
     assert.equal(entry.tools.echo.name, 'echo')
     assert.ok(entry.tools.echo.inputSchema, 'tool must carry its inputSchema')
+    // And, as Codex lists it, its annotations, icons and _meta.
+    assert.deepEqual(entry.tools.echo.annotations, { readOnlyHint: true })
+    assert.equal(entry.tools.echo.icons[0].mimeType, 'image/svg+xml')
+    assert.equal(entry.tools.echo._meta.ui.resourceUri, 'ui://fixture/view.html')
     assert.equal(entry.resources[0].uri, 'fixture://resource')
     assert.ok(['unsupported', 'notLoggedIn', 'bearerToken', 'oAuth'].includes(entry.authStatus))
   } finally {

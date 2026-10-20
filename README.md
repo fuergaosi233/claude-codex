@@ -105,6 +105,27 @@ cannot render inline visualizations. The file rules (a lowercase hyphenated
 5 MB) are in
 **[Using the Codex App](https://fuergaosi233.github.io/claude-codex/guide/gui#inline-visualizations)**.
 
+### Pull Requests panel
+
+The Codex App's Pull Requests panel talks to the MCP server of its bundled
+`code-review` plugin, which the App turns on with a `-c` setting when it starts
+the app-server. With `CLAUDE_CODEX_APP_PLUGIN_MCP=1` the adapter runs that
+server for the App's own calls (`mcpServerStatus/list`, `mcpServer/tool/call`,
+`mcpServer/resource/read`): one long-lived process per adapter, started from the
+plugin's folder with its `.mcp.json` command, `CODEX_MCP_NODE_PATH` pointing at
+a Node.js binary, and only a short list of environment variables (the basics
+such as `HOME` and `PATH`, plus the variables the plugin lists, minus any whose
+name looks like a credential). A comma-separated list of plugin names runs other
+plugins' servers the same way; `codex-app-tools` and `browser-use` are never
+run. It is off by default, and the server is never offered to Claude threads.
+
+The plugin uses the host's GitHub credentials, for example an existing `gh`
+login; the adapter does not read, log or pass on any token. Starting a review
+from the panel runs the Codex CLI's own `exec`, which needs a working Codex
+install and sign-in, and the plugin's ChatGPT-backed GitHub connection is not
+available, since it would start a second app-server. Details are in
+**[Using the Codex App](https://fuergaosi233.github.io/claude-codex/guide/gui#pull-requests-panel)**.
+
 ### Project instructions
 
 Claude threads follow the same `AGENTS.md` files Codex would: the global one in
@@ -146,9 +167,10 @@ written, `${...}` included, as Codex passes them. A server with
 to a tool outside `enabled_tools` is refused, and `tool_timeout_sec` becomes the
 server's tool-call timeout. Codex OAuth logins, `startup_timeout_sec`,
 `required`, per-tool approval settings and the servers plugins bring are not
-carried over. Claude Code signs in to MCP servers itself, and the Agent SDK
-cannot start that sign-in, so a sign-in the App asks for fails rather than
-opening a page that leads nowhere. The error says to sign in with `/mcp` in a
+carried over to Claude threads (the App's own Pull Requests panel calls are
+served separately, see above). Claude Code signs in to MCP servers itself, and
+the Agent SDK cannot start that sign-in, so a sign-in the App asks for fails
+rather than opening a page that leads nowhere. The error says to sign in with `/mcp` in a
 Claude Code session; the App does not show its text, only that it couldn't
 connect. Every new session picks up such a sign-in, and a client's
 `config/mcpServer/reload` lets a session that is still open reconnect.

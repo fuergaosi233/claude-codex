@@ -1,5 +1,12 @@
 import { spawn } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
+import {
+  type AppPluginServer,
+  appPluginRequest,
+  appPluginServers,
+  type InstalledAppPlugin,
+  startAppPluginServer,
+} from './app-plugin-mcp.mjs'
 import { inheritedMcpServers, type McpToolRules, mcpToolRules } from './inherited-config.mjs'
 import { ownVariable, remoteCredential } from './mcp-credentials.mjs'
 
@@ -19,6 +26,10 @@ export interface McpConfigScope {
   readonly cwd?: string | null
   // false leaves out the servers the Codex and Claude Code configs bring.
   readonly inherit?: boolean
+  // The App plugins plugin/install named. Their MCP servers answer the App's
+  // own requests when CLAUDE_CODEX_APP_PLUGIN_MCP names them (see
+  // app-plugin-mcp.mts); a name the Claude config has stays Claude's.
+  readonly appPlugins?: readonly InstalledAppPlugin[]
 }
 
 // CLAUDE_CODEX_MCP_SERVERS, over the servers the Codex and Claude Code
@@ -74,11 +85,18 @@ export async function listMcpServerStatuses(
 ): Promise<Array<Record<string, unknown>>> {
   const snapshot = readMcpConfig(scope)
   const names = serverNames(snapshot.sdkValue)
-  const key = JSON.stringify(snapshot.sdkValue ?? null)
+  const plugins = pluginServers(names, scope)
+  const key = JSON.stringify([
+    snapshot.sdkValue ?? null,
+    plugins.map((server) => [server.pluginId, server.name, server.cwd]),
+  ])
   if (statusCache && statusCache.key === key && Date.now() - statusCache.at < STATUS_CACHE_MS) {
     return statusCache.data
   }
-  const data = await Promise.all(names.map((name) => enumerateServerStatus(name, scope)))
+  const data = await Promise.all([
+    ...names.map((name) => enumerateServerStatus(name, scope)),
+    ...plugins.map((server) => pluginServerStatus(server)),
+  ])
   statusCache = { key, at: Date.now(), data }
   return data
 }
@@ -95,6 +113,81 @@ export function resetMcpStatusCache(): void {
 export function mcpOauthUnavailable(name: string): string {
   const server = name ? `"${name}"` : 'the server'
   return `Claude Code signs in to MCP servers itself, and the adapter cannot start that sign-in. Sign in to ${server} with /mcp in a Claude Code session that has it configured.`
+}
+
+// The App plugin servers a request can reach: those whose names the Claude
+// config does not have.
+function pluginServers(claudeNames: readonly string[], scope: McpConfigScope): AppPluginServer[] {
+  if (!scope.appPlugins) return []
+  return appPluginServers(scope.appPlugins).filter((server) => !claudeNames.includes(server.name))
+}
+
+function pluginServerFor(serverName: string, scope: McpConfigScope): AppPluginServer | null {
+  const servers = scope.appPlugins ? appPluginServers(scope.appPlugins) : []
+  const server = servers.find((candidate) => candidate.name === serverName)
+  if (!server || serverNames(readMcpConfig(scope).sdkValue).includes(serverName)) return null
+  return server
+}
+
+// A plugin server's status as Codex reports it: connected with the server's
+// own info once it has started, failed with the reason otherwise.
+async function pluginServerStatus(server: AppPluginServer): Promise<Record<string, unknown>> {
+  const status: Record<string, unknown> = {
+    ...listStatusEntry(server.name),
+    runtimeStatus: 'failed',
+    pluginId: server.pluginId,
+    httpOrigin: null,
+    serverInfo: null,
+    serverCapabilities: null,
+    toolsError: null,
+  }
+  let capabilities: Record<string, unknown>
+  try {
+    const initialized = await startAppPluginServer(server)
+    capabilities = asRecord(initialized.capabilities)
+    const info = asRecord(initialized.serverInfo)
+    status.runtimeStatus = 'connected'
+    status.serverInfo = {
+      ...info,
+      name: stringOr(info.name, server.name),
+      version: typeof info.version === 'string' ? info.version : '',
+    }
+    status.serverCapabilities = initialized.capabilities ?? null
+  } catch (error) {
+    status.toolsError = error instanceof Error ? error.message : String(error)
+    return status
+  }
+  const list = async (method: string, key: string): Promise<unknown[]> => {
+    const items: unknown[] = []
+    let cursor: string | null = null
+    for (let page = 0; page < 20; page++) {
+      const result = asRecord(
+        await appPluginRequest(server, method, cursor == null ? {} : { cursor }),
+      )
+      if (Array.isArray(result[key])) items.push(...(result[key] as unknown[]))
+      cursor = typeof result.nextCursor === 'string' && result.nextCursor ? result.nextCursor : null
+      if (cursor == null) break
+    }
+    return items
+  }
+  if (capabilities.tools) {
+    try {
+      status.tools = toolMap(await list('tools/list', 'tools'))
+    } catch (error) {
+      status.toolsError = error instanceof Error ? error.message : String(error)
+    }
+  }
+  if (capabilities.resources) {
+    const [resources, templates] = await Promise.all([
+      list('resources/list', 'resources').catch(() => []),
+      list('resources/templates/list', 'resourceTemplates').catch(() => []),
+    ])
+    status.resources = resources.map(asRecord).filter((r) => typeof r.uri === 'string')
+    status.resourceTemplates = templates
+      .map(asRecord)
+      .filter((r) => typeof r.uriTemplate === 'string')
+  }
+  return status
 }
 
 async function enumerateServerStatus(
@@ -119,6 +212,8 @@ async function enumerateServerStatus(
   return base
 }
 
+// The tools as Codex lists them, annotations, icons and _meta included: the
+// App finds a plugin's views and entry points in a tool's _meta.
 function toolMap(tools: unknown[]): Record<string, Record<string, unknown>> {
   const entries = tools
     .map((raw) => asRecord(raw))
@@ -133,6 +228,9 @@ function toolMap(tools: unknown[]): Record<string, Record<string, unknown>> {
         ...(typeof tool.description === 'string' ? { description: tool.description } : {}),
         inputSchema: tool.inputSchema ?? {},
         ...(tool.outputSchema ? { outputSchema: tool.outputSchema } : {}),
+        ...(isObject(tool.annotations) ? { annotations: tool.annotations } : {}),
+        ...(Array.isArray(tool.icons) ? { icons: tool.icons } : {}),
+        ...(isObject(tool._meta) ? { _meta: tool._meta } : {}),
       },
     ])
   return Object.fromEntries(entries)
@@ -153,16 +251,31 @@ async function safeMcpList(
   return Array.isArray(value) ? value : []
 }
 
+// The _meta Codex hands the server with a client's tool call: the client's
+// own, with the thread's id set in it. A _meta that is not an object stays
+// as it is.
+export function toolCallMeta(meta: unknown, threadId: string): unknown {
+  if (!threadId) return meta ?? null
+  if (meta == null) return { threadId }
+  return isObject(meta) ? { ...meta, threadId } : meta
+}
+
+// meta is the _meta the server gets with the call, see toolCallMeta.
 export async function callMcpTool(
   serverName: string,
   toolName: string,
   args: unknown,
   scope: McpConfigScope = {},
+  meta: unknown = null,
 ): Promise<Record<string, unknown>> {
-  const result = await runMcpRequest(
+  const result = await routeMcpRequest(
     serverName,
     'tools/call',
-    { name: toolName, arguments: args ?? {} },
+    {
+      name: toolName,
+      arguments: args ?? {},
+      ...(meta && typeof meta === 'object' && !Array.isArray(meta) ? { _meta: meta } : {}),
+    },
     scope,
   )
   const record = asRecord(result)
@@ -179,9 +292,21 @@ export async function readMcpResource(
   uri: string,
   scope: McpConfigScope = {},
 ): Promise<Record<string, unknown>> {
-  const result = await runMcpRequest(serverName, 'resources/read', { uri }, scope)
+  const result = await routeMcpRequest(serverName, 'resources/read', { uri }, scope)
   const record = asRecord(result)
   return { contents: Array.isArray(record.contents) ? record.contents : [] }
+}
+
+function routeMcpRequest(
+  serverName: string,
+  method: string,
+  params: unknown,
+  scope: McpConfigScope,
+): Promise<unknown> {
+  const plugin = pluginServerFor(serverName, scope)
+  return plugin
+    ? appPluginRequest(plugin, method, params)
+    : runMcpRequest(serverName, method, params, scope)
 }
 
 async function runMcpRequest(
@@ -411,6 +536,10 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : {}
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return value != null && typeof value === 'object' && !Array.isArray(value)
 }
 
 function stringOr(value: unknown, fallback: string): string {
