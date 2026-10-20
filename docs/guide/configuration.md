@@ -400,6 +400,26 @@ The same settings exist as flags: `--ws-auth capability-token|none`,
 - `ws://[::1]:8788` listens on the IPv6 loopback address, and port `0` picks a
   free port; the `listening on ws://…` line shows the port actually bound.
 
+## Claude Code variables
+
+The Claude Code process of a Claude thread inherits the adapter's environment,
+with the few variables the adapter sets for its own features on top, so a Claude
+Code variable set where the adapter starts (the login shell, or
+`~/.claude-codex/runtime.env` for the shim) reaches Claude Code as it would in a
+terminal. The adapter has no settings of its own for these.
+
+Fork subagents are one example. Since Claude Code 2.1.302, Agent SDK sessions
+can start an agent with `subagent_type: "fork"`, which inherits the whole
+conversation and runs on its parent's model, effort and permission mode. The
+Codex App shows it as a subagent whose role is `fork`, and its spawn card shows
+the parent's model and effort. `CLAUDE_CODE_FORK_SUBAGENT=0` in the adapter's
+environment turns forks off; unset, Claude Code's default applies.
+
+With [model process profiles](#model-process-profiles), a profile's process
+inherits only the variables its `inheritEnv` names. Add
+`CLAUDE_CODE_FORK_SUBAGENT` (or another Claude Code variable) there, or set it in
+the profile's `env` or env file.
+
 ## Reference table
 
 | Setting | Purpose |
@@ -447,7 +467,7 @@ The same settings exist as flags: `--ws-auth capability-token|none`,
 | `CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS` | How long a turn waits on a subagent or workflow that shows no sign of life before it fails the turn (default `1800000`, 30 minutes; `0` never gives up; at least `100`). Any progress (the agent's output or tool heartbeats, task progress, a workflow agent starting or finishing) starts the wait over. On expiry the turn is stopped as an interrupt would stop it, which keeps background work earlier turns left running; while background agents the turn itself handed off still run, only its own stuck agents and workflows stop and those agents keep going. |
 | `CLAUDE_CODEX_QUIET_BACKGROUND_TURNS` | `0` marks every finished turn unread in the Codex App again. By default a turn that ends while its background agents or workflows still run leaves the chat read and sends no notification (background Bash shells do not count, since one can run for hours); see [Background work and the unread dot](/guide/gui#background-work-and-the-unread-dot). |
 | `CLAUDE_CODEX_LIVE_FILE_CHANGES` | `0` shows a file change only once Claude has written the whole call. By default the card of an Edit, Write or MultiEdit call opens as soon as Claude's streamed input names the file and grows while Claude writes the rest, as the Codex App draws a patch Codex is still writing; see [File changes while Claude writes them](/guide/gui#file-changes-while-claude-writes-them). |
-| `CLAUDE_CODEX_COMMAND_OUTPUT_POLL_MS` | How often a running Bash command's output is read for its command item in the App (default `1000`); `0` shows the output only once the command finishes. |
+| `CLAUDE_CODEX_COMMAND_OUTPUT_POLL_MS` | How often a running Bash command's output is read for its command item in the App (default `1000`); `0` shows the output only once the command finishes. A session whose Claude Code reports a version before 2.1.287 cannot answer the reads and shows the output when the command finishes. |
 | `CLAUDE_CODEX_MCP_TIMEOUT_MS` | How long the adapter waits on an MCP server it reaches itself, for `mcpServerStatus/list` and the App's `mcpServer/tool/call` and `mcpServer/resource/read`, before it gives up and ends a stdio server (default `20000`, for the whole connection). |
 | `CLAUDE_CODEX_SESSION_SETTLE_MS` | How long an idle session waits for Claude to answer a task that just ended, when the CLI does not report session state (default `15000`). |
 | `CLAUDE_CODEX_SDK_LAUNCH_GATE` | `1` starts the Claude Code processes of Claude threads one at a time: each waits until the one before has sent its first message. Several starting at the same moment, such as the chats that all resume their Claude sessions right after a restart, write the user's `~/.claude.json` at once and can corrupt it ([anthropics/claude-code#28847](https://github.com/anthropics/claude-code/issues/28847)). Prompts and steers sent meanwhile wait for their process. Off by default. |
@@ -463,3 +483,4 @@ The same settings exist as flags: `--ws-auth capability-token|none`,
 | `CLAUDE_CODEX_MOCK` | Run the protocol without Claude credentials. |
 | `CLAUDE_CODEX_STATE_DB_TIMEOUT_MS` | How long a state-database write waits for another connection's lock before it fails (default `5000`). |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` | Claude auth / custom endpoint configuration. Keep real values out of git. |
+| `CLAUDE_CODE_FORK_SUBAGENT` | Claude Code's own switch, passed on from the adapter's environment: `0` keeps Claude from starting fork subagents (`subagent_type: "fork"`), which Claude Code 2.1.302 and later offer by default. With model process profiles, only a profile that inherits or sets it passes it on. See [Claude Code variables](#claude-code-variables). |

@@ -85,6 +85,14 @@ until the one before has sent its first message, or for at most
 `CLAUDE_CODEX_SDK_LAUNCH_GATE_TIMEOUT_MS` (default 30000) when it stays silent.
 Prompts and steers sent meanwhile wait for their process. It is off by default.
 
+That process inherits the adapter's environment, so Claude Code's own variables
+work as they do in a terminal. For example, `CLAUDE_CODE_FORK_SUBAGENT=0` keeps
+Claude from starting fork subagents (`subagent_type: "fork"`), which Claude Code
+offers Agent SDK sessions by default since 2.1.302; a fork shows in the App as a
+subagent with the role `fork`. With model process profiles, a profile passes such
+a variable on only when its `inheritEnv` names it or its `env` sets it. See
+[Claude Code variables](https://fuergaosi233.github.io/claude-codex/guide/configuration#claude-code-variables).
+
 ### Model process profiles
 
 By default every Claude thread runs the same Claude Code with the adapter's

@@ -260,6 +260,8 @@ import type {
 } from './types.mjs'
 import {
   adapterHome,
+  CLAUDE_CODE_AGENT_EFFORT_VERSION,
+  claudeCodeAtLeast,
   claudeModelOptions,
   claudeOutputFormat,
   codexCliVersion,
@@ -355,6 +357,12 @@ interface SubagentContext {
   // The user stopped this child from its own thread; its Agent call then
   // returns early and the child counts as interrupted, not failed.
   stoppedByUser?: boolean
+  // An agent another subagent launched hangs off that agent's child thread
+  // (its host), as in Codex: its spawn, wait and activity items go to the
+  // host's turn. Absent for an agent the main thread launched, whose items
+  // go to the parent turn.
+  hostThreadId?: string
+  hostTurnId?: string
 }
 
 interface ActiveSubagentState {
@@ -3061,10 +3069,15 @@ export class CodexClaudeAppServer {
     }
     if (this.activeTurnByThread.has(threadId)) await this.turnInterrupt(peer, { threadId })
     // Background agents go with the thread that launched them (or that they
-    // are): their turns end before their threads do.
+    // are, or that they hang off): their turns end before their threads do.
     for (const entry of [...this.backgroundSubagents.values()]) {
       if (!entry.running) continue
-      if (entry.parentThreadId !== threadId && entry.context.childThreadId !== threadId) continue
+      if (
+        entry.parentThreadId !== threadId &&
+        entry.context.childThreadId !== threadId &&
+        !this.isSubagentDescendant(entry.context.childThreadId, threadId)
+      )
+        continue
       await this.stopBackgroundSubagent(entry)
     }
     for (const id of this.store.deleteThread(threadId)) {
@@ -4897,26 +4910,39 @@ export class CodexClaudeAppServer {
               typeof event.input.subagent_type === 'string' ? event.input.subagent_type : null
             // A fork runs on its parent's model and effort; Claude ignores
             // the Agent tool's model and effort inputs for it. Claude matches
-            // the agent type ignoring case.
+            // the agent type ignoring case. A CLI older than the effort input
+            // runs every subagent at its parent's effort.
             const forkSubagent = subType?.trim().toLowerCase() === 'fork'
             const subagentModel =
               !forkSubagent && typeof event.input.model === 'string'
                 ? event.input.model
                 : thread.model
+            const effortInput =
+              !forkSubagent &&
+              claudeCodeAtLeast(
+                this.runtime.cliVersion?.(thread.id),
+                CLAUDE_CODE_AGENT_EFFORT_VERSION,
+              )
             const subagentEffort =
-              (forkSubagent ? null : subagentEffortFromInput(event.input.effort)) ??
+              (effortInput ? subagentEffortFromInput(event.input.effort) : null) ??
               thread.reasoningEffort
             const childThreadId = newThreadId()
             // The id's random tail: its head is a timestamp, shared by agents
             // spawned in the same millisecond.
             const agentNickname = `agent-${childThreadId.replace(/-/g, '').slice(-12)}`
-            const agentPath = `/root/${agentNickname}`
+            // A subagent's own Agent call nests the new child under that
+            // agent's child thread. Without the agent's id (older CLIs) every
+            // child hangs off this thread, as before.
+            const host = this.nestingHost(thread.id, subagentContexts, event.agentId)
+            const hostThreadId = host?.childThreadId ?? thread.id
+            const hostTurnId = host?.childTurnId ?? turn.id
+            const agentPath = `${host?.agentPath ?? '/root'}/${agentNickname}`
             const agentRole = subType ?? 'general-purpose'
             const childStartedAt = nowSeconds()
             const childThread: ThreadRecord = {
               id: childThreadId,
               sessionId: thread.sessionId,
-              forkedFromId: thread.id,
+              forkedFromId: hostThreadId,
               isPinned: false,
               sectionId: null,
               sectionEnteredAt: null,
@@ -4960,6 +4986,9 @@ export class CodexClaudeAppServer {
             this.subscribe(childThreadId, peer)
             for (const follower of this.subscribersOf(thread.id))
               this.subscribe(childThreadId, follower)
+            if (host)
+              for (const follower of this.subscribersOf(hostThreadId))
+                this.subscribe(childThreadId, follower)
             const childTurn: TurnRecord = {
               id: newId(),
               threadId: childThreadId,
@@ -5000,12 +5029,13 @@ export class CodexClaudeAppServer {
             const childPrompt = childTurn.items.find((item) => item.type === 'userMessage')
             if (childPrompt) this.emitItemLifecycle(peer, childThreadId, childTurn.id, childPrompt)
             recordRunEvent('subagent.spawned', {
-              parentThreadId: thread.id,
-              parentTurnId: turn.id,
+              parentThreadId: hostThreadId,
+              parentTurnId: hostTurnId,
               childThreadId,
               model: subagentModel,
               agentRole,
               agentNickname,
+              ...(host ? { rootThreadId: thread.id, rootTurnId: turn.id } : {}),
             })
 
             // Stage 1 — spawnAgent (begin + end emitted together; the agent is
@@ -5016,24 +5046,28 @@ export class CodexClaudeAppServer {
             // threadSource — an empty string from a sloppy resume crashes the App.
             // Normalize here once and reuse for every stage of the lifecycle.
             const collabEffort = normalizeReasoningEffortEnum(subagentEffort)
+            // The App finds an agent's child through the spawn item of the
+            // conversation the child names as its parent, so a nested agent's
+            // items live in its host's turn.
+            // App rule: nested-subagent
             const spawnBegin: ThreadItem = {
               type: 'collabAgentToolCall',
               id: spawnId,
               tool: 'spawnAgent',
               status: 'inProgress',
-              senderThreadId: thread.id,
+              senderThreadId: hostThreadId,
               receiverThreadIds: [],
               prompt: promptText || null,
               model: subagentModel,
               reasoningEffort: collabEffort,
               agentsStates: {},
             }
-            this.store.appendItem(turn.id, spawnBegin)
+            this.store.appendItem(hostTurnId, spawnBegin)
             this.notify(peer, {
               method: 'item/started',
               params: {
-                threadId: thread.id,
-                turnId: turn.id,
+                threadId: hostThreadId,
+                turnId: hostTurnId,
                 item: spawnBegin,
                 startedAtMs: nowMillis(),
               },
@@ -5043,19 +5077,19 @@ export class CodexClaudeAppServer {
               id: spawnId,
               tool: 'spawnAgent',
               status: 'completed',
-              senderThreadId: thread.id,
+              senderThreadId: hostThreadId,
               receiverThreadIds: [childThreadId],
               prompt: promptText || null,
               model: subagentModel,
               reasoningEffort: collabEffort,
               agentsStates: { [childThreadId]: { status: 'running', message: null } },
             }
-            this.store.updateItem(turn.id, spawnId, () => spawnEnd)
+            this.store.updateItem(hostTurnId, spawnId, () => spawnEnd)
             this.notify(peer, {
               method: 'item/completed',
               params: {
-                threadId: thread.id,
-                turnId: turn.id,
+                threadId: hostThreadId,
+                turnId: hostTurnId,
                 item: spawnEnd,
                 completedAtMs: nowMillis(),
               },
@@ -5068,8 +5102,9 @@ export class CodexClaudeAppServer {
               agentPath,
               prompt: promptText,
               subType,
+              ...(host ? { hostThreadId, hostTurnId } : {}),
             }
-            this.emitSubagentActivity(peer, thread.id, turn.id, subagentContext, 'started')
+            this.emitSubagentActivity(peer, hostThreadId, hostTurnId, subagentContext, 'started')
 
             // Wait begins after the activity item; this is the long phase that
             // gives Codex App its "agent is working" indicator while the
@@ -5083,25 +5118,27 @@ export class CodexClaudeAppServer {
                 id: waitId,
                 tool: 'wait',
                 status: 'inProgress',
-                senderThreadId: thread.id,
+                senderThreadId: hostThreadId,
                 receiverThreadIds: [childThreadId],
                 prompt: null,
                 model: null,
                 reasoningEffort: null,
                 agentsStates: {},
               }
-              this.store.appendItem(turn.id, waitBegin)
+              this.store.appendItem(hostTurnId, waitBegin)
               this.notify(peer, {
                 method: 'item/started',
                 params: {
-                  threadId: thread.id,
-                  turnId: turn.id,
+                  threadId: hostThreadId,
+                  turnId: hostTurnId,
                   item: waitBegin,
                   startedAtMs: nowMillis(),
                 },
               })
             }
 
+            // The turn keeps track of every agent it runs, nested ones too:
+            // they are its own for the watchdog and for its end.
             itemIds.set(event.toolUseId, waitId)
             subagentContexts.set(event.toolUseId, subagentContext)
             activeSubagents.add(event.toolUseId)
@@ -5140,6 +5177,10 @@ export class CodexClaudeAppServer {
             // usage the SDK reports.
             const parsed = parseSubagentTrailer(rawResultText)
             const resultText = parsed.cleanText
+            // Where the agent's collab items live: its host agent's thread
+            // for a nested agent, this one otherwise.
+            const hostThreadId = ctx.hostThreadId ?? thread.id
+            const hostTurnId = ctx.hostTurnId ?? turn.id
 
             // A child the user stopped already ended as interrupted.
             const childTurn =
@@ -5153,8 +5194,8 @@ export class CodexClaudeAppServer {
                 parsed.usage?.durationMs ?? null,
               )
             recordRunEvent('subagent.completed', {
-              parentThreadId: thread.id,
-              parentTurnId: turn.id,
+              parentThreadId: hostThreadId,
+              parentTurnId: hostTurnId,
               childThreadId: ctx.childThreadId,
               childTurnId: childTurn.id,
               status: childTurn.status,
@@ -5176,8 +5217,8 @@ export class CodexClaudeAppServer {
             // snapshot is sufficient for legacy reducers.
             this.emitSubagentActivity(
               peer,
-              thread.id,
-              turn.id,
+              hostThreadId,
+              hostTurnId,
               ctx,
               event.isError || stopped ? 'interrupted' : 'completed',
             )
@@ -5223,27 +5264,34 @@ export class CodexClaudeAppServer {
             // closes failed instead. The App never renders a wait, and this
             // child's own agentsStates still carries its real outcome.
             // App rule: completed-wait
-            const siblingRunning =
-              [...activeSubagents].some((id) => id !== event.toolUseId) ||
-              this.hasRunningBackgroundSubagent(thread.id)
+            // A nested agent's siblings are the other agents of its host;
+            // the agent the host itself is runs on regardless.
+            const siblingRunning = ctx.hostThreadId
+              ? [...activeSubagents].some(
+                  (id) =>
+                    id !== event.toolUseId &&
+                    subagentContexts.get(id)?.hostThreadId === ctx.hostThreadId,
+                ) || this.hostHasRunningBackgroundSubagent(ctx.hostThreadId)
+              : [...activeSubagents].some((id) => id !== event.toolUseId) ||
+                this.hasRunningBackgroundSubagent(thread.id)
             const waitEnd: ThreadItem = {
               type: 'collabAgentToolCall',
               id: ctx.waitItemId,
               tool: 'wait',
               status: siblingRunning ? 'failed' : collabStatus,
-              senderThreadId: thread.id,
+              senderThreadId: hostThreadId,
               receiverThreadIds: [ctx.childThreadId],
               prompt: null,
               model: null,
               reasoningEffort: null,
               agentsStates: { [ctx.childThreadId]: { status: agentStatus, message: null } },
             }
-            this.store.updateItemAndMoveToEnd(turn.id, ctx.waitItemId, () => waitEnd)
+            this.store.updateItemAndMoveToEnd(hostTurnId, ctx.waitItemId, () => waitEnd)
             this.notify(peer, {
               method: 'item/completed',
               params: {
-                threadId: thread.id,
-                turnId: turn.id,
+                threadId: hostThreadId,
+                turnId: hostTurnId,
                 item: waitEnd,
                 completedAtMs: nowMillis(),
               },
@@ -5256,9 +5304,14 @@ export class CodexClaudeAppServer {
             // legacy closeAgent cleanup only for failed results.
             // App rule: subagent-close-hides
             if (event.isError) {
-              this.emitLegacyCloseAgent(peer, thread.id, turn.id, ctx.childThreadId, collabStatus, {
-                [ctx.childThreadId]: { status: agentStatus, message: null },
-              })
+              this.emitLegacyCloseAgent(
+                peer,
+                hostThreadId,
+                hostTurnId,
+                ctx.childThreadId,
+                collabStatus,
+                { [ctx.childThreadId]: { status: agentStatus, message: null } },
+              )
             }
             // Keep the context discoverable until the child turn and wait
             // item have both been persisted. If one of those operations throws,
@@ -6305,11 +6358,17 @@ export class CodexClaudeAppServer {
     // The App shows an interrupted agent as done and an errored one as failed.
     // App rule: agent-states
     const agentState = status === 'interrupted' ? 'interrupted' : 'errored'
-    for (const toolUseId of Array.from(active)) {
+    // Deepest first: a nested agent ends inside its host's turn, before the
+    // host agent's turn does. Agents of one depth keep their order.
+    const depth = (toolUseId: string): number =>
+      contexts.get(toolUseId)?.agentPath.split('/').length ?? 0
+    for (const toolUseId of Array.from(active).sort((a, b) => depth(b) - depth(a))) {
       const context = contexts.get(toolUseId)
       active.delete(toolUseId)
       contexts.delete(toolUseId)
       if (!context) continue
+      const hostThreadId = context.hostThreadId ?? thread.id
+      const hostTurnId = context.hostTurnId ?? turn.id
 
       const message = failureMessage
       const childTurn = this.completeSubagentChildTurn(
@@ -6320,39 +6379,39 @@ export class CodexClaudeAppServer {
         status === 'failed' ? { message } : null,
       )
       recordRunEvent('subagent.completed', {
-        parentThreadId: thread.id,
-        parentTurnId: turn.id,
+        parentThreadId: hostThreadId,
+        parentTurnId: hostTurnId,
         childThreadId: context.childThreadId,
         childTurnId: childTurn.id,
         status,
         agentRole: context.subType ?? 'general-purpose',
       })
 
-      this.emitSubagentActivity(peer, thread.id, turn.id, context, 'interrupted')
+      this.emitSubagentActivity(peer, hostThreadId, hostTurnId, context, 'interrupted')
 
       const waitEnd: ThreadItem = {
         type: 'collabAgentToolCall',
         id: context.waitItemId,
         tool: 'wait',
         status: 'failed',
-        senderThreadId: thread.id,
+        senderThreadId: hostThreadId,
         receiverThreadIds: [context.childThreadId],
         prompt: null,
         model: null,
         reasoningEffort: null,
         agentsStates: { [context.childThreadId]: { status: agentState, message } },
       }
-      this.store.updateItemAndMoveToEnd(turn.id, context.waitItemId, () => waitEnd)
+      this.store.updateItemAndMoveToEnd(hostTurnId, context.waitItemId, () => waitEnd)
       this.notify(peer, {
         method: 'item/completed',
         params: {
-          threadId: thread.id,
-          turnId: turn.id,
+          threadId: hostThreadId,
+          turnId: hostTurnId,
           item: waitEnd,
           completedAtMs: nowMillis(),
         },
       })
-      this.emitLegacyCloseAgent(peer, thread.id, turn.id, context.childThreadId, 'failed', {
+      this.emitLegacyCloseAgent(peer, hostThreadId, hostTurnId, context.childThreadId, 'failed', {
         [context.childThreadId]: { status: agentState, message },
       })
     }
@@ -6377,23 +6436,30 @@ export class CodexClaudeAppServer {
     // working agent done on a *completed* wait, while a failed one keeps the
     // child's own state (still running) and leaves no open item behind.
     // App rule: completed-wait
+    const hostThreadId = context.hostThreadId ?? thread.id
+    const hostTurnId = context.hostTurnId ?? turn.id
     const waitEnd: ThreadItem = {
       type: 'collabAgentToolCall',
       id: context.waitItemId,
       tool: 'wait',
       status: 'failed',
-      senderThreadId: thread.id,
+      senderThreadId: hostThreadId,
       receiverThreadIds: [context.childThreadId],
       prompt: null,
       model: null,
       reasoningEffort: null,
       agentsStates: { [context.childThreadId]: { status: 'running', message: null } },
     }
-    const updated = this.store.updateItem(turn.id, context.waitItemId, () => waitEnd)
+    const updated = this.store.updateItem(hostTurnId, context.waitItemId, () => waitEnd)
     if (updated?.items.some((item) => item.id === context.waitItemId))
       this.notify(peer, {
         method: 'item/completed',
-        params: { threadId: thread.id, turnId: turn.id, item: waitEnd, completedAtMs: nowMillis() },
+        params: {
+          threadId: hostThreadId,
+          turnId: hostTurnId,
+          item: waitEnd,
+          completedAtMs: nowMillis(),
+        },
       })
     const agentId =
       typeof structured?.agentId === 'string' && structured.agentId ? structured.agentId : null
@@ -6441,6 +6507,50 @@ export class CodexClaudeAppServer {
     return null
   }
 
+  // The agent whose own Agent call this is, when the frame names it by task
+  // id (agent_id, newer CLIs) and it is still working in this turn or in the
+  // background: the new child then hangs off that agent's child thread.
+  // Null for the main loop's calls, for an older CLI and for a host whose
+  // child turn is over, which leaves the child under the parent thread.
+  private nestingHost(
+    threadId: string,
+    contexts: Map<string, SubagentContext>,
+    agentId: string | undefined,
+  ): SubagentContext | null {
+    if (!agentId) return null
+    let host: SubagentContext | null = null
+    for (const [toolUseId, context] of contexts) {
+      if (this.taskIdByToolUse.get(toolUseId) !== agentId) continue
+      host = context
+      break
+    }
+    if (!host) {
+      const entry = this.findBackgroundSubagent(threadId, { taskId: agentId })
+      if (entry?.running) host = entry.context
+    }
+    if (!host || this.store.getTurn(host.childTurnId)?.status !== 'inProgress') return null
+    return host
+  }
+
+  private hostHasRunningBackgroundSubagent(hostThreadId: string): boolean {
+    for (const entry of this.backgroundSubagents.values())
+      if (entry.running && entry.context.hostThreadId === hostThreadId) return true
+    return false
+  }
+
+  // Whether a subagent thread sits somewhere below the given thread.
+  private isSubagentDescendant(threadId: string, ancestorThreadId: string): boolean {
+    const seen = new Set<string>()
+    let current = this.store.getThread(threadId)
+    while (current?.threadSource === 'subagent' && current.forkedFromId) {
+      if (current.forkedFromId === ancestorThreadId) return true
+      if (seen.has(current.id)) return false
+      seen.add(current.id)
+      current = this.store.getThread(current.forkedFromId)
+    }
+    return false
+  }
+
   // A child that ran in the foreground, or before a restart, has no entry,
   // yet SendMessage resumes it all the same: the CLI runs it on in the
   // background. Track it from then on like any background agent.
@@ -6449,15 +6559,31 @@ export class CodexClaudeAppServer {
     turnId: string,
     agentId: string,
   ): BackgroundSubagent | null {
-    const child = this.store
-      .listThreads({ includeEphemeral: true, parentThreadId: thread.id, limit: 200 })
-      .find((candidate) => candidate.agentNickname === agentId)
+    // A direct child first; then one nested below another agent.
+    const child =
+      this.store
+        .listThreads({ includeEphemeral: true, parentThreadId: thread.id, limit: 200 })
+        .find((candidate) => candidate.agentNickname === agentId) ??
+      this.store
+        .listThreads({
+          includeEphemeral: true,
+          ancestorThreadId: thread.id,
+          sourceKinds: ['subAgentThreadSpawn'],
+          limit: 200,
+        })
+        .find(
+          (candidate) =>
+            candidate.agentNickname === agentId &&
+            this.isSubagentDescendant(candidate.id, thread.id),
+        )
     // A child still inside its Agent call is not this one's to take over.
     if (!child || this.store.lastTurnStatus(child.id) === 'inProgress') return null
-    const parentItems = this.store.listTurns(thread.id).flatMap((parentTurn) => parentTurn.items)
-    const marker = parentItems.find(
-      (item) => item.type === 'subAgentActivity' && item.agentThreadId === child.id,
-    )
+    const hostThreadId = child.forkedFromId ?? thread.id
+    const hostTurns = this.store.listTurns(hostThreadId)
+    const marker = hostTurns
+      .flatMap((hostTurn) => hostTurn.items)
+      .find((item) => item.type === 'subAgentActivity' && item.agentThreadId === child.id)
+    const hostTurnId = hostTurns.at(-1)?.id
     const entry: BackgroundSubagent = {
       parentThreadId: thread.id,
       parentTurnId: turnId,
@@ -6474,6 +6600,7 @@ export class CodexClaudeAppServer {
             : `/root/${agentId}`,
         prompt: '',
         subType: child.agentRole,
+        ...(hostThreadId !== thread.id && hostTurnId ? { hostThreadId, hostTurnId } : {}),
       },
       running: false,
     }
@@ -6544,6 +6671,7 @@ export class CodexClaudeAppServer {
       const entry = this.findBackgroundSubagent(threadId, { toolUseId: event.toolUseId })
       if (entry) entry.taskId = event.taskId
       else this.rememberTaskId(event.toolUseId, event.taskId)
+      if (event.parentTaskId) this.checkNestingParent(threadId, event.toolUseId, event.parentTaskId)
       return
     }
     const entry = this.findBackgroundSubagent(threadId, {
@@ -6573,6 +6701,37 @@ export class CodexClaudeAppServer {
         )
         return
     }
+  }
+
+  // task_started names the agent that launched a nested one (parent_task_id).
+  // Its spawning frame's agent_id placed the child already, as the thread
+  // must exist before the task starts; a disagreement only goes to the log.
+  private checkNestingParent(threadId: string, toolUseId: string, parentTaskId: string): void {
+    const states = [...this.subagentStateByTurn.values()].filter(
+      (state) => state.thread.id === threadId,
+    )
+    const context =
+      states.map((state) => state.contexts.get(toolUseId)).find(Boolean) ??
+      this.findBackgroundSubagent(threadId, { toolUseId })?.context
+    if (!context) return
+    const hostTaskIds = new Set<string>()
+    if (context.hostThreadId) {
+      for (const state of states)
+        for (const [id, candidate] of state.contexts) {
+          const taskId = this.taskIdByToolUse.get(id)
+          if (candidate.childThreadId === context.hostThreadId && taskId) hostTaskIds.add(taskId)
+        }
+      const background = this.backgroundSubagents.get(context.hostThreadId)
+      if (background?.taskId) hostTaskIds.add(background.taskId)
+      if (background?.agentId) hostTaskIds.add(background.agentId)
+    }
+    if (hostTaskIds.has(parentTaskId)) return
+    debugLog('subagent.nesting_mismatch', {
+      threadId,
+      toolUseId,
+      parentTaskId,
+      hostThreadId: context.hostThreadId ?? null,
+    })
   }
 
   private publishChildTokenUsage(entry: BackgroundSubagent, usage: RuntimeTaskUsage): void {
@@ -6645,12 +6804,24 @@ export class CodexClaudeAppServer {
 
   // Subagent activity belongs to a parent turn. A background agent usually
   // reports after that turn ended; hold the item for the turn Claude starts
-  // to answer it (or the user's next one).
+  // to answer it (or the user's next one). A nested agent reports to its
+  // host's child turn while that runs, else to the parent thread like any
+  // other.
+  // App rule: nested-subagent
   private publishSubagentActivity(
     parentThreadId: string,
     context: SubagentContext,
     kind: SubagentActivityKind,
   ): void {
+    if (
+      context.hostThreadId &&
+      context.hostTurnId &&
+      this.store.getTurn(context.hostTurnId)?.status === 'inProgress'
+    ) {
+      const peer = this.peerForThread(context.hostThreadId)
+      this.emitSubagentActivity(peer, context.hostThreadId, context.hostTurnId, context, kind)
+      return
+    }
     const turnId = this.activeTurnByThread.get(parentThreadId)
     if (turnId) {
       const peer = this.peerForThread(parentThreadId)

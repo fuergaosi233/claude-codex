@@ -49,6 +49,8 @@ export class MockRuntime implements ClaudeRuntime {
   // runs until it is interrupted.
   private failingCompactions = new Set<string>()
   private holdingCompactions = new Set<string>()
+  // The Claude Code version a scenario's session reports ("on cli x.y.z").
+  private cliVersions = new Map<string, string>()
 
   async runTurn(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void> {
     // A session slow to come up (the CLI's, while an interrupted turn is
@@ -927,6 +929,20 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    // Claude Code refused to start for the named reason, as its zeroed
+    // error result says, with the CLI's stderr (here a proxy URL with its
+    // credentials) in the result's errors.
+    const startupFailure = /startup failure check (\S+)/i.exec(context.prompt)?.[1]
+    if (startupFailure) {
+      await handlers.onEvent({
+        type: 'completed',
+        success: false,
+        result: 'Invalid proxy URL: http://user:secret@proxy.invalid:8080',
+        failure: { terminalReason: null, category: null, status: null, startupFailure },
+      })
+      return
+    }
+
     if (/policy check/i.test(context.prompt)) {
       await handlers.onEvent({
         type: 'text_delta',
@@ -1400,9 +1416,10 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
-    if (/(background|foreground) message check/i.test(context.prompt)) {
+    if (/(background|foreground) message (nested )?check/i.test(context.prompt)) {
       // A foreground agent is the one `subagent check` ran; the CLI resumes
-      // it in the background just the same.
+      // it in the background just the same. "nested" has the resumed agent
+      // launch an agent of its own before the turn ends.
       const toolUseId = `send-${Date.now()}`
       const agentId = /foreground/i.test(context.prompt)
         ? MOCK_FOREGROUND_AGENT_ID
@@ -1428,6 +1445,22 @@ export class MockRuntime implements ClaudeRuntime {
         toolUseId,
         content: `Agent "${agentId}" was resumed in the background.`,
       })
+      if (/message nested check/i.test(context.prompt)) {
+        // The agent keeps its task id across the resume; its frames carry it.
+        const nestedUseId = `task-nested-${Date.now()}`
+        await handlers.onEvent({
+          type: 'tool_use',
+          toolUseId: nestedUseId,
+          toolName: 'Agent',
+          input: { description: 'mock nested agent', prompt: 'check one file' },
+          agentId,
+        })
+        await handlers.onEvent({
+          type: 'tool_result',
+          toolUseId: nestedUseId,
+          content: 'nested report',
+        })
+      }
       this.scheduleBackgroundReport(
         context.threadId,
         agentId,
@@ -1474,7 +1507,10 @@ export class MockRuntime implements ClaudeRuntime {
 
     if (/subagent effort check/i.test(context.prompt)) {
       // An agent asked to run on its own model and effort, and a fork asked
-      // the same: Claude ignores both inputs for a fork.
+      // the same: Claude ignores both inputs for a fork. "on cli x.y.z"
+      // plays a session whose CLI reports that version.
+      const cli = /\bon cli (\d+\.\d+\.\d+)/i.exec(context.prompt)?.[1]
+      if (cli) this.cliVersions.set(context.threadId, cli)
       const ownId = `task-own-${Date.now()}`
       const forkId = `task-fork-${Date.now()}`
       const namedForkId = `task-named-fork-${Date.now()}`
@@ -1492,6 +1528,63 @@ export class MockRuntime implements ClaudeRuntime {
       }
       await handlers.onEvent({ type: 'text_delta', delta: 'both agents reported' })
       await handlers.onEvent({ type: 'completed', success: true, result: 'efforts' })
+      return
+    }
+
+    if (/nested subagent check/i.test(context.prompt)) {
+      // An agent launches an agent of its own. Newer CLIs name the agent
+      // behind a subagent's frame (agent_id) and the agent that launched a
+      // task (parent_task_id); "without ids" plays a CLI that sends neither.
+      const withIds = !/without ids/i.test(context.prompt)
+      const parentUseId = `task-parent-${Date.now()}`
+      const nestedUseId = `task-nested-${Date.now()}`
+      const parentTaskId = 'mock-parent-task'
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId: parentUseId,
+        toolName: 'Agent',
+        input: { description: 'mock parent agent', prompt: 'plan the work' },
+      })
+      await this.listener?.onTaskEvent(context.threadId, {
+        type: 'task_started',
+        taskId: parentTaskId,
+        toolUseId: parentUseId,
+        taskType: 'local_agent',
+        description: 'mock parent agent',
+        subagentType: null,
+        prompt: 'plan the work',
+        backgrounded: false,
+      })
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId: nestedUseId,
+        toolName: 'Agent',
+        input: { description: 'mock nested agent', prompt: 'check one file' },
+        ...(withIds ? { agentId: parentTaskId } : {}),
+      })
+      await this.listener?.onTaskEvent(context.threadId, {
+        type: 'task_started',
+        taskId: 'mock-nested-task',
+        toolUseId: nestedUseId,
+        taskType: 'local_agent',
+        description: 'mock nested agent',
+        subagentType: null,
+        prompt: 'check one file',
+        backgrounded: false,
+        ...(withIds ? { parentTaskId } : {}),
+      })
+      await handlers.onEvent({
+        type: 'tool_result',
+        toolUseId: nestedUseId,
+        content: 'nested report',
+      })
+      await handlers.onEvent({
+        type: 'tool_result',
+        toolUseId: parentUseId,
+        content: 'parent report',
+      })
+      await handlers.onEvent({ type: 'text_delta', delta: 'nested agents reported' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'nested agents reported' })
       return
     }
 
@@ -1678,6 +1771,10 @@ export class MockRuntime implements ClaudeRuntime {
 
   filtersNestedEvents(threadId: string): boolean {
     return this.nestedFiltered.has(threadId)
+  }
+
+  cliVersion(threadId: string): string | null {
+    return this.cliVersions.get(threadId) ?? null
   }
 
   async stop(): Promise<void> {

@@ -254,6 +254,20 @@ versioning or publishing metadata.
   `rateLimitExceeded`, ...), never one the App answers with a ChatGPT account
   flow. CLI notifications of high or immediate priority go out as `warning`
   notifications, which the App opts out of, as it does with Codex.
+- A Claude CLI that refuses to start fails the turn with an adapter-written
+  message for its `startup_failure_reason` and the reason's name as details,
+  never the CLI's own output, which can hold proxy credentials. Reasons a
+  retry can fix (`org_config_required_unavailable`, organization settings or
+  checks that could not be reached) are `httpConnectionFailed`, which the App
+  offers to retry; refused sign-ins, `provider_not_allowed`, invalid managed
+  settings and local problems are `other`. The adapter sets
+  `CLAUDE_CODE_STARTUP_FAILURE_RESULTS=1` so every startup failure is reported
+  this way unless the environment sets it.
+- The adapter keeps the Claude Code version each session reports (in the
+  initialize reply from 2.1.296, in `system/init` from every CLI) and leaves
+  off what an older CLI cannot do: live Bash output needs 2.1.287
+  (`get_task_output`), and a spawn card shows an Agent call's own `effort`
+  only from 2.1.292. While the version is unknown, both stay on.
 - Claude chats show their branch in the App sidebar. Threads carry Codex
   `gitInfo` (commit, branch, and the `origin` remote without credentials),
   looked up after `thread/start`, when a thread without it resumes and when a
@@ -340,11 +354,22 @@ versioning or publishing metadata.
   children as Codex does, `SendMessage` / `TaskStop` map to agent calls, the
   CLI 2.1.283 hand-back report and usage trailer are parsed, and a finishing
   child no longer clears its still-running siblings from the roster.
-- A subagent's spawn card and thread show the effort Claude Code 2.1.290+
+- A subagent's spawn card and thread show the effort Claude Code 2.1.292+
   runs it at when the Agent call sets one (`max` shows as `xhigh`, the top of
   the App's scale). A fork subagent, on by default in Agent SDK sessions since
   Claude Code 2.1.302, shows its parent's model and effort, since Claude
-  ignores the Agent call's `model` and `effort` for it.
+  ignores the Agent call's `model` and `effort` for it. Claude Code reads
+  `CLAUDE_CODE_FORK_SUBAGENT` from the adapter's environment, so `0` there
+  turns forks off; a model process profile passes it on only when its
+  `inheritEnv` names it or its `env` sets it.
+- An agent another agent launches hangs off that agent's child thread, one
+  level deeper, with its spawn and wait cards in that agent's conversation,
+  when Claude Code names the agent behind each frame (`agent_id`, newer
+  Claude Code versions); without the ids every agent still hangs off the
+  parent thread. An agent `SendMessage` resumes keeps its child
+  thread, and the agents it launches hang off it. Task frames still arriving
+  from the run a resume replaced (`run_id`) are dropped instead of being
+  counted against the new run.
 - Deleting a thread ends its running background agents first, so each child
   turn completes as interrupted; stopping a turn no longer wakes the thread to
   acknowledge the background agents Claude Code stopped with it; and

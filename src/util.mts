@@ -202,6 +202,33 @@ export function codexCliVersion(): string {
   return `codex-cli ${codexCompatVersion()}${suffix ? ` (${suffix})` : ''}`
 }
 
+// The first Claude Code versions with a feature the adapter uses only when the
+// session's CLI has it: the get_task_output request behind live Bash output,
+// and the Agent tool's effort parameter.
+export const CLAUDE_CODE_TASK_OUTPUT_VERSION = '2.1.287'
+export const CLAUDE_CODE_AGENT_EFFORT_VERSION = '2.1.292'
+
+// Whether a Claude Code version, as system/init or the initialize reply
+// report it ("2.1.304"), is at least `minimum`. A version that is unknown or
+// cannot be read counts as new enough: a feature is never turned off only
+// because the version could not be read.
+export function claudeCodeAtLeast(version: string | null | undefined, minimum: string): boolean {
+  const have = versionParts(version)
+  const need = versionParts(minimum)
+  if (!have || !need) return true
+  for (let index = 0; index < 3; index += 1) {
+    const ours = have[index] ?? 0
+    const wanted = need[index] ?? 0
+    if (ours !== wanted) return ours > wanted
+  }
+  return true
+}
+
+function versionParts(value: string | null | undefined): number[] | null {
+  const match = /^\s*v?(\d+)\.(\d+)\.(\d+)/.exec(value ?? '')
+  return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : null
+}
+
 export function codexUserAgent(clientName: string, clientVersion: string): string {
   const name = clientName.trim() || 'codex-app'
   const version = clientVersion.trim() || 'unknown'

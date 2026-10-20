@@ -330,6 +330,50 @@ test('a new auto-compact window starts a new native session', () => {
   assert.notEqual(sessionSignature(nativeTurnContext({ autoCompactWindow: 500_000 })), window)
 })
 
+test('native SDK runtime asks Claude Code to report every startup failure as a result, unless the environment says otherwise', () => {
+  const runtime = new NativeClaudeRuntime()
+  const buildOptions = Reflect.get(runtime, 'buildOptions')
+  const context = nativeTurnContext({})
+  const session = { current: { context, handlers: {}, resolved: false }, lastContext: context }
+  const env = () =>
+    buildOptions.call(runtime, {}, context, new AbortController(), () => session)
+      .env as NodeJS.ProcessEnv
+  const previous = process.env.CLAUDE_CODE_STARTUP_FAILURE_RESULTS
+  try {
+    delete process.env.CLAUDE_CODE_STARTUP_FAILURE_RESULTS
+    assert.equal(env().CLAUDE_CODE_STARTUP_FAILURE_RESULTS, '1')
+    process.env.CLAUDE_CODE_STARTUP_FAILURE_RESULTS = '0'
+    assert.equal(env().CLAUDE_CODE_STARTUP_FAILURE_RESULTS, '0')
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_CODE_STARTUP_FAILURE_RESULTS
+    else process.env.CLAUDE_CODE_STARTUP_FAILURE_RESULTS = previous
+  }
+})
+
+test("native SDK runtime leaves fork subagents to Claude Code and the adapter's environment", () => {
+  const runtime = new NativeClaudeRuntime()
+  const buildOptions = Reflect.get(runtime, 'buildOptions')
+  const context = nativeTurnContext({ planMode: true })
+  const session = { current: { context, handlers: {}, resolved: false }, lastContext: context }
+  const env = () =>
+    buildOptions.call(runtime, {}, context, new AbortController(), () => session)
+      .env as NodeJS.ProcessEnv
+  const previous = process.env.CLAUDE_CODE_FORK_SUBAGENT
+  try {
+    // Unset, the adapter adds nothing and Claude Code's default applies.
+    delete process.env.CLAUDE_CODE_FORK_SUBAGENT
+    assert.equal(env().CLAUDE_CODE_FORK_SUBAGENT, undefined)
+    // A value the user exported reaches the CLI as it is.
+    for (const value of ['0', '1']) {
+      process.env.CLAUDE_CODE_FORK_SUBAGENT = value
+      assert.equal(env().CLAUDE_CODE_FORK_SUBAGENT, value)
+    }
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_CODE_FORK_SUBAGENT
+    else process.env.CLAUDE_CODE_FORK_SUBAGENT = previous
+  }
+})
+
 test('native SDK runtime approves goal tools without shadowing canUseTool', async () => {
   const runtime = new NativeClaudeRuntime()
   Reflect.set(runtime, 'zod', z)

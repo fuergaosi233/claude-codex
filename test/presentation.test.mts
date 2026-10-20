@@ -4,7 +4,13 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { CodexClaudeAppServer } from '../src/server.mjs'
-import { codexErrorInfo, parseSubagentTrailer, retryTurnError } from '../src/server-helpers.mjs'
+import {
+  codexErrorInfo,
+  parseSubagentTrailer,
+  retryTurnError,
+  turnErrorOf,
+  turnFailure,
+} from '../src/server-helpers.mjs'
 import { SessionStore } from '../src/store.mjs'
 import type {
   ClaudeRuntime,
@@ -434,6 +440,73 @@ test('Claude failures map onto the Codex error codes the App knows', () => {
       codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: 500 } },
       additionalDetails: 'HTTP 500 server error; retrying in 4s',
     },
+  )
+})
+
+test('a CLI that refused to start says why, offers a retry only when one can help, and hides its own text', () => {
+  const startup = (startupFailure: string): RuntimeFailure => ({
+    terminalReason: null,
+    category: null,
+    status: null,
+    startupFailure,
+  })
+  const retryable = { httpConnectionFailed: { httpStatusCode: null } }
+  const cases: Array<[string, unknown, RegExp]> = [
+    // Something could not be loaded or checked right now.
+    ['org_config_required_unavailable', retryable, /policy limits.*try again/],
+    ['remote_settings_required_unavailable', retryable, /managed settings.*try again/],
+    ['org_verify_failed', retryable, /verify/],
+    ['worktree_unverified', retryable, /worktree/],
+    // A new sign-in or an administrator: a retry does not help.
+    ['org_config_refused', 'other', /refused.*claude \/login/],
+    ['gateway_signin_required', 'other', /claude \/login/],
+    ['gateway_access_denied', 'other', /administrator/],
+    ['org_pin_api_key_conflict', 'other', /API key/],
+    ['org_pin_mismatch', 'other', /allowed account/],
+    ['provider_not_allowed', 'other', /provider/],
+    ['managed_settings_invalid', 'other', /managed settings/],
+    // Something on this machine to fix first.
+    ['proxy_invalid', 'other', /proxy/],
+    ['temp_dir_unusable', 'other', /temporary directory/],
+    ['cwd_unavailable', 'other', /working directory/],
+    ['shell_tool_missing', 'other', /shell/],
+    ['session_held_by_background', 'other', /background session/],
+    ['worktree_resume_refused', 'other', /resume/],
+    ['cli_version_too_old', 'other', /Update Claude Code/],
+    ['bypass_root', 'other', /root/],
+    // A reason newer than the adapter.
+    ['brand_new_reason', 'other', /^Claude Code refused to start \(brand_new_reason\)\.$/],
+  ]
+  for (const [reason, code, message] of cases) {
+    assert.deepEqual(codexErrorInfo(startup(reason)), code, reason)
+    // A refused start is never a retry the CLI itself makes.
+    assert.deepEqual(codexErrorInfo(startup(reason), true), code, reason)
+    const raw = 'Invalid proxy URL: http://user:secret@proxy.invalid:8080 (sk-ant-api03-key)'
+    const error = turnErrorOf(turnFailure(raw, startup(reason)))
+    assert.match(error.message, message, reason)
+    assert.deepEqual(error.codexErrorInfo, code, reason)
+    assert.equal(error.additionalDetails, `Claude Code startup failure: ${reason}`)
+    assert.doesNotMatch(JSON.stringify(error), /secret|sk-ant|proxy\.invalid/, reason)
+  }
+  // A reason that does not look like one is not repeated.
+  const odd = turnErrorOf(turnFailure('raw', startup('Bearer abc.def')))
+  assert.deepEqual(odd, {
+    message: 'Claude Code refused to start.',
+    codexErrorInfo: 'other',
+    additionalDetails: null,
+  })
+  // Inherited keys are no reasons.
+  assert.equal(turnErrorOf(turnFailure('raw', startup('constructor'))).codexErrorInfo, 'other')
+  // A failure without a startup reason keeps its own message.
+  assert.equal(
+    turnErrorOf(
+      turnFailure('API Error: 500', {
+        terminalReason: 'api_error',
+        category: 'server_error',
+        status: 500,
+      }),
+    ).message,
+    'API Error: 500',
   )
 })
 
