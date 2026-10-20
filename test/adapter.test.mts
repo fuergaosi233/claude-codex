@@ -7960,6 +7960,95 @@ test('subagent watchdog leaves the background agents a stalled turn handed off r
   )
 })
 
+test('subagent watchdog does not take background agents finishing for progress of a stuck one', async () => {
+  await runWatchdogScript(
+    300,
+    `
+      const interrupted = []
+      const abandoned = []
+      let listener = null
+      const server = new CodexClaudeAppServer(store, {
+        setBackgroundListener(next) {
+          listener = next
+        },
+        async runTurn(context, handlers) {
+          for (let index = 0; index < 10; index += 1) {
+            const toolUseId = 'bg-use-' + index
+            await handlers.onEvent({
+              type: 'tool_use',
+              toolUseId,
+              toolName: 'Agent',
+              input: {
+                description: 'survey ' + index,
+                prompt: 'survey part ' + index,
+                run_in_background: true,
+              },
+            })
+            await listener.onTaskEvent(context.threadId, {
+              type: 'task_started',
+              taskId: 'bg-task-' + index,
+              toolUseId,
+              taskType: 'local_agent',
+              description: 'survey ' + index,
+              subagentType: null,
+              prompt: 'survey part ' + index,
+              backgrounded: true,
+            })
+            await handlers.onEvent({
+              type: 'tool_result',
+              toolUseId,
+              content: 'Async agent launched successfully. agentId: bg-task-' + index,
+              structured: { status: 'async_launched', agentId: 'bg-task-' + index, isAsync: true },
+            })
+          }
+          await handlers.onEvent({
+            type: 'tool_use',
+            toolUseId: 'stuck-use',
+            toolName: 'Agent',
+            input: { description: 'stuck', prompt: 'never returns' },
+          })
+          return new Promise(() => {})
+        },
+        async steer() {},
+        async interrupt(threadId) {
+          interrupted.push(threadId)
+        },
+        async abandonTurn(_threadId, turnId) {
+          abandoned.push(turnId)
+          return true
+        },
+        async stop() {},
+      })
+      const { threadId, turnId } = await startTurn(server, 'survey in the background, then check')
+      await waitFor(() => childStatus('never returns') === 'inProgress', 'stuck agent')
+      // The agents the turn handed off finish one by one, faster than the
+      // window; none of that is a sign of life from the stuck one.
+      let finished = 0
+      while (!completion(turnId) && finished < 10) {
+        await sleep(100)
+        await listener.onTaskEvent(threadId, {
+          type: 'task_notification',
+          taskId: 'bg-task-' + finished,
+          toolUseId: 'bg-use-' + finished,
+          status: 'completed',
+          summary: 'Agent "survey ' + finished + '" completed',
+          result: 'Part ' + finished + ' surveyed.',
+          usage: null,
+        })
+        finished += 1
+      }
+      const completed = await waitFor(() => completion(turnId), 'watchdog')
+      assert.equal(completed.params.turn.status, 'failed')
+      assert.ok(finished < 10, 'the turn fails while the agents it handed off still finish')
+      await waitFor(() => abandoned.length === 1, 'abandon')
+      assert.deepEqual(interrupted, [])
+      assert.equal(childStatus('never returns'), 'failed')
+      assert.equal(childStatus('survey part 0'), 'completed')
+      await server.stop()
+    `,
+  )
+})
+
 test('subagent watchdog counts tool_progress heartbeats of a quiet agent as progress', async () => {
   await runWatchdogScript(
     600,

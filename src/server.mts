@@ -4870,7 +4870,6 @@ export class CodexClaudeAppServer {
     context: SubagentContext,
     kind: SubagentActivityKind,
   ): void {
-    this.subagentStateByTurn.get(parentTurnId)?.noteProgress()
     const item: ThreadItem = {
       type: 'subAgentActivity',
       id: newId(),
