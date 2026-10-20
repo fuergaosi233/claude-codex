@@ -356,6 +356,26 @@ The same settings exist as flags: `--ws-auth capability-token|none`,
 - `ws://[::1]:8788` listens on the IPv6 loopback address, and port `0` picks a
   free port; the `listening on ws://…` line shows the port actually bound.
 
+## Claude Code variables
+
+The Claude Code process of a Claude thread inherits the adapter's environment,
+with the few variables the adapter sets for its own features on top, so a Claude
+Code variable set where the adapter starts (the login shell, or
+`~/.claude-codex/runtime.env` for the shim) reaches Claude Code as it would in a
+terminal. The adapter has no settings of its own for these.
+
+Fork subagents are one example. Since Claude Code 2.1.302, Agent SDK sessions
+can start an agent with `subagent_type: "fork"`, which inherits the whole
+conversation and runs on its parent's model, effort and permission mode. The
+Codex App shows it as a subagent whose role is `fork`, and its spawn card shows
+the parent's model and effort. `CLAUDE_CODE_FORK_SUBAGENT=0` in the adapter's
+environment turns forks off; unset, Claude Code's default applies.
+
+With [model process profiles](#model-process-profiles), a profile's process
+inherits only the variables its `inheritEnv` names. Add
+`CLAUDE_CODE_FORK_SUBAGENT` (or another Claude Code variable) there, or set it in
+the profile's `env` or env file.
+
 ## Reference table
 
 | Setting | Purpose |
@@ -415,3 +435,4 @@ The same settings exist as flags: `--ws-auth capability-token|none`,
 | `CLAUDE_CODEX_MOCK` | Run the protocol without Claude credentials. |
 | `CLAUDE_CODEX_STATE_DB_TIMEOUT_MS` | How long a state-database write waits for another connection's lock before it fails (default `5000`). |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` | Claude auth / custom endpoint configuration. Keep real values out of git. |
+| `CLAUDE_CODE_FORK_SUBAGENT` | Claude Code's own switch, passed on from the adapter's environment: `0` keeps Claude from starting fork subagents (`subagent_type: "fork"`), which Claude Code 2.1.302 and later offer by default. With model process profiles, only a profile that inherits or sets it passes it on. See [Claude Code variables](#claude-code-variables). |

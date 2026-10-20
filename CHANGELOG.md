@@ -332,11 +332,14 @@ versioning or publishing metadata.
   children as Codex does, `SendMessage` / `TaskStop` map to agent calls, the
   CLI 2.1.283 hand-back report and usage trailer are parsed, and a finishing
   child no longer clears its still-running siblings from the roster.
-- A subagent's spawn card and thread show the effort Claude Code 2.1.290+
+- A subagent's spawn card and thread show the effort Claude Code 2.1.292+
   runs it at when the Agent call sets one (`max` shows as `xhigh`, the top of
   the App's scale). A fork subagent, on by default in Agent SDK sessions since
   Claude Code 2.1.302, shows its parent's model and effort, since Claude
-  ignores the Agent call's `model` and `effort` for it.
+  ignores the Agent call's `model` and `effort` for it. Claude Code reads
+  `CLAUDE_CODE_FORK_SUBAGENT` from the adapter's environment, so `0` there
+  turns forks off; a model process profile passes it on only when its
+  `inheritEnv` names it or its `env` sets it.
 - Deleting a thread ends its running background agents first, so each child
   turn completes as interrupted; stopping a turn no longer wakes the thread to
   acknowledge the background agents Claude Code stopped with it; and
