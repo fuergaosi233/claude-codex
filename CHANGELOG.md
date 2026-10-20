@@ -117,6 +117,13 @@ versioning or publishing metadata.
   state on `turn/completed` only, so such a turn kept the thread spinning for
   the rest of the connection — with the answer already written to Claude's
   transcript — until the user interrupted it by hand.
+- With `CLAUDE_CODEX_DYNAMIC_TOOLS=1`, Claude gets the dynamic tools a client
+  registers on `thread/start` (the Codex App's own tools, which it sends to
+  remote hosts), one in-process MCP server per namespace. A call goes back to
+  the client as `item/tool/call` and shows as a `dynamicToolCall` item; specs
+  Codex refuses fail `thread/start` with its messages, and a chat keeps its
+  tools across restarts, resumes and forks. Off by default, since the App's
+  tools act on the desktop without an approval prompt.
 
 ### Provider and multi-agent boundaries
 
