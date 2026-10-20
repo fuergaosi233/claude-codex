@@ -1119,8 +1119,11 @@ export class CodexClaudeAppServer {
       cwd: options.cwd,
       model: options.model,
       effort: leader.reasoningEffort,
-      approvalPolicy: leader.approvalPolicy,
-      sandbox: leader.sandboxMode,
+      // A leader without a policy asks before tools run. thread/start reads
+      // a missing one as never and full access, so pass the asking pair that
+      // runs the same: a started chat gets no more than its leader.
+      approvalPolicy: leader.approvalPolicy ?? 'on-request',
+      sandbox: leader.sandboxMode ?? 'workspace-write',
       permissions: leader.permissionProfileId,
       baseInstructions: leader.baseInstructions,
       developerInstructions: leader.developerInstructions,

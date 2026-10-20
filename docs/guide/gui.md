@@ -144,7 +144,8 @@ Limits that always apply:
 - A leader never answers approvals or questions. A chat that waits on one shows as
   `blocked`, `thread_prompt` refuses it, and Claude is told to send you there.
 - Started chats inherit the leader's approval policy, sandbox and permissions, and
-  ask for their own approvals. They are Claude chats only for now, and
+  ask for their own approvals. A leader with no policy set asks before tools run,
+  and so do the chats it starts. They are Claude chats only for now, and
   `thread_start` refuses while new chats run on the Codex proxy backend.
 - In plan mode a leader can only list, wait for and read its chats.
 - Which chat leads which is stored with the threads, so it survives restarts.

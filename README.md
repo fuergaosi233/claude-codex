@@ -276,11 +276,12 @@ started gets the `codex_leader` MCP server, whose tools start other Claude chats
 (`thread_start`), list them (`thread_list`), wait for them (`thread_wait`), send
 them messages (`thread_prompt`) and read them (`thread_read`). Each started chat
 is an ordinary chat in the Codex App sidebar, which you can open and keep talking
-to, and Claude's reply shows a card for it, as Codex does for the chats it starts.
-Chats a leader starts cannot lead in turn, a leader has at most
-`CLAUDE_CODEX_LEADER_MAX_RUNNING` (default 4) chats working at once, and it never
-answers their approvals or questions: those stay with you. The tools need the
-native Claude Agent SDK backend; see
+to. When Claude repeats the line `thread_start` returns, its reply shows a card
+for the chat, as Codex does for the chats it starts. Started chats get the
+leader's permissions and never more, and cannot lead in turn; a leader has at
+most `CLAUDE_CODEX_LEADER_MAX_RUNNING` (default 4) chats working at once, and it
+never answers their approvals or questions: those stay with you. The tools need
+the native Claude Agent SDK backend; see
 **[Using the Codex App](https://fuergaosi233.github.io/claude-codex/guide/gui#leader-chats)**.
 
 ### `/workflows` compatibility

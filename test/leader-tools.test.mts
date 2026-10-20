@@ -6,6 +6,9 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import test from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
+import { CodexClaudeAppServer } from '../src/server.mjs'
+import { SessionStore } from '../src/store.mjs'
+import type { ClaudeRuntime, RpcPeer, RuntimeTurnContext, WireMessage } from '../src/types.mjs'
 
 // The leader tools end to end: a mock app-server over stdio, with the mock
 // runtime calling the tools for each `leader <tool> <json>` line of a prompt.
@@ -182,6 +185,10 @@ test('leader tools are off unless enabled, and chats a leader starts get none', 
     assert.equal(waited.threads[0].lastAgentMessage, 'leader tools: off')
     // Not even when the user prompts it later.
     assert.equal(await server.ask(started.threadId, 'leader tools check'), 'leader tools: off')
+    // Nor in a fork of it, which would otherwise lift the one-level limit.
+    const { thread: fork } = await server.request('thread/fork', { threadId: started.threadId })
+    assert.equal(await server.ask(fork.id, 'leader tools check'), 'leader tools: off')
+    assert.equal(await server.ask(leader, 'leader tools check'), 'leader tools: on')
   })
 })
 
@@ -295,6 +302,29 @@ test('thread_wait returns when a chat blocks on an approval, and thread_prompt r
     const done = await server.tool(leader, 'thread_wait', { threadIds: [childId] })
     assert.equal(done.threads[0].status, 'done-unread')
     assert.equal(done.threads[0].turnStatus, 'completed')
+  })
+})
+
+test('a chat a leader starts gets its permissions and never more', async () => {
+  await withServer(LEADER_ENV, async (server) => {
+    const leader = await server.startThread({ approvalPolicy: 'untrusted', sandbox: 'read-only' })
+    const policyOf = async (): Promise<string> => {
+      const started = await server.tool(leader, 'thread_start', { prompt: 'policy check' })
+      const waited = await server.tool(leader, 'thread_wait', { threadIds: [started.threadId] })
+      return waited.threads[0].lastAgentMessage
+    }
+    assert.equal(await policyOf(), 'approvalPolicy=untrusted sandboxMode=read-only')
+
+    // Values the adapter does not know leave the leader with no policy, which
+    // asks before tools run. The chat it starts asks too: thread/start would
+    // read a missing policy as never and full access.
+    await server.request('thread/resume', {
+      threadId: leader,
+      approvalPolicy: 'bogus',
+      sandbox: 'bogus',
+    })
+    assert.equal(await server.ask(leader, 'policy check'), 'approvalPolicy=null sandboxMode=null')
+    assert.equal(await policyOf(), 'approvalPolicy=on-request sandboxMode=workspace-write')
   })
 })
 
@@ -439,5 +469,153 @@ test('a leader runs a limited number of chats, and its links survive a restart',
     } finally {
       await server.stop()
     }
+  })
+})
+
+// In process, with a runtime that keeps every turn open: for what the mock
+// adapter cannot reach, which picks its own runtime and passes no signal.
+const PROCESS_ENV = [
+  'CLAUDE_CODEX_HOME',
+  'CODEX_HOME',
+  'CLAUDE_CODEX_MOCK',
+  'CLAUDE_CODEX_PROVIDER',
+  'CLAUDE_CODEX_AGENT_LOOP',
+  'CLAUDE_CODEX_RUNTIME_TYPE',
+  'CLAUDE_CODEX_RUNTIME',
+  'CLAUDE_CODEX_BACKEND',
+  'CLAUDE_CODEX_LEADER_TOOLS',
+  'CLAUDE_CODEX_LEADER_MAX_RUNNING',
+]
+
+interface InProcess {
+  home: string
+  store: SessionStore
+  request(method: string, params: Record<string, unknown>): Promise<any>
+  notified(method: string): any[]
+  // The context of the thread's latest turn, once the runtime has it.
+  turnOf(threadId: string): Promise<RuntimeTurnContext>
+}
+
+async function withInProcessServer(run: (server: InProcess) => Promise<void>): Promise<void> {
+  const saved = PROCESS_ENV.map((key) => [key, process.env[key]] as const)
+  await withHome(async (home) => {
+    for (const key of PROCESS_ENV) delete process.env[key]
+    Object.assign(process.env, {
+      CLAUDE_CODEX_HOME: home,
+      CODEX_HOME: home,
+      CLAUDE_CODEX_LEADER_TOOLS: '1',
+    })
+    const store = new SessionStore(join(home, 'state.sqlite'))
+    const turns = new Map<string, RuntimeTurnContext>()
+    const runtime: ClaudeRuntime = {
+      // Never settles: an interrupt or the server's stop ends the turn.
+      runTurn: (context) => {
+        turns.set(context.threadId, context)
+        return new Promise<void>(() => {})
+      },
+      steer: async () => false,
+      interrupt: async () => {},
+      stop: async () => {},
+    }
+    const server = new CodexClaudeAppServer(store, runtime)
+    const messages: any[] = []
+    const peer: RpcPeer = {
+      id: 'leader-test',
+      close: () => {},
+      send: (message: WireMessage) => messages.push(structuredClone(message)),
+    }
+    let nextId = 1
+    try {
+      await run({
+        home,
+        store,
+        request: async (method, params) => {
+          const id = nextId++
+          await server.handle(peer, { id, method, params })
+          const reply = messages.find((message) => message.id === id && message.method == null)
+          if (reply?.error) throw new Error(reply.error.message)
+          return reply?.result
+        },
+        notified: (method) =>
+          messages.filter((message) => message.method === method).map((message) => message.params),
+        turnOf: async (threadId) => {
+          for (let waited = 0; waited < 5_000; waited += 20) {
+            const context = turns.get(threadId)
+            if (context) return context
+            await delay(20)
+          }
+          throw new Error(`no turn ran on ${threadId}`)
+        },
+      })
+    } finally {
+      await server.stop()
+      for (const [key, value] of saved) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+    }
+  })
+}
+
+async function startLeader(server: InProcess) {
+  const { thread } = await server.request('thread/start', { cwd: server.home, model: 'sonnet' })
+  await server.request('turn/start', {
+    threadId: thread.id,
+    input: [{ type: 'text', text: 'start some chats', text_elements: [] }],
+  })
+  const { leaderTools } = await server.turnOf(thread.id)
+  assert.ok(leaderTools)
+  return { leaderId: thread.id as string, tools: leaderTools }
+}
+
+// What thread_start returns, without its ::created-thread line.
+function startResult(result: string): any {
+  const [json = ''] = result.split('\n')
+  return JSON.parse(json)
+}
+
+test('thread_start starts no chat while new chats run on the Codex proxy', async () => {
+  await withInProcessServer(async (server) => {
+    const { leaderId, tools } = await startLeader(server)
+    process.env.CLAUDE_CODEX_PROVIDER = 'codex'
+    await assert.rejects(tools.start({ prompt: 'count to three' }), /Codex proxy/)
+    assert.deepEqual(
+      server.notified('thread/started').map((params) => params.thread.id),
+      [leaderId],
+    )
+    assert.deepEqual(server.store.listLeaderThreads(leaderId), [])
+
+    // Back on Claude, the same call starts a Claude chat, which gets no tools.
+    delete process.env.CLAUDE_CODEX_PROVIDER
+    const started = startResult(await tools.start({ prompt: 'count to three' }))
+    const child = await server.turnOf(started.threadId)
+    assert.match(child.prompt, /count to three/)
+    assert.equal(child.leaderTools ?? null, null)
+    assert.equal(server.store.getThread(started.threadId)?.runtimeBackend, 'claude')
+  })
+})
+
+test('a pending wait ends when its call is aborted or the leader turn is interrupted', async () => {
+  await withInProcessServer(async (server) => {
+    const { leaderId, tools } = await startLeader(server)
+    const { threadId } = startResult(await tools.start({ prompt: 'keep working' }))
+    await server.turnOf(threadId)
+
+    // The SDK aborts a tool call when the leader's turn stops.
+    const controller = new AbortController()
+    const aborted = tools.wait({ threadIds: [threadId], timeoutSec: 30 }, controller.signal)
+    controller.abort()
+    const afterAbort = JSON.parse(await aborted)
+    assert.equal(afterAbort.timedOut, true)
+    assert.equal(afterAbort.threads[0].status, 'working')
+
+    // Without a signal, the leader's turn ending is enough.
+    const since = Date.now()
+    const waiting = tools.wait({ threadIds: [threadId], timeoutSec: 30 })
+    await server.request('turn/interrupt', { threadId: leaderId })
+    const afterInterrupt = JSON.parse(await waiting)
+    assert.equal(afterInterrupt.timedOut, true)
+    assert.equal(afterInterrupt.threads[0].status, 'working')
+    assert.ok(Date.now() - since < 5_000)
   })
 })
