@@ -115,6 +115,22 @@ versioning or publishing metadata.
   they used to start a full stdio server, with its startup recovery and
   cleanup, and never print their answer. The `codex` shim answers the plain
   forms itself, without starting node.
+- `CLAUDE_CODEX_SOCKET_PATH` moves the unix socket that
+  `app-server --listen unix://` listens on and `app-server proxy` connects
+  to when neither names one (by default
+  `app-server-control/app-server-control.sock` under `CODEX_HOME`); an
+  explicit `--listen unix://PATH` or `proxy --sock PATH` still wins. Both
+  commands read it, so set it where both run. The daemon makes the socket's
+  folder private to the user, so give the socket a folder of its own.
+- With `CLAUDE_CODEX_SDK_LAUNCH_GATE=1`, the native runtime starts Claude
+  Code processes one at a time: a new session waits until the previous
+  launch has sent its first SDK message, has ended, or has held the slot for
+  `CLAUDE_CODEX_SDK_LAUNCH_GATE_TIMEOUT_MS` (default 30000) without a word,
+  and the prompt, steers and settings changes sent meanwhile wait with it.
+  This keeps the chats that all resume right after a restart from writing
+  `~/.claude.json` at once, which can corrupt it
+  (anthropics/claude-code#28847). A `SessionStart` hook does not hold the
+  gate. Without the switch nothing changes.
 - The App's "/" popup offers Claude Code's built-in skills (`/simplify`,
   `/code-review`, …) from the list the CLI reports, and a picked one runs as
   the CLI's slash command.
@@ -330,6 +346,18 @@ versioning or publishing metadata.
   `thread/compacted`, `thread/closed`, `project/changed`,
   `thread/project/updated` and `command/exec/outputDelta`, which it no longer
   receives from the adapter, as from Codex.
+- Several clients can follow one thread, as with Codex's app-server: every
+  client that starts, resumes, forks or sends a turn to a thread gets its
+  notifications, instead of only the client that touched it last, and a
+  turn one client starts shows its `userMessage` item to the others.
+  Approvals, questions and elicitations go to every follower; the first
+  answer wins, `serverRequest/resolved` takes the card down everywhere, and
+  a later answer is ignored. A client that opens the thread while a request
+  waits, including one that closed and reopened the chat, gets the request
+  again, and the requests of a turn that ended are dropped.
+  `thread/unsubscribe` drops only the caller, which alone gets
+  `thread/closed`; `thread/delete` tells every follower. With one client
+  connected nothing changes on the wire.
 - `config/read` reports `web_search = "live"` instead of `"disabled"`, matching
   the web search `modelProvider/capabilities/read` advertises;
   `CLAUDE_CODEX_WEBSEARCH=0` turns both off.
@@ -418,6 +446,45 @@ versioning or publishing metadata.
 - An interrupt while a session idles no longer leaves its earlier idle timer
   running, which could close the session (and its background agents) on the
   old deadline although they kept reporting progress.
+- A thread stays on the runtime backend that holds its conversation. Once
+  it has one, `turn/start`, `thread/settings/update` and
+  `thread/metadata/update` refuse a model of the other backend (a Codex
+  model in a Claude chat, or the reverse) with "cannot change runtime
+  backend …; start a new thread" before changing anything, and the App's
+  model menu shows "Couldn't update model settings". They used to hand a
+  `gpt-*` id to the Claude CLI or move the chat to Codex without its
+  history. A Codex thread keeps any model while the Codex proxy carries
+  every thread, a thread with no conversation yet still takes its model's
+  backend, and a structured (`outputSchema`) turn, such as the App's title
+  and summary turns, runs its model for that turn alone instead of
+  rewriting the thread's model. With `CLAUDE_CODEX_DISABLE_CODEX_PROXY=1`,
+  unless the Codex proxy carries every thread, `thread/start` and a first
+  turn refuse a Codex model outside the App's helper threads.
+- Opt-in model process profiles: `CLAUDE_CODEX_MODEL_PROFILES_FILE` (or the
+  same JSON inline in `CLAUDE_CODEX_MODEL_PROFILES`) lists the Claude models
+  of the picker, each running its turns in its own Claude Code process with
+  its own executable, a provider environment built from an allowlist of
+  inherited variables, a private env file and `${VAR}` references, and its
+  own `CLAUDE_CONFIG_DIR`, so transcripts never mix between providers. The
+  adapter's own provider settings and credentials never reach a profile
+  process. The profiles file must belong to the user and be neither a
+  symlink nor writable by group or others, an env file must also be mode
+  0600, and a secret-like key may only reference a variable. A chat with a
+  conversation stays on its profile: another profile is refused, and a chat
+  whose profile changed or is gone still opens but refuses turns, forks,
+  compaction, review and model changes with "… cannot continue; start a new
+  chat"; a queued message or goal reports that and does not run. Profiles
+  replace `CLAUDE_CODEX_MODELS` and `CLAUDE_CODEX_MODEL_ALIASES` and need
+  the native runtime. Without a profiles file nothing changes.
+- Resuming a Claude session copies its transcript only into the config dir
+  that turn's Claude Code runs from (a model profile's, else
+  `CLAUDE_CONFIG_DIR` or `~/.claude`, or with `CLAUDE_CODEX_CLI` the
+  router's dir for the model), from the newest copy found. It used to copy
+  the whole conversation into every config dir it knew of and never
+  refreshed a copy already there, so switching back to a model resumed a
+  stale copy without the turns taken on another. A copy that is identical,
+  newer or longer stays as it is; a new copy keeps the source's file mode
+  and is a clone where the file system supports it.
 
 ### Rust-first protocol groundwork
 
