@@ -148,6 +148,37 @@ test('native SDK runtime maps manual /workflows prompts to the human workflow tr
   )
 })
 
+test('native SDK runtime runs Claude Code with auto-memory only for threads that ask for it', () => {
+  const runtime = new NativeClaudeRuntime()
+  const buildOptions = Reflect.get(runtime, 'buildOptions')
+  const envFor = (overrides: Partial<RuntimeTurnContext>) => {
+    const context = nativeTurnContext(overrides)
+    const session = { current: { context, handlers: {}, resolved: false }, lastContext: context }
+    return buildOptions.call(runtime, {}, context, new AbortController(), () => session)
+      .env as NodeJS.ProcessEnv
+  }
+  const previous = process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY
+  try {
+    delete process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY
+    // Off unless the thread turns it on: no --settings, the CLI's own switch.
+    assert.equal(envFor({}).CLAUDE_CODE_DISABLE_AUTO_MEMORY, '1')
+    assert.equal(envFor({ autoMemory: false }).CLAUDE_CODE_DISABLE_AUTO_MEMORY, '1')
+    assert.equal(envFor({ autoMemory: true }).CLAUDE_CODE_DISABLE_AUTO_MEMORY, undefined)
+    assert.equal(envFor({}).CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS, '1')
+
+    // A value the user exported to force auto-memory on does not override a
+    // thread without memories, and one that turns it off still does.
+    process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = '0'
+    assert.equal(envFor({ autoMemory: false }).CLAUDE_CODE_DISABLE_AUTO_MEMORY, '1')
+    assert.equal(envFor({ autoMemory: true }).CLAUDE_CODE_DISABLE_AUTO_MEMORY, '0')
+    process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = '1'
+    assert.equal(envFor({ autoMemory: true }).CLAUDE_CODE_DISABLE_AUTO_MEMORY, '1')
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY
+    else process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = previous
+  }
+})
+
 test('native SDK runtime approves goal tools without shadowing canUseTool', async () => {
   const runtime = new NativeClaudeRuntime()
   Reflect.set(runtime, 'zod', z)
@@ -2243,6 +2274,57 @@ test('claude-p runtime runs each turn in its own cwd', async () => {
     assert.equal(await realpath(argCwdB!), await realpath(cwdB))
     assert.equal(promptB, 'prompt-b')
   } finally {
+    await rm(tmp, { recursive: true, force: true })
+  }
+})
+
+test('claude-p runtime turns auto-memory off unless the thread asks for it', async () => {
+  const tmp = await mkdtemp(join(tmpdir(), 'claude-codex-claude-p-memory-test-'))
+  const command = join(tmp, 'fake-claude-p.mjs')
+  await writeFile(
+    command,
+    [
+      '#!/usr/bin/env node',
+      'const value = process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY ?? "unset";',
+      'console.log(JSON.stringify({ result: value, session_id: null, is_error: false }));',
+    ].join('\n'),
+  )
+  await chmod(command, 0o755)
+  const runtime = new ClaudePTranscriptRuntime({
+    command,
+    extraArgs: [],
+    timeoutMs: 20_000,
+    skipPermissions: false,
+    resume: false,
+  })
+  const run = async (autoMemory: boolean | undefined): Promise<string> => {
+    let text = ''
+    await runtime.runTurn(
+      nativeTurnContext({
+        threadId: `thread-${String(autoMemory)}`,
+        cwd: tmp,
+        ...(autoMemory === undefined ? {} : { autoMemory }),
+      }),
+      {
+        onEvent: (event) => {
+          if (event.type === 'text_delta') text += event.delta
+        },
+        onPermissionRequest: async () => ({ decision: 'accept' }),
+      },
+    )
+    return text
+  }
+  const previous = process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY
+  delete process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY
+  try {
+    assert.deepEqual(await Promise.all([run(undefined), run(false), run(true)]), [
+      '1',
+      '1',
+      'unset',
+    ])
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY
+    else process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = previous
     await rm(tmp, { recursive: true, force: true })
   }
 })

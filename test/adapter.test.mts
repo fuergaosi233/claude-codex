@@ -2183,6 +2183,67 @@ test('startup recovery terminalizes persisted in-progress item liveness', async 
   }
 })
 
+test("a thread's memory mode survives a stale save and a restart", async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const path = join(home, 'state.sqlite')
+  const store = new SessionStore(path)
+  const now = Math.floor(Date.now() / 1000)
+  const record = (id: string, memoryMode?: 'enabled' | 'disabled') => ({
+    id,
+    sessionId: id,
+    forkedFromId: null,
+    preview: 'memory mode',
+    name: null,
+    archived: false,
+    cwd: process.cwd(),
+    model: 'sonnet',
+    reasoningEffort: null,
+    modelProvider: 'claude-code',
+    claudeSessionId: null,
+    source: 'appServer',
+    createdAt: now,
+    updatedAt: now,
+    status: { type: 'idle' as const },
+    approvalPolicy: 'on-request',
+    sandboxMode: 'workspace-write',
+    ephemeral: false,
+    threadSource: 'user',
+    agentRole: null,
+    agentNickname: null,
+    baseInstructions: null,
+    developerInstructions: null,
+    personality: null,
+    runtimeBackend: 'claude' as const,
+    codexSessionId: null,
+    ...(memoryMode ? { memoryMode } : {}),
+  })
+  const threadId = randomUUID()
+  const olderId = randomUUID()
+  let open: SessionStore | null = store
+  try {
+    store.upsertThread(record(threadId, 'enabled'))
+    store.upsertThread(record(olderId))
+    assert.equal(store.getThread(threadId)?.memoryMode, 'enabled')
+    // A thread saved without a mode follows the global config.
+    assert.equal(store.getThread(olderId)?.memoryMode, null)
+
+    store.setThreadMemoryMode(threadId, 'disabled')
+    // A turn saving the record it read before the switch keeps the switch.
+    store.upsertThread(record(threadId, 'enabled'))
+    assert.equal(store.getThread(threadId)?.memoryMode, 'disabled')
+    store.close()
+    open = null
+
+    const reopened = new SessionStore(path)
+    open = reopened
+    assert.equal(reopened.getThread(threadId)?.memoryMode, 'disabled')
+    assert.equal(reopened.getThread(olderId)?.memoryMode, null)
+  } finally {
+    open?.close()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('startup recovery repairs stale items on already-terminal turns and is idempotent', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const store = new SessionStore(join(home, 'state.sqlite'))

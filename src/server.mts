@@ -36,6 +36,15 @@ import {
   readMcpConfig,
   readMcpResource,
 } from './mcp.mjs'
+import {
+  experimentalFeatureList,
+  MEMORIES_FEATURE,
+  memoriesConfigTable,
+  memoriesEnabled,
+  memoryStatus,
+  newThreadMemoryMode,
+  parseMemoryMode,
+} from './memories.mjs'
 import { projectInstructions } from './project-instructions.mjs'
 import { projectProviderLoopConfig } from './provider-loop-config.mjs'
 import {
@@ -451,6 +460,9 @@ export class CodexClaudeAppServer {
   // so the user's settings survive a daemon restart instead of resetting on
   // every reconnect.
   private configOverrides: Record<string, unknown> = {}
+  // The memories feature as the App last set it with
+  // experimentalFeature/enablement/set; features.memories in the config wins.
+  private memoriesEnablement: boolean | null = null
   // Codex App plugins whose skills Claude can run, as the App installed them.
   private appPlugins: AppPlugin[] = []
   private readonly configPath = join(adapterHome(), 'config.json')
@@ -717,15 +729,19 @@ export class CodexClaudeAppServer {
         return this.projectMove(asRecord(params))
       case 'thread/settings/update':
         return this.threadSettingsUpdate(peer, asRecord(params))
-      // Intentional no-ops: Claude Code has no equivalent concept, so the
-      // adapter acknowledges the call without side effects rather than failing
-      // the RPC (which would break the Codex App connection).
       case 'thread/memoryMode/set':
+        return this.threadMemoryModeSet(asRecord(params))
+      // Claude Code keeps its auto-memory in per-project folders that Claude
+      // Code in a terminal shares, so deleting them here would take memories
+      // the App never made. The App reports the failure.
+      // App rule: memories-settings
       case 'memory/reset':
-        return {}
-      // Claude Code keeps no Codex memories, so none were ever consolidated.
+        throw new Error(
+          "memory/reset is not supported: Claude Code keeps its memories in its own per-project folders, shared with Claude Code outside the App. Review or delete them with Claude Code's /memory command.",
+        )
+      // Claude Code never consolidates chats into Codex memories.
       case 'memory/status':
-        return { v2ConsolidatedThreads: 0, v2Ready: false }
+        return memoryStatus(asRecord(params))
       case 'thread/unarchive':
         return this.historyForPeer(peer, this.threadArchive(asRecord(params), false))
       case 'thread/compact/start':
@@ -801,11 +817,11 @@ export class CodexClaudeAppServer {
           webSearch: process.env.CLAUDE_CODEX_WEBSEARCH !== '0',
         }
       case 'experimentalFeature/list':
-        return { data: [], nextCursor: null }
+        return this.experimentalFeatureList(asRecord(params))
       case 'permissionProfile/list':
         return permissionProfileList(asRecord(params))
       case 'experimentalFeature/enablement/set':
-        return { enablement: asRecord(asRecord(params).enablement) }
+        return this.experimentalFeatureEnablementSet(asRecord(params))
       case 'collaborationMode/list':
         return method === 'collaborationMode/list' ? { data: [] } : {}
       case 'mock/experimentalMethod':
@@ -1063,6 +1079,11 @@ export class CodexClaudeAppServer {
         typeof params.developerInstructions === 'string' ? params.developerInstructions : null,
       ),
       personality: normalizePersonality(params.personality),
+      // The App's per-chat memories switches arrive as memories.* config.
+      // Helper threads never remember.
+      memoryMode: isTitleOrHelper
+        ? 'disabled'
+        : newThreadMemoryMode(asRecord(params.config), this.configOverrides),
       // Pick the runtime backend from the chosen model — picking gpt-* in
       // the App's model dropdown flips the new thread to runtimeBackend
       // 'codex' so turns get forwarded to `codex exec`. Default 'claude'.
@@ -1213,6 +1234,9 @@ export class CodexClaudeAppServer {
       // The App forks a thread to describe it and asks for an ephemeral fork;
       // like any helper thread, it stays out of the thread list.
       ephemeral: params.ephemeral === true || parent.ephemeral,
+      // A fork remembers like its parent; an ephemeral one never does.
+      memoryMode:
+        params.ephemeral === true || parent.ephemeral ? 'disabled' : (parent.memoryMode ?? null),
       threadSource:
         typeof params.threadSource === 'string'
           ? normalizeThreadSource(params.threadSource)
@@ -3699,6 +3723,7 @@ export class CodexClaudeAppServer {
           process.env.CLAUDE_CODEX_GOAL_TOOLS !== '0'
             ? this.goalToolsFor(thread.id)
             : null,
+        autoMemory: !isCodexThread && this.autoMemoryFor(thread),
         ...(continuation ? { continuation: true } : {}),
       },
       {
@@ -5973,6 +5998,9 @@ export class CodexClaudeAppServer {
         service_tier: this.configOverrides.service_tier ?? null,
         analytics: this.configOverrides.analytics ?? null,
         apps: this.configOverrides.apps ?? null,
+        // The App reads its memories switches from the table; the adapter
+        // keeps the key paths it writes flat.
+        memories: memoriesConfigTable(this.configOverrides),
         model_providers: this.exposedModelProviders(),
         provider_loop_config: projectProviderLoopConfig(
           undefined,
@@ -6020,6 +6048,49 @@ export class CodexClaudeAppServer {
         ([key]) => !isProviderLoopSelectionConfigKey(key),
       ),
     )
+  }
+
+  // App rule: memories-settings
+  private memoriesOn(): boolean {
+    return memoriesEnabled(this.configOverrides, this.memoriesEnablement)
+  }
+
+  private experimentalFeatureList(params: Record<string, unknown>): unknown {
+    // Codex reads the flags of a thread's own config; every thread here has
+    // the global ones.
+    const threadId = stringOr(params.threadId, '')
+    if (threadId && !this.store.getThread(threadId))
+      throw new Error(`thread not found: ${threadId}`)
+    return experimentalFeatureList(this.memoriesOn(), params)
+  }
+
+  // The App sets its defaults for the connection with this, memories among
+  // them. The other features have nothing to switch on Claude threads.
+  private experimentalFeatureEnablementSet(params: Record<string, unknown>): unknown {
+    const enablement = asRecord(params.enablement)
+    const memories = enablement[MEMORIES_FEATURE]
+    if (typeof memories === 'boolean') this.memoriesEnablement = memories
+    return { enablement }
+  }
+
+  private threadMemoryModeSet(params: Record<string, unknown>): unknown {
+    const threadId = stringOr(params.threadId, '')
+    const mode = parseMemoryMode(params.mode)
+    if (!mode) throw new Error(`invalid memory mode: ${String(params.mode)}`)
+    if (!this.store.getThread(threadId)) throw new Error(`unknown thread: ${threadId}`)
+    this.store.setThreadMemoryMode(threadId, mode)
+    debugLog('thread.memoryMode', { threadId, mode })
+    return {}
+  }
+
+  // Whether the thread's sessions run with Claude Code's auto-memory: the
+  // feature is on and so is the thread's mode, which threads saved before
+  // modes existed take from the config. The mode is read from the store
+  // because it can change while a turn holds an older record.
+  private autoMemoryFor(thread: ThreadRecord): boolean {
+    if (thread.ephemeral || !this.memoriesOn()) return false
+    const mode = this.store.getThread(thread.id)?.memoryMode ?? thread.memoryMode
+    return (mode ?? newThreadMemoryMode({}, this.configOverrides)) === 'enabled'
   }
 
   // Build the model_providers map served by config/read. Always exposes

@@ -113,6 +113,11 @@ export interface ThreadRecord {
   baseInstructions: string | null
   developerInstructions: string | null
   personality: string | null
+  // Codex's per-thread memory mode, from the memories.* config of
+  // thread/start. Saved only when the thread is created; change it through
+  // SessionStore.setThreadMemoryMode (thread/memoryMode/set). Null on threads
+  // saved before it existed; they follow the global memories config.
+  memoryMode?: 'enabled' | 'disabled' | null
   // The project the thread belongs to. Read-only here: upsertThread leaves it
   // alone, so a stale record saved after a turn cannot undo an assignment
   // made meanwhile. Assign through SessionStore.setThreadProject.
@@ -448,6 +453,10 @@ export interface RuntimeTurnContext {
   // The thread has a goal: expose Codex's goal tools (get_goal, create_goal,
   // update_goal) to Claude. Backends without in-process tools ignore it.
   goalTools?: GoalToolHandlers | null
+  // Let Claude Code's auto-memory read and write its memory folder. True only
+  // when the user turned memories on in the App and the thread's memory mode
+  // is enabled; otherwise the runtime switches auto-memory off.
+  autoMemory?: boolean
 }
 
 // Each handler returns the text of the tool result; a thrown Error becomes an

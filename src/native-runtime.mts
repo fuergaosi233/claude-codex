@@ -51,6 +51,7 @@ import {
   GET_GOAL_DESCRIPTION,
   UPDATE_GOAL_DESCRIPTION,
 } from './goal-prompts.mjs'
+import { autoMemoryEnv } from './memories.mjs'
 import { echoedUuids, TurnInput, type TurnInputMessage } from './native-turn-input.mjs'
 import { sdkHooks } from './sdk-hooks.mjs'
 import { readTaskResult } from './task-output.mjs'
@@ -579,7 +580,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }
     // session_state_changed tells a session that outlives its turn when the
     // CLI has finished answering everything queued (see maybeRelease).
-    opts.env = { ...process.env, CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1' }
+    // Auto-memory runs only for threads the user turned memories on for.
+    opts.env = {
+      ...process.env,
+      CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1',
+      ...autoMemoryEnv(context.autoMemory === true),
+    }
     // A forked thread resumes a transcript that opens with its parent's
     // history. Left alone, the CLI would schedule the parent's session cron
     // jobs a second time and report the parent's background tasks as its own
@@ -2822,6 +2828,7 @@ function sessionSignature(context: RuntimeTurnContext): string {
     parseWorkflowCommand(context.prompt)?.type === 'run',
     context.planMode === true,
     configuredPermissionMode(),
+    context.autoMemory === true,
   ])
 }
 

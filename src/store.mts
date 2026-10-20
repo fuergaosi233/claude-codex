@@ -202,6 +202,9 @@ export class SessionStore {
     // Project membership; written only by setThreadProject and deleteProject.
     this.ensureColumn('threads', 'project_id', 'TEXT')
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_threads_project ON threads(project_id)')
+    // Codex's per-thread memory mode; set when the thread is created, then
+    // only by setThreadMemoryMode.
+    this.ensureColumn('threads', 'memory_mode', 'TEXT')
     this.ensurePinnedSection()
     this.migrateLegacyPinState()
     this.sanitizeLegacyEnumColumns()
@@ -290,10 +293,11 @@ export class SessionStore {
           preview, name, archived, cwd, model, reasoning_effort, model_provider, claude_session_id,
           source, created_at, updated_at, status_json,
           approval_policy, sandbox_mode, permission_profile_id, ephemeral, thread_source, agent_role, agent_nickname,
-          base_instructions, developer_instructions, personality, runtime_backend, codex_session_id
+          base_instructions, developer_instructions, personality, runtime_backend, codex_session_id,
+          memory_mode
         ) VALUES (
           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         ON CONFLICT(id) DO UPDATE SET
           session_id=excluded.session_id,
@@ -358,6 +362,7 @@ export class SessionStore {
         thread.personality,
         thread.runtimeBackend,
         thread.codexSessionId,
+        thread.memoryMode ?? null,
       )
   }
 
@@ -835,6 +840,12 @@ export class SessionStore {
       .prepare('UPDATE threads SET project_id = ? WHERE id = ? AND project_id IS NOT ?')
       .run(projectId, threadId, projectId)
     return Number(result.changes) > 0
+  }
+
+  // Like the project, outside upsertThread: a turn saving the thread record it
+  // read before the switch must not undo it.
+  setThreadMemoryMode(threadId: string, mode: 'enabled' | 'disabled'): void {
+    this.db.prepare('UPDATE threads SET memory_mode = ? WHERE id = ?').run(mode, threadId)
   }
 
   private projectIds(): string[] {
@@ -1481,6 +1492,8 @@ export class SessionStore {
       personality: row.personality == null ? null : String(row.personality),
       runtimeBackend: row.runtime_backend === 'codex' ? 'codex' : 'claude',
       codexSessionId: row.codex_session_id == null ? null : String(row.codex_session_id),
+      memoryMode:
+        row.memory_mode === 'enabled' || row.memory_mode === 'disabled' ? row.memory_mode : null,
       projectId: row.project_id == null ? null : String(row.project_id),
     }
   }

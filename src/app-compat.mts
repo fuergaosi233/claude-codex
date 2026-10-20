@@ -198,6 +198,14 @@ export const APP_RULES: readonly AppRule[] = [
     verify:
       'Open a new chat without sending anything, restart the adapter and reload the App: no empty chat shows in the sidebar.',
   },
+  {
+    id: 'memories-settings',
+    app: 'Shows the Memories settings under Settings > Personalization, and the /memories command, only while experimentalFeature/list lists the memories feature enabled. Sets its defaults for the connection with experimentalFeature/enablement/set (memories off) when it connects. Its switches write features.memories, memories.generate_memories and memories.use_memories with config/batchWrite and read them back from the memories table of config/read. A chat started with its own switches carries them as memories.* config on thread/start; /memories in a chat sends thread/memoryMode/set. Delete calls memory/reset and shows an error toast when it fails.',
+    adapter:
+      "Lists memories as a beta feature, on only when features.memories in the config, or else the connection's enablement, turns it on. Keeps each thread's mode and runs Claude Code with auto-memory only for threads whose mode is enabled while the feature is on, switching it off with CLAUDE_CODE_DISABLE_AUTO_MEMORY otherwise. Refuses memory/reset, since Claude Code's memory folders are shared with Claude Code outside the App.",
+    verify:
+      'Turn Memories on in Settings > Personalization: the switch stays on after a reload, and /memories shows in the composer of a chat.',
+  },
 ]
 
 // The methods the App starts calling, or sends new parameters to, once the
