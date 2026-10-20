@@ -31,6 +31,15 @@ import { debugLog } from './util.mjs'
 // exit 2 blocks (or, for events that cannot block, shows stderr to the user
 // or nothing), any other exit is a non-blocking error.
 //
+// A hook with `onFailure: "block"` fails closed instead, as in Claude Code:
+// when it cannot start, times out, exits with a code other than 0 or 2, or
+// prints JSON that does not parse, the CLI gets what exit 2 would give it,
+// with a reason that names the hook and what went wrong. Async hooks and
+// Stop and SubagentStop hooks ignore it. The SDK takes no onFailure for a
+// callback, so the adapter applies it, and the callback gets a few seconds
+// more than the command, so that the command's own timeout, which blocks,
+// comes before the CLI's, which does not.
+//
 // Two events never reach a callback. The CLI runs SessionStart hooks for a
 // new, resumed or forked session while it loads, before it reads the SDK's
 // initialize request that registers the callbacks, and SessionEnd hooks as
@@ -69,6 +78,8 @@ export const CLAUDE_HOOK_EVENTS = [
 // Exit code 2 shows stderr to the user only for these events, and does
 // nothing for Notification.
 const USER_ONLY_EVENTS = new Set(['SubagentStart', 'SessionStart', 'SessionEnd'])
+// The events whose hooks ignore onFailure: a failure there never blocks.
+const FAILURE_IGNORED_EVENTS = new Set(['Stop', 'SubagentStop'])
 // Plain output of a successful hook becomes context for these events.
 const CONTEXT_EVENTS = new Set(['UserPromptSubmit', 'SessionStart'])
 // Claude Code's defaults for a command hook: ten minutes, less for the
@@ -87,6 +98,10 @@ const TOOL_EVENTS = new Set(['PreToolUse', 'PostToolUse', 'PostToolUseFailure'])
 const DRAIN_MS = 250
 // How often a killed hook is killed again until it is gone.
 const KILL_RETRY_MS = 100
+// How much longer the CLI waits for a hook that blocks on failure than its
+// command may run: room to kill it, drain its output and answer, even when
+// the adapter is busy, before the CLI gives up and lets the action go ahead.
+const FAILURE_GRACE_SEC = 5
 const OUTPUT_LIMIT = 1024 * 1024
 const OUTPUT_KEYS = [
   'continue',
@@ -115,6 +130,9 @@ export interface ClaudeHookSpec {
   readonly async: boolean
   // The permission rule a tool call must match for the hook to run, or null.
   readonly if: string | null
+  // What a failure of the hook does: nothing (continue, the default), or
+  // block as exit 2 does.
+  readonly onFailure: 'continue' | 'block'
   // The settings file the hook came from.
   readonly source: string
 }
@@ -145,7 +163,8 @@ export function claudeHookSpecs(cwd: string, configDir: string): ClaudeHookSpec[
   // As in Claude Code, disableAllHooks turns every hook off.
   if (settings.some(({ data }) => data?.disableAllHooks === true)) return []
   const specs: ClaudeHookSpec[] = []
-  const seen = new Set<string>()
+  // The index in `specs` of each command.
+  const seen = new Map<string, number>()
   for (const { path, data } of settings) {
     const table = asTable(data?.hooks)
     if (!table) continue
@@ -161,10 +180,16 @@ export function claudeHookSpecs(cwd: string, configDir: string): ClaudeHookSpec[
         for (const handler of Array.isArray(group?.hooks) ? group.hooks : []) {
           const spec = hookSpec(path, event, matcher, asTable(handler))
           if (!spec) continue
-          // Claude Code runs an identical command once.
+          // Claude Code runs an identical command once. It blocks on failure
+          // when any copy asks for it, so a copy cannot loosen another.
           const key = JSON.stringify([event, matcher, spec.shell, spec.command, spec.args, spec.if])
-          if (seen.has(key)) continue
-          seen.add(key)
+          const index = seen.get(key)
+          const kept = index === undefined ? undefined : specs[index]
+          if (index !== undefined && kept) {
+            if (spec.onFailure === 'block') specs[index] = { ...kept, onFailure: 'block' }
+            continue
+          }
+          seen.set(key, specs.length)
           specs.push(spec)
         }
       }
@@ -208,6 +233,7 @@ function hookSpec(
     timeoutSec: timeout > 0 ? timeout : fallback,
     async: handler.async === true || handler.asyncRewake === true,
     if: condition,
+    onFailure: handler.onFailure === 'block' ? 'block' : 'continue',
     source,
   }
 }
@@ -280,7 +306,10 @@ export function claudeHookSession(
     }
     const result = await runHookCommand(spec, input, options.projectDir, signal)
     logResult(spec, result)
-    return hookOutput(spec.event, result, options.approvals)
+    // A hook the CLI gave up on (or whose session budget is spent) answers
+    // nothing anyone reads, failed or not.
+    const failed = signal?.aborted ? null : failureOutput(spec, result)
+    return failed ?? hookOutput(spec.event, result, options.approvals)
   }
 
   const { origin } = options
@@ -321,7 +350,12 @@ export function claudeHookSession(
       if (spec.if && !conditionMet(spec.if, input, options.projectDir)) return {}
       return run(spec, input, signal)
     }
-    const matcher: HookMatcher = { hooks: [callback], timeout: spec.timeoutSec }
+    // More time for a hook that blocks on failure: its own timeout blocks,
+    // the CLI's would let the action go ahead.
+    const matcher: HookMatcher = {
+      hooks: [callback],
+      timeout: spec.timeoutSec + (blocksOnFailure(spec) ? FAILURE_GRACE_SEC : 0),
+    }
     if (spec.matcher) matcher.matcher = spec.matcher
     add(spec.event, matcher)
   }
@@ -525,7 +559,46 @@ export function hookOutput(event: string, result: HookCommandResult, approvals =
     return {}
   }
   if (result.code !== 2) return {}
-  const reason = result.stderr.trim() || `The ${event} hook exited with code 2.`
+  return exitTwoOutput(event, result.stderr.trim() || `The ${event} hook exited with code 2.`)
+}
+
+// What a hook that blocks on failure tells the CLI when it failed: what exit
+// 2 would, with a reason that names the hook and the failure, and what the
+// hook wrote to stderr. Null when it did not fail, or ignores onFailure.
+export function failureOutput(spec: ClaudeHookSpec, result: HookCommandResult): HookOutput | null {
+  if (!blocksOnFailure(spec)) return null
+  const failure = hookFailure(spec, result)
+  if (!failure) return null
+  const stderr = result.stderr.trim()
+  const reason = `The ${spec.event} hook ${hookName(spec)} ${failure}, and it blocks on failure (onFailure: "block").`
+  return exitTwoOutput(spec.event, stderr ? `${reason}\n${stderr}` : reason)
+}
+
+function blocksOnFailure(spec: ClaudeHookSpec): boolean {
+  return spec.onFailure === 'block' && !spec.async && !FAILURE_IGNORED_EVENTS.has(spec.event)
+}
+
+// How a finished command failed, as Claude Code counts it, or null when it
+// did not.
+function hookFailure(spec: ClaudeHookSpec, result: HookCommandResult): string | null {
+  if (result.timedOut) return `timed out after ${spec.timeoutSec} s`
+  if (result.error !== null) return `could not start (${result.error})`
+  if (result.code === null) return 'was killed'
+  if (result.code !== 0 && result.code !== 2) return `exited with code ${result.code}`
+  const text = result.stdout.trim()
+  if (result.code === 0 && text.startsWith('{') && !jsonObject(text)) return 'printed invalid JSON'
+  return null
+}
+
+// A hook as a reason names it: its command line, without what looks like a
+// secret, and shortened.
+function hookName(spec: ClaudeHookSpec): string {
+  const line = redactSecretLikeText([spec.command, ...(spec.args ?? [])].join(' '))
+  return `\`${line.length > 120 ? `${line.slice(0, 119)}…` : line}\``
+}
+
+// What exit code 2 tells the CLI, `reason` saying why.
+function exitTwoOutput(event: string, reason: string): HookOutput {
   if (event === 'PreToolUse')
     return {
       hookSpecificOutput: {
@@ -575,6 +648,7 @@ function logResult(spec: ClaudeHookSpec, result: HookCommandResult): void {
     code: result.code,
     timedOut: result.timedOut,
     error: result.error,
+    onFailure: spec.onFailure,
     durationMs: result.durationMs,
     stderr: redactSecretLikeText(result.stderr.trim().slice(0, 2000)),
   })

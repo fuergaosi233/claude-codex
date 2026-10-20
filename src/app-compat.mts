@@ -48,6 +48,14 @@ export const APP_RULES: readonly AppRule[] = [
       'In the bundle, the prediction path still gives up with unsupported_provider before its thread/fork when modelProvider is not openai.',
   },
   {
+    id: 'daemon-version',
+    app: 'With CODEX_APP_SERVER_USE_LOCAL_DAEMON=1 on a local host, runs `codex app-server daemon version` (2.5 s timeout) before connecting. When it prints JSON whose appServerVersion is at least 0.141.0, the App talks to the server on <CODEX_HOME>/app-server-control/app-server-control.sock instead of starting one over stdio; when it fails, the App starts its own.',
+    adapter:
+      'Answers the probe without opening the state database: the compat version when a server accepts connections on that socket (the unix daemon listens there by default), a failure otherwise.',
+    verify:
+      'Find `daemon`,`version` in the network-startup chunk of the bundle and check the socket path and the version check next to it.',
+  },
+  {
     id: 'config-warnings',
     app: 'Lists configWarning notifications under Settings > Agent > Configuration, keeping the last 20 per host.',
     adapter:
@@ -95,8 +103,9 @@ export const APP_RULES: readonly AppRule[] = [
     id: 'optimistic-user-message',
     app: 'Draws its own user message for every turn/start it sends.',
     adapter:
-      'Publishes the userMessage item only for turns it starts itself: from the server-side queue, or for the leader tools.',
-    verify: 'A sent message shows once; a queued one shows when it starts.',
+      "Publishes the userMessage item for turns it starts itself (from the server-side queue, or for the leader tools), and to a thread's other followers, which did not send the message.",
+    verify:
+      'A sent message shows once; a queued one shows when it starts; a second window open on the chat shows it too.',
   },
   {
     id: 'server-started-threads',
@@ -235,17 +244,65 @@ export const APP_RULES: readonly AppRule[] = [
     id: 'helper-thread-model',
     app: 'Generates chat titles, descriptions and turn summaries in ephemeral helper threads (threadSource thread_title, thread_description, thread_summary) on its own OpenAI model, the ephemeralGenerationModel of its statsig config, and allows the server to fall back to another model. A title starts a thread and a description forks the chat; its turn/start carries model null and an outputSchema its zod schemas declare as JSON Schema draft 2020-12, and the JSON in the last agentMessage counts once turn/completed reports completed within 30 seconds. When title generation fails, the chat keeps its first words as its title.',
     adapter:
-      'With CLAUDE_CODEX_DISABLE_CODEX_PROXY=1 and no Codex proxy selected, starts a helper thread that names a Codex model on the Claude summary model instead of the Codex backend, maps a Codex model on its turns the same way, and keeps an ephemeral fork of a Claude chat on the chat model. Other threads that name a Codex model are left on Codex. Drops the draft declaration of an outputSchema, which the Claude CLI refuses.',
+      'With CLAUDE_CODEX_DISABLE_CODEX_PROXY=1 and no Codex proxy selected, starts a helper thread that names a Codex model on the Claude summary model (the summary profile when model process profiles are configured) instead of the Codex backend, maps a Codex model on its turns the same way, and keeps an ephemeral fork of a Claude chat on the chat model. A chat on a model process profile keeps that fork, and its summary turns, on its profile whether or not Codex routing is on. Refuses any other thread/start that names a Codex model, since the picker offers none. Drops the draft declaration of an outputSchema, which the Claude CLI refuses.',
     verify:
       'With Codex routing off, send the first message of a new chat: the chat gets a generated title, not its first words.',
   },
   {
-    id: 'prewarmed-threads',
-    app: 'Starts the thread of a new chat with thread/start before the user sends anything, keeps it out of thread/list and holds back its thread/started until it sends turn/start there, and deletes it with thread/delete once the chat goes unused for 10 minutes. It forgets such threads when the app-server connection drops or the App quits.',
+    id: 'model-menu-settings',
+    app: 'Applies a model picked from the menu of an open chat it has resumed with thread/settings/update (model, effort and multiAgentMode); in a new chat the pick only rides on the first turn/start. When the request fails it shows a “Couldn’t update model settings” toast, adding the error message only for code -32600, and puts the menu back. Only code -32601, or a message saying method not found, or unknown method or unknown variant next to the method name, counts as the server lacking the method.',
     adapter:
-      'Lists and searches a thread only once it has a turn or a preview, as Codex lists a thread only once it has a user message, so a prewarmed chat the App forgot does not show up empty in the sidebar. The archive, a chosen section and subagent queries still list every thread.',
+      "Refuses a model on the other backend from the chat's (a Codex model in a Claude chat, or a Claude model in a Codex chat unless the Codex proxy carries every thread) once the chat has a conversation, with a plain error raised before anything changes, so the menu goes back and the chat keeps its model. With model process profiles configured, a Claude chat with a conversation refuses another profile the same way, and a chat its profile can no longer run (the profile changed or went away, or the chat predates profiles) refuses any model. The chat's current model sent along with other settings is no change.",
     verify:
-      'Open a new chat without sending anything, restart the adapter and reload the App: no empty chat shows in the sidebar.',
+      'With Codex models in the menu, pick one in a Claude chat that has a reply: a toast says the model settings could not be updated and the menu shows the Claude model again; another Claude model still applies.',
+  },
+  {
+    id: 'reasoning-summary',
+    app: 'Shows a reasoning item only through its summary parts: one part as it is, several with the first in bold as a title, and an item with an empty summary not at all. Fills the parts from item/reasoning/summaryTextDelta by summaryIndex, and keeps the raw content of item/reasoning/textDelta without rendering it.',
+    adapter:
+      'Asks the Claude CLI for summarized thinking (--thinking-display summarized) on a chat\'s own turns and streams each thinking run into one summary part; history reads show content-only items stored before as their summary. CLAUDE_CODEX_REASONING_VISIBLE=0 or model_reasoning_summary = "none" keeps the thinking in content only.',
+    verify:
+      'Ask a question Claude thinks about: its thinking shows above the reply while it streams and after the chat is reopened.',
+  },
+  {
+    id: 'reconnecting-errors',
+    app: 'Shows an `error` notification with willRetry as a passing stream-error row in the turn that replaces the one before it, and reads the attempt count only from a message of the form "Reconnecting... n/m"; any other message shows as it is.',
+    adapter:
+      'Turns each retry the Claude CLI reports for a chat\'s main loop (system/api_retry) into an `error` with willRetry, the message "Reconnecting... n/m" and the HTTP status and wait in additionalDetails, and does not store it, as Codex does not. Retries inside a subagent or a structured-output helper turn show nothing.',
+    verify:
+      'Point the adapter at an API that answers 529 for a while: the turn shows "Reconnecting 1/10", counting up, and then the reply.',
+  },
+  {
+    id: 'error-codes',
+    app: 'Reads codexErrorInfo on `error` notifications and failed turns: serverOverloaded shows "Server is busy" and may offer a retry, usageLimitExceeded opens a ChatGPT plan upgrade card, cyberPolicy a safety notice, and unauthorized is only counted.',
+    adapter:
+      'Gives every error a code from what the Claude CLI reported: contextWindowExceeded, serverOverloaded, rateLimitExceeded, badRequest, internalServerError, httpConnectionFailed, responseStreamDisconnected with the HTTP status for a retry, and other for the rest. It never sends usageLimitExceeded or cyberPolicy, and an authentication failure stays other.',
+    verify:
+      'Let the API stay overloaded until Claude gives up: the failed turn says the server is busy instead of showing a bare error.',
+  },
+  {
+    id: 'thread-git-info',
+    app: "Shows a thread's gitInfo.branch in the sidebar and uses originUrl for the repository name and pull request flows. When thread/start answers with gitInfo null it looks the workspace up itself; a thread/list refresh keeps what it knows when a row has none, but thread/resume replaces it with the answer's gitInfo. After creating a branch for a thread it sends thread/metadata/update with gitInfo.branch.",
+    adapter:
+      "Stores gitInfo on the thread: looked up after thread/start, on a resume of a thread without it, and when a turn ends, so thread/list and thread/read never run git. thread/start answers with null as Codex does, and thread/metadata/update patches gitInfo with Codex's rules.",
+    verify:
+      'Start a chat in a git repository on a feature branch and send a message: after an App restart the sidebar still shows the branch, and it follows a branch Claude switches to once the turn ends.',
+  },
+  {
+    id: 'context-gauge',
+    app: "Fills the composer's context gauge from the thread's latest thread/tokenUsage/updated, as last.totalTokens over modelContextWindow, and hides it when either is null.",
+    adapter:
+      "Reports each main-loop API call as it streams, with that call as last and on top of the settled total, once a result has reported the window for the thread or its model; the turn's result then settles the total. A subagent's tokens add to the total and leave last alone.",
+    verify:
+      'Ask for a task with many tool calls in a chat that has finished a turn: the context gauge moves while Claude works instead of jumping when the turn ends.',
+  },
+  {
+    id: 'prewarmed-threads',
+    app: "Starts the thread of a new chat with thread/start before the user sends anything, keeps it out of thread/list and holds back its thread/started until it sends turn/start there, and deletes it with thread/delete once the chat goes unused for 10 minutes. It forgets such threads when the app-server connection drops or the App quits. It sends the chat's first message to that thread whatever model was picked meanwhile, comparing only permissions, instructions and feature overrides.",
+    adapter:
+      'Lists and searches a thread only once it has a turn or a preview, as Codex lists a thread only once it has a user message, so a prewarmed chat the App forgot does not show up empty in the sidebar. The archive, a chosen section and subagent queries still list every thread. A thread with no conversation yet takes the backend (and model process profile) of the model its first turn names, so that message runs on the model picked.',
+    verify:
+      'Open a new chat without sending anything, restart the adapter and reload the App: no empty chat shows in the sidebar. Open a new chat, pick a model of the other backend and send: the reply comes from that model.',
   },
   {
     id: 'file-change-preview',
@@ -278,6 +335,30 @@ export const APP_RULES: readonly AppRule[] = [
       "Streams a background shell's output into the completed item of the Bash call that started it, also after its turn ended, and stores it cut the same way.",
     verify:
       'Ask Claude to start a background command that prints a line every second: after the turn ends, its command item keeps showing new lines.',
+  },
+  {
+    id: 'explored-commands',
+    app: 'Folds consecutive commandExecution items whose commandActions are all read, listFiles or search into one "Explored" row counting the files, searches and lists, labelling a search "Searched for <query> in <path>" and a list "Listed files in <path>". An item with no actions, an unknown one, or a declined one shows as its command.',
+    adapter:
+      "Shows Claude's Read, Grep, Glob and LS calls as commandExecution items with one matching action, and gives a Bash command the actions Codex's own parser would; a command it cannot parse is one unknown action.",
+    verify:
+      'Ask Claude to look around a repository: its Read, Grep and Glob calls and a `cat` or `rg` it runs fold into one "Explored" row.',
+  },
+  {
+    id: 'command-approval-actions',
+    app: "Shows a command approval as the commands of its commandActions joined with ' && ' in place of command when it has any, and offers its own decisions whatever availableDecisions says.",
+    adapter:
+      'Sends the actions only when a single one spells out the whole command, else one unknown action with the command, so the card never hides part of what runs. Only a Bash command is remembered for the session; an acceptForSession on any other card accepts that call only.',
+    verify:
+      'With approvals on, have Claude run `cat README.md && touch x`: the card shows the whole command.',
+  },
+  {
+    id: 'item-completed-replaces',
+    app: 'Replaces the item with the same id on item/completed, whatever type it started as.',
+    adapter:
+      'Completes an image Read that fails or is stopped as its failed Read command in place of the imageView it started as.',
+    verify:
+      'Ask Claude to read an image file that does not exist: the turn shows the failed Read, not an empty image.',
   },
 ]
 

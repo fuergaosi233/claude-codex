@@ -1,10 +1,12 @@
 import { mkdirSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
+import { currentProcessOwner, otherProcessRunning } from './process-owner.mjs'
 import type {
   ClaudeCheckpoint,
   ClaudeResumePoint,
   DynamicToolSpec,
+  GitInfo,
   ImportHistoryRecord,
   ProjectRecord,
   QueuedSubmission,
@@ -77,6 +79,17 @@ function checkpointFrom(sessionId: unknown, messageUuid: unknown): ClaudeCheckpo
   return typeof sessionId === 'string' && typeof messageUuid === 'string'
     ? { sessionId, messageUuid }
     : null
+}
+
+function parseGitInfo(json: unknown): GitInfo | null {
+  if (typeof json !== 'string') return null
+  try {
+    const value = JSON.parse(json)
+    const field = (key: string) => (typeof value?.[key] === 'string' ? value[key] : null)
+    return { sha: field('sha'), branch: field('branch'), originUrl: field('originUrl') }
+  } catch {
+    return null
+  }
 }
 
 export class SessionStore {
@@ -218,12 +231,20 @@ export class SessionStore {
     this.ensureColumn('turns', 'claude_message_uuid', 'TEXT')
     // TurnRecord.rootTurnId; NULL when the turn is its own root.
     this.ensureColumn('turns', 'root_turn_id', 'TEXT')
+    // The server that last wrote the turn (see process-owner.mts), so startup
+    // recovery leaves alone what another live server is still running.
+    this.ensureColumn('turns', 'owner_pid', 'INTEGER')
+    this.ensureColumn('turns', 'owner_started', 'TEXT')
     // Project membership; written only by setThreadProject and deleteProject.
     this.ensureColumn('threads', 'project_id', 'TEXT')
+    // Model process profile identity a thread is pinned to (model-profiles.mts).
+    this.ensureColumn('threads', 'model_profile_fingerprint', 'TEXT')
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_threads_project ON threads(project_id)')
     // Codex's per-thread memory mode; set when the thread is created, then
     // only by setThreadMemoryMode.
     this.ensureColumn('threads', 'memory_mode', 'TEXT')
+    // Codex GitInfo as JSON; written only by setThreadGitInfo.
+    this.ensureColumn('threads', 'git_info_json', 'TEXT')
     this.ensurePinnedSection()
     this.migrateLegacyPinState()
     this.sanitizeLegacyEnumColumns()
@@ -309,14 +330,14 @@ export class SessionStore {
       .prepare(`
         INSERT INTO threads (
           id, session_id, forked_from_id, is_pinned, section_id, section_entered_at, section_position,
-          preview, name, archived, cwd, model, reasoning_effort, model_provider, claude_session_id,
+          preview, name, archived, cwd, model, model_profile_fingerprint, reasoning_effort, model_provider, claude_session_id,
           source, created_at, updated_at, status_json,
           approval_policy, sandbox_mode, permission_profile_id, ephemeral, thread_source, agent_role, agent_nickname,
           base_instructions, developer_instructions, personality, runtime_backend, codex_session_id,
           memory_mode
         ) VALUES (
           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         ON CONFLICT(id) DO UPDATE SET
           session_id=excluded.session_id,
@@ -330,6 +351,7 @@ export class SessionStore {
           archived=excluded.archived,
           cwd=excluded.cwd,
           model=excluded.model,
+          model_profile_fingerprint=excluded.model_profile_fingerprint,
           reasoning_effort=excluded.reasoning_effort,
           model_provider=excluded.model_provider,
           claude_session_id=excluded.claude_session_id,
@@ -362,6 +384,7 @@ export class SessionStore {
         thread.archived ? 1 : 0,
         thread.cwd,
         thread.model,
+        thread.modelProfileFingerprint ?? null,
         thread.reasoningEffort,
         thread.modelProvider,
         thread.claudeSessionId,
@@ -867,6 +890,15 @@ export class SessionStore {
     this.db.prepare('UPDATE threads SET memory_mode = ? WHERE id = ?').run(mode, threadId)
   }
 
+  // Returns whether the thread's git info changed.
+  setThreadGitInfo(threadId: string, gitInfo: GitInfo | null): boolean {
+    const json = gitInfo ? JSON.stringify(gitInfo) : null
+    const result = this.db
+      .prepare('UPDATE threads SET git_info_json = ? WHERE id = ? AND git_info_json IS NOT ?')
+      .run(json, threadId, json)
+    return Number(result.changes) > 0
+  }
+
   private projectIds(): string[] {
     return (
       this.db
@@ -1098,10 +1130,11 @@ export class SessionStore {
   }
 
   upsertTurn(turn: TurnRecord): void {
+    const owner = currentProcessOwner()
     this.db
       .prepare(`
-        INSERT INTO turns (id, thread_id, status, started_at, completed_at, duration_ms, items_json, diff, error_json, root_turn_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO turns (id, thread_id, status, started_at, completed_at, duration_ms, items_json, diff, error_json, root_turn_id, owner_pid, owner_started)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           status=excluded.status,
           started_at=excluded.started_at,
@@ -1110,7 +1143,9 @@ export class SessionStore {
           items_json=excluded.items_json,
           diff=excluded.diff,
           error_json=excluded.error_json,
-          root_turn_id=COALESCE(excluded.root_turn_id, turns.root_turn_id)
+          root_turn_id=COALESCE(excluded.root_turn_id, turns.root_turn_id),
+          owner_pid=excluded.owner_pid,
+          owner_started=excluded.owner_started
       `)
       .run(
         turn.id,
@@ -1123,6 +1158,8 @@ export class SessionStore {
         turn.diff,
         turn.error == null ? null : JSON.stringify(turn.error),
         turn.rootTurnId ?? null,
+        owner?.pid ?? null,
+        owner?.started ?? null,
       )
   }
 
@@ -1348,15 +1385,36 @@ export class SessionStore {
     return completed
   }
 
+  // Fails the in-progress turns of servers that are gone. A turn another
+  // server on this state dir still runs is left alone, as are the item
+  // markers in its turns; a turn written before turns recorded their server
+  // is failed as before.
   recoverStaleInProgressTurns(message = 'server restarted before completing turn'): number {
-    const rows = this.db
-      .prepare('SELECT id, thread_id, started_at, items_json FROM turns WHERE status = ?')
-      .all('inProgress') as Array<{
-      id: string
-      thread_id: string
-      started_at: number | null
-      items_json: string
-    }>
+    const running = new Map<string, boolean>()
+    const ownerRunning = (row: { owner_pid: number | null; owner_started: string | null }) => {
+      if (row.owner_pid == null || row.owner_started == null) return false
+      const key = `${row.owner_pid} ${row.owner_started}`
+      let alive = running.get(key)
+      if (alive === undefined) {
+        alive = otherProcessRunning({ pid: Number(row.owner_pid), started: row.owner_started })
+        running.set(key, alive)
+      }
+      return alive
+    }
+    const rows = (
+      this.db
+        .prepare(
+          'SELECT id, thread_id, started_at, items_json, owner_pid, owner_started FROM turns WHERE status = ?',
+        )
+        .all('inProgress') as Array<{
+        id: string
+        thread_id: string
+        started_at: number | null
+        items_json: string
+        owner_pid: number | null
+        owner_started: string | null
+      }>
+    ).filter((row) => !ownerRunning(row))
     const completedAt = nowSeconds()
     const errorJson = JSON.stringify({ message })
     const updateTurn = this.db.prepare(`
@@ -1364,8 +1422,10 @@ export class SessionStore {
       SET status = ?, completed_at = ?, duration_ms = ?, error_json = ?, items_json = ?
       WHERE id = ?
     `)
-    const updateThread = this.db.prepare(
-      'UPDATE threads SET status_json = ?, updated_at = ? WHERE id = ?',
+    const reconcileThread = this.db.prepare(
+      `UPDATE threads SET status_json = ?, updated_at = ?
+       WHERE id = ?
+         AND NOT EXISTS (SELECT 1 FROM turns WHERE thread_id = threads.id AND status = ?)`,
     )
     const seenThreads = new Set<string>()
     let recoveredCount = 0
@@ -1390,15 +1450,19 @@ export class SessionStore {
       recoveredCount += 1
     }
     for (const threadId of seenThreads) {
-      updateThread.run(JSON.stringify({ type: 'idle' }), completedAt, threadId)
+      reconcileThread.run(JSON.stringify({ type: 'idle' }), completedAt, threadId, 'inProgress')
     }
     const terminalRows = this.db
-      .prepare('SELECT id, thread_id, status, items_json FROM turns WHERE status <> ?')
+      .prepare(
+        'SELECT id, thread_id, status, items_json, owner_pid, owner_started FROM turns WHERE status <> ?',
+      )
       .all('inProgress') as Array<{
       id: string
       thread_id: string
       status: TurnStatus
       items_json: string
+      owner_pid: number | null
+      owner_started: string | null
     }>
     const updateItems = this.db.prepare('UPDATE turns SET items_json = ? WHERE id = ?')
     const repairThreadIds = new Set<string>()
@@ -1406,16 +1470,11 @@ export class SessionStore {
       // A background agent outlives the parent turn that spawned it, so its
       // markers can sit in a turn that ended long before the restart.
       const itemsJson = this.terminalizeStaleItems(row.items_json, message, isDead)
-      if (itemsJson === row.items_json) continue
+      if (itemsJson === row.items_json || ownerRunning(row)) continue
       updateItems.run(itemsJson, row.id)
       repairThreadIds.add(String(row.thread_id))
       recoveredCount += 1
     }
-    const reconcileThread = this.db.prepare(
-      `UPDATE threads SET status_json = ?, updated_at = ?
-       WHERE id = ?
-         AND NOT EXISTS (SELECT 1 FROM turns WHERE thread_id = threads.id AND status = ?)`,
-    )
     for (const threadId of repairThreadIds) {
       reconcileThread.run(JSON.stringify({ type: 'idle' }), completedAt, threadId, 'inProgress')
     }
@@ -1628,6 +1687,8 @@ export class SessionStore {
       archived: Number(row.archived) === 1,
       cwd: String(row.cwd),
       model: String(row.model),
+      modelProfileFingerprint:
+        row.model_profile_fingerprint == null ? null : String(row.model_profile_fingerprint),
       reasoningEffort: row.reasoning_effort == null ? null : String(row.reasoning_effort),
       modelProvider: String(row.model_provider),
       claudeSessionId: row.claude_session_id == null ? null : String(row.claude_session_id),
@@ -1652,6 +1713,7 @@ export class SessionStore {
       memoryMode:
         row.memory_mode === 'enabled' || row.memory_mode === 'disabled' ? row.memory_mode : null,
       projectId: row.project_id == null ? null : String(row.project_id),
+      gitInfo: parseGitInfo(row.git_info_json),
     }
   }
 

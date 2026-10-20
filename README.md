@@ -59,11 +59,47 @@ Codex App ──SSH──▶ login shell ──▶ codex (shim, earlier in PATH)
                   everything else  ──────▶ real Codex CLI (CODEX_REAL)
 ```
 
-Agent text and reasoning stream into the conversation; `Bash` becomes command
-approvals; `Edit`/`Write`/`MultiEdit` become file-change approvals with live
+Agent text and reasoning stream into the conversation, Claude's thinking as the
+reasoning summary the App shows (`CLAUDE_CODEX_REASONING_VISIBLE=0` hides it);
+`Bash` becomes command approvals; `Edit`/`Write`/`MultiEdit` become file-change approvals with live
 diffs. Runtime selection maps only to existing backend paths today: default
 in-process Claude Agent SDK, `agent-http`, `agentapi`, `claude-p`, `codex-proxy`,
 and `mock`.
+
+The App starts one adapter daemon with `codex app-server --listen unix://` and
+reaches it through `codex app-server proxy`. Neither names a socket, so both use
+`$CODEX_HOME/app-server-control/app-server-control.sock` by default. To put it
+somewhere else, set `CLAUDE_CODEX_SOCKET_PATH` to an absolute path in a folder of
+its own, in the login shell or `~/.claude-codex/runtime.env`, since the daemon
+and the proxy must agree on it. See
+[Configuration](https://fuergaosi233.github.io/claude-codex/guide/configuration).
+
+Each Claude thread runs its own Claude Code process. Several of them starting at
+the same moment, such as the chats that all resume their Claude sessions right
+after the adapter or the App restarts, write the user's Claude Code config
+(`~/.claude.json`) at once and can corrupt it
+([anthropics/claude-code#28847](https://github.com/anthropics/claude-code/issues/28847)).
+`CLAUDE_CODEX_SDK_LAUNCH_GATE=1` starts them one at a time instead: each waits
+until the one before has sent its first message, or for at most
+`CLAUDE_CODEX_SDK_LAUNCH_GATE_TIMEOUT_MS` (default 30000) when it stays silent.
+Prompts and steers sent meanwhile wait for their process. It is off by default.
+
+### Model process profiles
+
+By default every Claude thread runs the same Claude Code with the adapter's
+environment. With `CLAUDE_CODEX_MODEL_PROFILES_FILE` pointing at a profiles file
+(or the same JSON inline in `CLAUDE_CODEX_MODEL_PROFILES`), each Claude model in
+the picker runs a Claude Code process of its own instead: its own executable,
+provider environment and Claude config folder, with none of the adapter's
+provider credentials. Secrets stay in the environment or in private env files;
+the profiles file only references them. A chat stays on the profile it started
+on. Once that profile's configuration changes, or for a chat from before
+profiles were set up, the chat still opens to be read, but a new message asks
+for a new chat rather than resuming its session somewhere else. Without a
+profiles file nothing changes. See
+[Model process profiles](https://fuergaosi233.github.io/claude-codex/guide/configuration#model-process-profiles)
+for the file format, its safety rules and how it relates to
+`CLAUDE_CODEX_MODELS`.
 
 ### Desktop conversation and visual explanations
 
@@ -266,9 +302,14 @@ everything it started. Exit 0 passes JSON output on (plain output becomes
 context for `UserPromptSubmit` and `SessionStart`), exit 2 blocks with stderr as
 the reason (for `SubagentStart`, `SessionStart` and `SessionEnd` it only shows
 stderr, for `Notification` it does nothing), other exits are non-blocking
-errors, and `disableAllHooks` turns them all off. In plan mode or a read-only
-sandbox a hook can still deny or ask but its approval is dropped, leaving the
-call to Codex. The CLI runs `SessionStart` hooks for a new, resumed or forked
+errors, and `disableAllHooks` turns them all off. A hook with
+`onFailure: "block"` fails closed, as in Claude Code: when it cannot start,
+times out, exits with a code other than 0 or 2, or prints JSON that does not
+parse, it answers as exit 2 would, with a reason that names the hook and the
+failure; async hooks and `Stop` and `SubagentStop` hooks ignore it. In plan mode
+or a read-only sandbox a hook can still deny or ask but its approval is dropped,
+leaving the call to Codex.
+The CLI runs `SessionStart` hooks for a new, resumed or forked
 session before the SDK has registered its callbacks, and `SessionEnd` hooks
 after the SDK has let go of them, so the adapter runs those two itself:
 `SessionStart` once the session takes its first prompt, with the source
@@ -321,6 +362,13 @@ clients that advertise it) plus `spawnAgent`/`wait` tool state; runtimes without
 fall back to one aggregate workflow agent when the workflow reaches a terminal state.
 A bare `/workflows` lists workflow runs
 recorded in the current Codex thread.
+
+A turn waiting on a subagent or workflow gives up only after it has heard nothing from it for
+`CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS` (default 30 minutes; `0` never gives up). Any sign of life
+(the agent's output or tool heartbeats, task progress, a workflow agent starting or finishing)
+starts that wait over, so a long but healthy workflow runs to the end. When it does give up, the
+turn fails and its stuck agents stop; background agents it handed off keep running. See the
+[configuration reference](https://fuergaosi233.github.io/claude-codex/guide/configuration#reference-table).
 
 This compatibility layer is specific to the native Claude Agent SDK backend. Alternate HTTP,
 agentapi, and `claude -p` backends receive no workflow event bridge. Interactive workflow

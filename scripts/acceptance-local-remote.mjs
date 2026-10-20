@@ -42,6 +42,9 @@ async function main() {
     NODE_NO_WARNINGS: '1',
   }
   delete env.CLAUDE_CODEX_MOCK
+  // The daemon and the proxy meet at the default socket under this CODEX_HOME,
+  // not at one the shell points to for everyday use.
+  delete env.CLAUDE_CODEX_SOCKET_PATH
 
   const version = run('codex', ['--version'], env)
   assert.match(version.stdout, /codex-cli/)

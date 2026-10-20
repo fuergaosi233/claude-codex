@@ -48,6 +48,40 @@ is_native_codex_mode() {
   return 1
 }
 
+# `app-server --print-startup-config [--startup-sign-out]`: the one line codex
+# prints, without starting node. Claude threads have no ChatGPT account to
+# sign out of, and no config requirements. Fails for anything else (a client
+# info to check, a usage error, a version that needs escaping), which the
+# adapter then answers.
+print_startup_config() {
+  shift
+  [ "$#" -gt 0 ] || return 1
+  case "$COMPAT_VERSION" in
+    '' | *[!A-Za-z0-9._+-]*) return 1 ;;
+  esac
+  local requested=0 arg
+  for arg in "$@"; do
+    case "$arg" in
+      --print-startup-config) requested=1 ;;
+      --startup-sign-out) ;;
+      *) return 1 ;;
+    esac
+  done
+  [ "$requested" = 1 ] || return 1
+  printf '{"appServerVersion":"%s","configRequirements":{"requirements":null}}\n' "$COMPAT_VERSION"
+}
+
+# `app-server daemon version` with no daemon socket: report it and fail at
+# once, as codex does, so the Codex App starts its own server. Fails for
+# anything else, and when the socket exists: the adapter then checks that a
+# daemon listens on it.
+no_daemon_running() {
+  [ "$#" = 3 ] && [ "$2" = daemon ] && [ "$3" = version ] || return 1
+  local socket="${CODEX_HOME:-$HOME/.codex}/app-server-control/app-server-control.sock"
+  [ -S "$socket" ] && return 1
+  echo "Error: no app-server daemon is running at $socket" >&2
+}
+
 REAL_CODEX="$(resolve_real_codex || true)"
 
 case "${1:-}" in
@@ -66,6 +100,10 @@ case "${1:-}" in
       echo "codex shim is in native Codex mode, but no real codex binary was found; set CODEX_REAL" >&2
       exit 127
     fi
+    # One-shot probes the shim can settle on its own. The adapter answers
+    # the rest of them, also without opening its state.
+    print_startup_config "$@" && exit 0
+    no_daemon_running "$@" && exit 1
     exec "$NODE_BIN" "$ADAPTER" "$@"
     ;;
 esac

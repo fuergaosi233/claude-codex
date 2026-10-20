@@ -938,6 +938,389 @@ test('native turn the server fails mid-stream stops only that turn while backgro
   })
 })
 
+function subagentProgress(events: RuntimeEvent[]): string[] {
+  return events.flatMap((event) => (event.type === 'subagent_progress' ? [event.toolUseId] : []))
+}
+
+test('native turn reports progress of the agents it waits on, not of those it handed off', async () => {
+  const { runtime, queries } = fakeRuntime()
+  const listener = recordingListener()
+  runtime.setBackgroundListener(listener)
+  const events: RuntimeEvent[] = []
+  const turn = runtime.runTurn(context, handlers(events))
+  const query = await waitFor(() => queries[0], 'session')
+  query.push(
+    // A background agent works on its own: the turn handed it off.
+    ...launchBackgroundAgent('a1').slice(0, 3),
+    {
+      type: 'assistant',
+      parent_tool_use_id: 'agent-use',
+      message: { id: 'bg-1', content: [text('Reading the parser')] },
+    },
+    {
+      type: 'system',
+      subtype: 'task_progress',
+      task_id: 'a1',
+      tool_use_id: 'agent-use',
+      description: 'investigate',
+    },
+    {
+      type: 'tool_progress',
+      tool_use_id: 'grep-0',
+      tool_name: 'Grep',
+      parent_tool_use_id: 'agent-use',
+      elapsed_time_seconds: 2,
+    },
+    // The turn waits on this one: its own frames, its task progress and the
+    // heartbeats of its quiet tools all count, at most once per interval.
+    assistant('m1', [
+      { type: 'tool_use', id: 'agent-1', name: 'Agent', input: { prompt: 'check the build' } },
+    ]),
+    {
+      type: 'assistant',
+      parent_tool_use_id: 'agent-1',
+      message: { id: 'sub-1', content: [text('Building')] },
+    },
+    {
+      type: 'system',
+      subtype: 'task_progress',
+      task_id: 'f1',
+      tool_use_id: 'agent-1',
+      description: 'check the build',
+    },
+    {
+      type: 'tool_progress',
+      tool_use_id: 'bash-1',
+      tool_name: 'Bash',
+      parent_tool_use_id: 'agent-1',
+      elapsed_time_seconds: 5,
+    },
+  )
+  await waitFor(() => subagentProgress(events).length === 1, 'first progress report')
+  await sleep(300)
+  query.push(
+    // A tool the main loop runs beside the agent is not the agent's progress.
+    {
+      type: 'tool_progress',
+      tool_use_id: 'bash-2',
+      tool_name: 'Bash',
+      parent_tool_use_id: null,
+      elapsed_time_seconds: 1,
+    },
+    {
+      type: 'tool_progress',
+      tool_use_id: 'agent-1',
+      tool_name: 'Agent',
+      parent_tool_use_id: null,
+      elapsed_time_seconds: 9,
+    },
+  )
+  await waitFor(() => subagentProgress(events).length === 2, 'second progress report')
+  query.push(
+    {
+      type: 'user',
+      parent_tool_use_id: null,
+      message: { content: [{ type: 'tool_result', tool_use_id: 'agent-1', content: 'built' }] },
+    },
+    assistant('m2', [text('Built.')]),
+    { type: 'result', subtype: 'success', result: 'Built.' },
+  )
+  await turn
+  assert.deepEqual(subagentProgress(events), ['agent-1', 'agent-1'])
+  await runtime.stop()
+})
+
+test('native turn keeps reporting agent progress after the wall clock is set back', async () => {
+  const wallClock = Date.now
+  try {
+    const { runtime, queries } = fakeRuntime()
+    const events: RuntimeEvent[] = []
+    const turn = runtime.runTurn(context, handlers(events))
+    const query = await waitFor(() => queries[0], 'session')
+    const heartbeat = (seconds: number) => ({
+      type: 'tool_progress',
+      tool_use_id: 'agent-1',
+      tool_name: 'Agent',
+      parent_tool_use_id: null,
+      elapsed_time_seconds: seconds,
+    })
+    query.push(
+      init,
+      assistant('m1', [
+        { type: 'tool_use', id: 'agent-1', name: 'Agent', input: { prompt: 'check the build' } },
+      ]),
+      heartbeat(1),
+    )
+    await waitFor(() => subagentProgress(events).length === 1, 'first progress report')
+    // An hour back: the agent's next heartbeat must still reach the server.
+    Date.now = () => wallClock() - 3_600_000
+    await sleep(300)
+    query.push(heartbeat(2))
+    await waitFor(() => subagentProgress(events).length === 2, 'progress after the clock change')
+    query.push(
+      {
+        type: 'user',
+        parent_tool_use_id: null,
+        message: { content: [{ type: 'tool_result', tool_use_id: 'agent-1', content: 'built' }] },
+      },
+      { type: 'result', subtype: 'success', result: 'Built.' },
+    )
+    await turn
+    await runtime.stop()
+  } finally {
+    Date.now = wallClock
+  }
+})
+
+test('native workflow progress reports the Workflow call it belongs to', async () => {
+  const { runtime, queries } = fakeRuntime()
+  runtime.setBackgroundListener(recordingListener())
+  const events: RuntimeEvent[] = []
+  const turn = runtime.runTurn(context, handlers(events))
+  const query = await waitFor(() => queries[0], 'session')
+  query.push(
+    assistant('launch-workflow', [
+      { type: 'tool_use', id: 'workflow-use', name: 'Workflow', input: { name: 'review' } },
+    ]),
+    {
+      type: 'system',
+      subtype: 'task_started',
+      task_id: 'w1',
+      tool_use_id: 'workflow-use',
+      task_type: 'local_workflow',
+      workflow_name: 'review',
+      description: 'review',
+      is_backgrounded: true,
+    },
+    { type: 'system', subtype: 'task_progress', task_id: 'w1', description: 'review' },
+  )
+  await waitFor(() => subagentProgress(events).length === 1, 'workflow progress')
+  assert.deepEqual(subagentProgress(events), ['workflow-use'])
+  await runtime.interrupt('thread')
+  await turn
+  await runtime.stop()
+})
+
+test('native turn the server gives up on stops its own agents and leaves the ones it handed off running', async () => {
+  await withSettleMs(40, async () => {
+    const { runtime, queries } = fakeRuntime()
+    const listener = recordingListener()
+    runtime.setBackgroundListener(listener)
+
+    const events: RuntimeEvent[] = []
+    const turn = runtime.runTurn(context, handlers(events))
+    const query = await waitFor(() => queries[0], 'session')
+    query.push(
+      init,
+      ...launchBackgroundAgent('a1').slice(0, 3),
+      assistant('m1', [
+        { type: 'tool_use', id: 'agent-1', name: 'Agent', input: { prompt: 'check the build' } },
+      ]),
+      {
+        type: 'system',
+        subtype: 'task_started',
+        task_id: 'f1',
+        tool_use_id: 'agent-1',
+        task_type: 'local_agent',
+        description: 'check the build',
+      },
+    )
+    await waitFor(
+      () => listener.tasks.some((event) => event.type === 'task_started' && event.taskId === 'f1'),
+      'foreground agent',
+    )
+    assert.equal(await runtime.abandonTurn('thread', 'turn-1'), true)
+    await turn
+    assert.equal(query.interrupts, 0, 'an interrupt would end the agent the turn handed off')
+    assert.deepEqual(query.stoppedTasks, ['f1'], 'only the agent the turn waited on stops')
+    assert.equal(query.closed, false)
+    assert.equal(
+      events.some((event) => event.type === 'completed'),
+      false,
+      'the server settled the turn itself',
+    )
+
+    // What the CLI still sends for the turn is drained, not replayed.
+    query.push(
+      {
+        type: 'user',
+        message: {
+          content: [
+            { type: 'tool_result', tool_use_id: 'agent-1', content: 'stopped', is_error: true },
+          ],
+        },
+      },
+      {
+        type: 'system',
+        subtype: 'task_notification',
+        task_id: 'f1',
+        tool_use_id: 'agent-1',
+        status: 'stopped',
+        summary: 'stopped',
+      },
+      assistant('m2', [text('The check was stopped.')]),
+      { type: 'result', subtype: 'success', result: 'The check was stopped.' },
+    )
+    await sleep(30)
+    assert.deepEqual(listener.autonomous, [])
+    assert.equal(runtime.hasPendingContinuation('thread'), false)
+    assert.equal(runtime.hasBackgroundWork(), true)
+
+    // The background agent still reports back, and Claude answers it.
+    query.push(
+      {
+        type: 'system',
+        subtype: 'task_notification',
+        task_id: 'a1',
+        tool_use_id: 'agent-use',
+        status: 'completed',
+        summary: 'Agent "investigate" completed',
+      },
+      init,
+    )
+    await waitFor(() => listener.autonomous.length === 1, 'report of the background agent')
+    await runtime.stop()
+  })
+})
+
+test('native turn the server gives up on is left to an interrupt when it handed nothing off', async () => {
+  await withSettleMs(40, async () => {
+    const { runtime, queries } = fakeRuntime()
+    const listener = recordingListener()
+    runtime.setBackgroundListener(listener)
+
+    const first = runtime.runTurn(context, handlers([]))
+    const query = await waitFor(() => queries[0], 'session')
+    query.push(...launchBackgroundAgent('a1'))
+    await first
+
+    const second = runtime.runTurn(
+      { ...context, turnId: 'turn-2', prompt: 'check the build' },
+      handlers([]),
+    )
+    await waitFor(() => query.prompts.length === 2, 'second prompt')
+    query.push(
+      init,
+      assistant('m1', [
+        { type: 'tool_use', id: 'agent-1', name: 'Agent', input: { prompt: 'check the build' } },
+      ]),
+      {
+        type: 'system',
+        subtype: 'task_started',
+        task_id: 'f1',
+        tool_use_id: 'agent-1',
+        task_type: 'local_agent',
+        description: 'check the build',
+      },
+    )
+    await waitFor(
+      () => listener.tasks.some((event) => event.type === 'task_started' && event.taskId === 'f1'),
+      'foreground agent',
+    )
+    // The agent an earlier turn handed off outlives an interrupt, which also
+    // ends the CLI's turn instead of leaving it to run unseen.
+    assert.equal(await runtime.abandonTurn('thread', 'turn-2'), false)
+    assert.deepEqual(query.stoppedTasks, [])
+    await runtime.interrupt('thread')
+    await second
+    assert.equal(query.interrupts, 1)
+    assert.equal(query.closed, false)
+    assert.equal(runtime.hasBackgroundWork(), true)
+    await runtime.stop()
+  })
+})
+
+test('native turn the server gives up on is left to an interrupt when nothing else runs', async () => {
+  const { runtime, queries } = fakeRuntime()
+  const listener = recordingListener()
+  runtime.setBackgroundListener(listener)
+  // The App is slow to take the turn's text, so the session is still busy
+  // routing it when the server gives up.
+  let holding = false
+  let release = (): void => {}
+  const held = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const turn = runtime.runTurn(context, {
+    ...handlers([]),
+    onEvent: async (event) => {
+      if (event.type !== 'text_delta' || event.delta !== 'hold') return
+      holding = true
+      await held
+    },
+  })
+  const query = await waitFor(() => queries[0], 'session')
+  query.push(
+    init,
+    assistant('m1', [
+      text('hold'),
+      { type: 'tool_use', id: 'agent-1', name: 'Agent', input: { prompt: 'check the build' } },
+    ]),
+    {
+      type: 'system',
+      subtype: 'task_started',
+      task_id: 'f1',
+      tool_use_id: 'agent-1',
+      task_type: 'local_agent',
+      description: 'check the build',
+    },
+  )
+  await waitFor(() => holding, 'busy session')
+  // The answer must not wait behind the session: the interrupt the server
+  // falls back to has to reach this turn, not one the user starts meanwhile.
+  const answer = await Promise.race([
+    runtime.abandonTurn('thread', 'turn-1'),
+    sleep(500).then(() => 'waited on the session'),
+  ])
+  assert.equal(answer, false)
+  assert.deepEqual(query.stoppedTasks, [])
+  assert.equal(query.closed, false)
+  release()
+  await waitFor(() => listener.tasks.length === 1, 'foreground agent')
+  await runtime.interrupt('thread')
+  await turn
+  assert.equal(query.closed, true)
+  await runtime.stop()
+})
+
+test('native background progress restarts the idle wait, even after an interrupt while idle', async () => {
+  const previous = process.env.CLAUDE_CODEX_BACKGROUND_IDLE_MS
+  process.env.CLAUDE_CODEX_BACKGROUND_IDLE_MS = '150'
+  try {
+    const { runtime, queries } = fakeRuntime()
+    const listener = recordingListener()
+    runtime.setBackgroundListener(listener)
+    const first = runtime.runTurn(context, handlers([]))
+    const query = await waitFor(() => queries[0], 'session')
+    query.push(...launchBackgroundAgent('a1'))
+    await first
+
+    // Stopping while nothing runs arms the wait again; the wait armed when the
+    // turn ended must not linger and close the session on its old deadline.
+    await runtime.interrupt('thread')
+    for (let beat = 0; beat < 8; beat += 1) {
+      await sleep(50)
+      query.push({
+        type: 'system',
+        subtype: 'task_progress',
+        task_id: 'a1',
+        tool_use_id: 'agent-use',
+        description: 'investigate',
+      })
+    }
+    await sleep(10)
+    assert.equal(query.closed, false, 'an agent that keeps reporting keeps its session')
+
+    // Once the agent goes quiet for the whole wait, the session closes.
+    await waitFor(() => query.closed, 'idle session close')
+    assert.deepEqual(listener.released, [{ threadId: 'thread', liveTaskIds: ['a1'] }])
+    await runtime.stop()
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_CODEX_BACKGROUND_IDLE_MS
+    else process.env.CLAUDE_CODEX_BACKGROUND_IDLE_MS = previous
+  }
+})
+
 test('readTaskResult returns the final response of a subagent transcript', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'claude-codex-task-'))
   try {

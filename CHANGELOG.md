@@ -103,6 +103,34 @@ versioning or publishing metadata.
 - The adapter stops Claude CLI processes a previous adapter on the same state
   dir left running, matching pid, start time and command line before
   signalling (`CLAUDE_CODEX_REAP_ORPHANED_CLI=0` turns it off).
+- A second adapter started on the same state dir (a startup probe, another
+  window) no longer fails the turns a running adapter is still working on.
+  Each turn records the process that wrote it, by pid and start time, and
+  startup recovery fails only the turns of processes that are gone; turns
+  written before this change are recovered as before.
+- `app-server --print-startup-config` (codex 0.164) prints its one JSON line
+  (`appServerVersion` and `configRequirements`) and exits, and
+  `app-server daemon version` reports the unix daemon listening on the control
+  socket, or fails when none is. Both answer before the state database opens;
+  they used to start a full stdio server, with its startup recovery and
+  cleanup, and never print their answer. The `codex` shim answers the plain
+  forms itself, without starting node.
+- `CLAUDE_CODEX_SOCKET_PATH` moves the unix socket that
+  `app-server --listen unix://` listens on and `app-server proxy` connects
+  to when neither names one (by default
+  `app-server-control/app-server-control.sock` under `CODEX_HOME`); an
+  explicit `--listen unix://PATH` or `proxy --sock PATH` still wins. Both
+  commands read it, so set it where both run. The daemon makes the socket's
+  folder private to the user, so give the socket a folder of its own.
+- With `CLAUDE_CODEX_SDK_LAUNCH_GATE=1`, the native runtime starts Claude
+  Code processes one at a time: a new session waits until the previous
+  launch has sent its first SDK message, has ended, or has held the slot for
+  `CLAUDE_CODEX_SDK_LAUNCH_GATE_TIMEOUT_MS` (default 30000) without a word,
+  and the prompt, steers and settings changes sent meanwhile wait with it.
+  This keeps the chats that all resume right after a restart from writing
+  `~/.claude.json` at once, which can corrupt it
+  (anthropics/claude-code#28847). A `SessionStart` hook does not hold the
+  gate. Without the switch nothing changes.
 - The App's "/" popup offers Claude Code's built-in skills (`/simplify`,
   `/code-review`, …) from the list the CLI reports, and a picked one runs as
   the CLI's slash command.
@@ -133,6 +161,12 @@ versioning or publishing metadata.
   and accepts the `user` reviewer the App sends when permissions change during
   a turn, instead of failing on any change. An unknown model fails instead of
   falling back to the thread's model.
+- Claude Code command hooks the adapter runs honour `onFailure: "block"`: a
+  hook that cannot start, times out, exits with a code other than 0 or 2, or
+  prints JSON that does not parse blocks the tool call or prompt as exit 2
+  would, with a reason that names the hook and the failure, instead of letting
+  it through. `continue` stays the default; async hooks and `Stop` /
+  `SubagentStop` hooks ignore it, as in Claude Code.
 - Claude Code's hook runs show as `hook/started` / `hook/completed` in the
   turn's hook summary, with the settings file that configures them and a
   blocked status for a hook that blocks; `hooks/list` also lists `SessionEnd`,
@@ -275,6 +309,68 @@ versioning or publishing metadata.
   SDK sessions since Claude Code 2.1.285, or the call's own `timeout` up to 2
   hours). `CLAUDE_CODEX_COMMAND_OUTPUT_POLL_MS=0` shows the output only when
   the command finishes, as before.
+- Claude's thinking shows in the Codex App. The CLI is asked for summarized
+  thinking (`--thinking-display summarized`), which recent models otherwise
+  redact, and it streams as the reasoning summary, the only part of a
+  reasoning item the App renders (`item/reasoning/summaryPartAdded`, then
+  `summaryTextDelta`). Thinking stored before as raw content reads back as
+  the summary. `CLAUDE_CODEX_REASONING_VISIBLE=0` or the App's Reasoning
+  summary setting set to None keeps the previous behavior.
+- API retries show in the turn as Codex shows a stream retry: each
+  `system/api_retry` of the main loop becomes an `error` notification with
+  `willRetry` and the message `Reconnecting... n/m`, which the App folds into
+  one passing row, and is not stored. Errors and failed turns carry a Codex
+  `codexErrorInfo` code from the CLI's terminal reason, error category and
+  HTTP status (`serverOverloaded` for a 529, `contextWindowExceeded`,
+  `rateLimitExceeded`, ...), never one the App answers with a ChatGPT account
+  flow. CLI notifications of high or immediate priority go out as `warning`
+  notifications, which the App opts out of, as it does with Codex.
+- Claude chats show their branch in the App sidebar. Threads carry Codex
+  `gitInfo` (commit, branch, and the `origin` remote without credentials),
+  looked up after `thread/start`, when a thread without it resumes and when a
+  turn ends, and stored, so `thread/list` and `thread/read` run no git.
+  `thread/metadata/update` patches it as Codex does, which the App uses after
+  creating a branch, and `getConversationSummary` returns it. Threads also
+  carry their `model` and `reasoningEffort`.
+- The context gauge moves while a turn runs, as it does for Codex: each API
+  call of the main loop sends `thread/tokenUsage/updated` as it streams, with
+  that call as `last` and on top of the settled total, once a result has
+  reported the context window for the thread or its model. The turn's result
+  still settles the total, so nothing is counted twice.
+- Notifications a client opts out of in `initialize`
+  (`capabilities.optOutNotificationMethods`) are no longer sent to it. The App
+  opts out of `turn/diff/updated`, so its threads also skip the whole-tree
+  `git diff` after every tool call. It also opts out of `warning`,
+  `thread/compacted`, `thread/closed`, `project/changed`,
+  `thread/project/updated` and `command/exec/outputDelta`, which it no longer
+  receives from the adapter, as from Codex.
+- Several clients can follow one thread, as with Codex's app-server: every
+  client that starts, resumes, forks or sends a turn to a thread gets its
+  notifications, instead of only the client that touched it last, and a
+  turn one client starts shows its `userMessage` item to the others.
+  Approvals, questions and elicitations go to every follower; the first
+  answer wins, `serverRequest/resolved` takes the card down everywhere, and
+  a later answer is ignored. A client that opens the thread while a request
+  waits, including one that closed and reopened the chat, gets the request
+  again, and the requests of a turn that ended are dropped.
+  `thread/unsubscribe` drops only the caller, which alone gets
+  `thread/closed`; `thread/delete` tells every follower. With one client
+  connected nothing changes on the wire.
+- `config/read` reports `web_search = "live"` instead of `"disabled"`, matching
+  the web search `modelProvider/capabilities/read` advertises;
+  `CLAUDE_CODEX_WEBSEARCH=0` turns both off.
+- Claude's file exploration folds into the App's "Explored" row, as Codex's
+  does. Read, Grep, Glob and LS calls are command items named after the tool
+  (`Read src/app.ts`) with Codex `read`, `search` and `listFiles` command
+  actions, and a Bash command that only reads, lists or searches files gets
+  its actions from a port of Codex's command parser, which unlike Codex's
+  never folds a command that can write files or start other programs, such
+  as `find -delete` or `| xargs rm`. The App keeps the first
+  30,000 characters of their output; Claude still gets all of it. A Read of
+  an image is an `imageView`, WebFetch a `webSearch` item opening the page,
+  and an MCP tool names its server, split by the turn's configured server
+  names. A Read, Grep, Glob or LS call Claude Code asks about asks on the
+  command card, and only a Bash command can be allowed for the session.
 
 ### Provider and multi-agent boundaries
 
@@ -335,6 +431,58 @@ versioning or publishing metadata.
   do not count, since a dev server or watcher can run for the rest of the chat.
   `CLAUDE_CODEX_QUIET_BACKGROUND_TURNS=0` marks every finished turn unread
   again.
+- The subagent watchdog (`CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS`, default 30
+  minutes, now documented) waits for inactivity instead of a fixed deadline:
+  a subagent's output and tool heartbeats, task progress and workflow agents
+  starting or finishing all start it over. It used to fail every workflow
+  that ran past 30 minutes, however busy, and interrupt the whole Claude
+  session, which ended every workflow agent and unrelated background agent
+  with it. When it does give up, the turn is stopped as an interrupt would
+  stop it, which keeps background work earlier turns left running; while
+  background agents the turn itself handed off still run, only its own stuck
+  agents and workflows stop and those agents keep going.
+- An interrupt while a session idles no longer leaves its earlier idle timer
+  running, which could close the session (and its background agents) on the
+  old deadline although they kept reporting progress.
+- A thread stays on the runtime backend that holds its conversation. Once
+  it has one, `turn/start`, `thread/settings/update` and
+  `thread/metadata/update` refuse a model of the other backend (a Codex
+  model in a Claude chat, or the reverse) with "cannot change runtime
+  backend …; start a new thread" before changing anything, and the App's
+  model menu shows "Couldn't update model settings". They used to hand a
+  `gpt-*` id to the Claude CLI or move the chat to Codex without its
+  history. A Codex thread keeps any model while the Codex proxy carries
+  every thread, a thread with no conversation yet still takes its model's
+  backend, and a structured (`outputSchema`) turn, such as the App's title
+  and summary turns, runs its model for that turn alone instead of
+  rewriting the thread's model. With `CLAUDE_CODEX_DISABLE_CODEX_PROXY=1`,
+  unless the Codex proxy carries every thread, `thread/start` and a first
+  turn refuse a Codex model outside the App's helper threads.
+- Opt-in model process profiles: `CLAUDE_CODEX_MODEL_PROFILES_FILE` (or the
+  same JSON inline in `CLAUDE_CODEX_MODEL_PROFILES`) lists the Claude models
+  of the picker, each running its turns in its own Claude Code process with
+  its own executable, a provider environment built from an allowlist of
+  inherited variables, a private env file and `${VAR}` references, and its
+  own `CLAUDE_CONFIG_DIR`, so transcripts never mix between providers. The
+  adapter's own provider settings and credentials never reach a profile
+  process. The profiles file must belong to the user and be neither a
+  symlink nor writable by group or others, an env file must also be mode
+  0600, and a secret-like key may only reference a variable. A chat with a
+  conversation stays on its profile: another profile is refused, and a chat
+  whose profile changed or is gone still opens but refuses turns, forks,
+  compaction, review and model changes with "… cannot continue; start a new
+  chat"; a queued message or goal reports that and does not run. Profiles
+  replace `CLAUDE_CODEX_MODELS` and `CLAUDE_CODEX_MODEL_ALIASES` and need
+  the native runtime. Without a profiles file nothing changes.
+- Resuming a Claude session copies its transcript only into the config dir
+  that turn's Claude Code runs from (a model profile's, else
+  `CLAUDE_CONFIG_DIR` or `~/.claude`, or with `CLAUDE_CODEX_CLI` the
+  router's dir for the model), from the newest copy found. It used to copy
+  the whole conversation into every config dir it knew of and never
+  refreshed a copy already there, so switching back to a model resumed a
+  stale copy without the turns taken on another. A copy that is identical,
+  newer or longer stays as it is; a new copy keeps the source's file mode
+  and is a clone where the file system supports it.
 
 ### Rust-first protocol groundwork
 

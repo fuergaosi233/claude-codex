@@ -7,10 +7,15 @@ Implemented as real remote/runtime behavior:
   `--ws-auth capability-token` (`--ws-token-file`, `--ws-token-sha256`) and,
   like `codex app-server`, refuses a non-loopback address without it unless
   `--ws-allow-unauthenticated` is passed; `signed-bearer-token` is not
-  implemented.
+  implemented. The one-shot `app-server --print-startup-config` and
+  `app-server daemon version` probes answer without opening the state database.
 - **Thread lifecycle** — start, resume, fork, list, read, turns list, name,
   archive/unarchive, unsubscribe, interrupt, delete, and rollback/revert that
   rewind Claude's session to the kept turns.
+- **Several clients per thread** — every connection that opens a thread follows
+  it: notifications reach all of them, approvals and questions go to each and
+  the first answer wins, and one that opens the thread while a request is
+  pending gets it replayed.
 - **History and search** — turn, item and timeline paging; thread search over
   names, previews and messages; find-in-conversation occurrences.
 - **Projects and attachments** — `project/*` and `thread/attachment/*`, kept in
@@ -20,13 +25,17 @@ Implemented as real remote/runtime behavior:
   allowed tools, add dirs, file checkpointing.
 - **Turn input** — user input, and the `toolOutput` of a thread handoff as a
   `functionCallOutput` item.
-- **Approval bridge** — `Bash` → command approval; `Edit` / `Write` /
-  `MultiEdit` → file-change approval with diffs; MCP elicitation → the App's
-  form or link prompt.
+- **Approval bridge** — `Bash`, and `Read` / `Grep` / `Glob` / `LS` →
+  command approval with Codex command actions; `Edit` / `Write` / `MultiEdit`
+  → file-change approval with diffs; MCP elicitation → the App's form or link
+  prompt.
 - **Streaming** — turn started/completed, thread status changes, agent text
   deltas, reasoning deltas, command output deltas, file patches (updated while
-  Claude is still writing the call), generic tool item completion, hook runs,
-  model reroutes, and aggregated git diff updates.
+  Claude is still writing the call), file exploration as commands with Codex
+  command actions, image views, web searches and page opens, MCP tool calls by
+  server and tool, hook runs, model reroutes, aggregated git diff updates, and
+  `error` notifications for API retries (`willRetry`) and failed turns, with
+  Codex error codes.
 - **Remote utilities** — file read/write/list/metadata/copy/remove/watch,
   command exec with stdin/terminate, process spawn/stdin/kill, fuzzy file
   search, direct MCP stdio/HTTP tool and resource calls.

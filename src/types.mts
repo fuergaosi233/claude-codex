@@ -64,6 +64,9 @@ export interface ThreadRecord {
   archived: boolean
   cwd: string
   model: string
+  // Fingerprint of the model process profile the thread started on (see
+  // model-profiles.mts); null for Codex threads and when no profiles exist.
+  modelProfileFingerprint?: string | null
   reasoningEffort: string | null
   modelProvider: string
   // Which backend actually drives this thread's turns. 'claude' = our native
@@ -122,6 +125,17 @@ export interface ThreadRecord {
   // alone, so a stale record saved after a turn cannot undo an assignment
   // made meanwhile. Assign through SessionStore.setThreadProject.
   projectId?: string | null
+  // Codex `GitInfo` of the thread's workspace: captured when the thread is
+  // created and refreshed when a turn ends. Read-only here like projectId;
+  // write through SessionStore.setThreadGitInfo.
+  gitInfo?: GitInfo | null
+}
+
+// Codex `GitInfo`. originUrl never carries credentials.
+export interface GitInfo {
+  sha: string | null
+  branch: string | null
+  originUrl: string | null
 }
 
 // Codex `Project`: a named group of threads with workspace roots. Times are
@@ -261,6 +275,15 @@ export interface RecalledMemory {
   content: string | null
 }
 
+// Codex v2 CommandAction: what a command does, as the App's "Explored" rows
+// and approval cards show it. A read path is absolute; listFiles and search
+// paths are short display paths.
+export type CommandAction =
+  | { type: 'read'; command: string; name: string; path: string }
+  | { type: 'listFiles'; command: string; path: string | null }
+  | { type: 'search'; command: string; query: string | null; path: string | null }
+  | { type: 'unknown'; command: string }
+
 export type ThreadItem =
   // clientId echoes turn/start's or turn/steer's clientUserMessageId so the
   // App can reconcile its optimistic copy of the message.
@@ -288,7 +311,7 @@ export type ThreadItem =
       processId: string | null
       source: string
       status: 'inProgress' | 'completed' | 'failed' | 'declined'
-      commandActions: unknown[]
+      commandActions: CommandAction[]
       aggregatedOutput: string | null
       exitCode: number | null
       durationMs: number | null
@@ -480,6 +503,10 @@ export interface RuntimeTurnContext {
   cwd: string
   runtimeType: RuntimeBackendType | null
   model: string | null
+  // Model process profile the turn runs in, and the fingerprint its current
+  // configuration must still match.
+  modelProfileId?: string | null
+  modelProfileFingerprint?: string | null
   effort: string | null
   claudeSessionId: string | null
   forkSession: boolean
@@ -553,6 +580,10 @@ export interface RuntimeTurnContext {
   // prompt, wait on and read separate chats. Off unless the adapter enables
   // them; backends without in-process tools ignore it.
   leaderTools?: LeaderToolHandlers | null
+  // Ask Claude to return its thinking as readable summaries (the CLI's
+  // --thinking-display). Unset keeps the CLI's default, which recent models
+  // answer with redacted thinking. Backends without the flag ignore it.
+  thinkingDisplay?: 'summarized' | null
 }
 
 // Each handler returns the text of the tool result; a thrown Error becomes an
@@ -674,6 +705,11 @@ export type RuntimeEvent =
   // One API call of the main loop, before the turn's result settles its
   // usage. A message can be reported again with a larger count.
   | { type: 'usage_progress'; messageId: string; usage: Record<string, unknown> }
+  // A subagent or workflow the turn waits on is still working: its own
+  // output, a task progress frame or a tool_progress heartbeat, which a
+  // backend that filters nested events would otherwise keep to itself.
+  // `toolUseId` is the call that started it.
+  | { type: 'subagent_progress'; toolUseId: string }
   | {
       type: 'metrics'
       durationMs: number | null
@@ -701,8 +737,37 @@ export type RuntimeEvent =
     }
   // Claude's auto-memory recalled these memories for the prompt.
   | { type: 'memory_recall'; memories: RecalledMemory[] }
-  | { type: 'completed'; claudeSessionId?: string | null; result?: string | null; success: boolean }
+  // A model request of the main loop failed and Claude will send it again
+  // after `delayMs`. `status` is the API's HTTP status (null when nothing
+  // answered) and `category` the SDK's error category ('overloaded', ...).
+  | {
+      type: 'retrying'
+      attempt: number
+      maxRetries: number
+      status: number | null
+      category: string | null
+      delayMs: number | null
+    }
+  | {
+      type: 'completed'
+      claudeSessionId?: string | null
+      result?: string | null
+      success: boolean
+      // Why a failed turn failed, when the backend can tell.
+      failure?: RuntimeFailure | null
+    }
   | { type: 'error'; message: string }
+
+// Why a Claude turn failed, in Claude's terms. The server maps it onto the
+// error codes the Codex App knows.
+export interface RuntimeFailure {
+  // The result's terminal_reason ('prompt_too_long', 'max_turns', ...).
+  terminalReason: string | null
+  // The SDK's API error category of the last response ('overloaded', ...).
+  category: string | null
+  // The HTTP status of the API error that ended the turn.
+  status: number | null
+}
 
 // Codex's request_user_input primitive — surfaces Claude's AskUserQuestion as a
 // native choice card in the App instead of a generic mcpToolCall blob. Matches
@@ -897,6 +962,13 @@ export interface ClaudeRuntime {
     options?: RuntimeSteerOptions,
   ): Promise<boolean | undefined>
   interrupt(threadId: string): Promise<void>
+  // Let go of a turn the server gave up on (its subagents stopped reporting
+  // progress) without ending the background agents it handed off, which an
+  // interrupt would stop too: the turn's own stuck agents and workflows stop,
+  // and the rest of the session keeps running. Resolves false, without
+  // waiting on the session, when none of those agents still run; an
+  // interrupt then ends no more than the user's stop would.
+  abandonTurn?(threadId: string, turnId: string): Promise<boolean>
   stop(): Promise<void>
   // Switch the running turn's model or effort until it ends; the next turn
   // runs on its own settings again. Resolves false when the thread is not

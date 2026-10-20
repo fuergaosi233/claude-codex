@@ -444,6 +444,161 @@ test('Claude compacting the conversation becomes compaction events; a subagent c
   }
 })
 
+test('native API retries of the main loop become retrying events, and urgent CLI notifications warnings', async () => {
+  const notification = (key: string, fields: Record<string, unknown>) =>
+    system('notification', { key, text: `${key} text`, priority: 'high', ...fields })
+  const events = await collect([
+    system('api_retry', {
+      attempt: 1,
+      max_retries: 10,
+      retry_delay_ms: 600,
+      error_status: 529,
+      error: 'overloaded',
+    }),
+    // A subagent's retries are its own.
+    system('api_retry', {
+      attempt: 1,
+      max_retries: 10,
+      retry_delay_ms: 600,
+      error_status: 500,
+      error: 'server_error',
+      parent_tool_use_id: 'agent',
+    }),
+    system('api_retry', {
+      attempt: 2,
+      max_retries: 10,
+      retry_delay_ms: 1200,
+      error_status: null,
+      error: 'unknown',
+    }),
+    notification('compact-failed', { color: 'error' }),
+    notification('compact-failed', { color: 'error' }),
+    notification('model-denied', { priority: 'immediate' }),
+    notification('tip', { priority: 'low' }),
+    notification('status', { priority: 'medium' }),
+    notification('blank', { text: '' }),
+  ])
+  assert.deepEqual(events, [
+    {
+      type: 'retrying',
+      attempt: 1,
+      maxRetries: 10,
+      status: 529,
+      category: 'overloaded',
+      delayMs: 600,
+    },
+    {
+      type: 'retrying',
+      attempt: 2,
+      maxRetries: 10,
+      status: null,
+      category: 'unknown',
+      delayMs: 1200,
+    },
+    { type: 'notice', level: 'error', message: 'compact-failed text' },
+    { type: 'notice', level: 'warning', message: 'model-denied text' },
+  ])
+})
+
+async function completedEvent(messages: Record<string, unknown>[]) {
+  const runtime = new NativeClaudeRuntime()
+  Reflect.set(runtime, 'sdk', {
+    query: async function* () {
+      yield* messages
+    },
+  })
+  const events: RuntimeEvent[] = []
+  const outcome = await runtime
+    .runTurn(context, {
+      onEvent: async (event) => {
+        events.push(event)
+      },
+      onPermissionRequest: async () => ({ decision: 'accept' }),
+    })
+    .then(
+      () => 'resolved',
+      (error: Error) => error.message,
+    )
+  return { outcome, completed: events.find((event) => event.type === 'completed') }
+}
+
+test('a failed native turn says why it failed, and a successful one carries no failure', async () => {
+  const overloaded = await completedEvent([
+    system('api_retry', {
+      attempt: 10,
+      max_retries: 10,
+      retry_delay_ms: 30_000,
+      error_status: 529,
+      error: 'overloaded',
+    }),
+    {
+      type: 'assistant',
+      message: { id: 'failed', content: [text('API Error')] },
+      error: 'overloaded',
+    },
+    {
+      type: 'result',
+      subtype: 'success',
+      is_error: true,
+      result: 'API Error: 529 Overloaded',
+      terminal_reason: 'api_error',
+      api_error_status: 529,
+    },
+  ])
+  assert.equal(overloaded.outcome, 'API Error: 529 Overloaded')
+  assert.deepEqual(overloaded.completed, {
+    type: 'completed',
+    success: false,
+    result: 'API Error: 529 Overloaded',
+    claudeSessionId: null,
+    failure: { terminalReason: 'api_error', category: 'overloaded', status: 529 },
+  })
+
+  // A retry the next response answered says nothing about a later failure.
+  const tooLong = await completedEvent([
+    system('api_retry', {
+      attempt: 1,
+      max_retries: 10,
+      retry_delay_ms: 600,
+      error_status: 529,
+      error: 'overloaded',
+    }),
+    assistant('answered', [text('Working on it.')]),
+    {
+      type: 'result',
+      subtype: 'error_during_execution',
+      is_error: true,
+      result: 'Prompt is too long',
+      terminal_reason: 'prompt_too_long',
+    },
+  ])
+  assert.deepEqual(tooLong.completed, {
+    type: 'completed',
+    success: false,
+    result: 'Prompt is too long',
+    claudeSessionId: null,
+    failure: { terminalReason: 'prompt_too_long', category: null, status: null },
+  })
+
+  const succeeded = await completedEvent([
+    system('api_retry', {
+      attempt: 1,
+      max_retries: 10,
+      retry_delay_ms: 600,
+      error_status: 529,
+      error: 'overloaded',
+    }),
+    { type: 'result', subtype: 'success', result: 'done' },
+  ])
+  assert.equal(succeeded.outcome, 'resolved')
+  assert.deepEqual(succeeded.completed, {
+    type: 'completed',
+    success: true,
+    result: 'done',
+    claudeSessionId: null,
+  })
+})
+
 test('native MCP elicitations reach the turn handler, and are declined without one', async () => {
   const elicit = async (handled: boolean) => {
     const runtime = new NativeClaudeRuntime()

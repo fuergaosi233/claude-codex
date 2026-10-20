@@ -4,11 +4,12 @@ import {
   type ChildProcessWithoutNullStreams,
   execFileSync,
   spawn,
+  spawnSync,
 } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import { existsSync } from 'node:fs'
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import http from 'node:http'
 import net from 'node:net'
 import { tmpdir } from 'node:os'
@@ -1680,7 +1681,7 @@ test('with Codex routing off, the App titles a chat on the Claude summary model'
     assert.equal(fork.error, undefined)
     assert.equal(fork.result.model, 'sonnet')
 
-    // A chat of the user's own on a Codex model keeps it.
+    // A chat of the user's own on a Codex model has nowhere to run.
     proc.stdin.write(
       json({
         id: 6,
@@ -1688,9 +1689,31 @@ test('with Codex routing off, the App titles a chat on the Claude summary model'
         params: { cwd: process.cwd(), model: 'gpt-5.6-luna' },
       }),
     )
-    const own = await reader.nextResponse(6)
-    assert.equal(own.error, undefined)
-    assert.equal(own.result.model, 'gpt-5.6-luna')
+    const refused = await reader.nextResponse(6)
+    assert.equal(refused.result, undefined)
+    assert.match(
+      refused.error?.message ?? '',
+      /Codex model routing is disabled, so gpt-5\.6-luna cannot run here; pick a Claude model/,
+    )
+
+    // Nor does a first message that names one in a chat started on Claude.
+    proc.stdin.write(
+      json({
+        id: 7,
+        method: 'turn/start',
+        params: {
+          threadId: chat.result.thread.id,
+          model: 'gpt-5.6-luna',
+          input: [{ type: 'text', text: 'hi', text_elements: [] }],
+        },
+      }),
+    )
+    const firstTurn = await reader.nextResponse(7)
+    assert.equal(firstTurn.result, undefined)
+    assert.match(
+      firstTurn.error?.message ?? '',
+      /Codex model routing is disabled, so gpt-5\.6-luna cannot run here; pick a Claude model/,
+    )
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -1706,6 +1729,139 @@ test('with Codex routing on, the App title thread keeps its Codex model', async 
     const start = await reader.nextResponse(1)
     assert.equal(start.error, undefined)
     assert.equal(start.result.model, 'gpt-5.6-luna')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('a thread keeps the runtime backend of its conversation', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  // The picker lists gpt-5.5, as it lists the Codex models with routing on.
+  const proc = spawnMockAdapter(home, {
+    ...titleAdapterEnv,
+    CLAUDE_CODEX_DISABLE_CODEX_PROXY: '',
+    CLAUDE_CODEX_MODELS: 'sonnet,opus,haiku,gpt-5.5',
+  })
+  const reader = new JsonLineReader(proc)
+  let nextId = 1
+  const request = async (method: string, params: Record<string, unknown>) => {
+    const id = nextId++
+    proc.stdin.write(json({ id, method, params }))
+    return reader.nextResponse(id)
+  }
+  const waitForTurnCompleted = async () => {
+    let text = ''
+    for (;;) {
+      const message = await reader.next()
+      if (message.method === 'item/agentMessage/delta') text += message.params.delta
+      if (message.method === 'turn/completed') return { text, turn: message.params.turn }
+    }
+  }
+  const input = [{ type: 'text', text: 'output schema check', text_elements: [] }]
+  const resumed = async (threadId: string) => (await request('thread/resume', { threadId })).result
+  const threadModel = async (threadId: string) => (await resumed(threadId)).model
+  const crossing =
+    /cannot change runtime backend from claude to codex for gpt-5\.5; start a new thread/
+  try {
+    const chat = await request('thread/start', { cwd: process.cwd(), model: 'sonnet' })
+    assert.equal(chat.error, undefined)
+    const threadId = chat.result.thread.id
+    assert.equal((await request('turn/start', { threadId, input })).error, undefined)
+    await waitForTurnCompleted()
+
+    // A Codex model would move the Claude conversation to Codex: refused, by
+    // a turn, by the model menu and by a metadata update, and the thread keeps
+    // its model and everything else the refused request carried.
+    const crossed = await request('turn/start', { threadId, model: 'gpt-5.5', input })
+    assert.equal(crossed.result, undefined)
+    assert.match(crossed.error?.message ?? '', crossing)
+    assert.equal(await threadModel(threadId), 'sonnet')
+    const menu = await request('thread/settings/update', {
+      threadId,
+      model: 'gpt-5.5',
+      effort: 'low',
+    })
+    assert.equal(menu.result, undefined)
+    assert.match(menu.error?.message ?? '', crossing)
+    const metadata = await request('thread/metadata/update', {
+      threadId,
+      model: 'gpt-5.5',
+      isPinned: true,
+    })
+    assert.equal(metadata.result, undefined)
+    assert.match(metadata.error?.message ?? '', crossing)
+    const kept = await resumed(threadId)
+    assert.equal(kept.model, 'sonnet')
+    assert.notEqual(kept.reasoningEffort, 'low')
+    assert.equal(kept.thread.isPinned, false)
+
+    // Another Claude model is fine and becomes the thread's model.
+    const opus = await request('turn/start', { threadId, model: 'opus', input })
+    assert.equal(opus.error, undefined)
+    assert.equal(JSON.parse((await waitForTurnCompleted()).text).model, 'opus')
+    assert.equal(await threadModel(threadId), 'opus')
+
+    // A structured summary turn names the App's Codex model: it runs on the
+    // summary model for that turn alone.
+    const summary = await request('turn/start', {
+      threadId,
+      model: 'gpt-5.4-mini',
+      outputSchema: {
+        type: 'object',
+        properties: { title: { type: 'string' } },
+        required: ['title'],
+        additionalProperties: false,
+      },
+      input,
+    })
+    assert.equal(summary.error, undefined)
+    const summaryTurn = await waitForTurnCompleted()
+    assert.equal(summaryTurn.turn.status, 'completed')
+    assert.equal(JSON.parse(summaryTurn.text).model, 'haiku')
+    assert.equal(await threadModel(threadId), 'opus')
+
+    // The App starts a new chat's thread before anything is sent, and sends
+    // the first message on whatever model was picked meanwhile: until there
+    // is a conversation, the model picks the backend.
+    const fresh = await request('thread/start', { cwd: process.cwd(), model: 'sonnet' })
+    const freshId = fresh.result.thread.id
+    const first = await request('turn/start', { threadId: freshId, model: 'gpt-5.5', input })
+    assert.equal(first.error, undefined)
+    await waitForTurnCompleted()
+    assert.equal(await threadModel(freshId), 'gpt-5.5')
+    // Its conversation is on Codex now, and does not move to Claude either.
+    const back = await request('turn/start', { threadId: freshId, model: 'sonnet', input })
+    assert.equal(back.result, undefined)
+    assert.match(
+      back.error?.message ?? '',
+      /cannot change runtime backend from codex to claude for sonnet; start a new thread/,
+    )
+    assert.equal(await threadModel(freshId), 'gpt-5.5')
+
+    // The same goes for a model picked through the settings of a chat with
+    // nothing sent yet.
+    const unsent = await request('thread/start', { cwd: process.cwd(), model: 'sonnet' })
+    const unsentId = unsent.result.thread.id
+    const picked = await request('thread/settings/update', { threadId: unsentId, model: 'gpt-5.5' })
+    assert.equal(picked.error, undefined)
+    assert.equal(await threadModel(unsentId), 'gpt-5.5')
+
+    // The App sends the chat's current model along with other settings; that
+    // is no change, even for a model the picker does not list.
+    const unlisted = await request('thread/start', { cwd: process.cwd(), model: 'gpt-5.4' })
+    const unlistedId = unlisted.result.thread.id
+    assert.equal((await request('turn/start', { threadId: unlistedId, input })).error, undefined)
+    await waitForTurnCompleted()
+    const effort = await request('thread/settings/update', {
+      threadId: unlistedId,
+      model: 'gpt-5.4',
+      effort: 'low',
+    })
+    assert.equal(effort.error, undefined)
+    const unlistedThread = await resumed(unlistedId)
+    assert.equal(unlistedThread.model, 'gpt-5.4')
+    assert.equal(unlistedThread.reasoningEffort, 'low')
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -2251,6 +2407,55 @@ test('stdio app-server recovers stale in-progress turns after process restart', 
   }
 })
 
+test('a second stdio app-server on the same CODEX_HOME leaves a running turn of the first alone', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const first = spawnMockAdapter(home)
+  let second: ChildProcessWithoutNullStreams | null = null
+  try {
+    const reader1 = new JsonLineReader(first)
+    const threadId = await startMockThread(reader1, first)
+    first.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: textInput('hold this turn until released') },
+      }),
+    )
+    const turnId = (await reader1.nextResponse(2)).result.turn.id
+
+    // A probe or another window starts a server on the same state dir while
+    // the first one is mid-turn.
+    second = spawnMockAdapter(home)
+    const reader2 = new JsonLineReader(second)
+    second.stdin.write(
+      json({ id: 3, method: 'thread/read', params: { threadId, includeTurns: true } }),
+    )
+    const read = await reader2.nextResponse(3)
+    assert.equal(
+      read.result.thread.turns.find((turn: any) => turn.id === turnId)?.status,
+      'inProgress',
+    )
+    await stopProcess(second)
+
+    first.stdin.write(
+      json({
+        id: 4,
+        method: 'turn/steer',
+        params: { threadId, expectedTurnId: turnId, input: textInput('release') },
+      }),
+    )
+    const completed = await awaitMessage(
+      reader1,
+      (message) => message.method === 'turn/completed' && message.params.turn.id === turnId,
+    )
+    assert.equal(completed.params.turn.status, 'completed')
+  } finally {
+    await stopProcess(first)
+    if (second) await stopProcess(second)
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('the adapter warns once as it starts that bridged hooks need a CLI without settings', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const env: NodeJS.ProcessEnv = {
@@ -2785,6 +2990,134 @@ test('startup recovery keeps markers of finished agents and ends the ones it cut
   }
 })
 
+test('startup recovery fails only the turns of servers that are gone', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const path = join(home, 'state.sqlite')
+  const store = new SessionStore(path)
+  const now = Math.floor(Date.now() / 1000)
+  // live: another server still runs it. reused: its server's pid now names a
+  // process that started later. legacy: written before turns named a server.
+  const threads = { live: randomUUID(), reused: randomUUID(), legacy: randomUUID() }
+  const turns = { live: randomUUID(), reused: randomUUID(), legacy: randomUUID() }
+  let server: ChildProcessWithoutNullStreams | null = null
+  try {
+    for (const threadId of Object.values(threads)) {
+      store.upsertThread({
+        id: threadId,
+        sessionId: threadId,
+        forkedFromId: null,
+        preview: 'owner recovery',
+        name: null,
+        archived: false,
+        cwd: process.cwd(),
+        model: 'sonnet',
+        reasoningEffort: null,
+        modelProvider: 'claude-code',
+        claudeSessionId: null,
+        source: 'appServer',
+        createdAt: now,
+        updatedAt: now,
+        status: { type: 'active', activeFlags: [] },
+        approvalPolicy: 'on-request',
+        sandboxMode: 'workspace-write',
+        ephemeral: false,
+        threadSource: 'user',
+        agentRole: null,
+        agentNickname: null,
+        baseInstructions: null,
+        developerInstructions: null,
+        personality: null,
+        runtimeBackend: 'claude',
+        codexSessionId: null,
+      })
+    }
+    // The other server writes its turns, then keeps running.
+    const pairs = (['live', 'reused', 'legacy'] as const).map((key) => [threads[key], turns[key]])
+    server = spawn(
+      process.execPath,
+      [
+        '--no-warnings',
+        '--input-type=module',
+        '-e',
+        `
+      import { SessionStore } from './dist/src/store.mjs'
+
+      const store = new SessionStore(${JSON.stringify(path)})
+      for (const [threadId, id] of ${JSON.stringify(pairs)}) {
+        store.upsertTurn({
+          id,
+          threadId,
+          status: 'inProgress',
+          startedAt: ${now},
+          completedAt: null,
+          durationMs: null,
+          items: [],
+          diff: '',
+          error: null,
+        })
+      }
+      process.stdout.write('ready\\n')
+      setInterval(() => {}, 60_000)
+      `,
+      ],
+      { stdio: ['pipe', 'pipe', 'pipe'] },
+    )
+    let stderr = ''
+    server.stderr.setEncoding('utf8')
+    server.stderr.on('data', (chunk: string) => {
+      stderr += chunk
+    })
+    await Promise.race([
+      once(server.stdout, 'data'),
+      once(server, 'exit').then(() => {
+        throw new Error(`the other server exited early: ${stderr}`)
+      }),
+    ])
+
+    const db = new DatabaseSync(path)
+    try {
+      const owner = db
+        .prepare('SELECT owner_pid, owner_started FROM turns WHERE id = ?')
+        .get(turns.live) as { owner_pid: number; owner_started: string }
+      assert.equal(owner.owner_pid, server.pid)
+      assert.ok(owner.owner_started)
+      db.prepare('UPDATE turns SET owner_started = ? WHERE id = ?').run(
+        'Thu Jan  1 00:00:00 1970',
+        turns.reused,
+      )
+      db.prepare('UPDATE turns SET owner_pid = NULL, owner_started = NULL WHERE id = ?').run(
+        turns.legacy,
+      )
+    } finally {
+      db.close()
+    }
+
+    const second = new SessionStore(path)
+    try {
+      assert.equal(second.recoverStaleInProgressTurns(), 2)
+      assert.equal(second.getTurn(turns.live)?.status, 'inProgress')
+      assert.equal(second.getThread(threads.live)?.status.type, 'active')
+      for (const key of ['reused', 'legacy'] as const) {
+        assert.equal(second.getTurn(turns[key])?.status, 'interrupted')
+        assert.equal(second.getThread(threads[key])?.status.type, 'idle')
+      }
+
+      server.kill('SIGKILL')
+      await waitForExit(server, 2000)
+      assert.equal(server.signalCode, 'SIGKILL')
+      assert.equal(second.recoverStaleInProgressTurns(), 1)
+      assert.equal(second.getTurn(turns.live)?.status, 'interrupted')
+      assert.equal(second.getThread(threads.live)?.status.type, 'idle')
+    } finally {
+      second.close()
+    }
+  } finally {
+    if (server) await stopProcess(server)
+    store.close()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('app-server proxy forwards websocket handshake bytes to unix daemon', {
   timeout: 15_000,
 }, async () => {
@@ -2820,6 +3153,55 @@ test('app-server proxy forwards websocket handshake bytes to unix daemon', {
     proxy.stdin?.end()
     await Promise.all([stopProcess(proxy), stopProcess(daemon)])
     await rm(sock, { force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('the daemon and the proxy meet at CLAUDE_CODEX_SOCKET_PATH without a path argument', {
+  timeout: 15_000,
+}, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const sock = join(tmpdir(), `ccx-test-${randomUUID().slice(0, 8)}.sock`)
+  // Started as the App starts them: `--listen unix://` and `proxy`, no path.
+  const env = {
+    ...process.env,
+    CODEX_HOME: home,
+    CLAUDE_CODEX_SOCKET_PATH: sock,
+    CLAUDE_CODEX_MOCK: '1',
+    NODE_NO_WARNINGS: '1',
+  }
+  const daemon = spawn(process.execPath, [adapter, 'app-server', '--listen', 'unix://'], {
+    stdio: ['ignore', 'ignore', 'pipe'],
+    env,
+  })
+  let proxy: ChildProcess | null = null
+  try {
+    await waitForStderr(daemon, /listening on/)
+    assert.equal(existsSync(sock), true)
+    assert.equal(existsSync(join(home, 'app-server-control')), false)
+    proxy = spawn(process.execPath, [adapter, 'app-server', 'proxy'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env,
+    })
+    const stdout = new TextCollector(proxy)
+    proxy.stdin?.write(
+      [
+        'GET / HTTP/1.1',
+        'Host: localhost',
+        'Upgrade: websocket',
+        'Connection: Upgrade',
+        'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==',
+        'Sec-WebSocket-Version: 13',
+        '',
+        '',
+      ].join('\r\n'),
+    )
+    await stdout.waitFor(/101 Switching Protocols/)
+  } finally {
+    proxy?.stdin?.end()
+    await Promise.all([proxy ? stopProcess(proxy) : null, stopProcess(daemon)])
+    await rm(sock, { force: true })
+    await rm(`${sock}.pid`, { force: true })
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
@@ -2929,6 +3311,213 @@ test('remote shim launches daemon and proxy with Codex-compatible commands', {
     proxy.stdin?.end()
     await Promise.all([stopProcess(proxy), stopProcess(daemon)])
     await rm(sock, { force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('app-server --print-startup-config prints one JSON line without opening the state database', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    HOME: home,
+    CLAUDE_CODEX_COMPAT_VERSION: '0.164.0-alpha.6',
+    NODE_NO_WARNINGS: '1',
+  }
+  delete env.CODEX_HOME
+  delete env.CLAUDE_CODEX_HOME
+  const run = (...args: string[]) =>
+    spawnSync(process.execPath, [adapter, 'app-server', ...args], {
+      env,
+      encoding: 'utf8',
+      timeout: 15_000,
+    })
+  let proc: ChildProcessWithoutNullStreams | null = null
+  try {
+    const clientInfo = JSON.stringify({ name: 'codex_desktop', title: null, version: '26.1013.0' })
+    for (const args of [
+      ['--print-startup-config'],
+      ['--print-startup-config', '--startup-sign-out', '--startup-client-info', clientInfo],
+      [`--startup-client-info=${clientInfo}`, '--print-startup-config'],
+    ]) {
+      const result = run(...args)
+      assert.equal(result.status, 0, result.stderr)
+      assert.equal(result.stderr, '')
+      assert.match(result.stdout, /^[^\n]+\n$/)
+      assert.deepEqual(JSON.parse(result.stdout), {
+        appServerVersion: '0.164.0-alpha.6',
+        configRequirements: { requirements: null },
+      })
+    }
+    // Usage errors, as codex reports them: stderr only.
+    for (const [args, status] of [
+      [['--print-startup-config', '--listen', 'stdio://'], 2],
+      [['--startup-sign-out'], 2],
+      [['--print-startup-config', '--startup-client-info', '{"name":"codex_desktop"}'], 2],
+      [['--print-startup-config', 'daemon', 'version'], 1],
+    ] as const) {
+      const result = run(...args)
+      assert.equal(result.status, status, args.join(' '))
+      assert.equal(result.stdout, '')
+      assert.match(result.stderr, /^error: /)
+    }
+    // Nothing under HOME: no Codex home, state database or debug log.
+    assert.deepEqual(await readdir(home), [])
+
+    // configRequirements/read on a running server answers the same.
+    proc = spawnMockAdapter(join(home, 'server'))
+    const reader = new JsonLineReader(proc)
+    proc.stdin.write(json({ id: 1, method: 'configRequirements/read', params: {} }))
+    assert.deepEqual((await reader.nextResponse(1)).result, { requirements: null })
+  } finally {
+    if (proc) await stopProcess(proc)
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('app-server daemon version reports the unix daemon on the control socket, and fails without one', {
+  timeout: 30_000,
+}, async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'ccx-'))
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    CODEX_HOME: home,
+    CLAUDE_CODEX_MOCK: '1',
+    CLAUDE_CODEX_COMPAT_VERSION: '0.163.0',
+    NODE_NO_WARNINGS: '1',
+  }
+  delete env.CLAUDE_CODEX_HOME
+  const run = (...args: string[]) =>
+    spawnSync(process.execPath, [adapter, 'app-server', 'daemon', ...args], {
+      env,
+      encoding: 'utf8',
+      timeout: 15_000,
+    })
+  let daemon: ChildProcess | null = null
+  try {
+    // No daemon: fail at once, as codex does, so the App starts its own
+    // server, and leave the state dir alone.
+    const missing = run('version')
+    assert.equal(missing.status, 1)
+    assert.equal(missing.stdout, '')
+    assert.match(missing.stderr, /no app-server daemon is running/)
+    const unsupported = run('start')
+    assert.equal(unsupported.status, 1)
+    assert.equal(unsupported.stdout, '')
+    assert.deepEqual(await readdir(home), [])
+
+    const socketPath = join(home, 'app-server-control', 'app-server-control.sock')
+    // The daemon moves its socket elsewhere when this path is too long for
+    // one, as under a deep temp dir; the App would not find it there either.
+    if (socketPath.length > 100) {
+      t.skip('the temp dir is too deep for a unix socket at the control path')
+      return
+    }
+    daemon = spawn(process.execPath, [adapter, 'app-server', '--listen', 'unix://'], {
+      stdio: ['ignore', 'ignore', 'pipe'],
+      env,
+    })
+    await waitForStderr(daemon, /listening on/)
+    const running = run('version')
+    assert.equal(running.status, 0, running.stderr)
+    assert.match(running.stdout, /^[^\n]+\n$/)
+    assert.deepEqual(JSON.parse(running.stdout), {
+      status: 'running',
+      socketPath,
+      appServerVersion: '0.163.0',
+    })
+    // The shim leaves a socket that exists to the adapter to check.
+    const shimmed = spawnSync(shim, ['app-server', 'daemon', 'version'], {
+      env: {
+        ...env,
+        CLAUDE_CODEX_RUNTIME_ENV: join(home, 'runtime.env'),
+        CLAUDE_CODEX_ADAPTER: adapter,
+      },
+      encoding: 'utf8',
+      timeout: 15_000,
+    })
+    assert.equal(shimmed.status, 0, shimmed.stderr)
+    assert.equal(shimmed.stdout, running.stdout)
+    assert.equal(daemon.exitCode, null)
+  } finally {
+    if (daemon) await stopProcess(daemon)
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('the shim answers one-shot probes without node, and leaves them to a native codex', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'ccx-'))
+  const realCodex = join(home, 'real-codex')
+  await writeFile(realCodex, '#!/bin/sh\nprintf "real codex: %s\\n" "$*"\n')
+  await chmod(realCodex, 0o755)
+  const base: NodeJS.ProcessEnv = {
+    ...process.env,
+    CODEX_HOME: join(home, 'codex'),
+    // The shim sources a runtime env; keep the developer's own out of it.
+    CLAUDE_CODEX_RUNTIME_ENV: join(home, 'runtime.env'),
+    // No adapter: what the shim answers, it answers without starting node.
+    CLAUDE_CODEX_ADAPTER: join(home, 'missing-adapter.mjs'),
+    CLAUDE_CODEX_COMPAT_VERSION: '0.164.0-alpha.6',
+    NODE_NO_WARNINGS: '1',
+  }
+  for (const key of ['CLAUDE_CODEX_ROUTE', 'CLAUDE_CODEX_RUNTIME_TYPE', 'CODEX_REAL'])
+    delete base[key]
+  const run = (args: string[], env: NodeJS.ProcessEnv = {}) =>
+    spawnSync(shim, ['app-server', ...args], {
+      env: { ...base, ...env },
+      encoding: 'utf8',
+      timeout: 15_000,
+    })
+  const line = '{"appServerVersion":"0.164.0-alpha.6","configRequirements":{"requirements":null}}\n'
+  try {
+    for (const args of [
+      ['--print-startup-config'],
+      ['--startup-sign-out', '--print-startup-config'],
+    ]) {
+      const result = run(args)
+      assert.equal(result.status, 0, result.stderr)
+      assert.equal(result.stdout, line)
+      assert.equal(result.stderr, '')
+    }
+    const missing = run(['daemon', 'version'])
+    assert.equal(missing.status, 1)
+    assert.equal(missing.stdout, '')
+    assert.equal(
+      missing.stderr,
+      `Error: no app-server daemon is running at ${join(home, 'codex', 'app-server-control', 'app-server-control.sock')}\n`,
+    )
+    assert.equal(existsSync(join(home, 'codex')), false)
+
+    // The adapter answers what the shim does not settle.
+    const clientInfo = JSON.stringify({ name: 'codex_desktop', version: '26.1013.0' })
+    const withAdapter = { CLAUDE_CODEX_ADAPTER: adapter }
+    const described = run(
+      ['--print-startup-config', '--startup-client-info', clientInfo],
+      withAdapter,
+    )
+    assert.equal(described.status, 0, described.stderr)
+    assert.equal(described.stdout, line)
+    const quoted = run(['--print-startup-config'], {
+      ...withAdapter,
+      CLAUDE_CODEX_COMPAT_VERSION: '0.164.0 "x"',
+    })
+    assert.equal(quoted.status, 0, quoted.stderr)
+    assert.equal(JSON.parse(quoted.stdout).appServerVersion, '0.164.0 "x"')
+    const conflict = run(['--print-startup-config', '--listen', 'stdio://'], withAdapter)
+    assert.equal(conflict.status, 2)
+    assert.equal(conflict.stdout, '')
+    assert.equal(existsSync(join(home, 'codex')), false)
+
+    // A native codex gets them unchanged.
+    const native = { CLAUDE_CODEX_ROUTE: 'codex', CODEX_REAL: realCodex }
+    for (const args of [
+      ['--print-startup-config', '--startup-sign-out'],
+      ['daemon', 'version'],
+    ]) {
+      const result = run(args, native)
+      assert.equal(result.status, 0, result.stderr)
+      assert.equal(result.stdout, `real codex: app-server ${args.join(' ')}\n`)
+    }
+  } finally {
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
@@ -3180,7 +3769,8 @@ test('review/start and thread/compact/start emit real turn items', async () => {
       reviewTurn.items.map((item: any) => item.type),
       ['userMessage', 'enteredReviewMode', 'reasoning', 'agentMessage', 'exitedReviewMode'],
     )
-    assert.equal(reviewTurn.items.at(-1).review, 'done')
+    // Reviews show Claude's thinking like any other turn.
+    assert.equal(reviewTurn.items.at(-1).review, 'done thinkingDisplay=summarized')
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -3281,48 +3871,226 @@ test('a review cut off by an interrupt or by the adapter stopping still exits re
   }
 })
 
-test('Claude thinking maps to Codex reasoning content without a duplicate summary', async () => {
+// Runs the mock thinking turn and returns what it sent about reasoning.
+async function runThinkingTurn(
+  reader: JsonLineReader,
+  proc: ChildProcessWithoutNullStreams,
+  threadId: string,
+  id: number,
+): Promise<{ reasoning: any[]; completed: any; text: string }> {
+  proc.stdin.write(
+    json({ id, method: 'turn/start', params: { threadId, input: textInput('thinking check') } }),
+  )
+  const seen = await readUntil(reader, (message) => message.method === 'turn/completed')
+  const reasoning = seen.filter(
+    (message) =>
+      message.method?.startsWith('item/reasoning/') ||
+      (message.method?.startsWith('item/') && message.params?.item?.type === 'reasoning'),
+  )
+  const completed = seen.find(
+    (message) => message.method === 'item/completed' && message.params.item.type === 'reasoning',
+  )?.params.item
+  const text = seen
+    .filter((message) => message.method === 'item/agentMessage/delta')
+    .map((message) => message.params.delta)
+    .join('')
+  return { reasoning, completed, text }
+}
+
+async function readReasoningItems(
+  reader: JsonLineReader,
+  proc: ChildProcessWithoutNullStreams,
+  threadId: string,
+  id: number,
+): Promise<any[]> {
+  proc.stdin.write(json({ id, method: 'thread/read', params: { threadId, includeTurns: true } }))
+  const read = await reader.nextResponse(id)
+  return read.result.thread.turns
+    .flatMap((turn: any) => turn.items)
+    .filter((item: any) => item.type === 'reasoning')
+}
+
+test('Claude thinking streams as the Codex reasoning summary', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
-  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
-    stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
-  })
+  const proc = spawnMockAdapter(home)
   const reader = new JsonLineReader(proc)
   try {
-    proc.stdin.write(
-      json({
-        id: 1,
-        method: 'thread/start',
-        params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false },
-      }),
+    const threadId = await startMockThread(reader, proc)
+    const { reasoning, completed, text } = await runThinkingTurn(reader, proc, threadId, 2)
+
+    // The CLI is asked for readable thinking, which the App shows only as a
+    // summary: the part opens first, then the text streams into it.
+    assert.equal(text, 'done thinkingDisplay=summarized')
+    assert.deepEqual(
+      reasoning.map((message) => message.method),
+      [
+        'item/started',
+        'item/reasoning/summaryPartAdded',
+        'item/reasoning/summaryTextDelta',
+        'item/completed',
+      ],
     )
-    const start = await reader.nextResponse(1)
-    const threadId = start.result.thread.id
+    assert.deepEqual(reasoning[0].params.item.summary, [''])
+    assert.deepEqual(reasoning[0].params.item.content, [])
+    assert.equal(reasoning[1].params.summaryIndex, 0)
+    assert.equal(reasoning[1].params.itemId, completed.id)
+    assert.equal(reasoning[2].params.summaryIndex, 0)
+    assert.equal(reasoning[2].params.delta, 'mock thinking')
+    assert.deepEqual(completed.summary, ['mock thinking'])
+    assert.deepEqual(completed.content, [])
+
+    const stored = await readReasoningItems(reader, proc, threadId, 3)
+    assert.deepEqual(
+      stored.map((item) => [item.summary, item.content]),
+      [[['mock thinking'], []]],
+    )
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('with reasoning summaries off Claude thinking stays raw reasoning content', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  let proc = spawnMockAdapter(home, { CLAUDE_CODEX_REASONING_VISIBLE: '0' })
+  let reader = new JsonLineReader(proc)
+  let threadId = ''
+  try {
+    threadId = await startMockThread(reader, proc)
+    const { reasoning, completed, text } = await runThinkingTurn(reader, proc, threadId, 2)
+    assert.equal(text, 'done thinkingDisplay=default')
+    assert.deepEqual(
+      reasoning.map((message) => message.method),
+      ['item/started', 'item/reasoning/textDelta', 'item/completed'],
+    )
+    assert.equal(reasoning[1].params.contentIndex, 0)
+    assert.deepEqual(completed.summary, [])
+    assert.deepEqual(completed.content, ['mock thinking'])
+  } finally {
+    proc.kill()
+    await once(proc, 'exit')
+  }
+
+  // Without the opt-out the thinking stored as content reads back as the
+  // summary, until model_reasoning_summary turns summaries off again.
+  proc = spawnMockAdapter(home)
+  reader = new JsonLineReader(proc)
+  try {
+    const shown = await readReasoningItems(reader, proc, threadId, 1)
+    assert.deepEqual(
+      shown.map((item) => [item.summary, item.content]),
+      [[['mock thinking'], ['mock thinking']]],
+    )
 
     proc.stdin.write(
       json({
         id: 2,
-        method: 'turn/start',
-        params: { threadId, input: [{ type: 'text', text: 'thinking check', text_elements: [] }] },
+        method: 'config/value/write',
+        params: { keyPath: 'model_reasoning_summary', value: 'none' },
       }),
     )
     await reader.nextResponse(2)
+    const hidden = await readReasoningItems(reader, proc, threadId, 3)
+    assert.deepEqual(
+      hidden.map((item) => [item.summary, item.content]),
+      [[[], ['mock thinking']]],
+    )
+    const { completed, text } = await runThinkingTurn(reader, proc, threadId, 4)
+    assert.equal(text, 'done thinkingDisplay=default')
+    assert.deepEqual(completed.summary, [])
+    assert.deepEqual(completed.content, ['mock thinking'])
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
 
-    let sawSummary = false
-    let sawContent = false
-    let completedReasoning: any = null
-    for (let i = 0; i < 500; i += 1) {
-      const message = await reader.next()
-      if (message.method === 'item/reasoning/summaryTextDelta') sawSummary = true
-      if (message.method === 'item/reasoning/textDelta') sawContent = true
-      if (message.method === 'item/completed' && message.params.item.type === 'reasoning')
-        completedReasoning = message.params.item
-      if (message.method === 'turn/completed') break
+test('API retries show as Reconnecting errors and a failed turn carries its Codex error code', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  try {
+    const threadId = await startMockThread(reader, proc)
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: textInput('api retry check') },
+      }),
+    )
+    const retried = await readUntil(reader, (message) => message.method === 'turn/completed')
+    const retries = retried.filter((message) => message.method === 'error')
+    const turnId = retried.at(-1)?.params.turn.id
+    // The App counts attempts only from a message of exactly this form.
+    assert.deepEqual(
+      retries.map((message) => message.params),
+      [
+        {
+          threadId,
+          turnId,
+          willRetry: true,
+          error: {
+            message: 'Reconnecting... 1/10',
+            codexErrorInfo: 'serverOverloaded',
+            additionalDetails: 'HTTP 529 overloaded; retrying in 1s',
+          },
+        },
+        {
+          threadId,
+          turnId,
+          willRetry: true,
+          error: {
+            message: 'Reconnecting... 2/10',
+            codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: null } },
+            additionalDetails: 'no response',
+          },
+        },
+      ],
+    )
+    for (const retry of retries) {
+      assert.match(retry.params.error.message, /^Reconnecting(?:\.\.\.)?\s+(\d+)\/(\d+)$/)
     }
-    assert.equal(sawSummary, false)
-    assert.equal(sawContent, true)
-    assert.deepEqual(completedReasoning.summary, [])
-    assert.deepEqual(completedReasoning.content, ['mock thinking'])
+    assert.equal(retried.at(-1)?.params.turn.status, 'completed')
+    assert.equal(retried.at(-1)?.params.turn.error, null)
+
+    proc.stdin.write(
+      json({
+        id: 3,
+        method: 'turn/start',
+        params: { threadId, input: textInput('overloaded failure check') },
+      }),
+    )
+    const failed = await readUntil(reader, (message) => message.method === 'turn/completed')
+    const expected = {
+      message: 'API Error: 529 Overloaded',
+      codexErrorInfo: 'serverOverloaded',
+      additionalDetails: 'HTTP 529 overloaded',
+    }
+    const errors = failed.filter((message) => message.method === 'error')
+    assert.deepEqual(
+      errors.map((message) => [message.params.willRetry, message.params.error]),
+      [[false, expected]],
+    )
+    assert.equal(failed.at(-1)?.params.turn.status, 'failed')
+    assert.deepEqual(failed.at(-1)?.params.turn.error, expected)
+
+    // History keeps the failure with its code, and none of the retries.
+    proc.stdin.write(
+      json({ id: 4, method: 'thread/read', params: { threadId, includeTurns: true } }),
+    )
+    const read = await reader.nextResponse(4)
+    const turns = read.result.thread.turns
+    assert.deepEqual(
+      turns.map((turn: any) => [turn.status, turn.error]),
+      [
+        ['completed', null],
+        ['failed', expected],
+      ],
+    )
+    assert.equal(
+      turns.flatMap((turn: any) => turn.items).some((item: any) => item.type === 'error'),
+      false,
+    )
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -3366,6 +4134,70 @@ test('the context gauge follows the last API call and child tokens add to the to
     assert.deepEqual(updates[1].last, lastCall, 'child tokens leave the gauge alone')
     assert.equal(updates[1].total.totalTokens, 1320)
     assert.equal(updates[1].modelContextWindow, 200_000)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('the context gauge moves with each API call once the window is known', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  // [last, total, window] of each token usage update of a turn.
+  const runTurn = async (id: number, threadId: string): Promise<unknown[]> => {
+    proc.stdin.write(
+      json({
+        id,
+        method: 'turn/start',
+        params: { threadId, input: textInput('context usage check') },
+      }),
+    )
+    const turn = await readUntil(
+      reader,
+      (message) => message.method === 'turn/completed' && message.params.threadId === threadId,
+    )
+    return turn
+      .filter((m) => m.method === 'thread/tokenUsage/updated' && m.params.threadId === threadId)
+      .map(({ params: { tokenUsage } }) => [
+        tokenUsage.last.totalTokens,
+        tokenUsage.total.totalTokens,
+        tokenUsage.modelContextWindow,
+      ])
+  }
+  try {
+    const threadId = await startMockThread(reader, proc)
+    // The window comes with the first result, so the first turn moves the
+    // gauge only at its end.
+    assert.deepEqual(await runTurn(2, threadId), [
+      [200, 320, 200_000],
+      [200, 1320, 200_000],
+    ])
+    // Then each call moves it as it streams, once however often it repeats
+    // its usage, on top of the settled total; the result settles the same
+    // total, counting nothing twice, and a child adds to the total only.
+    assert.deepEqual(await runTurn(3, threadId), [
+      [120, 1440, 200_000],
+      [200, 1640, 200_000],
+      [200, 1640, 200_000],
+      [200, 2640, 200_000],
+    ])
+
+    // A new thread on the same model starts with the window it reported.
+    proc.stdin.write(
+      json({
+        id: 4,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false },
+      }),
+    )
+    const other = (await reader.nextResponse(4)).result.thread.id
+    assert.deepEqual(await runTurn(5, other), [
+      [120, 120, 200_000],
+      [200, 320, 200_000],
+      [200, 320, 200_000],
+      [200, 1320, 200_000],
+    ])
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -4139,7 +4971,7 @@ test('localImage user input becomes a multimodal Claude prompt + an imageView Th
   }
 })
 
-test('Claude WebSearch tool maps to native Codex webSearch ThreadItem with action', async () => {
+test('Claude WebSearch maps to a Codex webSearch item that stays a search', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -4183,32 +5015,49 @@ test('Claude WebSearch tool maps to native Codex webSearch ThreadItem with actio
     // (Option<...> with no serde default) — bare {type:'search'} would crash App.
     assert.deepEqual(webSearchItem.action, { type: 'search', query: 'mock query', queries: null })
     assert.ok(completedWebSearch, 'webSearch item should complete')
-    assert.equal(
-      completedWebSearch.action.type,
-      'openPage',
-      'tool_result with a URL should upgrade action to openPage',
-    )
-    assert.equal(completedWebSearch.action.url, 'https://example.com/article')
+    // Its results hold links, but the search opened no page.
+    assert.deepEqual(completedWebSearch.action, {
+      type: 'search',
+      query: 'mock query',
+      queries: null,
+    })
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
-test('modelProvider/capabilities/read advertises webSearch=true unless CLAUDE_CODEX_WEBSEARCH=0', async () => {
-  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
-  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
-    stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
-  })
-  const reader = new JsonLineReader(proc)
-  try {
-    proc.stdin.write(json({ id: 1, method: 'modelProvider/capabilities/read', params: {} }))
-    const cap = await reader.nextResponse(1)
-    assert.equal(cap.result.webSearch, true)
-  } finally {
-    proc.kill()
-    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+test('capabilities and config/read report live web search unless CLAUDE_CODEX_WEBSEARCH=0', async () => {
+  for (const [setting, webSearch, mode] of [
+    ['', true, 'live'],
+    ['0', false, 'disabled'],
+  ] as const) {
+    const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+    const proc = spawnMockAdapter(home, { CLAUDE_CODEX_WEBSEARCH: setting })
+    const reader = new JsonLineReader(proc)
+    try {
+      proc.stdin.write(json({ id: 1, method: 'modelProvider/capabilities/read', params: {} }))
+      assert.equal((await reader.nextResponse(1)).result.webSearch, webSearch)
+      proc.stdin.write(json({ id: 2, method: 'config/read', params: {} }))
+      const { config } = (await reader.nextResponse(2)).result
+      assert.equal(config.web_search, mode)
+      // Codex reports a context window only when config.toml sets one.
+      assert.equal(config.model_context_window, null)
+      // What the App's settings saved still wins.
+      proc.stdin.write(
+        json({
+          id: 3,
+          method: 'config/value/write',
+          params: { keyPath: 'web_search', value: 'cached' },
+        }),
+      )
+      await reader.nextResponse(3)
+      proc.stdin.write(json({ id: 4, method: 'config/read', params: {} }))
+      assert.equal((await reader.nextResponse(4)).result.config.web_search, 'cached')
+    } finally {
+      proc.kill()
+      await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+    }
   }
 })
 
@@ -6935,7 +7784,9 @@ test('debug.jsonl rotates once it crosses CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES', asy
 test('defaultSocketPath stays within the platform sun_path limit', async () => {
   const util = await import(resolve('dist/src/util.mjs'))
   const prev = process.env.CODEX_HOME
+  const prevSocket = process.env.CLAUDE_CODEX_SOCKET_PATH
   process.env.CODEX_HOME = '/' + 'very-long-codex-home-segment'.repeat(8)
+  delete process.env.CLAUDE_CODEX_SOCKET_PATH
   try {
     const socketPath = util.defaultSocketPath()
     assert.ok(
@@ -6945,6 +7796,7 @@ test('defaultSocketPath stays within the platform sun_path limit', async () => {
   } finally {
     if (prev == null) delete process.env.CODEX_HOME
     else process.env.CODEX_HOME = prev
+    if (prevSocket != null) process.env.CLAUDE_CODEX_SOCKET_PATH = prevSocket
   }
 })
 
@@ -7001,6 +7853,15 @@ test('approval requests round-trip through Codex server requests', {
       }
     }
     assert.equal(approvalRequest?.params.command, 'echo mock approval')
+    assert.deepEqual(approvalRequest?.params.commandActions, [
+      { type: 'unknown', command: 'echo mock approval' },
+    ])
+    assert.deepEqual(approvalRequest?.params.availableDecisions, [
+      'accept',
+      'acceptForSession',
+      'decline',
+      'cancel',
+    ])
     assert.equal(sawWaitingOnApproval, true)
     proc.stdin.write(json({ id: approvalRequest.id, result: { decision: 'accept' } }))
 
@@ -7024,7 +7885,7 @@ test('approval requests round-trip through Codex server requests', {
   }
 })
 
-test('generic Claude tools complete as Codex mcpToolCall items', async () => {
+test('Claude Code tools Codex has no item for complete as mcpToolCall items', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -7064,14 +7925,15 @@ test('generic Claude tools complete as Codex mcpToolCall items', async () => {
         completedTool = message.params.item
       if (message.method === 'turn/completed') break
     }
-    assert.equal(completedTool?.tool, 'Read README.md')
+    assert.equal(completedTool?.server, 'claude-code')
+    assert.equal(completedTool?.tool, 'ListMcpResourcesTool')
     assert.equal(completedTool?.status, 'completed')
     // Result must be wrapped in Codex v2 McpToolCallResult shape — {content[], structuredContent, _meta}.
-    // The mock runtime returns {text:'mock read result'} as the raw content, which we wrap as:
+    // The mock runtime returns {text:'mock tool result'} as the raw content, which we wrap as:
     //   content: [{type:'text', text:'<json>'}], structuredContent: <object>, _meta: null.
     assert.deepEqual(completedTool?.result, {
-      content: [{ type: 'text', text: JSON.stringify({ text: 'mock read result' }) }],
-      structuredContent: { text: 'mock read result' },
+      content: [{ type: 'text', text: JSON.stringify({ text: 'mock tool result' }) }],
+      structuredContent: { text: 'mock tool result' },
       _meta: null,
     })
     assert.equal(sawIdle, true)
@@ -7079,6 +7941,255 @@ test('generic Claude tools complete as Codex mcpToolCall items', async () => {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
+})
+
+// Runs one mock turn on a new thread and returns everything the adapter sent
+// until it completed.
+async function mockTurnMessages(
+  prompt: string,
+  env: NodeJS.ProcessEnv = {},
+  answer?: (request: any) => unknown,
+): Promise<any[]> {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home, env)
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), permissions: ':workspace' },
+      }),
+    )
+    const threadId = (await reader.nextResponse(1)).result.thread.id
+    proc.stdin.write(
+      json({ id: 2, method: 'turn/start', params: { threadId, input: textInput(prompt) } }),
+    )
+    const seen: any[] = []
+    await awaitMessage(
+      reader,
+      (message) => {
+        if (message.method?.endsWith('/requestApproval') && message.id != null && answer)
+          proc.stdin.write(json({ id: message.id, result: answer(message) }))
+        return message.method === 'turn/completed'
+      },
+      seen,
+    )
+    proc.stdin.write(
+      json({ id: 3, method: 'thread/read', params: { threadId, includeTurns: true } }),
+    )
+    seen.push(await reader.nextResponse(3))
+    return seen
+  } finally {
+    await stopProcess(proc)
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+}
+
+const completedItems = (seen: any[]): any[] =>
+  seen
+    .filter((message) => message.method === 'item/completed')
+    .map((message) => message.params.item)
+
+const replayedItems = (seen: any[]): any[] =>
+  seen.find((message) => message.id === 3)?.result.thread.turns.at(-1).items ?? []
+
+test('file exploration shows as commands the Codex App groups under Explored', async () => {
+  const seen = await mockTurnMessages('explore tools check')
+  const cwd = process.cwd()
+  const commands = completedItems(seen).filter((item) => item.type === 'commandExecution')
+  assert.deepEqual(
+    commands.map(({ command, cwd, processId, status, commandActions }) => ({
+      command,
+      cwd,
+      processId,
+      status,
+      commandActions,
+    })),
+    [
+      {
+        command: 'Read README.md',
+        commandActions: [
+          {
+            type: 'read',
+            command: 'Read README.md',
+            name: 'README.md',
+            path: join(cwd, 'README.md'),
+          },
+        ],
+      },
+      {
+        command: 'Grep TODO in src',
+        commandActions: [
+          { type: 'search', command: 'Grep TODO in src', query: 'TODO', path: 'src' },
+        ],
+      },
+      {
+        command: 'Glob **/*.mts',
+        commandActions: [
+          { type: 'search', command: 'Glob **/*.mts', query: '**/*.mts', path: null },
+        ],
+      },
+      {
+        command: 'cat README.md',
+        commandActions: [
+          {
+            type: 'read',
+            command: 'cat README.md',
+            name: 'README.md',
+            path: join(cwd, 'README.md'),
+          },
+        ],
+      },
+      {
+        // The card shows the search; `head` only trims its output.
+        command: 'rg -n TODO src | head -n 5',
+        commandActions: [{ type: 'search', command: 'rg -n TODO src', query: 'TODO', path: 'src' }],
+      },
+    ].map((expected, index) => ({
+      command: expected.command,
+      cwd,
+      processId: `claude:explore-${index}`,
+      status: 'completed',
+      commandActions: expected.commandActions,
+    })),
+  )
+  assert.equal(
+    completedItems(seen).some((item) => item.type === 'mcpToolCall'),
+    false,
+  )
+  // A whole file stays with Claude; the App keeps the first 30,000 characters.
+  const capped = `${'x'.repeat(30_000)}\n… 10000 more characters not shown`
+  assert.equal(commands[0].aggregatedOutput, capped)
+  assert.deepEqual(
+    seen
+      .filter(
+        (message) =>
+          message.method === 'item/commandExecution/outputDelta' &&
+          message.params.itemId === commands[0].id,
+      )
+      .map((message) => message.params.delta),
+    [capped],
+  )
+  assert.deepEqual(
+    replayedItems(seen).filter((item: any) => item.type === 'commandExecution'),
+    commands,
+  )
+})
+
+test('an image Claude reads shows as an imageView, and a failed one as its Read', async () => {
+  const seen = await mockTurnMessages('image read check')
+  const cwd = process.cwd()
+  const started = seen
+    .filter((message) => message.method === 'item/started')
+    .map((message) => message.params.item)
+    .filter((item) => item.type !== 'userMessage')
+  assert.deepEqual(
+    started.map(({ type, path }) => ({ type, path })),
+    [
+      { type: 'imageView', path: join(cwd, 'diagram.png') },
+      { type: 'imageView', path: join(cwd, 'missing.png') },
+    ],
+  )
+  const [shown, missing] = started
+  const completed = completedItems(seen)
+  assert.deepEqual(
+    completed.find((item) => item.id === shown.id),
+    { type: 'imageView', id: shown.id, path: join(cwd, 'diagram.png') },
+  )
+  const failed = completed.find((item) => item.id === missing.id)
+  assert.deepEqual(
+    {
+      type: failed.type,
+      command: failed.command,
+      status: failed.status,
+      aggregatedOutput: failed.aggregatedOutput,
+      exitCode: failed.exitCode,
+      commandActions: failed.commandActions,
+    },
+    {
+      type: 'commandExecution',
+      command: 'Read missing.png',
+      status: 'failed',
+      aggregatedOutput: 'File does not exist.',
+      exitCode: 1,
+      commandActions: [
+        {
+          type: 'read',
+          command: 'Read missing.png',
+          name: 'missing.png',
+          path: join(cwd, 'missing.png'),
+        },
+      ],
+    },
+  )
+  // The output of an item that was an image comes with the completed item.
+  assert.equal(
+    seen.some((message) => message.method === 'item/commandExecution/outputDelta'),
+    false,
+  )
+  assert.deepEqual(
+    replayedItems(seen).filter((item: any) => item.type !== 'userMessage'),
+    [completed.find((item) => item.id === shown.id), failed],
+  )
+})
+
+test('Claude WebFetch shows as a Codex page open', async () => {
+  const seen = await mockTurnMessages('web fetch check')
+  const fetched = completedItems(seen).find((item) => item.type === 'webSearch')
+  assert.deepEqual(fetched, {
+    type: 'webSearch',
+    id: fetched?.id,
+    query: 'https://example.com/docs',
+    action: { type: 'openPage', url: 'https://example.com/docs' },
+  })
+})
+
+test('MCP tool calls name their server and tool, even a server named with __', async () => {
+  const seen = await mockTurnMessages('mcp tool check', {
+    CLAUDE_CODEX_MCP_SERVERS: JSON.stringify({
+      team__docs: { command: 'node', args: ['docs-server.mjs'] },
+    }),
+  })
+  assert.deepEqual(
+    completedItems(seen)
+      .filter((item) => item.type === 'mcpToolCall')
+      .map(({ server, tool, arguments: args, status }) => ({ server, tool, args, status })),
+    [
+      { server: 'github', tool: 'create_issue', args: { title: 'Bug' }, status: 'completed' },
+      { server: 'team__docs', tool: 'search', args: { query: 'setup' }, status: 'completed' },
+    ],
+  )
+})
+
+test('a Read Claude asks about asks on the command card, without a session allow', async () => {
+  const seen = await mockTurnMessages('outside read check', {}, () => ({ decision: 'accept' }))
+  const request = seen.find((message) => message.method === 'item/commandExecution/requestApproval')
+  assert.ok(request, 'the Read should ask on the command card')
+  assert.equal(
+    seen.some((message) => message.method === 'item/fileChange/requestApproval'),
+    false,
+  )
+  const item = completedItems(seen).find((candidate) => candidate.id === request.params.itemId)
+  assert.deepEqual(
+    {
+      command: request.params.command,
+      cwd: request.params.cwd,
+      commandActions: request.params.commandActions,
+      availableDecisions: request.params.availableDecisions,
+    },
+    {
+      command: 'Read /etc/hosts',
+      cwd: process.cwd(),
+      commandActions: [
+        { type: 'read', command: 'Read /etc/hosts', name: 'hosts', path: '/etc/hosts' },
+      ],
+      availableDecisions: ['accept', 'decline', 'cancel'],
+    },
+  )
+  assert.equal(item?.type, 'commandExecution')
+  assert.equal(item?.status, 'completed')
+  assert.equal(item?.aggregatedOutput, '127.0.0.1 localhost')
 })
 
 function spawnMockAdapter(
@@ -8712,6 +9823,575 @@ test('workflow watchdog disarms when the original Workflow tool result arrives',
   } finally {
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
+})
+
+// Runs `body` in a child process whose subagent watchdog waits `windowMs`.
+// The body builds a server on `store` with the runtime it needs; it gets the
+// peer's messages (`receivedAt` holds when each arrived, on the monotonic
+// clock) and helpers to start a turn, find its turn/completed and read a
+// child agent's status by prompt.
+async function runWatchdogScript(windowMs: number, body: string): Promise<void> {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  try {
+    execFileSync(
+      process.execPath,
+      [
+        '--no-warnings',
+        '--input-type=module',
+        '-e',
+        `
+      import assert from 'node:assert/strict'
+      import { join } from 'node:path'
+      import { NativeClaudeRuntime } from './dist/src/native-runtime.mjs'
+      import { CodexClaudeAppServer } from './dist/src/server.mjs'
+      import { SessionStore } from './dist/src/store.mjs'
+
+      process.env.CLAUDE_CODEX_HOME = ${JSON.stringify(home)}
+      process.env.CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS = '${windowMs}'
+      process.env.CLAUDE_CODEX_GOAL_TOOLS = '0'
+      const store = new SessionStore(join(${JSON.stringify(home)}, 'state.sqlite'))
+      const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+      const messages = []
+      const receivedAt = new Map()
+      const peer = {
+        id: 'peer',
+        send: (message) => {
+          messages.push(message)
+          receivedAt.set(message, performance.now())
+        },
+        close() {},
+      }
+      const response = (id) => messages.find((message) => 'id' in message && message.id === id)
+      const completion = (turnId) =>
+        messages.find(
+          (message) => message.method === 'turn/completed' && message.params.turn.id === turnId,
+        )
+      const waitFor = async (probe, label) => {
+        const deadline = performance.now() + 5000
+        while (performance.now() < deadline) {
+          const value = probe()
+          if (value) return value
+          await sleep(10)
+        }
+        throw new Error('timed out waiting for ' + label)
+      }
+      const children = () =>
+        store
+          .listThreads({ includeEphemeral: true })
+          .filter((thread) => thread.threadSource === 'subagent')
+      const childStatus = (prompt) => {
+        const child = children().find((thread) => thread.preview === prompt)
+        return child ? store.listTurns(child.id)[0]?.status : 'missing'
+      }
+      const startTurn = async (server, text) => {
+        await server.handle(peer, {
+          id: 1,
+          method: 'thread/start',
+          params: { cwd: process.cwd(), persistExtendedHistory: false },
+        })
+        const threadId = response(1).result.thread.id
+        await server.handle(peer, {
+          id: 2,
+          method: 'turn/start',
+          params: { threadId, input: [{ type: 'text', text, text_elements: [] }] },
+        })
+        return { threadId, turnId: response(2).result.turn.id }
+      }
+      ${body}
+    `,
+      ],
+      { cwd: resolve('.'), stdio: 'pipe' },
+    )
+  } finally {
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+}
+
+test('subagent watchdog waits as long as a foreground agent keeps reporting progress', async () => {
+  await runWatchdogScript(
+    300,
+    `
+      const interrupted = []
+      let listener = null
+      const server = new CodexClaudeAppServer(store, {
+        setBackgroundListener(next) {
+          listener = next
+        },
+        async runTurn(context, handlers) {
+          const toolUseId = 'busy-' + context.turnId
+          await handlers.onEvent({
+            type: 'tool_use',
+            toolUseId,
+            toolName: 'Task',
+            input: { description: 'long check', prompt: 'run the long check' },
+          })
+          // Either kind of report alone spans two windows.
+          for (let beat = 0; beat < 6; beat += 1) {
+            await sleep(100)
+            await handlers.onEvent({ type: 'subagent_progress', toolUseId })
+          }
+          for (let beat = 0; beat < 6; beat += 1) {
+            await sleep(100)
+            await listener.onTaskEvent(context.threadId, {
+              type: 'task_progress',
+              taskId: 'task-1',
+              toolUseId,
+              description: 'long check',
+              summary: null,
+              lastToolName: 'Bash',
+              usage: null,
+            })
+          }
+          await handlers.onEvent({ type: 'tool_result', toolUseId, content: 'all checks passed' })
+          await handlers.onEvent({ type: 'completed', success: true, result: 'checked' })
+        },
+        async steer() {},
+        async interrupt(threadId) {
+          interrupted.push(threadId)
+        },
+        async stop() {},
+      })
+      const { turnId } = await startTurn(server, 'check everything')
+      const completed = await waitFor(() => completion(turnId), 'turn completion')
+      assert.equal(completed.params.turn.status, 'completed')
+      assert.equal(completed.params.turn.error, null)
+      assert.deepEqual(interrupted, [])
+      assert.equal(childStatus('run the long check'), 'completed')
+      await server.stop()
+    `,
+  )
+})
+
+test('subagent watchdog does not take a jump of the wall clock for a quiet agent', async () => {
+  await runWatchdogScript(
+    300,
+    `
+      const interrupted = []
+      const wallClock = Date.now
+      let jumpedMs = 0
+      Date.now = () => wallClock() + jumpedMs
+      const server = new CodexClaudeAppServer(store, {
+        async runTurn(context, handlers) {
+          const toolUseId = 'busy-' + context.turnId
+          await handlers.onEvent({
+            type: 'tool_use',
+            toolUseId,
+            toolName: 'Task',
+            input: { description: 'long check', prompt: 'run the long check' },
+          })
+          // The wall clock leaps an hour ahead after every report, as when a
+          // laptop wakes from sleep; the agent itself never goes quiet.
+          for (let beat = 0; beat < 6; beat += 1) {
+            await sleep(100)
+            await handlers.onEvent({ type: 'subagent_progress', toolUseId })
+            jumpedMs += 3_600_000
+          }
+          await handlers.onEvent({ type: 'tool_result', toolUseId, content: 'all checks passed' })
+          await handlers.onEvent({ type: 'completed', success: true, result: 'checked' })
+        },
+        async steer() {},
+        async interrupt(threadId) {
+          interrupted.push(threadId)
+        },
+        async stop() {},
+      })
+      const { turnId } = await startTurn(server, 'check everything')
+      const completed = await waitFor(() => completion(turnId), 'turn completion')
+      assert.equal(completed.params.turn.status, 'completed')
+      assert.equal(completed.params.turn.error, null)
+      assert.deepEqual(interrupted, [])
+      await server.stop()
+      Date.now = wallClock
+    `,
+  )
+})
+
+test('workflow watchdog waits while overlapping workflow agents keep starting and finishing', async () => {
+  await runWatchdogScript(
+    300,
+    `
+      const interrupted = []
+      const server = new CodexClaudeAppServer(store, {
+        async runTurn(context, handlers) {
+          const launch = 'workflow-' + context.turnId
+          await handlers.onEvent({
+            type: 'tool_use',
+            toolUseId: launch,
+            toolName: 'Workflow',
+            input: { command: '/workflows review' },
+          })
+          await handlers.onEvent({ type: 'tool_result', toolUseId: launch, content: 'launch accepted' })
+          // Projected from the workflow journal: six agents, each running
+          // longer than the window and always one running.
+          const agent = (index) => 'workflow-agent:task-1:a' + index
+          for (let tick = 0; tick < 9; tick += 1) {
+            if (tick < 6)
+              await handlers.onEvent({
+                type: 'tool_use',
+                toolUseId: agent(tick),
+                toolName: 'Agent',
+                input: {
+                  description: 'part ' + tick,
+                  prompt: 'review part ' + tick,
+                  subagent_type: 'workflow',
+                },
+              })
+            if (tick >= 3)
+              await handlers.onEvent({
+                type: 'tool_result',
+                toolUseId: agent(tick - 3),
+                content: 'part ' + (tick - 3) + ' reviewed',
+              })
+            await sleep(150)
+          }
+          await handlers.onEvent({ type: 'completed', success: true, result: 'review done' })
+        },
+        async steer() {},
+        async interrupt(threadId) {
+          interrupted.push(threadId)
+        },
+        async stop() {},
+      })
+      const { turnId } = await startTurn(server, '/workflows review')
+      const completed = await waitFor(() => completion(turnId), 'turn completion')
+      assert.equal(completed.params.turn.status, 'completed')
+      assert.equal(completed.params.turn.error, null)
+      assert.deepEqual(interrupted, [])
+      for (let index = 0; index < 6; index += 1)
+        assert.equal(childStatus('review part ' + index), 'completed')
+      await server.stop()
+    `,
+  )
+})
+
+test('subagent watchdog fails a turn whose agent goes quiet for a whole window', async () => {
+  await runWatchdogScript(
+    300,
+    `
+      const interrupted = []
+      const abandoned = []
+      let turnHandlers = null
+      let lastProgressAt = 0
+      const server = new CodexClaudeAppServer(store, {
+        async runTurn(context, handlers) {
+          turnHandlers = handlers
+          const toolUseId = 'quiet-' + context.turnId
+          await handlers.onEvent({
+            type: 'tool_use',
+            toolUseId,
+            toolName: 'Task',
+            input: { description: 'flaky check', prompt: 'goes quiet' },
+          })
+          for (let beat = 0; beat < 4; beat += 1) {
+            await sleep(100)
+            await handlers.onEvent({ type: 'subagent_progress', toolUseId })
+            lastProgressAt = performance.now()
+          }
+          return new Promise(() => {})
+        },
+        async steer() {},
+        async interrupt(threadId) {
+          interrupted.push(threadId)
+        },
+        // The turn handed nothing off: the backend leaves it to an interrupt.
+        async abandonTurn(_threadId, turnId) {
+          abandoned.push(turnId)
+          return false
+        },
+        async stop() {},
+      })
+      const startedAt = performance.now()
+      const { threadId, turnId } = await startTurn(server, 'check, then hang')
+      const completed = await waitFor(() => completion(turnId), 'watchdog')
+      const failedAt = receivedAt.get(completed)
+      assert.equal(completed.params.turn.status, 'failed')
+      assert.match(completed.params.turn.error.message, /terminal result within 1 second/)
+      assert.ok(failedAt - startedAt >= 650, 'each report starts the window over')
+      assert.ok(failedAt - lastProgressAt >= 250, 'the turn fails a window after the last report')
+      await waitFor(() => interrupted.length === 1, 'interrupt')
+      assert.deepEqual(abandoned, [turnId])
+      assert.equal(childStatus('goes quiet'), 'failed')
+      assert.equal(store.listTurns(threadId)[0].items.at(-1).status, 'failed')
+      // A frame the runtime still delivers does not bring the turn back.
+      await turnHandlers.onEvent({
+        type: 'tool_use',
+        toolUseId: 'late',
+        toolName: 'Task',
+        input: { description: 'late', prompt: 'too late' },
+      })
+      assert.equal(children().length, 1)
+      await server.stop()
+    `,
+  )
+})
+
+test('subagent watchdog leaves the background agents a stalled turn handed off running', async () => {
+  await runWatchdogScript(
+    300,
+    `
+      const interrupted = []
+      const abandoned = []
+      let listener = null
+      const server = new CodexClaudeAppServer(store, {
+        setBackgroundListener(next) {
+          listener = next
+        },
+        async runTurn(context, handlers) {
+          await handlers.onEvent({
+            type: 'tool_use',
+            toolUseId: 'bg-use',
+            toolName: 'Agent',
+            input: { description: 'survey', prompt: 'survey the code', run_in_background: true },
+          })
+          await listener.onTaskEvent(context.threadId, {
+            type: 'task_started',
+            taskId: 'bg-task',
+            toolUseId: 'bg-use',
+            taskType: 'local_agent',
+            description: 'survey',
+            subagentType: null,
+            prompt: 'survey the code',
+            backgrounded: true,
+          })
+          await handlers.onEvent({
+            type: 'tool_result',
+            toolUseId: 'bg-use',
+            content: 'Async agent launched successfully. agentId: bg-task',
+            structured: { status: 'async_launched', agentId: 'bg-task', isAsync: true },
+          })
+          await handlers.onEvent({
+            type: 'tool_use',
+            toolUseId: 'stuck-use',
+            toolName: 'Agent',
+            input: { description: 'stuck', prompt: 'never returns' },
+          })
+          return new Promise(() => {})
+        },
+        async steer() {},
+        async interrupt(threadId) {
+          interrupted.push(threadId)
+        },
+        // The session still runs the background agent: the backend lets the
+        // turn go without interrupting Claude.
+        async abandonTurn(_threadId, turnId) {
+          abandoned.push(turnId)
+          return true
+        },
+        async stop() {},
+      })
+      const { threadId, turnId } = await startTurn(server, 'survey in the background, then check')
+      // The background agent reports all along; that is no sign of the stuck one.
+      const beats = setInterval(() => {
+        void listener.onTaskEvent(threadId, {
+          type: 'task_progress',
+          taskId: 'bg-task',
+          toolUseId: 'bg-use',
+          description: 'survey',
+          summary: null,
+          lastToolName: 'Grep',
+          usage: null,
+        })
+      }, 100)
+      try {
+        const completed = await waitFor(() => completion(turnId), 'watchdog')
+        assert.equal(completed.params.turn.status, 'failed')
+        assert.match(completed.params.turn.error.message, /terminal result within 1 second/)
+        await waitFor(() => abandoned.length === 1, 'abandon')
+        assert.deepEqual(abandoned, [turnId])
+        assert.deepEqual(interrupted, [], 'an interrupt would end the background agent too')
+        assert.equal(childStatus('never returns'), 'failed')
+        assert.equal(childStatus('survey the code'), 'inProgress')
+      } finally {
+        clearInterval(beats)
+      }
+      await listener.onTaskEvent(threadId, {
+        type: 'task_notification',
+        taskId: 'bg-task',
+        toolUseId: 'bg-use',
+        status: 'completed',
+        summary: 'Agent "survey" completed',
+        result: 'Found three modules.',
+        usage: null,
+      })
+      assert.equal(childStatus('survey the code'), 'completed')
+      await server.stop()
+    `,
+  )
+})
+
+test('subagent watchdog does not take background agents finishing for progress of a stuck one', async () => {
+  await runWatchdogScript(
+    300,
+    `
+      const interrupted = []
+      const abandoned = []
+      let listener = null
+      const server = new CodexClaudeAppServer(store, {
+        setBackgroundListener(next) {
+          listener = next
+        },
+        async runTurn(context, handlers) {
+          for (let index = 0; index < 10; index += 1) {
+            const toolUseId = 'bg-use-' + index
+            await handlers.onEvent({
+              type: 'tool_use',
+              toolUseId,
+              toolName: 'Agent',
+              input: {
+                description: 'survey ' + index,
+                prompt: 'survey part ' + index,
+                run_in_background: true,
+              },
+            })
+            await listener.onTaskEvent(context.threadId, {
+              type: 'task_started',
+              taskId: 'bg-task-' + index,
+              toolUseId,
+              taskType: 'local_agent',
+              description: 'survey ' + index,
+              subagentType: null,
+              prompt: 'survey part ' + index,
+              backgrounded: true,
+            })
+            await handlers.onEvent({
+              type: 'tool_result',
+              toolUseId,
+              content: 'Async agent launched successfully. agentId: bg-task-' + index,
+              structured: { status: 'async_launched', agentId: 'bg-task-' + index, isAsync: true },
+            })
+          }
+          await handlers.onEvent({
+            type: 'tool_use',
+            toolUseId: 'stuck-use',
+            toolName: 'Agent',
+            input: { description: 'stuck', prompt: 'never returns' },
+          })
+          return new Promise(() => {})
+        },
+        async steer() {},
+        async interrupt(threadId) {
+          interrupted.push(threadId)
+        },
+        async abandonTurn(_threadId, turnId) {
+          abandoned.push(turnId)
+          return true
+        },
+        async stop() {},
+      })
+      const { threadId, turnId } = await startTurn(server, 'survey in the background, then check')
+      await waitFor(() => childStatus('never returns') === 'inProgress', 'stuck agent')
+      // The agents the turn handed off finish one by one, faster than the
+      // window; none of that is a sign of life from the stuck one.
+      let finished = 0
+      while (!completion(turnId) && finished < 10) {
+        await sleep(100)
+        await listener.onTaskEvent(threadId, {
+          type: 'task_notification',
+          taskId: 'bg-task-' + finished,
+          toolUseId: 'bg-use-' + finished,
+          status: 'completed',
+          summary: 'Agent "survey ' + finished + '" completed',
+          result: 'Part ' + finished + ' surveyed.',
+          usage: null,
+        })
+        finished += 1
+      }
+      const completed = await waitFor(() => completion(turnId), 'watchdog')
+      assert.equal(completed.params.turn.status, 'failed')
+      assert.ok(finished < 10, 'the turn fails while the agents it handed off still finish')
+      await waitFor(() => abandoned.length === 1, 'abandon')
+      assert.deepEqual(interrupted, [])
+      assert.equal(childStatus('never returns'), 'failed')
+      assert.equal(childStatus('survey part 0'), 'completed')
+      await server.stop()
+    `,
+  )
+})
+
+test('subagent watchdog counts tool_progress heartbeats of a quiet agent as progress', async () => {
+  await runWatchdogScript(
+    600,
+    `
+      const runtime = new NativeClaudeRuntime()
+      let interrupts = 0
+      // The CLI's frames: an Agent call whose only sign of life is
+      // tool_progress, first for the subagent's quiet Bash call, then for the
+      // Agent call itself. Either kind alone spans two windows.
+      const frames = async function* () {
+        yield { type: 'system', subtype: 'init', session_id: 'session-1' }
+        yield {
+          type: 'assistant',
+          parent_tool_use_id: null,
+          message: {
+            id: 'm1',
+            content: [
+              {
+                type: 'tool_use',
+                id: 'agent-1',
+                name: 'Agent',
+                input: { description: 'slow build', prompt: 'run the slow build' },
+              },
+            ],
+          },
+        }
+        for (let beat = 0; beat < 24; beat += 1) {
+          await sleep(100)
+          yield beat < 12
+            ? {
+                type: 'tool_progress',
+                tool_use_id: 'bash-1',
+                tool_name: 'Bash',
+                parent_tool_use_id: 'agent-1',
+                elapsed_time_seconds: beat / 10,
+              }
+            : {
+                type: 'tool_progress',
+                tool_use_id: 'agent-1',
+                tool_name: 'Agent',
+                parent_tool_use_id: null,
+                elapsed_time_seconds: beat / 10,
+              }
+        }
+        yield {
+          type: 'user',
+          parent_tool_use_id: null,
+          message: {
+            content: [{ type: 'tool_result', tool_use_id: 'agent-1', content: 'build passed' }],
+          },
+        }
+        yield {
+          type: 'assistant',
+          parent_tool_use_id: null,
+          message: { id: 'm2', content: [{ type: 'text', text: 'The build passed.' }] },
+        }
+        yield { type: 'result', subtype: 'success', result: 'The build passed.' }
+      }
+      Reflect.set(runtime, 'sdk', {
+        query: ({ prompt }) => {
+          void (async () => {
+            for await (const _message of prompt) {
+            }
+          })()
+          return Object.assign(frames(), {
+            interrupt: async () => {
+              interrupts += 1
+            },
+            close() {},
+            setModel: async () => {},
+            setPermissionMode: async () => {},
+          })
+        },
+      })
+      const server = new CodexClaudeAppServer(store, runtime)
+      const { turnId } = await startTurn(server, 'build it')
+      const completed = await waitFor(() => completion(turnId), 'turn completion')
+      assert.equal(completed.params.turn.status, 'completed')
+      assert.equal(completed.params.turn.error, null)
+      assert.equal(interrupts, 0)
+      assert.equal(childStatus('run the slow build'), 'completed')
+      await server.stop()
+    `,
+  )
 })
 
 test('server shutdown terminalizes active child turns before closing the store', async () => {

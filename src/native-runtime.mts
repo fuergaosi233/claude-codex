@@ -1,10 +1,17 @@
 import {
+  chmodSync,
   copyFileSync,
   existsSync,
+  constants as fsConstants,
   mkdirSync,
   readdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
+  rmSync,
+  type Stats,
+  statSync,
+  utimesSync,
 } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, join } from 'node:path'
@@ -69,6 +76,7 @@ import {
   THREAD_WAIT_DESCRIPTION,
 } from './leader-tools.mjs'
 import { autoMemoryEnv } from './memories.mjs'
+import { resolveClaudeModelProcess } from './model-profiles.mjs'
 import { echoedUuids, TurnInput, type TurnInputMessage } from './native-turn-input.mjs'
 import { sdkHooks } from './sdk-hooks.mjs'
 import { readTaskResult } from './task-output.mjs'
@@ -85,6 +93,7 @@ import type {
   PermissionDecision,
   RecalledMemory,
   RuntimeBackgroundListener,
+  RuntimeFailure,
   RuntimeHandlers,
   RuntimeLiveTask,
   RuntimeSteerOptions,
@@ -138,6 +147,9 @@ interface PendingTurn {
   workflowTranscriptRoots: string[]
   skippedWorkflowTaskIds: Set<string>
   workflowTasks: Map<string, WorkflowTaskState>
+  // Tasks Claude started while this turn ran. An interrupt of the turn also
+  // ends the background agents among them (see abandonTurn).
+  startedTasks: Set<string>
   // Tool ids whose content_block_start we already saw — used to skip the
   // second delivery via AssistantMessage.content (the SDK ships every
   // ToolUseBlock twice; we keep only the AssistantMessage copy because
@@ -155,12 +167,22 @@ interface PendingTurn {
   workflowFailure: string | null
   // The model behind the main loop's latest response.
   model: string | null
+  // When the server was last told a subagent or workflow of the turn is
+  // still working (see noteSubagentProgress), on the monotonic clock: a wall
+  // clock set back must not hold the reports back for as long.
+  progressReportedAtMs: number
+  // The API error behind the main loop's latest response or retry, null
+  // once a response arrives without one.
+  apiError: { category: string | null; status: number | null } | null
+  // Keys of the CLI notifications already shown this turn.
+  notificationKeys: Set<string>
 }
 
 interface PendingTurnResult {
   success: boolean
   resultText: string | null
   claudeSessionId: string | null
+  failure?: RuntimeFailure | null
 }
 
 interface WorkflowTaskState {
@@ -189,7 +211,10 @@ interface PendingPermission {
 // Session cron jobs live in the process the same way (see cron-jobs.mts).
 interface LiveSession {
   threadId: string
-  query: Query
+  // Null while the session waits for the launch slot (see acquireLaunchSlot).
+  query: Query | null
+  // Passes the launch slot on; set while the session holds it.
+  releaseLaunch: (() => void) | null
   input: TurnInput
   abort: AbortController
   // Registered for reuse by later turns of the thread. Structured-output and
@@ -198,6 +223,9 @@ interface LiveSession {
   reusable: boolean
   signature: string
   lastContext: RuntimeTurnContext
+  // The environment the CLI runs with: its CLAUDE_CONFIG_DIR is where the
+  // session's transcripts live (a model process profile has its own).
+  transcriptEnv: NodeJS.ProcessEnv
   model: string | null
   effort: string | null
   permissionMode: string
@@ -281,6 +309,12 @@ const SESSION_CONTROL_TIMEOUT_MS = 5_000
 // How long a new turn waits for an interrupted session to drain before it
 // gives up on the sink and goes ahead.
 const SINK_DRAIN_TIMEOUT_MS = 30_000
+// How often at most a turn tells the server its subagents are still working.
+// A busy child streams many frames a second; the server's watchdog, which
+// waits minutes, only needs to hear of it now and then.
+const SUBAGENT_PROGRESS_INTERVAL_MS = 250
+// How long a launch holds the launch slot when its CLI says nothing.
+const LAUNCH_GATE_TIMEOUT_MS = 30_000
 // setTimeout's ceiling (about 24.8 days).
 const MAX_TIMER_MS = 2 ** 31 - 1
 // How long past their budget stopping waits for SessionEnd hooks: a killed
@@ -310,6 +344,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   private sessionEnds = new Map<AbortController, SessionEnd>()
   // The SessionEnd hooks still running, with their budget in seconds.
   private ending = new Map<Promise<void>, number>()
+  // Settles once the last session to queue for the launch slot passes it on.
+  private launchTail: Promise<void> = Promise.resolve()
 
   setBackgroundListener(listener: RuntimeBackgroundListener): void {
     this.listener = listener
@@ -321,7 +357,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     const draining = this.sessions.get(context.threadId)
     if (draining && !draining.closed && draining.sink) await this.drainSink(draining)
     const live = this.sessions.get(context.threadId)
-    if (live && !live.closed && this.isReusable(context)) {
+    // A session still waiting for the launch slot has nothing to reuse yet.
+    if (live && !live.closed && live.query && this.isReusable(context)) {
       if (
         live.signature === sessionSignature(context) ||
         this.hasLiveWork(live) ||
@@ -367,6 +404,17 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (!pending || pending.resolved || pending.context.threadId !== threadId) return false
     const session = pending.session
     if (session.closed) return false
+    if (!session.query) {
+      // Still waiting for the launch slot: the CLI starts with these.
+      session.lastContext = {
+        ...session.lastContext,
+        ...(settings.model ? { model: settings.model } : {}),
+        ...(settings.effort ? { effort: settings.effort } : {}),
+      }
+      if (settings.model) session.model = settings.model
+      if (settings.effort) session.effort = settings.effort
+      return true
+    }
     // Not serialized with turn attachment: a turn waiting on an approval
     // holds that chain. The next turn attaching to this session puts its own
     // settings back (applySessionSettings).
@@ -393,9 +441,13 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
 
   async interrupt(threadId: string): Promise<void> {
     const live = this.sessions.get(threadId)
+    const liveQuery = live?.query
     const soft =
-      live != null && !live.closed && (live.liveTasks.size > 0 || this.holdsCronJobs(live))
-    if (soft && live) {
+      live != null &&
+      !live.closed &&
+      liveQuery != null &&
+      (live.liveTasks.size > 0 || this.holdsCronJobs(live))
+    if (soft && live && liveQuery) {
       // Aborting would kill the process and every background task (and
       // scheduled job) with it. Stop only the running turn; the tasks keep
       // going and report back.
@@ -414,7 +466,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         if (live.cliRunning || cancelled.length > 0)
           this.beginSink(live, cancelled, live.cliRunning)
         await settlesWithin(
-          live.query.interrupt().catch(() => {}),
+          liveQuery.interrupt().catch(() => {}),
           SESSION_CONTROL_TIMEOUT_MS,
         )
         this.maybeRelease(live)
@@ -430,13 +482,13 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       pending.session.steers.clear()
       this.closeSession(pending.session)
       pending.abort.abort()
-      await pending.session.query.interrupt().catch(() => {})
+      await pending.session.query?.interrupt().catch(() => {})
     }
   }
 
   async stopTask(threadId: string, taskId: string): Promise<boolean> {
     const live = this.sessions.get(threadId)
-    if (!live || live.closed) return false
+    if (!live || live.closed || !live.query) return false
     const query = live.query as Query & { stopTask?: (taskId: string) => Promise<void> }
     if (typeof query.stopTask !== 'function') return false
     live.stoppedTasks.add(taskId)
@@ -454,16 +506,77 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }
   }
 
+  // The server gave up on a turn whose subagents stopped reporting progress.
+  // An interrupt ends the CLI's turn and keeps what earlier turns left
+  // running (see interrupt), but it also ends the background agents this
+  // turn handed off. While any of those still run, the turn is let go
+  // instead: its stuck agents and workflows stop, and what the CLI still
+  // sends for it is dropped like an interrupted turn's tail. The choice is
+  // made before queueing behind the session, so the interrupt the server
+  // falls back to still finds this turn and not the user's next one.
+  async abandonTurn(threadId: string, turnId: string): Promise<boolean> {
+    const live = this.sessions.get(threadId)
+    const pending = this.turns.get(turnId)
+    if (!live || live.closed || !pending || pending.resolved || pending.session !== live)
+      return false
+    const handedOff = this.handedOffTasks(live, pending)
+    debugLog('native.turn.abandon', { threadId, turnId, handedOff })
+    if (handedOff.length === 0) return false
+    await this.serialize(live, async () => {
+      if (live.closed || pending.resolved) return
+      await this.stopSessionTasks(live, this.turnTaskIds(live, pending))
+      await this.stopWorkflowTasks(pending)
+      if (live.current === pending) {
+        const cancelled = this.cancelSends(live)
+        live.current = null
+        live.steers.clear()
+        live.backlog.length = 0
+        live.autonomousRequested = false
+        if (live.cliRunning || cancelled.length > 0)
+          this.beginSink(live, cancelled, live.cliRunning)
+      }
+      this.releaseTurn(pending)
+      this.maybeRelease(live)
+    })
+    return true
+  }
+
+  // Background tasks the turn started that still run without it waiting on
+  // them.
+  private handedOffTasks(live: LiveSession, pending: PendingTurn): string[] {
+    const own = this.turnTaskIds(live, pending)
+    return [...live.liveTasks].filter(
+      (taskId) => pending.startedTasks.has(taskId) && !own.has(taskId),
+    )
+  }
+
   // A workflow belongs to the turn that launched it; the turn waits for it.
   // Left running past an interrupt, it would finish later and wake the thread.
   private async stopLiveWorkflows(live: LiveSession, pending: PendingTurn): Promise<void> {
-    const query = live.query as (Query & { stopTask?: (taskId: string) => Promise<void> }) | null
-    if (typeof query?.stopTask !== 'function') return
+    await this.stopSessionTasks(live, this.workflowTaskIds(live, pending))
+  }
+
+  private workflowTaskIds(live: LiveSession, pending: PendingTurn): Set<string> {
     const taskIds = new Set<string>()
     for (const [taskId, state] of pending.workflowTasks ?? [])
       if (!state.terminal) taskIds.add(taskId)
     for (const taskId of live.liveTasks)
       if (live.tasks.get(taskId)?.taskType === 'local_workflow') taskIds.add(taskId)
+    return taskIds
+  }
+
+  // What the turn runs itself: its workflows and the foreground agents it
+  // waits on. Agents it handed off left activeSubagents at launch.
+  private turnTaskIds(live: LiveSession, pending: PendingTurn): Set<string> {
+    const taskIds = this.workflowTaskIds(live, pending)
+    for (const [taskId, task] of live.tasks)
+      if (task.toolUseId && pending.activeSubagents.has(task.toolUseId)) taskIds.add(taskId)
+    return taskIds
+  }
+
+  private async stopSessionTasks(live: LiveSession, taskIds: Set<string>): Promise<void> {
+    const query = live.query as (Query & { stopTask?: (taskId: string) => Promise<void> }) | null
+    if (typeof query?.stopTask !== 'function') return
     for (const taskId of taskIds) {
       live.stoppedTasks.add(taskId)
       let failed = false
@@ -474,7 +587,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         SESSION_CONTROL_TIMEOUT_MS,
       )
       if (failed) live.stoppedTasks.delete(taskId)
-      debugLog('native.workflow.stop', { threadId: live.threadId, taskId, settled, failed })
+      debugLog('native.task.stop', { threadId: live.threadId, taskId, settled, failed })
     }
   }
 
@@ -534,6 +647,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }
     for (const session of this.sessions.values()) {
       this.clearSessionTimers(session)
+      this.releaseLaunchSlot(session)
       session.closed = true
       session.commandOutputs.close()
       session.abort.abort()
@@ -645,9 +759,27 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       includeHookEvents: true,
       cwd: context.cwd,
     }
-    if (context.model) opts.model = context.model
+    // With model process profiles configured, every Claude turn runs in its
+    // profile's process: its own executable, provider env and config dir.
+    const modelProcess = resolveClaudeModelProcess(
+      context.modelProfileId,
+      process.env,
+      context.modelProfileFingerprint ?? null,
+    )
+    if (modelProcess) {
+      opts.model = modelProcess.sdkModel
+      opts.env = modelProcess.env
+      if (modelProcess.executable) opts.pathToClaudeCodeExecutable = modelProcess.executable
+    } else if (context.model) {
+      opts.model = context.model
+    }
     if (context.effort) opts.effort = context.effort
-    const resume = sdkResumeSessionId(context.claudeSessionId, context.cwd)
+    const resume = sdkResumeSessionId(
+      context.claudeSessionId,
+      context.cwd,
+      modelProcess ? defaultWorkflowTranscriptRoots(modelProcess.env, context.cwd)[0] : undefined,
+      context.model,
+    )
     if (resume) opts.resume = resume
     if (resume && context.forkSession) opts.forkSession = true
     // A rewound thread continues from one of its own checkpoints. Forking
@@ -666,7 +798,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     // With the memories mapping on, auto-memory runs only for threads the
     // user turned memories on for.
     opts.env = {
-      ...process.env,
+      ...((opts.env as NodeJS.ProcessEnv | undefined) ?? process.env),
       CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1',
       ...autoMemoryEnv(context.autoMemory),
     }
@@ -685,9 +817,14 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (allowedTools.length > 0) opts.allowedTools = allowedTools
     if (context.disallowedTools && context.disallowedTools.length > 0)
       opts.disallowedTools = context.disallowedTools
+    const extraArgs: Record<string, string | null> = {}
     // The servers go to the CLI in a file, off its command line.
     const mcpConfig = writeCliMcpConfig(context.mcpServers)
-    if (mcpConfig) opts.extraArgs = { 'mcp-config': mcpConfig }
+    if (mcpConfig) extraArgs['mcp-config'] = mcpConfig
+    // Passed as a flag rather than the SDK's thinking option, which would
+    // also switch the model to adaptive thinking whatever the effort says.
+    if (context.thinkingDisplay) extraArgs['thinking-display'] = context.thinkingDisplay
+    if (Object.keys(extraArgs).length > 0) opts.extraArgs = extraArgs
     if (context.agents && Object.keys(context.agents).length > 0) opts.agents = context.agents
     // The source the CLI would give this session's SessionStart hooks.
     const origin = !resume ? 'startup' : opts.forkSession ? 'fork' : 'resume'
@@ -795,7 +932,9 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }
 
     // CLI binary override (for users pinning a specific claude-code build).
-    if (process.env.CLAUDE_CODEX_CLI) opts.pathToClaudeCodeExecutable = process.env.CLAUDE_CODEX_CLI
+    // A model process profile names its own executable instead.
+    if (!modelProcess && process.env.CLAUDE_CODEX_CLI)
+      opts.pathToClaudeCodeExecutable = process.env.CLAUDE_CODEX_CLI
 
     void sdk // keep parameter referenced for future SDK-version-gated options
     return opts
@@ -1003,19 +1142,16 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       // later turns still reach the CLI.
       const input = new TurnInput()
       const reusable = this.isReusable(context) && this.listener != null
-      // canUseTool reaches the session only once Claude asks for a tool.
-      let session: LiveSession | null = null
-      const options = this.buildOptions(sdk, context, abort, () => session)
-      if (reusable) this.trackCronJobs(context, options)
-      const query = sdk.query({ prompt: input, options })
       const opened: LiveSession = {
         threadId: context.threadId,
-        query,
+        query: null,
+        releaseLaunch: null,
         input,
         abort,
         reusable,
         signature: sessionSignature(context),
         lastContext: context,
+        transcriptEnv: process.env,
         model: context.model,
         effort: context.effort ?? null,
         permissionMode: derivePermissionMode(
@@ -1038,14 +1174,18 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         steers: new Map(),
         stoppedTasks: new Set(),
         endedWhileIdle: [],
-        commandOutputs: new CommandOutputs(taskOutputReader(query), commandOutputPollMs()),
+        // startCli replaces it once the CLI's query exists.
+        commandOutputs: new CommandOutputs(null),
         sink: null,
         settleTimer: null,
         idleTimer: null,
         chain: Promise.resolve(),
         closed: false,
       }
-      session = opened
+      // Without the launch gate the CLI starts right away, else once the
+      // session gets the launch slot; the prompt waits in the input meanwhile.
+      const gateMs = launchGateMs()
+      if (gateMs == null) this.startCli(sdk, opened)
       this.send(opened, this.buildPromptMessage(context))
       const pending = this.createPendingTurn(opened, context, handlers, false, resolve, reject)
       opened.current = pending
@@ -1057,8 +1197,78 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       }
       // Run the receive loop in the background. runTurn() resolves when this
       // turn's result arrives; the loop itself runs for the session.
-      void this.consumeSession(opened)
+      if (gateMs == null) void this.consumeSession(opened)
+      else void this.launchSession(sdk, opened, gateMs)
     })
+  }
+
+  private startCli(sdk: ClaudeSdk, session: LiveSession): void {
+    const context = session.lastContext
+    const options = this.buildOptions(sdk, context, session.abort, () => session)
+    session.transcriptEnv = (options.env as NodeJS.ProcessEnv | undefined) ?? process.env
+    if (session.reusable) this.trackCronJobs(context, options, session.transcriptEnv)
+    if (session.current) {
+      session.current.workflowTranscriptRoots = defaultWorkflowTranscriptRoots(
+        session.transcriptEnv,
+        session.current.context.cwd,
+      )
+    }
+    session.query = sdk.query({ prompt: session.input, options })
+    session.commandOutputs = new CommandOutputs(
+      taskOutputReader(session.query),
+      commandOutputPollMs(),
+    )
+  }
+
+  // With the launch gate on, a session starts its CLI once it gets the launch
+  // slot. One that closed while it waited (interrupted, replaced by a newer
+  // session of the thread, or the adapter stopping) never starts.
+  private async launchSession(sdk: ClaudeSdk, session: LiveSession, gateMs: number): Promise<void> {
+    let failure: Error | null = null
+    try {
+      await this.acquireLaunchSlot(session, gateMs)
+      if (session.abort.signal.aborted)
+        throw new Error('Claude turn interrupted before Claude Code started')
+      if (!session.closed) this.startCli(sdk, session)
+    } catch (error) {
+      failure = error instanceof Error ? error : new Error(String(error))
+    }
+    if (session.query) return this.consumeSession(session)
+    this.releaseLaunchSlot(session)
+    await this.serialize(session, () => this.endSession(session, failure))
+  }
+
+  // Claude Code launches are serialized: a session gets the launch slot once
+  // the previous launch has produced its first message, or has held the slot
+  // for the gate's timeout without one. Several CLIs starting at the same
+  // moment contend for the user's Claude config. Prompts and steers sent
+  // meanwhile wait in the session's input. Sessions take hook events
+  // (includeHookEvents), so a CLI that runs a SessionStart or Setup hook while
+  // it loads reports the hook as it starts it: the hook's run time never
+  // counts against the timeout, and a slow hook holds no one back.
+  private async acquireLaunchSlot(session: LiveSession, timeoutMs: number): Promise<void> {
+    const previous = this.launchTail
+    let release: () => void = () => {}
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    this.launchTail = previous.then(() => held)
+    await previous
+    const timer = setTimeout(() => {
+      debugLog('native.launch.gate_timeout', { threadId: session.threadId, timeoutMs })
+      this.releaseLaunchSlot(session)
+    }, timeoutMs)
+    timer.unref()
+    session.releaseLaunch = () => {
+      clearTimeout(timer)
+      release()
+    }
+  }
+
+  private releaseLaunchSlot(session: LiveSession): void {
+    const release = session.releaseLaunch
+    session.releaseLaunch = null
+    release?.()
   }
 
   private attachContinuation(
@@ -1161,9 +1371,10 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       completedWorkflowTasks: new Set(),
       workflowToolUseIds: new Set(),
       workflowLaunches: new Map(),
-      workflowTranscriptRoots: defaultWorkflowTranscriptRoots(process.env, context.cwd),
+      workflowTranscriptRoots: defaultWorkflowTranscriptRoots(session.transcriptEnv, context.cwd),
       skippedWorkflowTaskIds: new Set(),
       workflowTasks: new Map(),
+      startedTasks: new Set(),
       toolStartSeen: new Set(),
       toolInputPreviews:
         process.env.CLAUDE_CODEX_LIVE_FILE_CHANGES === '0' ? null : new ToolInputPreviews(),
@@ -1172,6 +1383,9 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       deferredResult: null,
       workflowFailure: null,
       model: null,
+      progressReportedAtMs: Number.NEGATIVE_INFINITY,
+      apiError: null,
+      notificationKeys: new Set(),
     }
   }
 
@@ -1179,12 +1393,20 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     session: LiveSession,
     context: RuntimeTurnContext,
   ): Promise<void> {
+    if (!session.query) return
     const query = session.query as Query & {
       setModel?: (model?: string) => Promise<void>
       setPermissionMode?: (mode: string) => Promise<void>
       applyFlagSettings?: (settings: { effortLevel?: string | null }) => Promise<void>
     }
-    if (context.model && context.model !== session.model && query.setModel) {
+    // A model process profile pins the model with its process (see
+    // sessionSignature); only a plain session switches models in place.
+    if (
+      !context.modelProfileId &&
+      context.model &&
+      context.model !== session.model &&
+      query.setModel
+    ) {
       session.model = context.model
       await settlesWithin(
         query.setModel(context.model).catch(() => {}),
@@ -1227,6 +1449,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     let failure: Error | null = null
     try {
       for await (const message of session.query as AsyncIterable<Record<string, unknown>>) {
+        // The CLI is up: the next session may launch.
+        this.releaseLaunchSlot(session)
         await this.serialize(session, () => this.routeMessage(session, message))
         if (session.closed) break
       }
@@ -1428,7 +1652,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
 
   private reinterrupt(session: LiveSession): void {
     // Not awaited: routing must keep draining the stream meanwhile.
-    void session.query.interrupt().catch(() => {})
+    void session.query?.interrupt().catch(() => {})
   }
 
   private async drainSink(session: LiveSession): Promise<void> {
@@ -1506,6 +1730,10 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
 
   private maybeRelease(session: LiveSession): void {
     if (session.closed || session.current || session.backlog.length > 0) return
+    // Every message restarts the idle wait (routeMessage), and so does this:
+    // a timer armed earlier and left running would close the session on its
+    // old deadline while its background tasks are still reporting progress.
+    this.clearSessionTimers(session)
     if (!session.reusable) {
       this.closeSession(session)
       return
@@ -1571,12 +1799,16 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   // What a new session starts with: nothing for a fresh Claude session, the
   // jobs tracked so far when it resumes the session this thread last ran,
   // and otherwise what the transcript it resumes still holds.
-  private trackCronJobs(context: RuntimeTurnContext, options: Record<string, unknown>): void {
+  private trackCronJobs(
+    context: RuntimeTurnContext,
+    options: Record<string, unknown>,
+    env: NodeJS.ProcessEnv,
+  ): void {
     const resume = stringOrNull(options.resume)
     const known = this.cronJobs.get(context.threadId)
     if (resume && known && known.sessionId === resume && options.forkSession !== true) return
     const jobs = new CronJobs()
-    const file = resume ? sessionTranscriptFile(resume, context.cwd) : null
+    const file = resume ? sessionTranscriptFile(resume, context.cwd, env) : null
     if (file) {
       try {
         jobs.scanTranscript(
@@ -1601,7 +1833,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     session.commandOutputs.close()
     session.input.close()
     try {
-      ;(session.query as Query & { close?: () => void }).close?.()
+      ;(session.query as (Query & { close?: () => void }) | null)?.close?.()
     } catch {}
   }
 
@@ -1614,6 +1846,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
 
   private async endSession(session: LiveSession, failure: Error | null): Promise<void> {
     this.clearSessionTimers(session)
+    // A CLI that exits before it says anything passes the launch slot on.
+    this.releaseLaunchSlot(session)
     session.closed = true
     session.commandOutputs.close()
     // A superseded session winds down after its replacement registered; the
@@ -1765,6 +1999,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
 
     if (subtype === 'task_started') {
       session.tasks.set(taskId, { taskType, toolUseId, outputFile: known?.outputFile ?? null })
+      session.current?.startedTasks.add(taskId)
       const backgrounded =
         typeof message.is_backgrounded === 'boolean' ? message.is_backgrounded : null
       if (!session.levelSeen && backgrounded === true && message.ambient !== true)
@@ -1869,6 +2104,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       if (messageUuid && claudeSessionId)
         await pending.handlers.onEvent({ type: 'checkpoint', claudeSessionId, messageUuid })
     }
+    await this.noteSubagentProgress(pending, type, message)
     switch (type) {
       case 'system':
         await this.handleSystem(pending, message)
@@ -1889,6 +2125,60 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         // Rate-limit notifications and other non-system frames.
         await this.handleOther(pending, type, message)
     }
+  }
+
+  // A subagent's own frames, the progress of the turn's tasks and the CLI's
+  // tool_progress heartbeats for a tool that runs quietly stay here
+  // (filtersNestedEvents), so the server would otherwise take a long but
+  // healthy Agent call or workflow for a stuck one. Agents the turn handed
+  // off are no longer its concern and do not count.
+  private async noteSubagentProgress(
+    pending: PendingTurn,
+    type: string,
+    message: Record<string, unknown>,
+  ): Promise<void> {
+    const toolUseId = this.progressToolUseId(pending, type, message)
+    if (!toolUseId) return
+    const now = performance.now()
+    if (now - pending.progressReportedAtMs < SUBAGENT_PROGRESS_INTERVAL_MS) return
+    pending.progressReportedAtMs = now
+    await pending.handlers.onEvent({ type: 'subagent_progress', toolUseId })
+  }
+
+  private progressToolUseId(
+    pending: PendingTurn,
+    type: string,
+    message: Record<string, unknown>,
+  ): string | null {
+    const parent = stringOrNull(message.parent_tool_use_id)
+    if (parent && this.waitsOn(pending, parent)) return parent
+    const progress = type === 'tool_progress'
+    const subtype = String(message.subtype ?? '')
+    if (
+      !progress &&
+      (type !== 'system' ||
+        !['task_progress', 'task_updated', 'task_notification'].includes(subtype))
+    )
+      return null
+    const taskId = stringOrNull(message.task_id)
+    const workflow = taskId ? pending.workflowTasks.get(taskId) : undefined
+    if (workflow)
+      return workflow.terminal ? null : workflow.toolUseId || workflowTaskToolUseId(workflow.taskId)
+    const toolUseId =
+      stringOrNull(message.tool_use_id) ??
+      (taskId ? pending.session.tasks.get(taskId)?.toolUseId : null) ??
+      null
+    return toolUseId && this.waitsOn(pending, toolUseId) ? toolUseId : null
+  }
+
+  // The turn is waiting on this tool call: a foreground Agent call (or a
+  // workflow agent projected as one) or a workflow it launched.
+  private waitsOn(pending: PendingTurn, toolUseId: string): boolean {
+    if (pending.activeSubagents.has(toolUseId) || pending.workflowToolUseIds.has(toolUseId))
+      return true
+    for (const state of pending.workflowTasks.values())
+      if (!state.terminal && state.toolUseId === toolUseId) return true
+    return false
   }
 
   private async handleSystem(
@@ -1953,6 +2243,42 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
           ? { status: 'running' as const, entries: [] }
           : hookRunOutcome(message)
       await pending.handlers.onEvent({ type: 'hook_run', hookId, hookEvent, ...run })
+      return
+    }
+    if (subtype === 'api_retry') {
+      // A subagent's retries stay inside its own run.
+      if (message.parent_tool_use_id) return
+      const status = numberOrNull(message.error_status)
+      const category = stringOrNull(message.error)
+      pending.apiError = { category, status }
+      await pending.handlers.onEvent({
+        type: 'retrying',
+        attempt: numberOrNull(message.attempt) ?? 1,
+        maxRetries: numberOrNull(message.max_retries) ?? 1,
+        status,
+        category,
+        delayMs: numberOrNull(message.retry_delay_ms),
+      })
+      return
+    }
+    if (subtype === 'notification') {
+      // The CLI's own status line. What it would put in front of an
+      // interactive user at once (a failed compaction, a model the
+      // organization denies) becomes a warning, each key once a turn; the
+      // rest is noise here.
+      const key = String(message.key ?? '')
+      const text = stringOrNull(message.text)
+      const urgent = message.priority === 'high' || message.priority === 'immediate'
+      if (!text || !urgent || (key && pending.notificationKeys.has(key))) {
+        debugLog('native.notification', { key, priority: message.priority })
+        return
+      }
+      if (key) pending.notificationKeys.add(key)
+      await pending.handlers.onEvent({
+        type: 'notice',
+        level: message.color === 'error' ? 'error' : 'warning',
+        message: text,
+      })
       return
     }
     if (subtype === 'model_refusal_fallback') {
@@ -2315,6 +2641,10 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (!nestedMessage) {
       await this.beginAssistantMessage(pending, stringOrNull(inner.id))
       pending.model = stringOrNull(inner.model) ?? pending.model
+      // The CLI answers a request that failed for good with an assistant
+      // message naming the error; the result then carries its HTTP status.
+      const apiError = stringOrNull(message.error)
+      pending.apiError = apiError ? { category: apiError, status: null } : null
       const usage = recordOrNull(inner.usage)
       const messageId = stringOrNull(inner.id)
       // Not final until the result, but enough to see a goal budget run out
@@ -2737,6 +3067,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         success: deferred.success,
         result: deferred.resultText,
         claudeSessionId: deferred.claudeSessionId,
+        ...(deferred.failure ? { failure: deferred.failure } : {}),
       })
       if (deferred.success) {
         pending.resolve()
@@ -2790,7 +3121,16 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (pending.context.outputFormat && pending.structuredBuffer) {
       await pending.handlers.onEvent({ type: 'text_delta', delta: pending.structuredBuffer.trim() })
     }
-    pending.deferredResult = { success, resultText, claudeSessionId }
+    // Why it failed, in the terms the server maps onto Codex error codes.
+    const failure: RuntimeFailure | null =
+      success || pending.workflowFailure != null
+        ? null
+        : {
+            terminalReason: stringOrNull(message.terminal_reason),
+            category: pending.apiError?.category ?? null,
+            status: numberOrNull(message.api_error_status) ?? pending.apiError?.status ?? null,
+          }
+    pending.deferredResult = { success, resultText, claudeSessionId, failure }
     if (!success) await this.stopWorkflowTasks(pending)
     await this.finishDeferredResult(pending)
   }
@@ -3273,6 +3613,9 @@ function sessionSignature(context: RuntimeTurnContext): string {
     context.planMode === true,
     configuredPermissionMode(),
     context.autoMemory ?? null,
+    context.modelProfileId ?? null,
+    context.modelProfileFingerprint ?? null,
+    context.thinkingDisplay ?? null,
   ])
 }
 
@@ -3300,14 +3643,25 @@ function taskOutputReader(query: Query): ((taskId: string) => Promise<unknown>) 
   return (taskId) => read.call(query, taskId)
 }
 
+// How long a launch may hold the launch slot, or null when Claude Code
+// launches are not serialized (CLAUDE_CODEX_SDK_LAUNCH_GATE unset).
+function launchGateMs(): number | null {
+  if (process.env.CLAUDE_CODEX_SDK_LAUNCH_GATE !== '1') return null
+  return positiveEnvMs('CLAUDE_CODEX_SDK_LAUNCH_GATE_TIMEOUT_MS') ?? LAUNCH_GATE_TIMEOUT_MS
+}
+
 function truthyEnv(value: string | undefined): boolean {
   return value != null && value !== '' && value !== '0' && value.toLowerCase() !== 'false'
 }
 
 // The transcript the CLI resumes: its config directory, under the project
 // directory named after the session's cwd.
-function sessionTranscriptFile(sessionId: string, cwd: string): string | null {
-  const root = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')
+function sessionTranscriptFile(
+  sessionId: string,
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+): string | null {
+  const root = env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')
   const dirs = [cwd]
   try {
     const real = realpathSync(cwd)
@@ -3339,80 +3693,167 @@ function stringOrNull(value: unknown): string | null {
   return typeof value === 'string' && value.length > 0 ? value : null
 }
 
-export function sdkResumeSessionId(value: string | null, cwd?: string): string | null {
+// The session to resume, or null when no config dir has its transcript. The
+// CLI resumes it from the config dir it runs from: a model process profile's
+// (`configRoot`), else the adapter's (CLAUDE_CONFIG_DIR or ~/.claude), or, for
+// a custom CLI such as a model router, the router config dir named after
+// `model`. When the newest copy of the transcript is elsewhere (the session
+// ran on another model or router), it is copied into that one config dir,
+// unless the copy there is as new or longer. A profile's transcripts are only
+// resumed from its own config dir and never copied in from another one.
+export function sdkResumeSessionId(
+  value: string | null,
+  cwd?: string,
+  configRoot?: string,
+  model?: string | null,
+): string | null {
   if (!value) return null
   if (/^(agent-http|agentapi|claude-p):/.test(value)) return null
-  if (cwd) {
-    const home = homedir()
-    const slug = (dir: string) => dir.replace(/[^a-zA-Z0-9-]/g, '-')
-    const slugs = [slug(cwd)]
-    try {
-      const real = realpathSync(cwd)
-      if (real !== cwd) slugs.push(slug(real))
-    } catch {}
-
-    // Discover all candidate config directories (default ~/.claude plus any custom router / multi-model roots)
-    const configRoots = new Set<string>([join(home, '.claude')])
-    if (process.env.CLAUDE_CONFIG_DIR) configRoots.add(process.env.CLAUDE_CONFIG_DIR)
-    const extraRoots = (process.env.CLAUDE_CONFIG_DIRS || process.env.CLAUDE_ROUTER_DIR || '')
-      .split(/[,:]/)
-      .map((p) => p.trim())
-      .filter(Boolean)
-    for (const extra of extraRoots) {
-      if (existsSync(extra)) configRoots.add(extra)
-    }
-
-    // Generic discovery of cached multi-model router config workspaces under ~/.cache/*/claude-router
-    const cacheBase = join(home, '.cache')
-    if (existsSync(cacheBase)) {
-      try {
-        for (const sub of readdirSync(cacheBase)) {
-          const routerDir = join(cacheBase, sub, 'claude-router')
-          if (existsSync(routerDir)) {
-            for (const item of readdirSync(routerDir)) {
-              configRoots.add(join(routerDir, item))
-            }
-          }
-        }
-      } catch {}
-    }
-
-    let sourceFile: string | null = null
-    for (const root of configRoots) {
-      for (const s of slugs) {
-        const p = join(root, 'projects', s, value + '.jsonl')
-        if (existsSync(p)) {
-          sourceFile = p
-          break
-        }
-      }
-      if (sourceFile) break
-      const sessFile = join(root, 'sessions', value + '.jsonl')
-      if (existsSync(sessFile)) {
-        sourceFile = sessFile
-        break
-      }
-    }
-
-    if (!sourceFile) return null
-
-    // Ensure the session transcript is mirrored across candidate project roots
-    // so switching models or routers retains 100% conversation history
-    for (const root of configRoots) {
-      for (const s of slugs) {
-        const targetDir = join(root, 'projects', s)
-        const targetFile = join(targetDir, value + '.jsonl')
-        if (targetFile === sourceFile) continue
-        try {
-          if (!existsSync(targetDir)) mkdirSync(targetDir, { recursive: true })
-          if (!existsSync(targetFile)) {
-            copyFileSync(sourceFile, targetFile)
-          }
-        } catch {}
-      }
+  if (!cwd) return value
+  const slugs = [projectSlug(cwd)]
+  try {
+    const real = realpathSync(cwd)
+    if (real !== cwd) slugs.push(projectSlug(real))
+  } catch {}
+  const runRoot = configRoot ?? nativeConfigRoot(model)
+  const roots = configRoot ? [configRoot] : [runRoot, ...knownConfigRoots()]
+  let source: TranscriptCopy | null = null
+  for (const root of new Set(roots)) {
+    const files = slugs.map((slug) => join(root, 'projects', slug, `${value}.jsonl`))
+    files.push(join(root, 'sessions', `${value}.jsonl`))
+    for (const file of files) {
+      const stat = regularFileStat(file)
+      // The newest copy wins; on a tie, the one already in the run root.
+      if (stat && (!source || stat.mtimeMs > source.stat.mtimeMs)) source = { file, stat }
     }
   }
+  if (!source) return null
+  for (const slug of slugs) {
+    mirrorTranscript(value, source, join(runRoot, 'projects', slug, `${value}.jsonl`))
+  }
   return value
+}
+
+interface TranscriptCopy {
+  file: string
+  stat: Stats
+}
+
+function projectSlug(dir: string): string {
+  return dir.replace(/[^a-zA-Z0-9-]/g, '-')
+}
+
+// The config dir a turn without a model process profile runs from. The CLI
+// the SDK starts reads CLAUDE_CONFIG_DIR, else ~/.claude. A custom CLI
+// (CLAUDE_CODEX_CLI) may be a model router that runs each model from its own
+// config dir, the ones the model list is discovered from (util.mts).
+function nativeConfigRoot(model: string | null | undefined): string {
+  const own = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')
+  if (!model || !process.env.CLAUDE_CODEX_CLI) return own
+  if (basename(model) !== model || model === '.' || model === '..') return own
+  for (const parent of routerConfigParents()) {
+    const root = join(parent, model)
+    if (isDirectory(root)) return root
+  }
+  return own
+}
+
+// Every config dir a session may have run from: the adapter's own, the
+// CLAUDE_CONFIG_DIRS (or CLAUDE_ROUTER_DIR) entries, and the router config
+// dirs under them and under ~/.cache/*/claude-router.
+function knownConfigRoots(): string[] {
+  const roots = [join(homedir(), '.claude')]
+  if (process.env.CLAUDE_CONFIG_DIR) roots.push(process.env.CLAUDE_CONFIG_DIR)
+  for (const extra of extraConfigRoots()) {
+    if (existsSync(extra)) roots.push(extra)
+  }
+  for (const parent of routerConfigParents()) {
+    try {
+      for (const item of readdirSync(parent)) roots.push(join(parent, item))
+    } catch {}
+  }
+  return roots
+}
+
+function extraConfigRoots(): string[] {
+  return (process.env.CLAUDE_CONFIG_DIRS || process.env.CLAUDE_ROUTER_DIR || '')
+    .split(/[,:]/)
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+}
+
+// Folders whose subfolders are per-model router config dirs.
+function routerConfigParents(): string[] {
+  const parents = extraConfigRoots().filter(isDirectory)
+  const cacheBase = join(homedir(), '.cache')
+  try {
+    for (const sub of readdirSync(cacheBase)) {
+      const routerDir = join(cacheBase, sub, 'claude-router')
+      if (isDirectory(routerDir)) parents.push(routerDir)
+    }
+  } catch {}
+  return parents
+}
+
+function isDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory()
+  } catch {
+    return false
+  }
+}
+
+function regularFileStat(path: string): Stats | null {
+  try {
+    const stat = statSync(path)
+    return stat.isFile() ? stat : null
+  } catch {
+    return null
+  }
+}
+
+// Puts `source` at `target` unless the copy there stays (see
+// keepTranscriptCopy). A transcript holds the whole conversation, with what
+// each request sent: the copy keeps the source's (owner-only) mode, is a clone
+// where the file system has them (APFS, Btrfs, XFS) and replaces the target in
+// one step. Not a hard link: the CLI appends to the copy in the run root, which
+// must not change the transcript in the other config dir.
+function mirrorTranscript(sessionId: string, source: TranscriptCopy, target: string): void {
+  if (target === source.file) return
+  const existing = regularFileStat(target)
+  if (existing && keepTranscriptCopy(existing, source.stat)) {
+    if (existing.size > source.stat.size) {
+      debugLog('native.transcript.kept_longer', { sessionId, from: source.file, to: target })
+    }
+    return
+  }
+  const temp = `${target}.${newId()}.tmp`
+  try {
+    mkdirSync(dirname(target), { recursive: true, mode: 0o700 })
+    copyFileSync(source.file, temp, fsConstants.COPYFILE_EXCL | fsConstants.COPYFILE_FICLONE)
+    chmodSync(temp, source.stat.mode & 0o777)
+    utimesSync(temp, source.stat.atimeMs / 1000, source.stat.mtimeMs / 1000)
+    renameSync(temp, target)
+    debugLog('native.transcript.mirrored', {
+      sessionId,
+      bytes: source.stat.size,
+      from: source.file,
+      to: target,
+    })
+  } catch (error) {
+    rmSync(temp, { force: true })
+    debugLog('native.transcript.mirror_failed', { sessionId, to: target, error: String(error) })
+  }
+}
+
+// Whether the copy already at the target stays. A copy carries its source's
+// mtime, which utimes keeps to about a microsecond. The CLI only appends to a
+// transcript, so a shorter source is no later state of a longer copy, however
+// new its mtime (another file system's clock, a stale copy touched since):
+// replacing the copy would drop the turns only it has.
+function keepTranscriptCopy(copy: Stats, source: Stats): boolean {
+  if (copy.mtimeMs > source.mtimeMs || copy.size > source.size) return true
+  return copy.size === source.size && source.mtimeMs - copy.mtimeMs < 1
 }
 
 // ── AskUserQuestion bridging helpers ──

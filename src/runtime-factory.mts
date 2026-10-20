@@ -56,6 +56,13 @@ class SelectableRuntime implements ClaudeRuntime {
       return
     }
 
+    // Only the native runtime starts a profile's own Claude Code process;
+    // another would run the turn with the adapter's own provider settings.
+    if (context.modelProfileId && !runsModelProfiles(requestedType)) {
+      throw new Error(
+        `model process profile ${context.modelProfileId} needs the native Claude runtime, not ${requestedType}`,
+      )
+    }
     const runtime = this.runtimeFor(requestedType)
     debugLog('runtime.turn.select', {
       threadId: context.threadId,
@@ -104,6 +111,11 @@ class SelectableRuntime implements ClaudeRuntime {
       return
     }
     await Promise.allSettled([...this.runtimes.values()].map((entry) => entry.interrupt(threadId)))
+  }
+
+  async abandonTurn(threadId: string, turnId: string): Promise<boolean> {
+    const runtime = this.activeRuntimeByThread.get(threadId)
+    return (await runtime?.abandonTurn?.(threadId, turnId)) === true
   }
 
   async stop(): Promise<void> {
@@ -166,6 +178,10 @@ class SelectableRuntime implements ClaudeRuntime {
     this.runtimes.set(type, runtime)
     return runtime
   }
+}
+
+function runsModelProfiles(type: RuntimeBackendType): boolean {
+  return type === 'agent-sdk-sidecar' || type === 'mock'
 }
 
 function shouldHandleLocally(type: RuntimeBackendType, context: RuntimeTurnContext): boolean {
