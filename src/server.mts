@@ -24,6 +24,7 @@ import {
   reasoningEffortOptions,
   reportedClaudeModel,
 } from './claude-models.mjs'
+import { configRequirements } from './cli-probes.mjs'
 import { runCodexNotify } from './codex-notify.mjs'
 import { appendCommandOutput } from './command-output.mjs'
 import {
@@ -869,7 +870,7 @@ export class CodexClaudeAppServer {
       case 'config/read':
         return this.configRead()
       case 'configRequirements/read':
-        return { requirements: null }
+        return configRequirements()
       case 'model/list':
         return this.modelList()
       case 'modelProvider/capabilities/read':

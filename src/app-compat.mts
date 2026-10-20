@@ -48,6 +48,14 @@ export const APP_RULES: readonly AppRule[] = [
       'In the bundle, the prediction path still gives up with unsupported_provider before its thread/fork when modelProvider is not openai.',
   },
   {
+    id: 'daemon-version',
+    app: 'With CODEX_APP_SERVER_USE_LOCAL_DAEMON=1 on a local host, runs `codex app-server daemon version` (2.5 s timeout) before connecting. When it prints JSON whose appServerVersion is at least 0.141.0, the App talks to the server on <CODEX_HOME>/app-server-control/app-server-control.sock instead of starting one over stdio; when it fails, the App starts its own.',
+    adapter:
+      'Answers the probe without opening the state database: the compat version when a server accepts connections on that socket (the unix daemon listens there by default), a failure otherwise.',
+    verify:
+      'Find `daemon`,`version` in the network-startup chunk of the bundle and check the socket path and the version check next to it.',
+  },
+  {
     id: 'config-warnings',
     app: 'Lists configWarning notifications under Settings > Agent > Configuration, keeping the last 20 per host.',
     adapter:

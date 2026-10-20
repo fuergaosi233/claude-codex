@@ -4,6 +4,7 @@ import { dirname } from 'node:path'
 import { APP_PLUGIN_SERVER_ENV, setAppPluginConfigOverrides } from './app-plugin-mcp.mjs'
 import { sweepCliMcpConfigs } from './cli-mcp-config.mjs'
 import { reapOrphanedCliChildren } from './cli-orphans.mjs'
+import { daemonProbe, startupConfigProbe } from './cli-probes.mjs'
 import { inheritedHooksWarning } from './inherited-config.mjs'
 import { createRuntime } from './runtime-factory.mjs'
 import { CodexClaudeAppServer } from './server.mjs'
@@ -60,6 +61,16 @@ async function main(): Promise<void> {
   const args = process.argv.slice(2)
   if (args[0] !== 'app-server') {
     usage(1)
+    return
+  }
+
+  // One-shot probes, answered before the state database opens and before
+  // startup recovery, so a probe cannot disturb a server already running.
+  const probe = startupConfigProbe(args) ?? (await daemonProbe(args))
+  if (probe) {
+    process.stdout.write(probe.stdout)
+    process.stderr.write(probe.stderr)
+    process.exitCode = probe.code
     return
   }
 
@@ -326,6 +337,8 @@ function usage(code: number): never {
       [--ws-auth capability-token|none] [--ws-token-file ABS_PATH | --ws-token-sha256 HEX]
       [--ws-allowed-origins ORIGIN,...] [--ws-allow-unauthenticated]
   claude-codex-adapter app-server proxy [--sock PATH]
+  claude-codex-adapter app-server --print-startup-config [--startup-client-info JSON]
+  claude-codex-adapter app-server daemon version
 `
   ;(code === 0 ? process.stdout : process.stderr).write(text)
   process.exit(code)

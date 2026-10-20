@@ -7,7 +7,8 @@ Implemented as real remote/runtime behavior:
   `--ws-auth capability-token` (`--ws-token-file`, `--ws-token-sha256`) and,
   like `codex app-server`, refuses a non-loopback address without it unless
   `--ws-allow-unauthenticated` is passed; `signed-bearer-token` is not
-  implemented.
+  implemented. The one-shot `app-server --print-startup-config` and
+  `app-server daemon version` probes answer without opening the state database.
 - **Thread lifecycle** — start, resume, fork, list, read, turns list, name,
   archive/unarchive, unsubscribe, interrupt, delete, and rollback/revert that
   rewind Claude's session to the kept turns.

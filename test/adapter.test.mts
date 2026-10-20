@@ -4,11 +4,12 @@ import {
   type ChildProcessWithoutNullStreams,
   execFileSync,
   spawn,
+  spawnSync,
 } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import { existsSync } from 'node:fs'
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import http from 'node:http'
 import net from 'node:net'
 import { tmpdir } from 'node:os'
@@ -2251,6 +2252,55 @@ test('stdio app-server recovers stale in-progress turns after process restart', 
   }
 })
 
+test('a second stdio app-server on the same CODEX_HOME leaves a running turn of the first alone', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const first = spawnMockAdapter(home)
+  let second: ChildProcessWithoutNullStreams | null = null
+  try {
+    const reader1 = new JsonLineReader(first)
+    const threadId = await startMockThread(reader1, first)
+    first.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: textInput('hold this turn until released') },
+      }),
+    )
+    const turnId = (await reader1.nextResponse(2)).result.turn.id
+
+    // A probe or another window starts a server on the same state dir while
+    // the first one is mid-turn.
+    second = spawnMockAdapter(home)
+    const reader2 = new JsonLineReader(second)
+    second.stdin.write(
+      json({ id: 3, method: 'thread/read', params: { threadId, includeTurns: true } }),
+    )
+    const read = await reader2.nextResponse(3)
+    assert.equal(
+      read.result.thread.turns.find((turn: any) => turn.id === turnId)?.status,
+      'inProgress',
+    )
+    await stopProcess(second)
+
+    first.stdin.write(
+      json({
+        id: 4,
+        method: 'turn/steer',
+        params: { threadId, expectedTurnId: turnId, input: textInput('release') },
+      }),
+    )
+    const completed = await awaitMessage(
+      reader1,
+      (message) => message.method === 'turn/completed' && message.params.turn.id === turnId,
+    )
+    assert.equal(completed.params.turn.status, 'completed')
+  } finally {
+    await stopProcess(first)
+    if (second) await stopProcess(second)
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('the adapter warns once as it starts that bridged hooks need a CLI without settings', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const env: NodeJS.ProcessEnv = {
@@ -2785,6 +2835,134 @@ test('startup recovery keeps markers of finished agents and ends the ones it cut
   }
 })
 
+test('startup recovery fails only the turns of servers that are gone', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const path = join(home, 'state.sqlite')
+  const store = new SessionStore(path)
+  const now = Math.floor(Date.now() / 1000)
+  // live: another server still runs it. reused: its server's pid now names a
+  // process that started later. legacy: written before turns named a server.
+  const threads = { live: randomUUID(), reused: randomUUID(), legacy: randomUUID() }
+  const turns = { live: randomUUID(), reused: randomUUID(), legacy: randomUUID() }
+  let server: ChildProcessWithoutNullStreams | null = null
+  try {
+    for (const threadId of Object.values(threads)) {
+      store.upsertThread({
+        id: threadId,
+        sessionId: threadId,
+        forkedFromId: null,
+        preview: 'owner recovery',
+        name: null,
+        archived: false,
+        cwd: process.cwd(),
+        model: 'sonnet',
+        reasoningEffort: null,
+        modelProvider: 'claude-code',
+        claudeSessionId: null,
+        source: 'appServer',
+        createdAt: now,
+        updatedAt: now,
+        status: { type: 'active', activeFlags: [] },
+        approvalPolicy: 'on-request',
+        sandboxMode: 'workspace-write',
+        ephemeral: false,
+        threadSource: 'user',
+        agentRole: null,
+        agentNickname: null,
+        baseInstructions: null,
+        developerInstructions: null,
+        personality: null,
+        runtimeBackend: 'claude',
+        codexSessionId: null,
+      })
+    }
+    // The other server writes its turns, then keeps running.
+    const pairs = (['live', 'reused', 'legacy'] as const).map((key) => [threads[key], turns[key]])
+    server = spawn(
+      process.execPath,
+      [
+        '--no-warnings',
+        '--input-type=module',
+        '-e',
+        `
+      import { SessionStore } from './dist/src/store.mjs'
+
+      const store = new SessionStore(${JSON.stringify(path)})
+      for (const [threadId, id] of ${JSON.stringify(pairs)}) {
+        store.upsertTurn({
+          id,
+          threadId,
+          status: 'inProgress',
+          startedAt: ${now},
+          completedAt: null,
+          durationMs: null,
+          items: [],
+          diff: '',
+          error: null,
+        })
+      }
+      process.stdout.write('ready\\n')
+      setInterval(() => {}, 60_000)
+      `,
+      ],
+      { stdio: ['pipe', 'pipe', 'pipe'] },
+    )
+    let stderr = ''
+    server.stderr.setEncoding('utf8')
+    server.stderr.on('data', (chunk: string) => {
+      stderr += chunk
+    })
+    await Promise.race([
+      once(server.stdout, 'data'),
+      once(server, 'exit').then(() => {
+        throw new Error(`the other server exited early: ${stderr}`)
+      }),
+    ])
+
+    const db = new DatabaseSync(path)
+    try {
+      const owner = db
+        .prepare('SELECT owner_pid, owner_started FROM turns WHERE id = ?')
+        .get(turns.live) as { owner_pid: number; owner_started: string }
+      assert.equal(owner.owner_pid, server.pid)
+      assert.ok(owner.owner_started)
+      db.prepare('UPDATE turns SET owner_started = ? WHERE id = ?').run(
+        'Thu Jan  1 00:00:00 1970',
+        turns.reused,
+      )
+      db.prepare('UPDATE turns SET owner_pid = NULL, owner_started = NULL WHERE id = ?').run(
+        turns.legacy,
+      )
+    } finally {
+      db.close()
+    }
+
+    const second = new SessionStore(path)
+    try {
+      assert.equal(second.recoverStaleInProgressTurns(), 2)
+      assert.equal(second.getTurn(turns.live)?.status, 'inProgress')
+      assert.equal(second.getThread(threads.live)?.status.type, 'active')
+      for (const key of ['reused', 'legacy'] as const) {
+        assert.equal(second.getTurn(turns[key])?.status, 'interrupted')
+        assert.equal(second.getThread(threads[key])?.status.type, 'idle')
+      }
+
+      server.kill('SIGKILL')
+      await waitForExit(server, 2000)
+      assert.equal(server.signalCode, 'SIGKILL')
+      assert.equal(second.recoverStaleInProgressTurns(), 1)
+      assert.equal(second.getTurn(turns.live)?.status, 'interrupted')
+      assert.equal(second.getThread(threads.live)?.status.type, 'idle')
+    } finally {
+      second.close()
+    }
+  } finally {
+    if (server) await stopProcess(server)
+    store.close()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('app-server proxy forwards websocket handshake bytes to unix daemon', {
   timeout: 15_000,
 }, async () => {
@@ -2929,6 +3107,213 @@ test('remote shim launches daemon and proxy with Codex-compatible commands', {
     proxy.stdin?.end()
     await Promise.all([stopProcess(proxy), stopProcess(daemon)])
     await rm(sock, { force: true })
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('app-server --print-startup-config prints one JSON line without opening the state database', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    HOME: home,
+    CLAUDE_CODEX_COMPAT_VERSION: '0.164.0-alpha.6',
+    NODE_NO_WARNINGS: '1',
+  }
+  delete env.CODEX_HOME
+  delete env.CLAUDE_CODEX_HOME
+  const run = (...args: string[]) =>
+    spawnSync(process.execPath, [adapter, 'app-server', ...args], {
+      env,
+      encoding: 'utf8',
+      timeout: 15_000,
+    })
+  let proc: ChildProcessWithoutNullStreams | null = null
+  try {
+    const clientInfo = JSON.stringify({ name: 'codex_desktop', title: null, version: '26.1013.0' })
+    for (const args of [
+      ['--print-startup-config'],
+      ['--print-startup-config', '--startup-sign-out', '--startup-client-info', clientInfo],
+      [`--startup-client-info=${clientInfo}`, '--print-startup-config'],
+    ]) {
+      const result = run(...args)
+      assert.equal(result.status, 0, result.stderr)
+      assert.equal(result.stderr, '')
+      assert.match(result.stdout, /^[^\n]+\n$/)
+      assert.deepEqual(JSON.parse(result.stdout), {
+        appServerVersion: '0.164.0-alpha.6',
+        configRequirements: { requirements: null },
+      })
+    }
+    // Usage errors, as codex reports them: stderr only.
+    for (const [args, status] of [
+      [['--print-startup-config', '--listen', 'stdio://'], 2],
+      [['--startup-sign-out'], 2],
+      [['--print-startup-config', '--startup-client-info', '{"name":"codex_desktop"}'], 2],
+      [['--print-startup-config', 'daemon', 'version'], 1],
+    ] as const) {
+      const result = run(...args)
+      assert.equal(result.status, status, args.join(' '))
+      assert.equal(result.stdout, '')
+      assert.match(result.stderr, /^error: /)
+    }
+    // Nothing under HOME: no Codex home, state database or debug log.
+    assert.deepEqual(await readdir(home), [])
+
+    // configRequirements/read on a running server answers the same.
+    proc = spawnMockAdapter(join(home, 'server'))
+    const reader = new JsonLineReader(proc)
+    proc.stdin.write(json({ id: 1, method: 'configRequirements/read', params: {} }))
+    assert.deepEqual((await reader.nextResponse(1)).result, { requirements: null })
+  } finally {
+    if (proc) await stopProcess(proc)
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('app-server daemon version reports the unix daemon on the control socket, and fails without one', {
+  timeout: 30_000,
+}, async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'ccx-'))
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    CODEX_HOME: home,
+    CLAUDE_CODEX_MOCK: '1',
+    CLAUDE_CODEX_COMPAT_VERSION: '0.163.0',
+    NODE_NO_WARNINGS: '1',
+  }
+  delete env.CLAUDE_CODEX_HOME
+  const run = (...args: string[]) =>
+    spawnSync(process.execPath, [adapter, 'app-server', 'daemon', ...args], {
+      env,
+      encoding: 'utf8',
+      timeout: 15_000,
+    })
+  let daemon: ChildProcess | null = null
+  try {
+    // No daemon: fail at once, as codex does, so the App starts its own
+    // server, and leave the state dir alone.
+    const missing = run('version')
+    assert.equal(missing.status, 1)
+    assert.equal(missing.stdout, '')
+    assert.match(missing.stderr, /no app-server daemon is running/)
+    const unsupported = run('start')
+    assert.equal(unsupported.status, 1)
+    assert.equal(unsupported.stdout, '')
+    assert.deepEqual(await readdir(home), [])
+
+    const socketPath = join(home, 'app-server-control', 'app-server-control.sock')
+    // The daemon moves its socket elsewhere when this path is too long for
+    // one, as under a deep temp dir; the App would not find it there either.
+    if (socketPath.length > 100) {
+      t.skip('the temp dir is too deep for a unix socket at the control path')
+      return
+    }
+    daemon = spawn(process.execPath, [adapter, 'app-server', '--listen', 'unix://'], {
+      stdio: ['ignore', 'ignore', 'pipe'],
+      env,
+    })
+    await waitForStderr(daemon, /listening on/)
+    const running = run('version')
+    assert.equal(running.status, 0, running.stderr)
+    assert.match(running.stdout, /^[^\n]+\n$/)
+    assert.deepEqual(JSON.parse(running.stdout), {
+      status: 'running',
+      socketPath,
+      appServerVersion: '0.163.0',
+    })
+    // The shim leaves a socket that exists to the adapter to check.
+    const shimmed = spawnSync(shim, ['app-server', 'daemon', 'version'], {
+      env: {
+        ...env,
+        CLAUDE_CODEX_RUNTIME_ENV: join(home, 'runtime.env'),
+        CLAUDE_CODEX_ADAPTER: adapter,
+      },
+      encoding: 'utf8',
+      timeout: 15_000,
+    })
+    assert.equal(shimmed.status, 0, shimmed.stderr)
+    assert.equal(shimmed.stdout, running.stdout)
+    assert.equal(daemon.exitCode, null)
+  } finally {
+    if (daemon) await stopProcess(daemon)
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('the shim answers one-shot probes without node, and leaves them to a native codex', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'ccx-'))
+  const realCodex = join(home, 'real-codex')
+  await writeFile(realCodex, '#!/bin/sh\nprintf "real codex: %s\\n" "$*"\n')
+  await chmod(realCodex, 0o755)
+  const base: NodeJS.ProcessEnv = {
+    ...process.env,
+    CODEX_HOME: join(home, 'codex'),
+    // The shim sources a runtime env; keep the developer's own out of it.
+    CLAUDE_CODEX_RUNTIME_ENV: join(home, 'runtime.env'),
+    // No adapter: what the shim answers, it answers without starting node.
+    CLAUDE_CODEX_ADAPTER: join(home, 'missing-adapter.mjs'),
+    CLAUDE_CODEX_COMPAT_VERSION: '0.164.0-alpha.6',
+    NODE_NO_WARNINGS: '1',
+  }
+  for (const key of ['CLAUDE_CODEX_ROUTE', 'CLAUDE_CODEX_RUNTIME_TYPE', 'CODEX_REAL'])
+    delete base[key]
+  const run = (args: string[], env: NodeJS.ProcessEnv = {}) =>
+    spawnSync(shim, ['app-server', ...args], {
+      env: { ...base, ...env },
+      encoding: 'utf8',
+      timeout: 15_000,
+    })
+  const line = '{"appServerVersion":"0.164.0-alpha.6","configRequirements":{"requirements":null}}\n'
+  try {
+    for (const args of [
+      ['--print-startup-config'],
+      ['--startup-sign-out', '--print-startup-config'],
+    ]) {
+      const result = run(args)
+      assert.equal(result.status, 0, result.stderr)
+      assert.equal(result.stdout, line)
+      assert.equal(result.stderr, '')
+    }
+    const missing = run(['daemon', 'version'])
+    assert.equal(missing.status, 1)
+    assert.equal(missing.stdout, '')
+    assert.equal(
+      missing.stderr,
+      `Error: no app-server daemon is running at ${join(home, 'codex', 'app-server-control', 'app-server-control.sock')}\n`,
+    )
+    assert.equal(existsSync(join(home, 'codex')), false)
+
+    // The adapter answers what the shim does not settle.
+    const clientInfo = JSON.stringify({ name: 'codex_desktop', version: '26.1013.0' })
+    const withAdapter = { CLAUDE_CODEX_ADAPTER: adapter }
+    const described = run(
+      ['--print-startup-config', '--startup-client-info', clientInfo],
+      withAdapter,
+    )
+    assert.equal(described.status, 0, described.stderr)
+    assert.equal(described.stdout, line)
+    const quoted = run(['--print-startup-config'], {
+      ...withAdapter,
+      CLAUDE_CODEX_COMPAT_VERSION: '0.164.0 "x"',
+    })
+    assert.equal(quoted.status, 0, quoted.stderr)
+    assert.equal(JSON.parse(quoted.stdout).appServerVersion, '0.164.0 "x"')
+    const conflict = run(['--print-startup-config', '--listen', 'stdio://'], withAdapter)
+    assert.equal(conflict.status, 2)
+    assert.equal(conflict.stdout, '')
+    assert.equal(existsSync(join(home, 'codex')), false)
+
+    // A native codex gets them unchanged.
+    const native = { CLAUDE_CODEX_ROUTE: 'codex', CODEX_REAL: realCodex }
+    for (const args of [
+      ['--print-startup-config', '--startup-sign-out'],
+      ['daemon', 'version'],
+    ]) {
+      const result = run(args, native)
+      assert.equal(result.status, 0, result.stderr)
+      assert.equal(result.stdout, `real codex: app-server ${args.join(' ')}\n`)
+    }
+  } finally {
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
