@@ -1535,7 +1535,9 @@ export class MockRuntime implements ClaudeRuntime {
       // An agent launches an agent of its own. Newer CLIs name the agent
       // behind a subagent's frame (agent_id) and the agent that launched a
       // task (parent_task_id); "without ids" plays a CLI that sends neither.
+      // "without results" ends the turn while both agents still run.
       const withIds = !/without ids/i.test(context.prompt)
+      const withResults = !/without results/i.test(context.prompt)
       const parentUseId = `task-parent-${Date.now()}`
       const nestedUseId = `task-nested-${Date.now()}`
       const parentTaskId = 'mock-parent-task'
@@ -1573,6 +1575,10 @@ export class MockRuntime implements ClaudeRuntime {
         backgrounded: false,
         ...(withIds ? { parentTaskId } : {}),
       })
+      if (!withResults) {
+        await handlers.onEvent({ type: 'completed', success: true, result: 'missing tool results' })
+        return
+      }
       await handlers.onEvent({
         type: 'tool_result',
         toolUseId: nestedUseId,

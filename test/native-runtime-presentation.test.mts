@@ -607,7 +607,8 @@ test('a failed native turn says why it failed, and a successful one carries no f
     failure: { terminalReason: 'prompt_too_long', category: null, status: null },
   })
 
-  // A CLI that refused to start names the reason; its stderr stays behind.
+  // A CLI that refused to start names the reason; its stderr stays behind,
+  // and so does the id of a session it never loaded.
   const refused = await completedEvent([
     {
       type: 'result',
@@ -615,6 +616,7 @@ test('a failed native turn says why it failed, and a successful one carries no f
       is_error: true,
       duration_ms: 0,
       num_turns: 0,
+      session_id: 'never-loaded',
       startup_failure_reason: 'proxy_invalid',
       errors: ['Invalid proxy URL: http://user:secret@proxy.invalid:8080'],
     },

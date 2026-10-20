@@ -7131,6 +7131,74 @@ test('without the agent ids every agent hangs off the parent thread, as before',
   }
 })
 
+test('agents a turn leaves running end with it, a nested one inside its host first', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json(codex930Initialize(0)))
+    await reader.nextResponse(0)
+    const threadId = await startMockThread(reader, proc)
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: textInput('nested subagent check without results') },
+      }),
+    )
+    await reader.nextResponse(2)
+    const seen = await readUntil(
+      reader,
+      (m) => m.method === 'turn/completed' && m.params.threadId === threadId,
+    )
+    const outer = childByPrompt(seen, 'plan the work')
+    const inner = childByPrompt(seen, 'check one file')
+    assert.ok(outer && inner)
+    assert.equal(inner.parentThreadId, outer.id)
+    const outerTurnId = seen.find(
+      (m) => m.method === 'turn/started' && m.params.threadId === outer.id,
+    )?.params.turn.id
+    assert.ok(outerTurnId)
+
+    // The inner agent ends, and its wait closes in the outer agent's turn,
+    // before that turn ends.
+    const at = (predicate: (m: any) => boolean) => seen.findIndex(predicate)
+    const innerEnd = at((m) => m.method === 'turn/completed' && m.params.threadId === inner.id)
+    const innerWait = at(
+      (m) =>
+        m.method === 'item/completed' &&
+        m.params.item.tool === 'wait' &&
+        m.params.item.receiverThreadIds?.[0] === inner.id,
+    )
+    const outerEnd = at((m) => m.method === 'turn/completed' && m.params.threadId === outer.id)
+    assert.ok(innerEnd >= 0 && innerWait >= 0 && outerEnd >= 0)
+    assert.ok(innerEnd < outerEnd && innerWait < outerEnd)
+    assert.equal(seen[innerWait].params.threadId, outer.id)
+    assert.equal(seen[innerWait].params.turnId, outerTurnId)
+    assert.equal(seen[innerWait].params.item.status, 'failed')
+    assert.equal(seen[innerEnd].params.turn.status, 'failed')
+    assert.equal(seen[outerEnd].params.turn.status, 'failed')
+
+    // Read back, nothing anywhere in the tree is left in progress.
+    let id = 3
+    for (const readId of [threadId, outer.id, inner.id]) {
+      proc.stdin.write(
+        json({ id, method: 'thread/read', params: { threadId: readId, includeTurns: true } }),
+      )
+      const read = (await reader.nextResponse(id)).result.thread
+      id += 1
+      assert.ok(read.turns.length > 0)
+      for (const turn of read.turns) {
+        assert.notEqual(turn.status, 'inProgress')
+        for (const item of turn.items) assert.notEqual(item.status, 'inProgress', item.type)
+      }
+    }
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('an agent SendMessage resumes keeps its child thread, and the agents it launches hang off it', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawnMockAdapter(home)
