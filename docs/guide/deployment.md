@@ -77,6 +77,14 @@ client disconnects it shuts down after an idle grace period (deferred if a turn
 is still active; reconnecting during that window reattaches notifications). Tune
 with `CLAUDE_CODEX_IDLE_EXIT_MS` (default `15000`; `0` keeps it running).
 
+Several clients can follow one thread at once. A client follows the threads it
+starts, resumes, forks or sends a turn to, until it disconnects or sends
+`thread/unsubscribe`, which drops only that client; every follower gets the
+thread's notifications. An approval or question goes to all of them, the first
+answer wins, and the others get `serverRequest/resolved`; any connected client
+may answer. A client that opens a thread while one of its turns is waiting on a
+request, such as the App after a reconnect, gets the request too.
+
 ## Quick remote probe
 
 ```bash

@@ -245,6 +245,9 @@ function remoteEnv(options = {}) {
     `export CODEX_HOME=${shQuote(home)}`,
     `export CLAUDE_CODEX_ADAPTER=${shQuote(adapter)}`,
     `export CLAUDE_CODEX_NODE=${shQuote(nodeBin)}`,
+    // The daemon and the proxy meet at the default socket under this
+    // CODEX_HOME, not at one the login shell points to for everyday use.
+    'unset CLAUDE_CODEX_SOCKET_PATH',
   ]
   if (claudeCli) exports.push(`export CLAUDE_CODEX_CLI=${shQuote(claudeCli)}`)
   if (options.mock) exports.push('export CLAUDE_CODEX_MOCK=1')

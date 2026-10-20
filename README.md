@@ -65,6 +65,41 @@ diffs. Runtime selection maps only to existing backend paths today: default
 in-process Claude Agent SDK, `agent-http`, `agentapi`, `claude-p`, `codex-proxy`,
 and `mock`.
 
+The App starts one adapter daemon with `codex app-server --listen unix://` and
+reaches it through `codex app-server proxy`. Neither names a socket, so both use
+`$CODEX_HOME/app-server-control/app-server-control.sock` by default. To put it
+somewhere else, set `CLAUDE_CODEX_SOCKET_PATH` to an absolute path in a folder of
+its own, in the login shell or `~/.claude-codex/runtime.env`, since the daemon
+and the proxy must agree on it. See
+[Configuration](https://fuergaosi233.github.io/claude-codex/guide/configuration).
+
+Each Claude thread runs its own Claude Code process. Several of them starting at
+the same moment, such as the chats that all resume their Claude sessions right
+after the adapter or the App restarts, write the user's Claude Code config
+(`~/.claude.json`) at once and can corrupt it
+([anthropics/claude-code#28847](https://github.com/anthropics/claude-code/issues/28847)).
+`CLAUDE_CODEX_SDK_LAUNCH_GATE=1` starts them one at a time instead: each waits
+until the one before has sent its first message, or for at most
+`CLAUDE_CODEX_SDK_LAUNCH_GATE_TIMEOUT_MS` (default 30000) when it stays silent.
+Prompts and steers sent meanwhile wait for their process. It is off by default.
+
+### Model process profiles
+
+By default every Claude thread runs the same Claude Code with the adapter's
+environment. With `CLAUDE_CODEX_MODEL_PROFILES_FILE` pointing at a profiles file
+(or the same JSON inline in `CLAUDE_CODEX_MODEL_PROFILES`), each Claude model in
+the picker runs a Claude Code process of its own instead: its own executable,
+provider environment and Claude config folder, with none of the adapter's
+provider credentials. Secrets stay in the environment or in private env files;
+the profiles file only references them. A chat stays on the profile it started
+on. Once that profile's configuration changes, or for a chat from before
+profiles were set up, the chat still opens to be read, but a new message asks
+for a new chat rather than resuming its session somewhere else. Without a
+profiles file nothing changes. See
+[Model process profiles](https://fuergaosi233.github.io/claude-codex/guide/configuration#model-process-profiles)
+for the file format, its safety rules and how it relates to
+`CLAUDE_CODEX_MODELS`.
+
 ### Desktop conversation and visual explanations
 
 The native Claude Agent SDK backend receives presentation guidance modeled on

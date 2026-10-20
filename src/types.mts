@@ -64,6 +64,9 @@ export interface ThreadRecord {
   archived: boolean
   cwd: string
   model: string
+  // Fingerprint of the model process profile the thread started on (see
+  // model-profiles.mts); null for Codex threads and when no profiles exist.
+  modelProfileFingerprint?: string | null
   reasoningEffort: string | null
   modelProvider: string
   // Which backend actually drives this thread's turns. 'claude' = our native
@@ -480,6 +483,10 @@ export interface RuntimeTurnContext {
   cwd: string
   runtimeType: RuntimeBackendType | null
   model: string | null
+  // Model process profile the turn runs in, and the fingerprint its current
+  // configuration must still match.
+  modelProfileId?: string | null
+  modelProfileFingerprint?: string | null
   effort: string | null
   claudeSessionId: string | null
   forkSession: boolean

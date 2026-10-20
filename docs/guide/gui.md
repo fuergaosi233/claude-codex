@@ -24,7 +24,13 @@ Codex App's model menu stays a **model selector** only — pick `Claude Sonnet`,
 The default picker exposes Claude Code aliases; model availability and the version
 an alias selects depend on your account, provider, and Claude Code version. The
 list is not an account entitlement check. `CLAUDE_CODEX_MODELS` replaces the
-default Claude list when you need to customize it.
+default Claude list when you need to customize it. With
+[model process profiles](/guide/configuration#model-process-profiles), the
+Claude list is the profiles, each running its own Claude Code; a chat then
+keeps its profile once it has a conversation, and picking another one asks for
+a new chat. A chat whose profile changed or went away, or one from before
+profiles were set up, still opens to be read, but sending it a message asks for
+a new chat.
 
 Each Claude model offers the reasoning efforts Claude Code reports for it:
 **Max** on the models that take it, and no effort levels on Claude Haiku. Claude
@@ -39,6 +45,17 @@ Code's `opusplan` hybrid mode: Opus during planning, Sonnet during execution.
 Selecting it does not itself enable plan mode, so an ordinary conversation may
 correctly run on Sonnet. Choose **Claude Opus** to use Opus throughout. See the
 [Claude Code model configuration](https://code.claude.com/docs/en/model-config#opusplan-model-setting).
+
+A new chat runs on whichever model is picked before its first message. After
+that it stays on that model's backend, since its conversation lives in a Claude
+session or a Codex one and neither carries over. Picking a Codex model in a
+Claude chat, or a Claude model in a Codex chat (unless the `codex-proxy` route
+carries every chat), is refused: the App reports that it couldn't update the
+model settings and the chat keeps its model. Pick another model from the same
+family, or start a new chat for the other one. With
+`CLAUDE_CODEX_DISABLE_CODEX_PROXY=1` the menu lists no Codex models and a new chat
+on one is refused, while the App's own title and summary requests run on the
+Claude summary model.
 
 ## Inline visualizations
 

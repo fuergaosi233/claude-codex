@@ -11,6 +11,7 @@ import {
 } from 'node:fs'
 import { homedir, platform, tmpdir } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { loadClaudeModelProfiles, modelProfileFingerprint } from './model-profiles.mjs'
 import type { ImageInput, TurnToolOutput, UserInput } from './types.mjs'
 
 export function nowSeconds(): number {
@@ -71,7 +72,12 @@ export function socketPathLimit(): number {
   return platform() === 'darwin' ? 104 : 108
 }
 
+// CLAUDE_CODEX_SOCKET_PATH moves the socket. The daemon and the proxy each
+// resolve it, so both need it set. An explicit path is used as given, without
+// the short temp-directory fallback for a path too long for a socket.
 export function defaultSocketPath(): string {
+  const explicit = process.env.CLAUDE_CODEX_SOCKET_PATH?.trim()
+  if (explicit) return resolve(explicit)
   const preferred = join(codexHome(), 'app-server-control', 'app-server-control.sock')
   if (preferred.length <= socketPathLimit()) return preferred
   return join(tmpdir(), `ccx-${stableHash(preferred).slice(0, 16)}.sock`)
@@ -428,6 +434,17 @@ export function claudeModelOptions(): Array<{
   description: string
   isDefault?: boolean
 }> {
+  // Model process profiles, when configured, are the whole picker.
+  const processProfiles = loadClaudeModelProfiles()
+  if (processProfiles.length > 0) {
+    return processProfiles.map((profile) => ({
+      id: profile.id,
+      sdkModel: profile.sdkModel,
+      displayName: profile.displayName,
+      description: profile.description,
+      isDefault: profile.isDefault,
+    }))
+  }
   const configured = process.env.CLAUDE_CODEX_MODELS
   if (configured) {
     try {
@@ -509,6 +526,8 @@ export function resolveClaudeModel(
   purpose: 'normal' | 'summary' = 'normal',
 ): string | null {
   const raw = (model ?? '').trim()
+  const processProfiles = loadClaudeModelProfiles()
+  if (processProfiles.length > 0) return resolveProfileModel(raw, purpose, processProfiles)
   if (purpose === 'summary') {
     const summaryModel =
       process.env.CLAUDE_CODEX_SUMMARY_MODEL || process.env.CLAUDE_CODEX_TITLE_MODEL || 'haiku'
@@ -548,6 +567,91 @@ export function resolveClaudeModel(
   }
   if (isNativeClaudeModel(raw)) return raw
   return process.env.CLAUDE_CODEX_DEFAULT_MODEL || null
+}
+
+type ClaudeModelProfiles = ReturnType<typeof loadClaudeModelProfiles>
+
+function isDefaultModelAlias(raw: string): boolean {
+  return (
+    !raw ||
+    raw === 'default' ||
+    raw === 'claude-default' ||
+    raw === 'claude-code' ||
+    raw === 'custom'
+  )
+}
+
+function defaultModelProfile(profiles: ClaudeModelProfiles): ClaudeModelProfiles[number] | null {
+  return profiles.find((profile) => profile.isDefault) ?? profiles[0] ?? null
+}
+
+// The profile that answers summary turns (titles, compaction) of threads that
+// are not on a profile themselves.
+function summaryModelProfile(profiles: ClaudeModelProfiles): ClaudeModelProfiles[number] {
+  const summaryProfileId =
+    process.env.CLAUDE_CODEX_SUMMARY_MODEL ||
+    process.env.CLAUDE_CODEX_TITLE_MODEL ||
+    defaultModelProfile(profiles)?.id ||
+    ''
+  const profile = profiles.find((entry) => entry.id === summaryProfileId)
+  if (!profile) {
+    throw new Error(`unknown configured Claude summary model profile: ${summaryProfileId}`)
+  }
+  return profile
+}
+
+// With model process profiles configured, only profile ids (and the default
+// aliases) are Claude models; anything else is a configuration error rather
+// than a silent fallback to another provider.
+function resolveProfileModel(
+  raw: string,
+  purpose: 'normal' | 'summary',
+  profiles: ClaudeModelProfiles,
+): string | null {
+  if (purpose === 'summary' && (isCodexOpenAiModel(raw) || !raw)) {
+    return summaryModelProfile(profiles).sdkModel
+  }
+  const profile = profiles.find((entry) => entry.id === raw)
+  if (profile) return profile.sdkModel
+  if (isDefaultModelAlias(raw)) return defaultModelProfile(profiles)?.sdkModel ?? null
+  if (isCodexOpenAiModel(raw)) return raw
+  throw new Error(`unknown configured Claude model profile: ${raw}`)
+}
+
+// The model a summary turn runs on, plus the profile identity its process is
+// checked against. A thread on a profile keeps its pinned fingerprint; a
+// substitute profile (summary or default) is checked against its current one.
+export function resolveClaudeSummaryModelIdentity(
+  model: string | null | undefined,
+  pinnedProfileFingerprint: string | null = null,
+): {
+  model: string | null
+  modelProfileId: string | null
+  modelProfileFingerprint: string | null
+} {
+  const raw = (model ?? '').trim()
+  const processProfiles = loadClaudeModelProfiles()
+  const directProfile = processProfiles.find((profile) => profile.id === raw) ?? null
+  let profile = directProfile
+  if (!profile && processProfiles.length > 0) {
+    if (isCodexOpenAiModel(raw) || !raw) profile = summaryModelProfile(processProfiles)
+    else if (isDefaultModelAlias(raw)) profile = defaultModelProfile(processProfiles)
+  }
+  if (!profile) {
+    return {
+      model: resolveClaudeModel(model, 'summary'),
+      modelProfileId: null,
+      modelProfileFingerprint: null,
+    }
+  }
+  return {
+    model: profile.sdkModel,
+    modelProfileId: profile.id,
+    modelProfileFingerprint:
+      directProfile && pinnedProfileFingerprint
+        ? pinnedProfileFingerprint
+        : modelProfileFingerprint(profile.id),
+  }
 }
 
 export function defaultAllowedTools(): string[] | null {
