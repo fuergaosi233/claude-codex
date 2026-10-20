@@ -11,13 +11,16 @@ import { basename } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { stringOr } from './server-helpers.mjs'
 
-// A JSON-RPC error whose `data` the App reads.
+// A JSON-RPC error whose `data` the App reads. `code` defaults to the
+// adapter's generic server error; pass Codex's code where the App reads it.
 export class RpcError extends Error {
   readonly data: unknown
+  readonly code: number
 
-  constructor(message: string, data: unknown) {
+  constructor(message: string, data: unknown, code = -32000) {
     super(message)
     this.data = data
+    this.code = code
   }
 }
 

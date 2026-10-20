@@ -37,6 +37,10 @@ export class MockRuntime implements ClaudeRuntime {
   private shells = new Map<string, { threadId: string; toolUseId: string }>()
   // Background workflows: task id to thread id.
   private workflows = new Map<string, string>()
+  // Threads whose next /compact fails, as when Claude cannot compact, or
+  // runs until it is interrupted.
+  private failingCompactions = new Set<string>()
+  private holdingCompactions = new Set<string>()
 
   async runTurn(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void> {
     // A session slow to come up (the CLI's, while an interrupted turn is
@@ -76,6 +80,97 @@ export class MockRuntime implements ClaudeRuntime {
       claudeSessionId: sessionId,
       messageUuid: `${context.turnId}-entry`,
     })
+
+    // Claude Code's /compact in the thread's session: the summary replaces
+    // the conversation, reported by the status and compact_boundary messages.
+    if (context.prompt === '/compact') {
+      await handlers.onEvent({ type: 'compaction_started' })
+      if (this.holdingCompactions.delete(context.threadId)) {
+        for (let i = 0; i < 1000 && !this.interrupted.has(context.threadId); i += 1) await sleep(10)
+        await handlers.onEvent({ type: 'completed', success: false, result: 'interrupted' })
+        return
+      }
+      if (this.failingCompactions.delete(context.threadId)) {
+        await handlers.onEvent({
+          type: 'notice',
+          level: 'warning',
+          message: 'Claude could not compact the conversation: mock compaction failure',
+        })
+        await handlers.onEvent({ type: 'completed', success: true, result: '' })
+        return
+      }
+      await handlers.onEvent({
+        type: 'compaction_completed',
+        trigger: 'manual',
+        preTokens: 150_000,
+        postTokens: 12_000,
+      })
+      // The summary's own call; it does not measure the context.
+      await handlers.onEvent({
+        type: 'usage',
+        usage: { input_tokens: 150_000, output_tokens: 3_000 },
+        contextWindow: 200_000,
+      })
+      await handlers.onEvent({
+        type: 'completed',
+        success: true,
+        result: '',
+        claudeSessionId: sessionId,
+      })
+      return
+    }
+    // Not from a summary, whose prompt quotes the thread's earlier turns.
+    if (context.purpose !== 'compact') {
+      if (/next compaction fails/i.test(context.prompt))
+        this.failingCompactions.add(context.threadId)
+      if (/next compaction holds/i.test(context.prompt))
+        this.holdingCompactions.add(context.threadId)
+    }
+
+    // Claude compacting on its own partway through a turn. "boundary only"
+    // leaves out the status message before the boundary; "stalls" never
+    // reaches it, until an interrupt; "then hold" keeps the turn running
+    // afterwards until a steer says "release".
+    if (/auto compaction check/i.test(context.prompt)) {
+      await handlers.onEvent({ type: 'text_delta', delta: 'Reading the files.' })
+      if (!/boundary only/i.test(context.prompt))
+        await handlers.onEvent({ type: 'compaction_started' })
+      if (/stalls/i.test(context.prompt)) {
+        for (let i = 0; i < 1000 && !this.interrupted.has(context.threadId); i += 1) await sleep(10)
+        await handlers.onEvent({ type: 'completed', success: false, result: 'interrupted' })
+        return
+      }
+      await handlers.onEvent({
+        type: 'compaction_completed',
+        trigger: 'auto',
+        preTokens: 180_000,
+        postTokens: 20_000,
+      })
+      let released = false
+      if (/then hold/i.test(context.prompt)) {
+        for (let i = 0; i < 1000 && !released; i += 1) {
+          if (this.interrupted.has(context.threadId)) {
+            await handlers.onEvent({ type: 'completed', success: false, result: 'interrupted' })
+            return
+          }
+          released =
+            this.steered.get(context.threadId)?.some((prompt) => /release/i.test(prompt)) === true
+          if (!released) await sleep(10)
+        }
+        this.steered.delete(context.threadId)
+      }
+      await handlers.onEvent({
+        type: 'text_delta',
+        delta: released ? 'Released after compacting.' : 'Done after compacting.',
+      })
+      await handlers.onEvent({
+        type: 'usage',
+        usage: { input_tokens: 500, output_tokens: 50 },
+        contextWindow: 200_000,
+      })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'compacted' })
+      return
+    }
 
     if (/rewind check/i.test(context.prompt)) {
       const text = `resumed ${context.claudeSessionId ?? 'nothing'} at ${context.resumeSessionAt ?? 'end'} after ${this.resets.get(context.threadId) ?? 0} resets`
@@ -1095,6 +1190,10 @@ export class MockRuntime implements ClaudeRuntime {
 
   resetSession(threadId: string): void {
     this.resets.set(threadId, (this.resets.get(threadId) ?? 0) + 1)
+  }
+
+  compactsSessions(): boolean {
+    return true
   }
 
   private scheduleBackgroundReport(

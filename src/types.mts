@@ -382,8 +382,9 @@ export interface FileUpdateChange {
 export interface RuntimeTurnContext {
   threadId: string
   turnId: string
-  // normal = user-visible chat/review turn; summary = Codex App's structured
-  // title/metadata turn; compact = explicit context compaction.
+  // normal = user-visible chat/review turn, and a /compact run in the
+  // thread's own session; summary = Codex App's structured title/metadata
+  // turn; compact = the summary a compaction falls back to.
   purpose?: 'normal' | 'summary' | 'compact'
   prompt: string
   cwd: string
@@ -509,6 +510,16 @@ export type RuntimeEvent =
       questions: UserInputQuestion[]
     }
   | { type: 'notice'; level: 'info' | 'warning' | 'error'; message: string }
+  // Claude began compacting the conversation (on its own when the context
+  // fills, or for /compact) and finished it: the earlier history is now a
+  // summary of `postTokens` tokens, when Claude measured it.
+  | { type: 'compaction_started' }
+  | {
+      type: 'compaction_completed'
+      trigger: 'manual' | 'auto'
+      preTokens: number | null
+      postTokens: number | null
+    }
   // A result's usage. `child` marks tokens a subagent or workflow spent:
   // they add to the thread's total, not to its context window.
   | {
@@ -752,4 +763,7 @@ export interface ClaudeRuntime {
   // Close the thread's live session, background tasks included, so its next
   // turn starts a new one: the thread's history was rewound or deleted.
   resetSession?(threadId: string): void
+  // True when a turn whose prompt is `/compact` compacts the Claude session
+  // it resumes, reporting it with compaction_started / compaction_completed.
+  compactsSessions?(): boolean
 }

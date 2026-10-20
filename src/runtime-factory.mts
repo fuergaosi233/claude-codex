@@ -146,6 +146,11 @@ class SelectableRuntime implements ClaudeRuntime {
     for (const runtime of this.runtimes.values()) runtime.resetSession?.(threadId)
   }
 
+  // A Claude thread's turns run on the configured backend.
+  compactsSessions(): boolean {
+    return this.runtimeFor(this.config.type).compactsSessions?.() === true
+  }
+
   private runtimeFor(type: RuntimeBackendType): ClaudeRuntime {
     const existing = this.runtimes.get(type)
     if (existing) return existing

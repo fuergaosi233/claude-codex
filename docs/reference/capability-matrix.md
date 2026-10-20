@@ -54,11 +54,11 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 | Background subagents | Supported | `run_in_background` agents keep running across turns: the Claude session stays open while they run, a finished agent's report wakes the parent with a new turn, `SendMessage` resumes an agent, and the child's Stop button ends it. A turn that ends while background agents or workflows still run does not mark the chat unread; the turn the report wakes does. Background Bash shells do not count (`CLAUDE_CODEX_QUIET_BACKGROUND_TURNS=0` turns this off). |
 | Subagent control | Supported | Interrupting a turn stops the workflows it launched (Claude Code also stops the background agents it launched, and they wake no turn); stopping a foreground child from its own thread ends just that child, as interrupted. `SendMessage` and `TaskStop` on any child agent render as Codex `sendInput` / `closeAgent` calls, and the parent's own tools and text beside an Agent call keep their cards. `/workflows` also lists the workflows Claude ran on its own. |
 | Ephemeral / threadSource | Supported | `ephemeral: true` threads (title-gen, memory-consolidation, subagents, and the forks the App describes a thread in) persist but are excluded from `thread/list` unless `includeEphemeral: true`. `threadSource` round-trips. |
-| Claude side events | Supported | rate_limit / subagent / compaction events summarized into structured notice lines. A switch to a fallback model after a refusal is reported as `model/rerouted` when Claude names a cyber-safety refusal and as a `warning` otherwise; a refusal with no fallback is a `warning`. Text Claude streamed before a fallback stays in the transcript. |
+| Claude side events | Supported | rate_limit / subagent events summarized into structured notice lines; Claude compacting the conversation on its own within a turn shows as a `contextCompaction` item, after the message before it completes, and the context gauge drops to the compacted size. A subagent compacting its own context shows nothing. A switch to a fallback model after a refusal is reported as `model/rerouted` when Claude names a cyber-safety refusal and as a `warning` otherwise; a refusal with no fallback is a `warning`. Text Claude streamed before a fallback stays in the transcript. |
 | Hook runs | Supported | Claude Code's hook runs → `hook/started` / `hook/completed` with the Codex event name, the settings file that configures the event, and its outcome: exit code 2, a `block` decision or `continue: false` is `blocked`, with the reason as an entry. The App folds them into the turn's hook summary. Live only: history does not keep them. |
 | MCP elicitation | Supported | An MCP server asking the user for input → `mcpServer/elicitation/request`, as a form from its schema or a link to open; the App's accept, decline or cancel goes back to the server. A request outside a turn (from background work) is declined. |
 | Review mode | Supported (text) | `review/start` creates an in-progress review turn and routes the prompt through Claude. No native guardian finding items. |
-| Context compaction | Supported (summary) | `thread/compact/start` routes the summary prompt and emits contextCompaction items. No native persisted rollout compaction. |
+| Context compaction | Supported | `thread/compact/start` sends `/compact` to the thread's Claude session (the live one, or by resuming it), so the next turn goes on from Claude's own summary; the `contextCompaction` item completes when Claude reports the compaction, and the context gauge drops to its size. When the thread has no Claude session yet, Claude Code has `DISABLE_COMPACT` set, or the compaction fails (with a `warning`), the thread gets a summary-model summary as an agent message instead and keeps its session. Like Codex, a compaction turn, or a review, takes no `turn/steer` (`activeTurnNotSteerable`), and a compaction an interrupt cuts short stays open. |
 
 ## Utilities
 
@@ -156,6 +156,5 @@ codex.
 ## Next targets
 
 1. Parse Claude review text into first-class Codex review finding items.
-2. Persist compaction summaries in a dedicated store, not just UI items.
-3. Run the capability probe over SSH against a named host.
-4. Flesh out plugin/skill/app surfaces if Codex App starts relying on them.
+2. Run the capability probe over SSH against a named host.
+3. Flesh out plugin/skill/app surfaces if Codex App starts relying on them.

@@ -168,8 +168,9 @@ interface LiveSession {
   query: Query
   input: TurnInput
   abort: AbortController
-  // Registered for reuse by later turns of the thread. Structured-output,
-  // summary and compaction turns run in sessions of their own.
+  // Registered for reuse by later turns of the thread. Structured-output and
+  // summary turns run in sessions of their own, including the summary a
+  // compaction falls back to; `/compact` itself runs in the thread's session.
   reusable: boolean
   signature: string
   lastContext: RuntimeTurnContext
@@ -482,6 +483,13 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     const live = this.sessions.get(threadId)
     if (live) this.closeSession(live)
     this.cronJobs.delete(threadId)
+  }
+
+  // Claude Code runs a `/compact` prompt as its built-in command and reports
+  // it with the `status` / `compact_boundary` system messages, unless
+  // DISABLE_COMPACT turns the command off.
+  compactsSessions(): boolean {
+    return !truthyEnv(process.env.DISABLE_COMPACT)
   }
 
   async stop(): Promise<void> {
@@ -1701,6 +1709,35 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         .catch(() => {})
       const sessionId = String(message.session_id ?? '')
       if (sessionId) await pending.handlers.onEvent({ type: 'session', claudeSessionId: sessionId })
+      return
+    }
+    if (subtype === 'status' || subtype === 'compact_boundary') {
+      // A subagent compacting its own context leaves the thread's alone.
+      if (message.parent_tool_use_id) return
+      if (subtype === 'compact_boundary') {
+        const metadata = recordOrNull(message.compact_metadata) ?? {}
+        await pending.handlers.onEvent({
+          type: 'compaction_completed',
+          trigger: metadata.trigger === 'manual' ? 'manual' : 'auto',
+          preTokens: numberOrNull(metadata.pre_tokens),
+          postTokens: numberOrNull(metadata.post_tokens),
+        })
+        return
+      }
+      if (message.status === 'compacting') {
+        await pending.handlers.onEvent({ type: 'compaction_started' })
+        return
+      }
+      if (message.compact_result === 'failed') {
+        const reason = stringOrNull(message.compact_error)
+        await pending.handlers.onEvent({
+          type: 'notice',
+          level: 'warning',
+          message: reason
+            ? `Claude could not compact the conversation: ${reason}`
+            : 'Claude could not compact the conversation.',
+        })
+      }
       return
     }
     if (subtype === 'hook_started' || subtype === 'hook_response') {

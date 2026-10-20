@@ -48,6 +48,14 @@ versioning or publishing metadata.
 - The context gauge follows the main loop's latest API call, like Codex's
   `last_token_usage`, and tokens spent by subagents and workflows count toward
   the thread total without moving the gauge or goal progress.
+- `thread/compact/start` compacts the thread's own Claude session with
+  `/compact`, so the conversation goes on from Claude's summary instead of a
+  summary written beside it; a thread with no session yet, or whose
+  compaction fails, still gets the summary-model summary. Claude compacting
+  on its own within a turn now shows as a `contextCompaction` item, and the
+  context gauge drops to the compacted size either way. Only compaction and
+  review turns refuse `turn/steer`, with Codex's `activeTurnNotSteerable`
+  error, so a turn Claude compacted keeps taking messages.
 - A turn that ends early completes the message still streaming and fails the
   tool calls still running before `turn/completed`, instead of leaving them
   in progress in the App.
