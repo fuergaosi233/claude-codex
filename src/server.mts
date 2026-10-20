@@ -17,6 +17,7 @@ import {
 } from './claude-capabilities.mjs'
 import { onClaudeCommandsChanged, skillLinksToCommand } from './claude-commands.mjs'
 import { runCodexNotify } from './codex-notify.mjs'
+import { parseCommandActions } from './command-actions.mjs'
 import { gitInfoFor, patchGitInfo } from './git-info.mjs'
 import {
   continuePrompt,
@@ -93,7 +94,6 @@ import {
   numberOr,
   parseExitCodeFromResult,
   parseSubagentTrailer,
-  parseWebSearchAction,
   permissionProfileIdFromParams,
   permissionProfileList,
   permissionProfilePolicy,
@@ -136,9 +136,17 @@ import {
   sortDirectionOr,
   threadSnippet,
 } from './thread-history.mjs'
+import {
+  capOutput,
+  exploreToolCommand,
+  imageReadPath,
+  isExploreTool,
+  splitMcpToolName,
+} from './tool-items.mjs'
 import type {
   ClaudeCheckpoint,
   ClaudeRuntime,
+  CommandAction,
   ElicitationRequest,
   ElicitationResponse,
   FileUpdateChange,
@@ -311,7 +319,11 @@ const NO_PROGRESS_ITEM_TYPES = new Set([
 function goalTurnMadeProgress(turn: TurnRecord): boolean {
   return turn.items.some((item) => {
     if (NO_PROGRESS_ITEM_TYPES.has(item.type)) return false
-    return !(item.type === 'mcpToolCall' && item.tool.startsWith('mcp__codex_goal__'))
+    // Items from before MCP names were split keep the whole name as the tool.
+    return !(
+      item.type === 'mcpToolCall' &&
+      (item.server === 'codex_goal' || item.tool.startsWith('mcp__codex_goal__'))
+    )
   })
 }
 
@@ -3434,6 +3446,22 @@ export class CodexClaudeAppServer {
     // (interrupt, error, watchdog) drops the late result, so these are closed
     // as failed before the turn completes.
     const openToolItems = new Set<string>()
+    // Read, Grep, Glob and LS items, whose output the App keeps capped.
+    const exploreItemIds = new Set<string>()
+    // An image Read shows as an imageView. If Claude cannot read the image,
+    // the item becomes this failed Read command instead.
+    // App rule: item-completed-replaces
+    const imageReadFallbacks = new Map<string, ThreadItem>()
+    const failedImageRead = (
+      itemId: string,
+      output: string | null,
+      exitCode: number | null,
+      durationMs: number | null,
+    ): ThreadItem | null => {
+      const fallback = imageReadFallbacks.get(itemId)
+      if (fallback?.type !== 'commandExecution') return null
+      return { ...fallback, status: 'failed', aggregatedOutput: output, exitCode, durationMs }
+    }
     // Mutable holder rather than `let collectedMetrics`: TS's control-flow
     // analysis doesn't see writes from inside the onEvent callback, so a bare
     // `let` would still be inferred as `null` outside the closure.
@@ -3569,6 +3597,8 @@ export class CodexClaudeAppServer {
         const durationMs = started == null ? null : Math.max(0, nowMillis() - started)
         const updated = this.store.updateItem(turn.id, itemId, (item) => {
           if (item.type === 'commandExecution') return { ...item, status: 'failed', durationMs }
+          if (item.type === 'imageView')
+            return failedImageRead(itemId, null, null, durationMs) ?? item
           if (item.type === 'fileChange') return { ...item, status: 'failed' }
           if (item.type === 'mcpToolCall')
             return { ...item, status: 'failed', error: { message }, durationMs }
@@ -3760,6 +3790,10 @@ export class CodexClaudeAppServer {
     // permission rules and hooks the Codex and Claude Code configs bring.
     const inheritConfig = desktopPresentation && !isCodexThread
     const mcp = readMcpConfig({ cwd: turnCwd, inherit: inheritConfig })
+    // Tool items name the MCP server by these, as server names may hold `__`.
+    const toolItemOptions = {
+      mcpServers: Object.keys((mcp.sdkValue ?? {}) as Record<string, unknown>),
+    }
     const permissionRules = inheritConfig ? inheritedPermissionRules(turnCwd) : null
     const runtimeTurn = this.runtime.runTurn(
       {
@@ -4364,10 +4398,16 @@ export class CodexClaudeAppServer {
               itemIds.set(event.toolUseId, '')
               return
             }
-            const item = this.toolUseToItem(event, thread.cwd)
+            const item = this.toolUseToItem(event, thread.cwd, toolItemOptions)
             itemIds.set(event.toolUseId, item.id)
             itemStartedAtMs.set(item.id, nowMillis())
             openToolItems.add(item.id)
+            if (isExploreTool(event.toolName)) exploreItemIds.add(item.id)
+            if (item.type === 'imageView')
+              imageReadFallbacks.set(item.id, {
+                ...this.toolUseToItem(event, thread.cwd, { imageView: false }),
+                id: item.id,
+              })
             this.store.appendItem(turn.id, item)
             this.notify(peer, {
               method: 'item/started',
@@ -4416,16 +4456,19 @@ export class CodexClaudeAppServer {
               return started == null ? null : Math.max(0, nowMillis() - started)
             })()
             const parsedExitCode = parseExitCodeFromResult(event.content) ?? (event.isError ? 1 : 0)
+            const output = exploreItemIds.has(itemId) ? capOutput(resultText) : resultText
             const updated = this.store.updateItem(turn.id, itemId, (item) => {
               if (item.type === 'commandExecution') {
                 return {
                   ...item,
                   status: event.isError ? 'failed' : 'completed',
-                  aggregatedOutput: item.aggregatedOutput ?? resultText,
+                  aggregatedOutput: item.aggregatedOutput ?? output,
                   exitCode: parsedExitCode,
                   durationMs,
                 }
               }
+              if (item.type === 'imageView' && event.isError)
+                return failedImageRead(itemId, output, parsedExitCode, durationMs) ?? item
               if (item.type === 'fileChange')
                 return { ...item, status: event.isError ? 'failed' : 'completed' }
               if (item.type === 'mcpToolCall') {
@@ -4441,16 +4484,22 @@ export class CodexClaudeAppServer {
                   durationMs,
                 }
               }
-              if (item.type === 'webSearch') {
-                return { ...item, action: parseWebSearchAction(item.query, resultText) }
-              }
+              // A webSearch keeps the action it started with: its results
+              // always hold links, but a search is not a page open.
               return item
             })
             const item = updated?.items.find((candidate) => candidate.id === itemId)
-            if (item?.type === 'commandExecution' && resultText && !commandOutputSeen.has(itemId)) {
+            // A failed image Read was an imageView in the App until now; its
+            // output arrives with the completed item instead.
+            if (
+              item?.type === 'commandExecution' &&
+              output &&
+              !commandOutputSeen.has(itemId) &&
+              !imageReadFallbacks.has(itemId)
+            ) {
               this.notify(peer, {
                 method: 'item/commandExecution/outputDelta',
-                params: { threadId: thread.id, turnId: turn.id, itemId, delta: resultText },
+                params: { threadId: thread.id, turnId: turn.id, itemId, delta: output },
               })
             }
             if (item)
@@ -4632,10 +4681,14 @@ export class CodexClaudeAppServer {
                 input: event.input,
               },
               thread.cwd,
+              // The approval card asks about the Read command, so the item
+              // is that command, not the image it may show.
+              { ...toolItemOptions, imageView: false },
             )
             itemId = item.id
             itemIds.set(event.toolUseId, item.id)
             openToolItems.add(item.id)
+            if (isExploreTool(event.toolName)) exploreItemIds.add(item.id)
             this.store.appendItem(turn.id, item)
             this.notify(peer, {
               method: 'item/started',
@@ -4653,7 +4706,14 @@ export class CodexClaudeAppServer {
               })
             }
           }
-          const decision = await this.requestApproval(peer, thread.id, turn.id, itemId, event)
+          const decision = await this.requestApproval(
+            peer,
+            thread.id,
+            turn.id,
+            itemId,
+            event,
+            imageReadFallbacks.get(itemId),
+          )
           if (!turnIsActive()) return { decision: 'cancel' }
           if (decision.decision === 'acceptForSession') {
             const command = String(event.input.command ?? '')
@@ -5812,6 +5872,9 @@ export class CodexClaudeAppServer {
     turnId: string,
     itemId: string,
     event: Extract<RuntimeEvent, { type: 'permission_request' }>,
+    // The command an item that is not one asks about, such as the Read
+    // behind an image the App shows.
+    commandFallback?: ThreadItem,
   ): Promise<PermissionDecision> {
     // Defensive: if Codex App selected approvalPolicy=never (or "Full access"
     // sandbox), auto-accept without bouncing the request to the user. The
@@ -5832,7 +5895,23 @@ export class CodexClaudeAppServer {
 
     this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: ['waitingOnApproval'] })
     const requestId = newId()
-    const isCommand = event.toolName === 'Bash'
+    // Bash and the file exploration tools ask on the command card, as the
+    // command their item shows; an image Read asks as its Read.
+    const item =
+      commandFallback ??
+      this.store.getTurn(turnId)?.items.find((candidate) => candidate.id === itemId)
+    const commandItem = item?.type === 'commandExecution' ? item : null
+    const isBash = event.toolName === 'Bash'
+    const isCommand = isBash || commandItem !== null
+    const cardCommand = isBash ? command : (commandItem?.command ?? command)
+    // The card lists the actions' commands in place of the command, so it
+    // gets them only when they spell out the whole command.
+    // App rule: command-approval-actions
+    const actions = commandItem?.commandActions ?? []
+    const commandActions: CommandAction[] =
+      actions.length === 1 && actions[0]?.command === cardCommand
+        ? actions
+        : [{ type: 'unknown', command: cardCommand }]
     const method = isCommand
       ? 'item/commandExecution/requestApproval'
       : 'item/fileChange/requestApproval'
@@ -5844,13 +5923,16 @@ export class CodexClaudeAppServer {
           startedAtMs: nowMillis(),
           approvalId: requestId,
           reason: null,
-          command,
-          cwd: String(event.input.cwd ?? ''),
-          commandActions: [],
+          command: cardCommand,
+          cwd: commandItem?.cwd ?? String(event.input.cwd ?? ''),
+          commandActions,
           additionalPermissions: null,
           proposedExecpolicyAmendment: null,
           proposedNetworkPolicyAmendments: null,
-          availableDecisions: ['accept', 'acceptForSession', 'decline', 'cancel'],
+          // Only a Bash command can be remembered for the session.
+          availableDecisions: isBash
+            ? ['accept', 'acceptForSession', 'decline', 'cancel']
+            : ['accept', 'decline', 'cancel'],
         }
       : {
           threadId,
@@ -7051,30 +7133,44 @@ export class CodexClaudeAppServer {
     return {}
   }
 
+  // The thread item a Claude tool call shows as. `mcpServers` names the
+  // turn's configured MCP servers; `imageView: false` keeps an image Read a
+  // Read command.
   private toolUseToItem(
     event: Extract<RuntimeEvent, { type: 'tool_use' }>,
     cwd: string,
+    options: { mcpServers?: Iterable<string>; imageView?: boolean } = {},
   ): ThreadItem {
     const id = newId()
+    const command = (
+      text: string,
+      itemCwd: string,
+      commandActions: CommandAction[],
+    ): ThreadItem => ({
+      type: 'commandExecution',
+      id,
+      command: text,
+      cwd: itemCwd,
+      // Use the SDK's tool_use_id as a stable handle. Without a non-null
+      // processId the Codex App was treating these as "Background terminal"
+      // entries (no attached process) and hiding their output; with a
+      // synthetic id they render as inline command items like a normal
+      // foreground bash invocation.
+      processId: `claude:${event.toolUseId}`,
+      source: 'agent',
+      status: 'inProgress',
+      commandActions,
+      aggregatedOutput: null,
+      exitCode: null,
+      durationMs: null,
+    })
     if (event.toolName === 'Bash') {
-      return {
-        type: 'commandExecution',
-        id,
-        command: String(event.input.command ?? ''),
-        cwd: String(event.input.cwd ?? cwd),
-        // Use the SDK's tool_use_id as a stable handle. Without a non-null
-        // processId the Codex App was treating these as "Background terminal"
-        // entries (no attached process) and hiding their output; with a
-        // synthetic id they render as inline command items like a normal
-        // foreground bash invocation.
-        processId: `claude:${event.toolUseId}`,
-        source: 'agent',
-        status: 'inProgress',
-        commandActions: [],
-        aggregatedOutput: null,
-        exitCode: null,
-        durationMs: null,
-      }
+      const text = String(event.input.command ?? '')
+      const itemCwd = String(event.input.cwd ?? cwd)
+      // A command that only reads, lists or searches files joins the App's
+      // "Explored" group, as Codex's own commands do.
+      // App rule: explored-commands
+      return command(text, itemCwd, text ? parseCommandActions(text, itemCwd) : [])
     }
     if (['Edit', 'Write', 'MultiEdit'].includes(event.toolName)) {
       return {
@@ -7087,11 +7183,9 @@ export class CodexClaudeAppServer {
     if (event.toolName === 'WebSearch') {
       // Codex App has a dedicated `webSearch` ThreadItem with a structured
       // action — emit it instead of a generic mcpToolCall so the App can show
-      // the search badge (and follow-up open-page links) natively. The action
-      // is finalized when the tool_result arrives (see tool_result handler).
-      // The 'search' variant's `query` / `queries` are required (Option fields
-      // with no serde default), so always populate both even on the initial
-      // inProgress emit.
+      // the search badge natively. The 'search' variant's `query` / `queries`
+      // are required (Option fields with no serde default), so always
+      // populate both.
       const q = String(event.input.query ?? '')
       return {
         type: 'webSearch',
@@ -7100,40 +7194,30 @@ export class CodexClaudeAppServer {
         action: { type: 'search', query: q || null, queries: null },
       }
     }
-    let displayTool = event.toolName
-    if (event.toolName === 'Read') {
-      const raw = String(event.input.file_path || event.input.path || '')
-      if (raw) {
-        let displayPath = raw
-        try {
-          if (cwd && raw.startsWith(cwd)) {
-            displayPath = raw.slice(cwd.length).replace(/^\/+/, '')
-          } else {
-            const parts = raw.split(/\//).filter(Boolean)
-            displayPath = parts.length > 2 ? parts.slice(-2).join('/') : raw
-          }
-        } catch {}
-        displayTool = `Read ${displayPath || raw}`
-      }
-    } else if (event.toolName === 'Grep') {
-      const pat = String(event.input.pattern ?? '')
-      const rawPath = event.input.path ? String(event.input.path) : ''
-      let pathStr = ''
-      if (rawPath) {
-        const parts = rawPath.split(/\//).filter(Boolean)
-        pathStr = ` (${parts.length > 2 ? parts.slice(-2).join('/') : rawPath})`
-      }
-      if (pat) displayTool = `Grep ${pat}${pathStr}`
-    } else if (event.toolName === 'Glob') {
-      const pat = String(event.input.pattern ?? '')
-      if (pat) displayTool = `Glob ${pat}`
+    if (event.toolName === 'WebFetch') {
+      // Fetching a page is what Codex shows as opening it.
+      const url = String(event.input.url ?? '')
+      return { type: 'webSearch', id, query: url, action: { type: 'openPage', url: url || null } }
     }
-
+    const imagePath =
+      options.imageView === false ? null : imageReadPath(event.toolName, event.input, cwd)
+    if (imagePath) return { type: 'imageView', id, path: imagePath }
+    if (isExploreTool(event.toolName)) {
+      // Read, Grep, Glob and LS show as commands named after the tool, with
+      // the action Codex gives a shell command doing the same, so the App
+      // groups them under "Explored".
+      // App rule: explored-commands
+      const explored = exploreToolCommand(event.toolName, event.input, cwd)
+      return command(explored.command, cwd, explored.commandActions)
+    }
+    // MCP tools name their server; Claude Code's other tools are shown
+    // under a `claude-code` server.
+    const mcp = splitMcpToolName(event.toolName, options.mcpServers)
     return {
       type: 'mcpToolCall',
       id,
-      server: 'claude-code',
-      tool: displayTool,
+      server: mcp?.server ?? 'claude-code',
+      tool: mcp?.tool ?? event.toolName,
       status: 'inProgress',
       arguments: event.input,
       result: null,

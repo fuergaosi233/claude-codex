@@ -238,6 +238,30 @@ export const APP_RULES: readonly AppRule[] = [
     verify:
       'Open a new chat without sending anything, restart the adapter and reload the App: no empty chat shows in the sidebar.',
   },
+  {
+    id: 'explored-commands',
+    app: 'Folds consecutive commandExecution items whose commandActions are all read, listFiles or search into one "Explored" row counting the files, searches and lists, labelling a search "Searched for <query> in <path>" and a list "Listed files in <path>". An item with no actions, an unknown one, or a declined one shows as its command.',
+    adapter:
+      "Shows Claude's Read, Grep, Glob and LS calls as commandExecution items with one matching action, and gives a Bash command the actions Codex's own parser would; a command it cannot parse is one unknown action.",
+    verify:
+      'Ask Claude to look around a repository: its Read, Grep and Glob calls and a `cat` or `rg` it runs fold into one "Explored" row.',
+  },
+  {
+    id: 'command-approval-actions',
+    app: "Shows a command approval as the commands of its commandActions joined with ' && ' in place of command when it has any, and offers its own decisions whatever availableDecisions says.",
+    adapter:
+      'Sends the actions only when a single one spells out the whole command, else one unknown action with the command, so the card never hides part of what runs. Only a Bash command is remembered for the session; an acceptForSession on any other card accepts that call only.',
+    verify:
+      'With approvals on, have Claude run `cat README.md && touch x`: the card shows the whole command.',
+  },
+  {
+    id: 'item-completed-replaces',
+    app: 'Replaces the item with the same id on item/completed, whatever type it started as.',
+    adapter:
+      'Completes an image Read that fails or is stopped as its failed Read command in place of the imageView it started as.',
+    verify:
+      'Ask Claude to read an image file that does not exist: the turn shows the failed Read, not an empty image.',
+  },
 ]
 
 // The methods the App starts calling, or sends new parameters to, once the

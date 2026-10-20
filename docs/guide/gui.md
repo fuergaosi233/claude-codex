@@ -10,6 +10,8 @@ Once the shim and exports are installed and the adapter is built:
    - `Bash` calls surface as Codex **command approvals**.
    - `Edit` / `Write` / `MultiEdit` surface as **file-change approvals** with a
      live diff.
+   - Files Claude reads, searches and lists fold into **Explored** rows; see
+     [How tool calls show](#how-tool-calls-show).
 3. Approve actions in the Codex App UI as usual.
 4. Disconnecting closes the proxy. Once no turn is active, the daemon idles out
    and the in-process Claude runtime is reclaimed.
@@ -93,6 +95,35 @@ when each turn ends, so the label follows a branch Claude switches to or
 creates. Listing chats never runs git; switching branches by hand shows after
 the chat's next turn. Chats from before this version get their branch when
 they are next opened.
+
+## How tool calls show
+
+Claude's tool calls show as the items Codex uses for its own:
+
+- **Exploring files.** Claude's Read, Grep, Glob and LS calls show as commands
+  named after the tool, such as `Read src/app.ts` or `Grep TODO in src`, and
+  fold into an **Explored** row with the files read and the searches and
+  lists run. A Bash command that only reads, searches or lists files, such as
+  `cat`, `sed -n`, `rg`, `find` or `ls`, folds in the same way: the adapter
+  parses it as Codex parses its own commands, following `cd` and skipping
+  helpers such as `| head -n 20`. Anything else, including redirects,
+  variables and globs, shows as the plain command. The App keeps the first
+  30,000 characters of a file or search result; Claude gets all of it.
+- **Images.** A Read of an image file shows the image. If the Read fails, or
+  the turn stops before it ends, it shows as the failed Read instead.
+- **The web.** WebSearch shows as a web search, and WebFetch as opening the
+  page it fetches.
+- **MCP tools** show under their server's name. A server whose name contains
+  `__` is named right when the turn's MCP configuration lists it.
+- **Other Claude Code tools** show as tool calls of a `claude-code` server.
+
+When Claude Code asks before a Read, Grep, Glob or LS call, for a file outside
+the workspace for example, the App asks on the command card with the command
+the item shows. The card names a command's reads and searches only when one of
+them is the whole command, so it always shows everything that runs, and only a
+Bash command can be allowed for the rest of the session.
+
+Chats from before this version keep showing their earlier items.
 
 ## Inline visualizations
 

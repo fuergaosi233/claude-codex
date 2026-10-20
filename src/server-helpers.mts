@@ -973,27 +973,6 @@ export function parseExitCodeFromResult(content: unknown): number | null {
   return Number.isFinite(code) ? code : null
 }
 
-// Best-effort: when the WebSearch tool returns a result, sniff whether the
-// first result was an explicit page open vs a result list. Codex App's
-// `webSearch` ThreadItem renders the action badge accordingly.
-export function parseWebSearchAction(
-  query: string,
-  resultText: string,
-):
-  | { type: 'search'; query: string | null; queries: string[] | null }
-  | { type: 'openPage'; url: string | null }
-  | { type: 'findInPage'; pattern: string | null; url: string | null }
-  | { type: 'other' } {
-  // Codex v2 WebSearchAction variants are tagged but the inner fields are NOT
-  // optional in Rust — they're `Option<...>` with NO `#[serde(default)]`, so
-  // App rejects an item that ships a bare {type:'search'} (missing required
-  // fields). Always populate every field of the chosen variant, even if null.
-  if (!resultText) return { type: 'search', query: query || null, queries: null }
-  const urlMatch = resultText.match(/https?:\/\/[^\s)\]"'<]+/)
-  if (urlMatch && query) return { type: 'openPage', url: urlMatch[0] }
-  return { type: 'search', query: query || null, queries: null }
-}
-
 // Maps the raw Anthropic usage block carried on the Claude Agent SDK
 // ResultMessage onto the Codex `TokenUsageBreakdown` shape. Cache-creation
 // tokens count as input; Claude does not separate reasoning output tokens.

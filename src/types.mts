@@ -240,6 +240,15 @@ export interface TurnToolOutput {
   output: string | Array<Record<string, unknown>>
 }
 
+// Codex v2 CommandAction: what a command does, as the App's "Explored" rows
+// and approval cards show it. A read path is absolute; listFiles and search
+// paths are short display paths.
+export type CommandAction =
+  | { type: 'read'; command: string; name: string; path: string }
+  | { type: 'listFiles'; command: string; path: string | null }
+  | { type: 'search'; command: string; query: string | null; path: string | null }
+  | { type: 'unknown'; command: string }
+
 export type ThreadItem =
   // clientId echoes turn/start's or turn/steer's clientUserMessageId so the
   // App can reconcile its optimistic copy of the message.
@@ -261,7 +270,7 @@ export type ThreadItem =
       processId: string | null
       source: string
       status: 'inProgress' | 'completed' | 'failed' | 'declined'
-      commandActions: unknown[]
+      commandActions: CommandAction[]
       aggregatedOutput: string | null
       exitCode: number | null
       durationMs: number | null

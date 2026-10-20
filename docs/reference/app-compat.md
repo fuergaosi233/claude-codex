@@ -48,6 +48,9 @@ line a rule touches.
 | `thread-git-info` | shows `gitInfo.branch` in the sidebar, looks the workspace up itself when `thread/start` answers with none, replaces what it knows with the `thread/resume` answer, and sets the branch it creates with `thread/metadata/update` | after an App restart, a Claude chat in a repository still shows its branch in the sidebar |
 | `context-gauge` | fills the context gauge from the latest `thread/tokenUsage/updated` as `last.totalTokens` over `modelContextWindow`, and hides it when either is null | in a chat that has finished a turn, the gauge moves during a long turn instead of jumping at its end |
 | `prewarmed-threads` | starts a new chat's thread before anything is sent, hides it from `thread/list` until its first `turn/start`, and forgets it when the connection drops or the App quits | after an adapter restart, a new chat left empty does not show in the sidebar |
+| `explored-commands` | folds command items whose `commandActions` are all `read`, `listFiles` or `search` into one "Explored" row, and shows an item with no actions, an `unknown` one or a declined one as its command | Claude's Read, Grep and Glob calls and a `cat` or `rg` it runs fold into one "Explored" row |
+| `command-approval-actions` | shows a command approval as the commands of its `commandActions` joined with `&&` in place of `command`, and offers its own decisions whatever `availableDecisions` says | with approvals on, the card for `cat README.md && touch x` shows the whole command |
+| `item-completed-replaces` | replaces the item with the same id on `item/completed`, whatever type it started as | an image Read of a missing file shows as the failed Read, not an empty image |
 
 The full text of each rule, including the adapter side, is in
 `src/app-compat.mts`.

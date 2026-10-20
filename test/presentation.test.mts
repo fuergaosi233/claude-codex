@@ -129,7 +129,7 @@ test('progress, tools and final Markdown remain separate in streaming and replay
   )
   assert.deepEqual(
     turn.items.map((item) => item.type),
-    ['userMessage', 'agentMessage', 'mcpToolCall', 'agentMessage'],
+    ['userMessage', 'agentMessage', 'commandExecution', 'agentMessage'],
   )
   assert.deepEqual(
     assistantItems(turn.items).map(({ text, phase }) => ({ text, phase })),
@@ -143,7 +143,7 @@ test('progress, tools and final Markdown remain separate in streaming and replay
     .map((message) => message.params.item)
   assert.deepEqual(
     completedItems.map((item) => item.type),
-    ['agentMessage', 'mcpToolCall', 'agentMessage'],
+    ['agentMessage', 'commandExecution', 'agentMessage'],
   )
   assert.equal(new Set(completedItems.map((item) => item.id)).size, completedItems.length)
   assert.deepEqual(replay.items, turn.items)
@@ -553,18 +553,129 @@ test('a turn that ends early fails the tool calls still running before the turn'
           ? `${message.params.item.type}:${message.params.item.status}`
           : message.method,
       )
-    assert.deepEqual(order, ['mcpToolCall:completed', 'commandExecution:failed', 'turn/completed'])
+    assert.deepEqual(order, [
+      'commandExecution:completed',
+      'commandExecution:failed',
+      'turn/completed',
+    ])
     const live = messages.find(
       (message) =>
-        message.method === 'item/completed' && message.params.item.type === 'commandExecution',
+        message.method === 'item/completed' && message.params.item.command === 'sleep 10',
     )?.params.item
     assert.equal(live.exitCode, null)
     assert.equal(typeof live.durationMs, 'number')
     assert.deepEqual(
-      replay.items.find((item: ThreadItem) => item.type === 'commandExecution'),
+      replay.items.find(
+        (item: ThreadItem) => item.type === 'commandExecution' && item.command === 'sleep 10',
+      ),
       live,
     )
   }
+})
+
+test('an image Read asks about and falls back to its Read command', async () => {
+  const image = [
+    { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0K' } },
+  ]
+  let decision: string | null = null
+  const { messages, turn, replay } = await present(
+    async (handlers, { interrupt }) => {
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId: 'asked',
+        toolName: 'Read',
+        input: { file_path: '/elsewhere/chart.png' },
+      })
+      decision = (
+        await handlers.onPermissionRequest({
+          type: 'permission_request',
+          requestId: 'perm-asked',
+          toolUseId: 'asked',
+          toolName: 'Read',
+          input: { file_path: '/elsewhere/chart.png' },
+        })
+      ).decision
+      await handlers.onEvent({ type: 'tool_result', toolUseId: 'asked', content: image })
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId: 'open',
+        toolName: 'Read',
+        input: { file_path: 'late.png' },
+      })
+      await interrupt()
+    },
+    // Full access, the default, would accept without asking.
+    { sandbox: 'workspace-write' },
+  )
+  assert.equal(decision, 'accept')
+  const cwd = messages.find((message) => message.id === 1)?.result.thread.cwd
+  const started = messages
+    .filter((message) => message.method === 'item/started')
+    .map((message) => message.params.item)
+    .filter((item) => item.type !== 'userMessage')
+  assert.deepEqual(
+    started.map(({ type, path }) => ({ type, path })),
+    [
+      { type: 'imageView', path: '/elsewhere/chart.png' },
+      { type: 'imageView', path: join(cwd, 'late.png') },
+    ],
+  )
+  // The App asks about the Read on the command card, as for a command.
+  const request = messages.find(
+    (message) => message.method === 'item/commandExecution/requestApproval',
+  )?.params
+  assert.deepEqual(
+    {
+      itemId: request?.itemId,
+      command: request?.command,
+      cwd: request?.cwd,
+      commandActions: request?.commandActions,
+      availableDecisions: request?.availableDecisions,
+    },
+    {
+      itemId: started[0].id,
+      command: 'Read /elsewhere/chart.png',
+      cwd,
+      commandActions: [
+        {
+          type: 'read',
+          command: 'Read /elsewhere/chart.png',
+          name: 'chart.png',
+          path: '/elsewhere/chart.png',
+        },
+      ],
+      availableDecisions: ['accept', 'decline', 'cancel'],
+    },
+  )
+  const completed = messages
+    .filter((message) => message.method === 'item/completed')
+    .map((message) => message.params.item)
+  assert.deepEqual(completed[0], {
+    type: 'imageView',
+    id: started[0].id,
+    path: '/elsewhere/chart.png',
+  })
+  // The image a stopped Read never showed is the Read that failed.
+  assert.deepEqual(
+    {
+      id: completed[1].id,
+      type: completed[1].type,
+      command: completed[1].command,
+      status: completed[1].status,
+      aggregatedOutput: completed[1].aggregatedOutput,
+      exitCode: completed[1].exitCode,
+    },
+    {
+      id: started[1].id,
+      type: 'commandExecution',
+      command: 'Read late.png',
+      status: 'failed',
+      aggregatedOutput: null,
+      exitCode: null,
+    },
+  )
+  assert.equal(turn.status, 'interrupted')
+  assert.deepEqual(replay.items, turn.items)
 })
 
 test('subagent results keep only the report, in both CLI trailer formats', () => {

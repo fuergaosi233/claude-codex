@@ -297,7 +297,23 @@ export class MockRuntime implements ClaudeRuntime {
       await handlers.onEvent({ type: 'tool_result', toolUseId, content: 'todos updated' })
     }
 
-    if (/generic tool|read tool/i.test(context.prompt)) {
+    if (/generic tool/i.test(context.prompt)) {
+      // A Claude Code tool Codex has no item for.
+      const toolUseId = `tool-${Date.now()}`
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId,
+        toolName: 'ListMcpResourcesTool',
+        input: {},
+      })
+      await handlers.onEvent({
+        type: 'tool_result',
+        toolUseId,
+        content: { text: 'mock tool result' },
+      })
+    }
+
+    if (/read tool/i.test(context.prompt)) {
       const toolUseId = `tool-${Date.now()}`
       await handlers.onEvent({
         type: 'tool_use',
@@ -310,6 +326,127 @@ export class MockRuntime implements ClaudeRuntime {
         toolUseId,
         content: { text: 'mock read result' },
       })
+    }
+
+    if (/explore tools check/i.test(context.prompt)) {
+      // Claude looking around: its own Read, Grep and Glob tools, and Bash
+      // commands that only read or search.
+      const calls: { toolName: string; input: Record<string, unknown>; result: string }[] = [
+        {
+          toolName: 'Read',
+          input: { file_path: join(context.cwd, 'README.md') },
+          result: 'x'.repeat(40_000),
+        },
+        {
+          toolName: 'Grep',
+          input: { pattern: 'TODO', path: join(context.cwd, 'src') },
+          result: 'src/a.ts:1: // TODO',
+        },
+        { toolName: 'Glob', input: { pattern: '**/*.mts' }, result: 'src/a.mts' },
+        { toolName: 'Bash', input: { command: 'cat README.md' }, result: '# Readme' },
+        {
+          toolName: 'Bash',
+          input: { command: 'rg -n TODO src | head -n 5' },
+          result: 'src/a.ts:1: // TODO',
+        },
+      ]
+      for (const [index, { toolName, input, result }] of calls.entries()) {
+        const toolUseId = `explore-${index}`
+        await handlers.onEvent({ type: 'tool_use', toolUseId, toolName, input })
+        await handlers.onEvent({ type: 'tool_result', toolUseId, content: result })
+      }
+      await handlers.onEvent({ type: 'completed', success: true, result: 'explore tools check' })
+      return
+    }
+
+    if (/image read check/i.test(context.prompt)) {
+      const image = join(context.cwd, 'diagram.png')
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId: 'image-read',
+        toolName: 'Read',
+        input: { file_path: image },
+      })
+      await handlers.onEvent({
+        type: 'tool_result',
+        toolUseId: 'image-read',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0K' } },
+        ],
+      })
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId: 'missing-image-read',
+        toolName: 'Read',
+        input: { file_path: join(context.cwd, 'missing.png') },
+      })
+      await handlers.onEvent({
+        type: 'tool_result',
+        toolUseId: 'missing-image-read',
+        content: 'File does not exist.',
+        isError: true,
+      })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'image read check' })
+      return
+    }
+
+    if (/web fetch check/i.test(context.prompt)) {
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId: 'web-fetch',
+        toolName: 'WebFetch',
+        input: { url: 'https://example.com/docs', prompt: 'Summarize the page' },
+      })
+      await handlers.onEvent({
+        type: 'tool_result',
+        toolUseId: 'web-fetch',
+        content: 'The page explains the setup.',
+      })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'web fetch check' })
+      return
+    }
+
+    if (/mcp tool check/i.test(context.prompt)) {
+      // An MCP server whose name holds `__` only splits right when it is
+      // configured.
+      const calls = [
+        { toolName: 'mcp__github__create_issue', input: { title: 'Bug' } },
+        { toolName: 'mcp__team__docs__search', input: { query: 'setup' } },
+      ]
+      for (const [index, { toolName, input }] of calls.entries()) {
+        const toolUseId = `mcp-${index}`
+        await handlers.onEvent({ type: 'tool_use', toolUseId, toolName, input })
+        await handlers.onEvent({ type: 'tool_result', toolUseId, content: { ok: true } })
+      }
+      await handlers.onEvent({ type: 'completed', success: true, result: 'mcp tool check' })
+      return
+    }
+
+    if (/outside read check/i.test(context.prompt)) {
+      // A Read outside the workspace, which Claude Code asks about first.
+      const input = { file_path: '/etc/hosts' }
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId: 'outside-read',
+        toolName: 'Read',
+        input,
+      })
+      const decision = await handlers.onPermissionRequest({
+        type: 'permission_request',
+        requestId: 'perm-outside-read',
+        toolUseId: 'outside-read',
+        toolName: 'Read',
+        input,
+      })
+      const accepted = decision.decision === 'accept' || decision.decision === 'acceptForSession'
+      await handlers.onEvent({
+        type: 'tool_result',
+        toolUseId: 'outside-read',
+        content: accepted ? '127.0.0.1 localhost' : 'declined',
+        isError: !accepted,
+      })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'outside read check' })
+      return
     }
 
     if (/model effort check/i.test(context.prompt)) {

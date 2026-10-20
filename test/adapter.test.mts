@@ -3499,7 +3499,7 @@ test('localImage user input becomes a multimodal Claude prompt + an imageView Th
   }
 })
 
-test('Claude WebSearch tool maps to native Codex webSearch ThreadItem with action', async () => {
+test('Claude WebSearch maps to a Codex webSearch item that stays a search', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -3543,12 +3543,12 @@ test('Claude WebSearch tool maps to native Codex webSearch ThreadItem with actio
     // (Option<...> with no serde default) — bare {type:'search'} would crash App.
     assert.deepEqual(webSearchItem.action, { type: 'search', query: 'mock query', queries: null })
     assert.ok(completedWebSearch, 'webSearch item should complete')
-    assert.equal(
-      completedWebSearch.action.type,
-      'openPage',
-      'tool_result with a URL should upgrade action to openPage',
-    )
-    assert.equal(completedWebSearch.action.url, 'https://example.com/article')
+    // Its results hold links, but the search opened no page.
+    assert.deepEqual(completedWebSearch.action, {
+      type: 'search',
+      query: 'mock query',
+      queries: null,
+    })
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -6319,6 +6319,15 @@ test('approval requests round-trip through Codex server requests', {
       }
     }
     assert.equal(approvalRequest?.params.command, 'echo mock approval')
+    assert.deepEqual(approvalRequest?.params.commandActions, [
+      { type: 'unknown', command: 'echo mock approval' },
+    ])
+    assert.deepEqual(approvalRequest?.params.availableDecisions, [
+      'accept',
+      'acceptForSession',
+      'decline',
+      'cancel',
+    ])
     assert.equal(sawWaitingOnApproval, true)
     proc.stdin.write(json({ id: approvalRequest.id, result: { decision: 'accept' } }))
 
@@ -6342,7 +6351,7 @@ test('approval requests round-trip through Codex server requests', {
   }
 })
 
-test('generic Claude tools complete as Codex mcpToolCall items', async () => {
+test('Claude Code tools Codex has no item for complete as mcpToolCall items', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -6382,14 +6391,15 @@ test('generic Claude tools complete as Codex mcpToolCall items', async () => {
         completedTool = message.params.item
       if (message.method === 'turn/completed') break
     }
-    assert.equal(completedTool?.tool, 'Read README.md')
+    assert.equal(completedTool?.server, 'claude-code')
+    assert.equal(completedTool?.tool, 'ListMcpResourcesTool')
     assert.equal(completedTool?.status, 'completed')
     // Result must be wrapped in Codex v2 McpToolCallResult shape — {content[], structuredContent, _meta}.
-    // The mock runtime returns {text:'mock read result'} as the raw content, which we wrap as:
+    // The mock runtime returns {text:'mock tool result'} as the raw content, which we wrap as:
     //   content: [{type:'text', text:'<json>'}], structuredContent: <object>, _meta: null.
     assert.deepEqual(completedTool?.result, {
-      content: [{ type: 'text', text: JSON.stringify({ text: 'mock read result' }) }],
-      structuredContent: { text: 'mock read result' },
+      content: [{ type: 'text', text: JSON.stringify({ text: 'mock tool result' }) }],
+      structuredContent: { text: 'mock tool result' },
       _meta: null,
     })
     assert.equal(sawIdle, true)
@@ -6397,6 +6407,255 @@ test('generic Claude tools complete as Codex mcpToolCall items', async () => {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
+})
+
+// Runs one mock turn on a new thread and returns everything the adapter sent
+// until it completed.
+async function mockTurnMessages(
+  prompt: string,
+  env: NodeJS.ProcessEnv = {},
+  answer?: (request: any) => unknown,
+): Promise<any[]> {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home, env)
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), permissions: ':workspace' },
+      }),
+    )
+    const threadId = (await reader.nextResponse(1)).result.thread.id
+    proc.stdin.write(
+      json({ id: 2, method: 'turn/start', params: { threadId, input: textInput(prompt) } }),
+    )
+    const seen: any[] = []
+    await awaitMessage(
+      reader,
+      (message) => {
+        if (message.method?.endsWith('/requestApproval') && message.id != null && answer)
+          proc.stdin.write(json({ id: message.id, result: answer(message) }))
+        return message.method === 'turn/completed'
+      },
+      seen,
+    )
+    proc.stdin.write(
+      json({ id: 3, method: 'thread/read', params: { threadId, includeTurns: true } }),
+    )
+    seen.push(await reader.nextResponse(3))
+    return seen
+  } finally {
+    await stopProcess(proc)
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+}
+
+const completedItems = (seen: any[]): any[] =>
+  seen
+    .filter((message) => message.method === 'item/completed')
+    .map((message) => message.params.item)
+
+const replayedItems = (seen: any[]): any[] =>
+  seen.find((message) => message.id === 3)?.result.thread.turns.at(-1).items ?? []
+
+test('file exploration shows as commands the Codex App groups under Explored', async () => {
+  const seen = await mockTurnMessages('explore tools check')
+  const cwd = process.cwd()
+  const commands = completedItems(seen).filter((item) => item.type === 'commandExecution')
+  assert.deepEqual(
+    commands.map(({ command, cwd, processId, status, commandActions }) => ({
+      command,
+      cwd,
+      processId,
+      status,
+      commandActions,
+    })),
+    [
+      {
+        command: 'Read README.md',
+        commandActions: [
+          {
+            type: 'read',
+            command: 'Read README.md',
+            name: 'README.md',
+            path: join(cwd, 'README.md'),
+          },
+        ],
+      },
+      {
+        command: 'Grep TODO in src',
+        commandActions: [
+          { type: 'search', command: 'Grep TODO in src', query: 'TODO', path: 'src' },
+        ],
+      },
+      {
+        command: 'Glob **/*.mts',
+        commandActions: [
+          { type: 'search', command: 'Glob **/*.mts', query: '**/*.mts', path: null },
+        ],
+      },
+      {
+        command: 'cat README.md',
+        commandActions: [
+          {
+            type: 'read',
+            command: 'cat README.md',
+            name: 'README.md',
+            path: join(cwd, 'README.md'),
+          },
+        ],
+      },
+      {
+        // The card shows the search; `head` only trims its output.
+        command: 'rg -n TODO src | head -n 5',
+        commandActions: [{ type: 'search', command: 'rg -n TODO src', query: 'TODO', path: 'src' }],
+      },
+    ].map((expected, index) => ({
+      command: expected.command,
+      cwd,
+      processId: `claude:explore-${index}`,
+      status: 'completed',
+      commandActions: expected.commandActions,
+    })),
+  )
+  assert.equal(
+    completedItems(seen).some((item) => item.type === 'mcpToolCall'),
+    false,
+  )
+  // A whole file stays with Claude; the App keeps the first 30,000 characters.
+  const capped = `${'x'.repeat(30_000)}\n… 10000 more characters not shown`
+  assert.equal(commands[0].aggregatedOutput, capped)
+  assert.deepEqual(
+    seen
+      .filter(
+        (message) =>
+          message.method === 'item/commandExecution/outputDelta' &&
+          message.params.itemId === commands[0].id,
+      )
+      .map((message) => message.params.delta),
+    [capped],
+  )
+  assert.deepEqual(
+    replayedItems(seen).filter((item: any) => item.type === 'commandExecution'),
+    commands,
+  )
+})
+
+test('an image Claude reads shows as an imageView, and a failed one as its Read', async () => {
+  const seen = await mockTurnMessages('image read check')
+  const cwd = process.cwd()
+  const started = seen
+    .filter((message) => message.method === 'item/started')
+    .map((message) => message.params.item)
+    .filter((item) => item.type !== 'userMessage')
+  assert.deepEqual(
+    started.map(({ type, path }) => ({ type, path })),
+    [
+      { type: 'imageView', path: join(cwd, 'diagram.png') },
+      { type: 'imageView', path: join(cwd, 'missing.png') },
+    ],
+  )
+  const [shown, missing] = started
+  const completed = completedItems(seen)
+  assert.deepEqual(
+    completed.find((item) => item.id === shown.id),
+    { type: 'imageView', id: shown.id, path: join(cwd, 'diagram.png') },
+  )
+  const failed = completed.find((item) => item.id === missing.id)
+  assert.deepEqual(
+    {
+      type: failed.type,
+      command: failed.command,
+      status: failed.status,
+      aggregatedOutput: failed.aggregatedOutput,
+      exitCode: failed.exitCode,
+      commandActions: failed.commandActions,
+    },
+    {
+      type: 'commandExecution',
+      command: 'Read missing.png',
+      status: 'failed',
+      aggregatedOutput: 'File does not exist.',
+      exitCode: 1,
+      commandActions: [
+        {
+          type: 'read',
+          command: 'Read missing.png',
+          name: 'missing.png',
+          path: join(cwd, 'missing.png'),
+        },
+      ],
+    },
+  )
+  // The output of an item that was an image comes with the completed item.
+  assert.equal(
+    seen.some((message) => message.method === 'item/commandExecution/outputDelta'),
+    false,
+  )
+  assert.deepEqual(
+    replayedItems(seen).filter((item: any) => item.type !== 'userMessage'),
+    [completed.find((item) => item.id === shown.id), failed],
+  )
+})
+
+test('Claude WebFetch shows as a Codex page open', async () => {
+  const seen = await mockTurnMessages('web fetch check')
+  const fetched = completedItems(seen).find((item) => item.type === 'webSearch')
+  assert.deepEqual(fetched, {
+    type: 'webSearch',
+    id: fetched?.id,
+    query: 'https://example.com/docs',
+    action: { type: 'openPage', url: 'https://example.com/docs' },
+  })
+})
+
+test('MCP tool calls name their server and tool, even a server named with __', async () => {
+  const seen = await mockTurnMessages('mcp tool check', {
+    CLAUDE_CODEX_MCP_SERVERS: JSON.stringify({
+      team__docs: { command: 'node', args: ['docs-server.mjs'] },
+    }),
+  })
+  assert.deepEqual(
+    completedItems(seen)
+      .filter((item) => item.type === 'mcpToolCall')
+      .map(({ server, tool, arguments: args, status }) => ({ server, tool, args, status })),
+    [
+      { server: 'github', tool: 'create_issue', args: { title: 'Bug' }, status: 'completed' },
+      { server: 'team__docs', tool: 'search', args: { query: 'setup' }, status: 'completed' },
+    ],
+  )
+})
+
+test('a Read Claude asks about asks on the command card, without a session allow', async () => {
+  const seen = await mockTurnMessages('outside read check', {}, () => ({ decision: 'accept' }))
+  const request = seen.find((message) => message.method === 'item/commandExecution/requestApproval')
+  assert.ok(request, 'the Read should ask on the command card')
+  assert.equal(
+    seen.some((message) => message.method === 'item/fileChange/requestApproval'),
+    false,
+  )
+  const item = completedItems(seen).find((candidate) => candidate.id === request.params.itemId)
+  assert.deepEqual(
+    {
+      command: request.params.command,
+      cwd: request.params.cwd,
+      commandActions: request.params.commandActions,
+      availableDecisions: request.params.availableDecisions,
+    },
+    {
+      command: 'Read /etc/hosts',
+      cwd: process.cwd(),
+      commandActions: [
+        { type: 'read', command: 'Read /etc/hosts', name: 'hosts', path: '/etc/hosts' },
+      ],
+      availableDecisions: ['accept', 'decline', 'cancel'],
+    },
+  )
+  assert.equal(item?.type, 'commandExecution')
+  assert.equal(item?.status, 'completed')
+  assert.equal(item?.aggregatedOutput, '127.0.0.1 localhost')
 })
 
 function spawnMockAdapter(

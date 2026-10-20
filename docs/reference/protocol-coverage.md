@@ -16,14 +16,16 @@ Implemented as real remote/runtime behavior:
   allowed tools, add dirs, file checkpointing.
 - **Turn input** — user input, and the `toolOutput` of a thread handoff as a
   `functionCallOutput` item.
-- **Approval bridge** — `Bash` → command approval; `Edit` / `Write` /
-  `MultiEdit` → file-change approval with diffs; MCP elicitation → the App's
-  form or link prompt.
+- **Approval bridge** — `Bash`, and `Read` / `Grep` / `Glob` / `LS` →
+  command approval with Codex command actions; `Edit` / `Write` / `MultiEdit`
+  → file-change approval with diffs; MCP elicitation → the App's form or link
+  prompt.
 - **Streaming** — turn started/completed, thread status changes, agent text
-  deltas, reasoning deltas, command output deltas, file patches, generic tool
-  item completion, hook runs, model reroutes, aggregated git diff updates, and
-  `error` notifications for API retries (`willRetry`) and failed turns, with
-  Codex error codes.
+  deltas, reasoning deltas, command output deltas, file patches, file
+  exploration as commands with Codex command actions, image views, web
+  searches and page opens, MCP tool calls by server and tool, hook runs, model
+  reroutes, aggregated git diff updates, and `error` notifications for API
+  retries (`willRetry`) and failed turns, with Codex error codes.
 - **Remote utilities** — file read/write/list/metadata/copy/remove/watch,
   command exec with stdin/terminate, process spawn/stdin/kill, fuzzy file
   search, direct MCP stdio/HTTP tool and resource calls.
