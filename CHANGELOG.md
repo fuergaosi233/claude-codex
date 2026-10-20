@@ -58,6 +58,10 @@ versioning or publishing metadata.
 - `plugin/read` returns the plugin's `appTemplates` the protocol requires. The
   Codex App read them unguarded, so a thread with the in-app browser open
   showed an error page instead of the conversation.
+- A structured (`outputSchema`) Claude turn, such as the App's title and
+  summary turns, answers with what Claude passed to `StructuredOutput`. The
+  adapter used to drop that call and fill every field with the user's prompt,
+  so App chats were titled with the first words of the request.
 - Expanded Codex App Remote coverage across thread lifecycle, turn envelopes,
   item streaming, approvals, MCP status, fuzzy file search sessions, Claude
   skills/hooks, and `thread/turns/list` item views.

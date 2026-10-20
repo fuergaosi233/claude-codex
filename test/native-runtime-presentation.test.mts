@@ -30,6 +30,7 @@ const context: RuntimeTurnContext = {
 async function collect(
   messages: Record<string, unknown>[],
   overrides: Partial<RuntimeTurnContext> = {},
+  result: Record<string, unknown> = { type: 'result', subtype: 'success', result: 'done' },
 ): Promise<RuntimeEvent[]> {
   const runtime = new NativeClaudeRuntime()
   Reflect.set(runtime, 'sdk', {
@@ -39,7 +40,7 @@ async function collect(
         if (typeof message.wait === 'number') await delay(message.wait)
         else yield message
       }
-      yield { type: 'result', subtype: 'success', result: 'done' }
+      yield result
     },
   })
   const events: RuntimeEvent[] = []
@@ -232,6 +233,66 @@ test('structured output remains a single deduplicated result', async () => {
       { outputFormat: { type: 'json_schema', schema: { type: 'object' } } },
     ),
     [{ type: 'text_delta', delta: '{"ok":true}' }],
+  )
+})
+
+// Claude answers a structured turn by calling StructuredOutput, such as the
+// App's title request; the prose around the call is not the answer.
+test('a structured answer is what Claude passed to StructuredOutput', async () => {
+  const outputFormat = { type: 'json_schema' as const, schema: { type: 'object' } }
+  const title = { title: 'Reset relay backoff', description: 'Clear the reconnect timer' }
+  const answer = [
+    start('answer'),
+    delta('text', 'Here is the title.'),
+    assistant('answer', [
+      text('Here is the title.'),
+      toolUse('first', 'StructuredOutput', { title: 'Draft' }),
+    ]),
+    assistant('answer', [toolUse('second', 'StructuredOutput', title)]),
+  ]
+  const answered = [{ type: 'text_delta', delta: JSON.stringify(title) }]
+  // The CLI reports the call it accepted as structured_output.
+  assert.deepEqual(
+    await collect(
+      answer,
+      { outputFormat },
+      { type: 'result', subtype: 'success', result: '', structured_output: title },
+    ),
+    answered,
+  )
+  // A CLI that leaves it out: the latest call.
+  assert.deepEqual(
+    await collect(answer, { outputFormat }, { type: 'result', subtype: 'success', result: '' }),
+    answered,
+  )
+  // A turn that failed passes no call off as its answer.
+  const failed: RuntimeEvent[] = []
+  const runtime = new NativeClaudeRuntime()
+  Reflect.set(runtime, 'sdk', {
+    query: async function* () {
+      yield* answer
+      yield {
+        type: 'result',
+        subtype: 'error_max_structured_output_retries',
+        is_error: true,
+        terminal_reason: 'structured_output_retry_exhausted',
+      }
+    },
+  })
+  await runtime
+    .runTurn(
+      { ...context, outputFormat },
+      {
+        onEvent: async (event) => {
+          failed.push(event)
+        },
+        onPermissionRequest: async () => ({ decision: 'accept' }),
+      },
+    )
+    .catch(() => {})
+  assert.equal(
+    failed.some((event) => event.type === 'text_delta' && event.delta.includes('"title"')),
+    false,
   )
 })
 
