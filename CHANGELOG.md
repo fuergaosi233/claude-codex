@@ -123,11 +123,6 @@ versioning or publishing metadata.
   server failed also stops the CLI turn behind it.
 - An ephemeral `thread/fork`, which the App uses to describe a thread, stays
   out of `thread/list`.
-- The adapter advertises app-server `0.159.0-alpha.12.1`, the Codex build of
-  Codex App 26.930, so every feature gate of that App is on.
-  `CLAUDE_CODEX_COMPAT_VERSION` still overrides it, and
-  `docs/reference/app-compat.md` lists what the gates change, including the
-  two that also depend on the App's server-side flags.
 - A `turn/start` carrying `toolOutput` instead of input (a thread handoff, or
   a message from another thread) prompts Claude with its text and images and
   records it as a `functionCallOutput` item, instead of starting a turn with
@@ -189,10 +184,13 @@ versioning or publishing metadata.
   turns predate checkpoints, the fork keeps Claude's whole session, as before,
   and a `configWarning` says so.
 - The adapter advertises app-server `0.163.0-alpha.10.2`, the Codex build of
-  Codex App 26.1013, instead of `0.159.0-alpha.12.1`, so every feature gate of
-  26.1013 is on as well; App 26.930 turns on the same features as before.
-  Codex `0.163.0` has the same app-server protocol. `CLAUDE_CODEX_COMPAT_VERSION`
-  still overrides it. The App's composer predictions, which that version turns
+  Codex App 26.1013, so every feature gate of 26.1013 is on; App 26.930 turns
+  on every one of its own gates, as with the `0.159.0-alpha.12.1` the adapter
+  advertised before. Codex `0.163.0` has the same app-server protocol.
+  `CLAUDE_CODEX_COMPAT_VERSION` still overrides it, and
+  `docs/reference/app-compat.md` lists what the gates change, including the
+  two that also depend on the App's server-side flags. The App's composer
+  predictions, which that version turns
   on, fork only a thread whose `modelProvider` is `openai`, so they leave
   Claude threads (`claude-code`) alone.
 - Every turn carries `rootTurnId`, new in that protocol: the root a
@@ -399,6 +397,7 @@ versioning or publishing metadata.
 - No support is included for personal subscription sharing, credential pooling,
   browser cookie/session-token reuse, private provider endpoints, or provider
   bypass behavior.
-- The App's dynamic tools (the worktree tools of its `threadAttachments`
-  gate), MCP tool-call progress, and Claude Code plugin skills in the "/"
-  popup are not included. Hook runs are shown live but not kept in history.
+- The App's worktree tools (its `threadAttachments` gate) on a local host,
+  where the App names them for its bundled `codex_app` MCP server instead of
+  sending them as `dynamicTools`, MCP tool-call progress, and Claude Code
+  plugin skills in the "/" popup are not included. Hook runs are shown live but not kept in history.
