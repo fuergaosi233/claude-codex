@@ -1924,6 +1924,55 @@ test('stdio app-server recovers stale in-progress turns after process restart', 
   }
 })
 
+test('a second stdio app-server on the same CODEX_HOME leaves a running turn of the first alone', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const first = spawnMockAdapter(home)
+  let second: ChildProcessWithoutNullStreams | null = null
+  try {
+    const reader1 = new JsonLineReader(first)
+    const threadId = await startMockThread(reader1, first)
+    first.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: textInput('hold this turn until released') },
+      }),
+    )
+    const turnId = (await reader1.nextResponse(2)).result.turn.id
+
+    // A probe or another window starts a server on the same state dir while
+    // the first one is mid-turn.
+    second = spawnMockAdapter(home)
+    const reader2 = new JsonLineReader(second)
+    second.stdin.write(
+      json({ id: 3, method: 'thread/read', params: { threadId, includeTurns: true } }),
+    )
+    const read = await reader2.nextResponse(3)
+    assert.equal(
+      read.result.thread.turns.find((turn: any) => turn.id === turnId)?.status,
+      'inProgress',
+    )
+    await stopProcess(second)
+
+    first.stdin.write(
+      json({
+        id: 4,
+        method: 'turn/steer',
+        params: { threadId, expectedTurnId: turnId, input: textInput('release') },
+      }),
+    )
+    const completed = await awaitMessage(
+      reader1,
+      (message) => message.method === 'turn/completed' && message.params.turn.id === turnId,
+    )
+    assert.equal(completed.params.turn.status, 'completed')
+  } finally {
+    await stopProcess(first)
+    if (second) await stopProcess(second)
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('the adapter warns once as it starts that bridged hooks need a CLI without settings', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const env: NodeJS.ProcessEnv = {
@@ -2392,6 +2441,134 @@ test('startup recovery keeps markers of finished agents and ends the ones it cut
     assert.equal(store.getThread(threadId)?.status.type, 'idle')
     assert.equal(store.recoverStaleInProgressTurns(), 0)
   } finally {
+    store.close()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('startup recovery fails only the turns of servers that are gone', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const path = join(home, 'state.sqlite')
+  const store = new SessionStore(path)
+  const now = Math.floor(Date.now() / 1000)
+  // live: another server still runs it. reused: its server's pid now names a
+  // process that started later. legacy: written before turns named a server.
+  const threads = { live: randomUUID(), reused: randomUUID(), legacy: randomUUID() }
+  const turns = { live: randomUUID(), reused: randomUUID(), legacy: randomUUID() }
+  let server: ChildProcessWithoutNullStreams | null = null
+  try {
+    for (const threadId of Object.values(threads)) {
+      store.upsertThread({
+        id: threadId,
+        sessionId: threadId,
+        forkedFromId: null,
+        preview: 'owner recovery',
+        name: null,
+        archived: false,
+        cwd: process.cwd(),
+        model: 'sonnet',
+        reasoningEffort: null,
+        modelProvider: 'claude-code',
+        claudeSessionId: null,
+        source: 'appServer',
+        createdAt: now,
+        updatedAt: now,
+        status: { type: 'active', activeFlags: [] },
+        approvalPolicy: 'on-request',
+        sandboxMode: 'workspace-write',
+        ephemeral: false,
+        threadSource: 'user',
+        agentRole: null,
+        agentNickname: null,
+        baseInstructions: null,
+        developerInstructions: null,
+        personality: null,
+        runtimeBackend: 'claude',
+        codexSessionId: null,
+      })
+    }
+    // The other server writes its turns, then keeps running.
+    const pairs = (['live', 'reused', 'legacy'] as const).map((key) => [threads[key], turns[key]])
+    server = spawn(
+      process.execPath,
+      [
+        '--no-warnings',
+        '--input-type=module',
+        '-e',
+        `
+      import { SessionStore } from './dist/src/store.mjs'
+
+      const store = new SessionStore(${JSON.stringify(path)})
+      for (const [threadId, id] of ${JSON.stringify(pairs)}) {
+        store.upsertTurn({
+          id,
+          threadId,
+          status: 'inProgress',
+          startedAt: ${now},
+          completedAt: null,
+          durationMs: null,
+          items: [],
+          diff: '',
+          error: null,
+        })
+      }
+      process.stdout.write('ready\\n')
+      setInterval(() => {}, 60_000)
+      `,
+      ],
+      { stdio: ['pipe', 'pipe', 'pipe'] },
+    )
+    let stderr = ''
+    server.stderr.setEncoding('utf8')
+    server.stderr.on('data', (chunk: string) => {
+      stderr += chunk
+    })
+    await Promise.race([
+      once(server.stdout, 'data'),
+      once(server, 'exit').then(() => {
+        throw new Error(`the other server exited early: ${stderr}`)
+      }),
+    ])
+
+    const db = new DatabaseSync(path)
+    try {
+      const owner = db
+        .prepare('SELECT owner_pid, owner_started FROM turns WHERE id = ?')
+        .get(turns.live) as { owner_pid: number; owner_started: string }
+      assert.equal(owner.owner_pid, server.pid)
+      assert.ok(owner.owner_started)
+      db.prepare('UPDATE turns SET owner_started = ? WHERE id = ?').run(
+        'Thu Jan  1 00:00:00 1970',
+        turns.reused,
+      )
+      db.prepare('UPDATE turns SET owner_pid = NULL, owner_started = NULL WHERE id = ?').run(
+        turns.legacy,
+      )
+    } finally {
+      db.close()
+    }
+
+    const second = new SessionStore(path)
+    try {
+      assert.equal(second.recoverStaleInProgressTurns(), 2)
+      assert.equal(second.getTurn(turns.live)?.status, 'inProgress')
+      assert.equal(second.getThread(threads.live)?.status.type, 'active')
+      for (const key of ['reused', 'legacy'] as const) {
+        assert.equal(second.getTurn(turns[key])?.status, 'interrupted')
+        assert.equal(second.getThread(threads[key])?.status.type, 'idle')
+      }
+
+      server.kill('SIGKILL')
+      await waitForExit(server, 2000)
+      assert.equal(server.signalCode, 'SIGKILL')
+      assert.equal(second.recoverStaleInProgressTurns(), 1)
+      assert.equal(second.getTurn(turns.live)?.status, 'interrupted')
+      assert.equal(second.getThread(threads.live)?.status.type, 'idle')
+    } finally {
+      second.close()
+    }
+  } finally {
+    if (server) await stopProcess(server)
     store.close()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
