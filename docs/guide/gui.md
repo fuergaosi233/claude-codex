@@ -74,6 +74,16 @@ upgrade or sign-in prompt.
 Notices the Claude CLI would show an interactive user at once, such as a
 failed compaction, show as warnings, each once a turn.
 
+## Branches in the sidebar
+
+A chat whose folder is a git repository shows its branch in the sidebar, as
+Codex chats do. The adapter looks up the commit, the branch and the `origin`
+remote, without any credentials in its URL, when the chat starts and again
+when each turn ends, so the label follows a branch Claude switches to or
+creates. Listing chats never runs git; switching branches by hand shows after
+the chat's next turn. Chats from before this version get their branch when
+they are next opened.
+
 ## Inline visualizations
 
 With the default native Claude Agent SDK backend, Claude can answer with a

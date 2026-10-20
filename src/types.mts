@@ -117,6 +117,17 @@ export interface ThreadRecord {
   // alone, so a stale record saved after a turn cannot undo an assignment
   // made meanwhile. Assign through SessionStore.setThreadProject.
   projectId?: string | null
+  // Codex `GitInfo` of the thread's workspace: captured when the thread is
+  // created and refreshed when a turn ends. Read-only here like projectId;
+  // write through SessionStore.setThreadGitInfo.
+  gitInfo?: GitInfo | null
+}
+
+// Codex `GitInfo`. originUrl never carries credentials.
+export interface GitInfo {
+  sha: string | null
+  branch: string | null
+  originUrl: string | null
 }
 
 // Codex `Project`: a named group of threads with workspace roots. Times are

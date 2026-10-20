@@ -132,6 +132,13 @@ versioning or publishing metadata.
   HTTP status (`serverOverloaded` for a 529, `contextWindowExceeded`,
   `rateLimitExceeded`, ...), never one the App answers with a ChatGPT account
   flow. CLI notifications of high or immediate priority show as warnings.
+- Claude chats show their branch in the App sidebar. Threads carry Codex
+  `gitInfo` (commit, branch, and the `origin` remote without credentials),
+  looked up after `thread/start`, when a thread without it resumes and when a
+  turn ends, and stored, so `thread/list` and `thread/read` run no git.
+  `thread/metadata/update` patches it as Codex does, which the App uses after
+  creating a branch, and `getConversationSummary` returns it. Threads also
+  carry their `model` and `reasoningEffort`.
 
 ### Provider and multi-agent boundaries
 

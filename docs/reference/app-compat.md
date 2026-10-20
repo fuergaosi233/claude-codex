@@ -45,6 +45,7 @@ line a rule touches.
 | `reasoning-summary` | shows a reasoning item only through its summary parts, bolding the first when there are several, and never renders its raw content | Claude's thinking shows above the reply, live and after the chat is reopened |
 | `reconnecting-errors` | shows an `error` with `willRetry` as one passing row per turn, counting attempts only from a `Reconnecting... n/m` message | with the API answering 529 for a while, the turn shows `Reconnecting 1/10` counting up, then the reply |
 | `error-codes` | reads `codexErrorInfo`: `serverOverloaded` shows "Server is busy", `usageLimitExceeded` opens a ChatGPT plan upgrade card, `cyberPolicy` a safety notice | a turn the overloaded API ends says the server is busy |
+| `thread-git-info` | shows `gitInfo.branch` in the sidebar, looks the workspace up itself when `thread/start` answers with none, replaces what it knows with the `thread/resume` answer, and sets the branch it creates with `thread/metadata/update` | after an App restart, a Claude chat in a repository still shows its branch in the sidebar |
 | `prewarmed-threads` | starts a new chat's thread before anything is sent, hides it from `thread/list` until its first `turn/start`, and forgets it when the connection drops or the App quits | after an adapter restart, a new chat left empty does not show in the sidebar |
 
 The full text of each rule, including the adapter side, is in

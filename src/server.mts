@@ -17,6 +17,7 @@ import {
 } from './claude-capabilities.mjs'
 import { onClaudeCommandsChanged, skillLinksToCommand } from './claude-commands.mjs'
 import { runCodexNotify } from './codex-notify.mjs'
+import { gitInfoFor, patchGitInfo } from './git-info.mjs'
 import {
   continuePrompt,
   goalBudgetExhausted,
@@ -640,8 +641,11 @@ export class CodexClaudeAppServer {
       }
       case 'thread/start':
         return this.threadStart(peer, asRecord(params))
-      case 'thread/resume':
-        return this.historyForPeer(peer, this.threadResume(peer, asRecord(params)))
+      case 'thread/resume': {
+        const resumeParams = asRecord(params)
+        await this.gitInfoForResume(resumeParams)
+        return this.historyForPeer(peer, this.threadResume(peer, resumeParams))
+      }
       case 'thread/fork':
         return this.historyForPeer(peer, this.threadFork(peer, asRecord(params)))
       case 'thread/list':
@@ -1079,6 +1083,10 @@ export class CodexClaudeAppServer {
     }
     this.store.upsertThread(thread)
     if (projectId) this.store.setThreadProject(id, projectId)
+    // Like Codex, thread/start answers without git info; the App looks the
+    // branch up itself, and thread/list has it once the lookup lands.
+    // App rule: thread-git-info
+    if (!thread.ephemeral) void this.captureGitInfo(id, cwd)
     recordRunEvent('thread.started', {
       threadId: thread.id,
       cwd: thread.cwd,
@@ -1243,10 +1251,13 @@ export class CodexClaudeAppServer {
           : parent.personality,
       runtimeBackend,
       codexSessionId: null,
+      gitInfo: cwd === parent.cwd ? (parent.gitInfo ?? null) : null,
     }
     this.store.upsertThread(thread)
     // A fork stays in its parent's project.
     if (parent.projectId) this.store.setThreadProject(id, parent.projectId)
+    this.store.setThreadGitInfo(id, thread.gitInfo ?? null)
+    if (!thread.ephemeral && !thread.gitInfo) void this.captureGitInfo(id, cwd)
     if (forkPoint) {
       this.store.setForkCheckpoint(id, forkPoint)
       this.store.rewindClaudeSession(id, forkPoint.sessionId, forkPoint.messageUuid)
@@ -2270,6 +2281,9 @@ export class CodexClaudeAppServer {
     // projectId: omitted or null leaves it, '' clears it, an id assigns it.
     const projectId = typeof params.projectId === 'string' ? params.projectId || null : undefined
     if (projectId) this.requireProject(projectId)
+    // The App sets the branch after it creates one for the thread.
+    const gitInfo =
+      params.gitInfo == null ? undefined : patchGitInfo(thread.gitInfo ?? null, params.gitInfo)
 
     // Support dynamic model, reasoning effort, approval policy and sandbox updates
     const rawModel = modelFromParams(params, null)
@@ -2308,6 +2322,10 @@ export class CodexClaudeAppServer {
     if (projectId !== undefined) {
       this.assignThreadProject(threadId, projectId)
       thread.projectId = projectId
+    }
+    if (gitInfo !== undefined) {
+      this.store.setThreadGitInfo(threadId, gitInfo)
+      thread.gitInfo = gitInfo
     }
 
     thread.updatedAt = nowSeconds()
@@ -6856,7 +6874,13 @@ export class CodexClaudeAppServer {
         cwd: thread?.cwd ?? process.cwd(),
         cliVersion: codexCliVersion(),
         source: normalizeSessionSource(thread?.source),
-        gitInfo: null,
+        gitInfo: thread?.gitInfo
+          ? {
+              sha: thread.gitInfo.sha,
+              branch: thread.gitInfo.branch,
+              origin_url: thread.gitInfo.originUrl,
+            }
+          : null,
       },
     }
   }
@@ -7118,8 +7142,10 @@ export class CodexClaudeAppServer {
       threadSource: normalizeThreadSource(thread.threadSource),
       agentNickname,
       agentRole,
-      gitInfo: null,
+      gitInfo: thread.gitInfo ?? null,
       name: thread.name,
+      model: thread.model || null,
+      reasoningEffort: normalizeReasoningEffortEnum(thread.reasoningEffort),
       projectId: thread.projectId ?? null,
       turns: turns.map((turn) => this.toTurn(turn)),
     }
@@ -7391,11 +7417,55 @@ export class CodexClaudeAppServer {
       return
     }
     if (existed) {
+      this.refreshGitInfoAfterTurn(threadId)
       setImmediate(() => {
         if (!this.startFollowUp(threadId, settled?.status) && this.activeTurnByThread.size === 0)
           this.idleCheckHandler?.()
       })
     }
+  }
+
+  // Stores the git info of the thread's workspace once the lookup lands. A
+  // failed lookup keeps what is stored unless `replace` says the workspace
+  // itself changed.
+  private async captureGitInfo(
+    threadId: string,
+    cwd: string,
+    options: { fresh?: boolean; replace?: boolean } = {},
+  ): Promise<void> {
+    try {
+      const gitInfo = await gitInfoFor(cwd, { fresh: options.fresh === true })
+      if (this.stopped || (!gitInfo && !options.replace)) return
+      this.store.setThreadGitInfo(threadId, gitInfo)
+    } catch (error) {
+      debugLog('thread.git_info.failed', {
+        threadId,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
+
+  // A turn can switch or create the branch, so the sidebar follows the branch
+  // the thread last worked on.
+  private refreshGitInfoAfterTurn(threadId: string): void {
+    try {
+      const thread = this.store.getThread(threadId)
+      if (thread && !thread.ephemeral)
+        void this.captureGitInfo(threadId, thread.cwd, { fresh: true })
+    } catch {
+      // Only the branch label waits for the next turn.
+    }
+  }
+
+  // Threads stored before the adapter kept git info, or resumed before their
+  // start-time lookup landed, get it before resuming; resuming in another
+  // directory replaces it.
+  private async gitInfoForResume(params: Record<string, unknown>): Promise<void> {
+    const thread = this.store.getThread(stringOr(params.threadId, ''))
+    if (!thread || thread.ephemeral) return
+    const cwd = typeof params.cwd === 'string' && params.cwd.length > 0 ? params.cwd : thread.cwd
+    if (cwd !== thread.cwd) await this.captureGitInfo(thread.id, cwd, { replace: true })
+    else if (!thread.gitInfo) await this.captureGitInfo(thread.id, cwd)
   }
 
   // The MCP servers an App request sees: a named thread's, its project's

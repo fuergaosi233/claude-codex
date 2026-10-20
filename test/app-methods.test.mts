@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict'
-import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
+import { type ChildProcessWithoutNullStreams, execFileSync, spawn } from 'node:child_process'
 import { once } from 'node:events'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { delimiter, join, resolve } from 'node:path'
 import test from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
+import { isDeepStrictEqual } from 'node:util'
 
 // The App methods end to end: each test drives its own mock app-server over
 // stdio, the way the App does.
@@ -32,11 +33,17 @@ class AppServer {
   private nextId = 1
   private buffer = ''
 
-  constructor(home: string) {
+  constructor(home: string, env: Record<string, string> = {}) {
     this.home = home
     this.proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+      env: {
+        ...process.env,
+        CODEX_HOME: home,
+        CLAUDE_CODEX_MOCK: '1',
+        NODE_NO_WARNINGS: '1',
+        ...env,
+      },
     })
     this.proc.stderr.resume()
     this.proc.stdout.setEncoding('utf8')
@@ -126,8 +133,11 @@ class AppServer {
   }
 }
 
-async function withServer(run: (server: AppServer) => Promise<void>): Promise<void> {
-  const server = new AppServer(await mkdtemp(join(tmpdir(), 'claude-codex-app-methods-')))
+async function withServer(
+  run: (server: AppServer) => Promise<void>,
+  env: Record<string, string> = {},
+): Promise<void> {
+  const server = new AppServer(await mkdtemp(join(tmpdir(), 'claude-codex-app-methods-')), env)
   try {
     await run(server)
   } finally {
@@ -136,6 +146,17 @@ async function withServer(run: (server: AppServer) => Promise<void>): Promise<vo
 }
 
 const ids = (page: { data: Array<{ id: string }> }): string[] => page.data.map((entry) => entry.id)
+
+// Waits for what the server does after answering.
+async function eventually(read: () => Promise<unknown>, expected: unknown): Promise<void> {
+  let actual: unknown
+  for (let waited = 0; waited < 10_000; waited += 20) {
+    actual = await read()
+    if (isDeepStrictEqual(actual, expected)) return
+    await delay(20)
+  }
+  assert.deepEqual(actual, expected)
+}
 
 test('thread history pages turns, items and the timeline', async () => {
   await withServer(async (server) => {
@@ -779,6 +800,119 @@ test('projects persist, order, and carry their threads', async () => {
       new RegExp(`idempotency key refers to deleted project: ${alpha.id}`),
     )
   })
+})
+
+test('threads carry the git info of their workspace without listing running git', async () => {
+  // A git on PATH that logs each run, to show which requests run git.
+  const tools = await mkdtemp(join(tmpdir(), 'claude-codex-git-runs-'))
+  const log = join(tools, 'runs.log')
+  const realGit = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim()
+  await writeFile(
+    join(tools, 'git'),
+    `#!/bin/sh\necho "$*" >> '${log}'\nexec '${realGit}' "$@"\n`,
+    {
+      mode: 0o755,
+    },
+  )
+  const gitRuns = async () => (await readFile(log, 'utf8').catch(() => '')).split('\n').length
+  const env = { PATH: `${tools}${delimiter}${process.env.PATH ?? ''}` }
+  try {
+    await withServer(async (server) => {
+      const repo = join(server.home, 'repo')
+      const git = (...args: string[]) =>
+        execFileSync(
+          'git',
+          ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', ...args],
+          { cwd: repo, encoding: 'utf8' },
+        ).trim()
+      execFileSync('git', ['init', '-q', repo])
+      git('symbolic-ref', 'HEAD', 'refs/heads/feature/sidebar')
+      git('-c', 'commit.gpgsign=false', 'commit', '-q', '--allow-empty', '-m', 'first')
+      git('remote', 'add', 'origin', 'https://user:secret@example.com/acme/app.git')
+      const expected = {
+        sha: git('rev-parse', 'HEAD'),
+        branch: 'feature/sidebar',
+        originUrl: 'https://example.com/acme/app.git',
+      }
+      const gitInfo = async (threadId: string) =>
+        (await server.request('thread/read', { threadId })).thread.gitInfo
+
+      // Like Codex, thread/start answers before the lookup; the thread has it
+      // once the lookup lands. The model and effort are on the thread too.
+      const started = await server.request('thread/start', { cwd: repo, effort: 'high' })
+      const threadId = started.thread.id
+      assert.equal(started.thread.gitInfo, null)
+      assert.equal(started.thread.model, started.model)
+      assert.equal(started.thread.reasoningEffort, 'high')
+      await eventually(() => gitInfo(threadId), expected)
+
+      // Switching the branch outside a turn changes nothing stored; the end of
+      // the next turn looks again.
+      git('checkout', '-q', '-b', 'fix/later')
+      assert.deepEqual(await gitInfo(threadId), expected)
+      await server.runTurn(threadId, 'hello')
+      const later = { ...expected, branch: 'fix/later' }
+      await eventually(() => gitInfo(threadId), later)
+
+      // A fork in the same workspace starts with its parent's git info.
+      const { thread: fork } = await server.request('thread/fork', { threadId })
+      assert.deepEqual(fork.gitInfo, later)
+
+      // Listing, reading and resuming threads that have git info run no git.
+      const before = await gitRuns()
+      assert.ok(before > 1, 'the server runs the logging git')
+      const listed = await server.request('thread/list')
+      assert.deepEqual(
+        listed.data.map((thread: any) => thread.gitInfo),
+        [later, later],
+      )
+      for (const id of [threadId, fork.id]) {
+        assert.deepEqual(await gitInfo(id), later)
+        assert.deepEqual(
+          (await server.request('thread/resume', { threadId: id })).thread.gitInfo,
+          later,
+        )
+      }
+      assert.equal(await gitRuns(), before)
+      const { summary } = await server.request('getConversationSummary', {
+        conversationId: threadId,
+      })
+      assert.deepEqual(summary.gitInfo, {
+        sha: later.sha,
+        branch: 'fix/later',
+        origin_url: later.originUrl,
+      })
+
+      // The App sets the branch after creating one; Codex's patch rules apply.
+      const patch = (patchInfo: unknown) =>
+        server.request('thread/metadata/update', { threadId, gitInfo: patchInfo })
+      assert.deepEqual((await patch({ branch: '  release  ' })).thread.gitInfo, {
+        ...later,
+        branch: 'release',
+      })
+      assert.deepEqual(
+        (await patch({ sha: null, originUrl: 'alice@example.com:acme/app.git' })).thread.gitInfo,
+        { sha: null, branch: 'release', originUrl: 'example.com:acme/app.git' },
+      )
+      await assert.rejects(patch({}), /gitInfo must include at least one field/)
+      await assert.rejects(patch({ branch: ' ' }), /gitInfo.branch must not be empty/)
+      await assert.rejects(
+        patch({ originUrl: 'ext::sh -c secret' }),
+        /gitInfo.originUrl must be a valid Git remote/,
+      )
+      assert.equal((await patch({ branch: null, originUrl: null })).thread.gitInfo, null)
+
+      // Outside a repository there is none; resuming in another workspace
+      // looks there.
+      const plain = await server.startThread()
+      const resumed = await server.request('thread/resume', { threadId: plain, cwd: repo })
+      assert.deepEqual(resumed.thread.gitInfo, later)
+      const back = await server.request('thread/resume', { threadId: plain, cwd: server.home })
+      assert.equal(back.thread.gitInfo, null)
+    }, env)
+  } finally {
+    await rm(tools, { recursive: true, force: true })
+  }
 })
 
 test('rollback and revert rewind Claude to the newest remaining turn', async () => {

@@ -3,6 +3,7 @@ import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import type {
   ClaudeCheckpoint,
+  GitInfo,
   ImportHistoryRecord,
   ProjectRecord,
   QueuedSubmission,
@@ -75,6 +76,17 @@ function checkpointFrom(sessionId: unknown, messageUuid: unknown): ClaudeCheckpo
   return typeof sessionId === 'string' && typeof messageUuid === 'string'
     ? { sessionId, messageUuid }
     : null
+}
+
+function parseGitInfo(json: unknown): GitInfo | null {
+  if (typeof json !== 'string') return null
+  try {
+    const value = JSON.parse(json)
+    const field = (key: string) => (typeof value?.[key] === 'string' ? value[key] : null)
+    return { sha: field('sha'), branch: field('branch'), originUrl: field('originUrl') }
+  } catch {
+    return null
+  }
 }
 
 export class SessionStore {
@@ -202,6 +214,8 @@ export class SessionStore {
     // Project membership; written only by setThreadProject and deleteProject.
     this.ensureColumn('threads', 'project_id', 'TEXT')
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_threads_project ON threads(project_id)')
+    // Codex GitInfo as JSON; written only by setThreadGitInfo.
+    this.ensureColumn('threads', 'git_info_json', 'TEXT')
     this.ensurePinnedSection()
     this.migrateLegacyPinState()
     this.sanitizeLegacyEnumColumns()
@@ -834,6 +848,15 @@ export class SessionStore {
     const result = this.db
       .prepare('UPDATE threads SET project_id = ? WHERE id = ? AND project_id IS NOT ?')
       .run(projectId, threadId, projectId)
+    return Number(result.changes) > 0
+  }
+
+  // Returns whether the thread's git info changed.
+  setThreadGitInfo(threadId: string, gitInfo: GitInfo | null): boolean {
+    const json = gitInfo ? JSON.stringify(gitInfo) : null
+    const result = this.db
+      .prepare('UPDATE threads SET git_info_json = ? WHERE id = ? AND git_info_json IS NOT ?')
+      .run(json, threadId, json)
     return Number(result.changes) > 0
   }
 
@@ -1482,6 +1505,7 @@ export class SessionStore {
       runtimeBackend: row.runtime_backend === 'codex' ? 'codex' : 'claude',
       codexSessionId: row.codex_session_id == null ? null : String(row.codex_session_id),
       projectId: row.project_id == null ? null : String(row.project_id),
+      gitInfo: parseGitInfo(row.git_info_json),
     }
   }
 

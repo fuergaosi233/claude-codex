@@ -215,6 +215,14 @@ export const APP_RULES: readonly AppRule[] = [
       'Let the API stay overloaded until Claude gives up: the failed turn says the server is busy instead of showing a bare error.',
   },
   {
+    id: 'thread-git-info',
+    app: "Shows a thread's gitInfo.branch in the sidebar and uses originUrl for the repository name and pull request flows. When thread/start answers with gitInfo null it looks the workspace up itself; a thread/list refresh keeps what it knows when a row has none, but thread/resume replaces it with the answer's gitInfo. After creating a branch for a thread it sends thread/metadata/update with gitInfo.branch.",
+    adapter:
+      "Stores gitInfo on the thread: looked up after thread/start, on a resume of a thread without it, and when a turn ends, so thread/list and thread/read never run git. thread/start answers with null as Codex does, and thread/metadata/update patches gitInfo with Codex's rules.",
+    verify:
+      'Start a chat in a git repository on a feature branch and send a message: after an App restart the sidebar still shows the branch, and it follows a branch Claude switches to once the turn ends.',
+  },
+  {
     id: 'prewarmed-threads',
     app: 'Starts the thread of a new chat with thread/start before the user sends anything, keeps it out of thread/list and holds back its thread/started until it sends turn/start there, and deletes it with thread/delete once the chat goes unused for 10 minutes. It forgets such threads when the app-server connection drops or the App quits.',
     adapter:

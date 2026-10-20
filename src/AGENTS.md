@@ -17,6 +17,8 @@ Adapter internals. All files are `.mts` ESM, compiled to `dist/*.mjs`. See the
   keep tags and rules in step (see `docs/reference/app-compat.md`).
 - `mcp.mts` — MCP stdio/HTTP tool & resource calls.
 - `worktree.mts` — optional per-thread git worktree isolation.
+- `git-info.mts` — a thread's Codex `gitInfo`: cached lookups and remote URL
+  sanitizing.
 
 ## Runtime backends
 
