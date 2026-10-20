@@ -5192,7 +5192,7 @@ test('config/value/write persists arbitrary settings keys across restarts', asyn
   }
 })
 
-test('thread/inject_items appends a synthetic turn carrying the injected text', async () => {
+test('thread/inject_items keeps the items out of the transcript', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -5204,7 +5204,7 @@ test('thread/inject_items appends a synthetic turn carrying the injected text', 
     const start = await reader.nextResponse(1)
     const threadId = start.result.thread.id
 
-    // Codex App's actual payload shape: items[] of free-form Responses entries.
+    // The state of an inline visualization, as the App injects it before a turn.
     proc.stdin.write(
       json({
         id: 2,
@@ -5213,50 +5213,44 @@ test('thread/inject_items appends a synthetic turn carrying the injected text', 
           threadId,
           items: [
             {
-              type: 'message',
-              role: 'user',
-              content: [{ type: 'text', text: 'Here is some pinned context.' }],
+              type: 'function_call',
+              name: 'untrusted_input',
+              call_id: 'visualization_state_1',
+              arguments: '{}',
             },
             {
-              type: 'message',
-              role: 'assistant',
-              content: [{ type: 'text', text: 'Got it, remembered.' }],
+              type: 'function_call_output',
+              call_id: 'visualization_state_1',
+              output: [{ type: 'input_text', text: '{"path":"/v/chart.html","state":{}}' }],
             },
           ],
         },
       }),
     )
-
-    // The response + 3 notifications (turn/started, item/completed, turn/completed)
-    // arrive in some order. Drain everything until we've seen all four signals
-    // — don't pre-filter via nextResponse(2) because that would discard the
-    // notifications which are exactly what we want to assert.
-    let sawResponse = false
-    let injectedText = ''
-    for (let i = 0; i < 100; i += 1) {
-      const m = await reader.next()
-      if (m.id === 2 && m.method == null) sawResponse = true
-      if (m.method === 'item/completed' && m.params?.item?.type === 'agentMessage') {
-        injectedText = m.params.item.text
-      }
-      if (sawResponse && injectedText) break
-    }
-    assert.equal(sawResponse, true, 'thread/inject_items response must arrive')
-    assert.match(
-      injectedText,
-      /pinned context/,
-      'injected text must round-trip into the synthetic agentMessage',
-    )
-    assert.match(injectedText, /Got it, remembered/)
-
-    // thread/read should show the synthetic turn so reload preserves it.
     proc.stdin.write(
       json({ id: 3, method: 'thread/read', params: { threadId, includeTurns: true } }),
     )
-    const read = await reader.nextResponse(3)
-    const turns = read.result.thread.turns
-    assert.ok(turns.length >= 1, 'thread/read should include the injected turn')
-    assert.equal(turns.at(-1).items[0].type, 'agentMessage')
+    // Like Codex, the adapter answers with no turn and no item to show.
+    const seen: string[] = []
+    let response: any
+    let read: any
+    while (!read) {
+      const message = await reader.next()
+      if (message.method) seen.push(message.method)
+      else if (message.id === 2) response = message
+      else if (message.id === 3) read = message
+    }
+    assert.deepEqual(response?.result, {})
+    assert.deepEqual(
+      seen.filter((method) => method.startsWith('turn/') || method.startsWith('item/')),
+      [],
+    )
+    assert.deepEqual(read.result.thread.turns, [])
+
+    proc.stdin.write(
+      json({ id: 4, method: 'thread/inject_items', params: { threadId: 'missing', items: [] } }),
+    )
+    assert.ok((await reader.nextResponse(4)).error)
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })

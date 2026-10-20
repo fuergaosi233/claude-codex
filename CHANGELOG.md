@@ -62,6 +62,17 @@ versioning or publishing metadata.
   summary turns, answers with what Claude passed to `StructuredOutput`. The
   adapter used to drop that call and fill every field with the user's prompt,
   so App chats were titled with the first words of the request.
+- A chat the leader tools start is announced with its first message as its
+  preview and its `thread_start` title, kept to one line, as its name. The
+  Codex App shows that title or, without one, titles the chat from its first
+  message, as it titles the user's own chats; such chats used to stay
+  untitled.
+- `thread/inject_items` no longer adds a turn that shows the items as raw
+  JSON in an assistant message, which Claude never read. The items, such as
+  the state of an inline visualization or an MCP app's content, wait for the
+  next message and reach Claude before it as `<app_context>` blocks, the way
+  Codex adds them to the model's history without showing them. Images in
+  them are left out.
 - Expanded Codex App Remote coverage across thread lifecycle, turn envelopes,
   item streaming, approvals, MCP status, fuzzy file search sessions, Claude
   skills/hooks, and `thread/turns/list` item views.

@@ -187,7 +187,8 @@ export class LeaderThreads {
     // the place to add it is here and in the host's startThread.
     if (isCodexOpenAiModel(model))
       throw new Error(`thread_start starts Claude chats only, and ${model} is not a Claude model`)
-    const title = input.title?.trim().slice(0, 200) || null
+    // One line, as the sidebar shows it. Without one the App titles the chat.
+    const title = input.title?.replace(/\s+/g, ' ').trim().slice(0, TITLE_LIMIT) || null
     const { threadId, turnId } = await this.host.startThread(leader, { prompt, cwd, model, title })
     const thread = this.host.store.getThread(threadId)
     const started = JSON.stringify({

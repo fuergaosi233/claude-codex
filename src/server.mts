@@ -178,7 +178,6 @@ import {
   stringListFromEnv,
   stringOr,
   subagentEffortFromInput,
-  summarizeInjectedItem,
   summarizeRpcParams,
   threadPermissionProfileId,
   todoWriteToPlanSteps,
@@ -214,6 +213,7 @@ import {
 import {
   type AppToolNoteOptions,
   additionalContextBlocks,
+  injectedItemsContext,
   skillInstructions,
   withTurnContext,
 } from './turn-context.mjs'
@@ -973,7 +973,7 @@ export class CodexClaudeAppServer {
       case 'thread/loaded/list':
         return this.threadLoadedList(asRecord(params))
       case 'thread/inject_items':
-        return this.threadInjectItems(peer, asRecord(params))
+        return this.threadInjectItems(asRecord(params))
       case 'turn/start':
         return this.turnStart(peer, asRecord(params))
       case 'turn/steer':
@@ -1288,8 +1288,9 @@ export class CodexClaudeAppServer {
       sectionId: null,
       sectionEnteredAt: null,
       sectionPosition: null,
-      preview: '',
-      name: null,
+      // Set only for a chat the adapter starts itself; see startLeaderThread.
+      preview: typeof params._preview === 'string' ? params._preview.slice(0, 200) : '',
+      name: nullIfEmpty(typeof params._name === 'string' ? params._name : null),
       archived: false,
       cwd,
       model,
@@ -1396,13 +1397,19 @@ export class CodexClaudeAppServer {
       personality: leader.personality,
       projectId: leader.projectId,
       threadSource: 'user',
+      // The App names a chat it is told about from the thread/started it gets:
+      // it shows the name if there is one, and otherwise titles the chat from
+      // its preview, as it does a chat started in the composer. With neither
+      // the chat stays untitled, so both are set before the turn starts.
+      // App rule: added-thread-titles
+      _preview: options.prompt,
+      _name: options.title,
     })
     // No App follows the leader right now: threadStart subscribes no one, and
     // the chat finds its followers when an App opens it.
     const threadId = stringOr(asRecord(asRecord(started).thread).id, '')
     // Linked before its turn starts, so that turn already gets no leader tools.
     this.store.addLeaderThread(threadId, leader.id)
-    if (options.title) this.threadNameSet({ threadId, name: options.title })
     const result = await this.turnStart(peer, {
       threadId,
       input: [{ type: 'text', text: options.prompt, text_elements: [] }],
@@ -2213,79 +2220,19 @@ export class CodexClaudeAppServer {
     }
   }
 
-  // Codex App calls thread/inject_items to push hidden context into a thread's
-  // model history — typically file-attachment ingestion, "pin this output as
-  // future context", or App-side memory consolidation. Items are raw Responses
-  // API entries (free-form JSON). Without an implementation the App's
-  // ingestion just disappears, breaking any feature that relies on it.
-  //
-  // Approach: synthesize an injected turn carrying a single agentMessage that
-  // recaps the items as a human-readable block. That turn becomes part of the
-  // thread's transcript so the next runRuntimeTurn picks it up as prior
-  // conversation context, AND it's visible in thread/read so the user can
-  // confirm what was added. We pick agentMessage (instead of a custom type)
-  // for App-compatibility — every Codex App build renders it without needing
-  // a new ThreadItem variant.
-  private threadInjectItems(peer: RpcPeer, params: Record<string, unknown>): unknown {
+  // The App injects Responses API items into a thread's model history before
+  // a turn, such as an MCP app's content or the state of the chat's inline
+  // visualizations, and when it opens a side chat. Codex adds them to the
+  // history without a turn or an item, so the transcript does not show them.
+  // Claude's history is its own session, so they wait in the store and the
+  // next message hands them to Claude (see modelPrompt).
+  // App rule: injected-context
+  private threadInjectItems(params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
     if (!thread) throw new Error(`unknown thread: ${threadId}`)
     const items = Array.isArray(params.items) ? params.items : []
-    if (items.length === 0) return {}
-
-    const now = nowSeconds()
-    const turnId = newId()
-    const itemId = newId()
-    // Compact summary of injected items — try to extract human-readable text
-    // (Responses items often have `content` arrays with text segments).
-    const summary = items
-      .map((raw) => summarizeInjectedItem(raw))
-      .filter(Boolean)
-      .join('\n\n')
-    const text =
-      summary.length > 0
-        ? summary
-        : `[adapter] ${items.length} item(s) injected via thread/inject_items`
-    const agentItem: ThreadItem = {
-      type: 'agentMessage',
-      id: itemId,
-      text,
-      phase: null,
-      memoryCitation: null,
-    }
-    const turn: TurnRecord = {
-      id: turnId,
-      threadId,
-      status: 'completed',
-      startedAt: now,
-      completedAt: now,
-      durationMs: 0,
-      items: [agentItem],
-      diff: '',
-      error: null,
-    }
-    this.store.upsertTurn(turn)
-    thread.updatedAt = now
-    this.store.upsertThread(thread)
-    // Defer notifications past the inject_items response. Firing them
-    // synchronously enqueues them in front of the response on the wire,
-    // which trips clients that do "await response, then read notifications"
-    // (they end up draining the notifications while waiting for the
-    // response, then loop forever looking for already-discarded events).
-    queueMicrotask(() => {
-      this.notify(peer, {
-        method: 'turn/started',
-        params: { threadId, turn: this.toLifecycleTurn(turn) },
-      })
-      this.notify(peer, {
-        method: 'item/completed',
-        params: { threadId, turnId, item: agentItem, completedAtMs: nowMillis() },
-      })
-      this.notify(peer, {
-        method: 'turn/completed',
-        params: { threadId, turn: this.toLifecycleTurn(turn) },
-      })
-    })
+    this.store.addInjectedItems(threadId, items)
     debugLog('thread.inject_items', { threadId, count: items.length })
     return {}
   }
@@ -7686,7 +7633,7 @@ export class CodexClaudeAppServer {
       this.emitItemLifecycle(this.peerForThread(threadId), threadId, activeTurnId, item)
     }
     const thread = this.store.getThread(threadId)
-    const modelPrompt = thread ? this.modelPrompt(thread, prompt, params) : prompt
+    const modelPrompt = thread ? this.modelPrompt(thread, prompt, params, { steer: true }) : prompt
     const steered = await this.steerRunningTurn(threadId, activeTurnId, modelPrompt, {
       imageInputs: images,
       onAccepted: accept,
@@ -8735,25 +8682,31 @@ export class CodexClaudeAppServer {
     }
   }
 
-  // What Claude reads for a user message: the message, then the SKILL.md of
-  // each skill it picks and the context the App attached to it. Helper turns
-  // and the adapter's own prompts get neither.
+  // What Claude reads for a user message: the items the App injected into the
+  // thread since its last message, the message, then the SKILL.md of each
+  // skill it picks and the context the App attached to it. Helper turns and
+  // the adapter's own prompts get none of it, and leave the injected items to
+  // the next message. So does a steer: the App injects items only while no
+  // turn runs, for the turn it starts next.
   // App rule: skill-injection
   // App rule: additional-context
+  // App rule: injected-context
   private modelPrompt(
     thread: ThreadRecord,
     prompt: string,
     params: Record<string, unknown>,
+    options: { steer?: boolean } = {},
   ): string {
     if (params.outputSchema != null || typeof params._hiddenPrompt === 'string') return prompt
     const skillDirs = [
       ...claudeSkillDirs(thread.cwd),
       ...this.appSkillsFor(thread.id).appSkills.map((skill) => dirname(skill.path)),
     ]
-    return withTurnContext(prompt, [
-      skillInstructions(prompt, skillDirs),
-      additionalContextBlocks(params.additionalContext),
-    ])
+    return withTurnContext(
+      prompt,
+      [skillInstructions(prompt, skillDirs), additionalContextBlocks(params.additionalContext)],
+      options.steer ? null : injectedItemsContext(this.store.takeInjectedItems(thread.id)),
+    )
   }
 
   // The Codex App skills Claude can run in a thread, and where the thread's

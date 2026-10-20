@@ -158,6 +158,10 @@ export class SessionStore {
         thread_id TEXT PRIMARY KEY,
         tools_json TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS thread_injected_items (
+        thread_id TEXT PRIMARY KEY,
+        items_json TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS projects (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -1335,6 +1339,7 @@ export class SessionStore {
       this.db.prepare('DELETE FROM thread_goals WHERE thread_id = ?').run(id)
       this.db.prepare('DELETE FROM thread_queues WHERE thread_id = ?').run(id)
       this.db.prepare('DELETE FROM thread_dynamic_tools WHERE thread_id = ?').run(id)
+      this.db.prepare('DELETE FROM thread_injected_items WHERE thread_id = ?').run(id)
       this.db.prepare('DELETE FROM thread_attachments WHERE thread_id = ?').run(id)
       // Only the thread's own link: threads it led keep theirs, so they
       // stay below the depth limit after their leader is gone.
@@ -1674,6 +1679,38 @@ export class SessionStore {
          ON CONFLICT(thread_id) DO UPDATE SET tools_json = excluded.tools_json`,
       )
       .run(threadId, JSON.stringify(tools))
+  }
+
+  // The items the client injected with thread/inject_items that no turn has
+  // read yet, in the order they came. Codex adds them to the thread's model
+  // history at once; Claude reads them with the next message.
+  addInjectedItems(threadId: string, items: readonly unknown[]): void {
+    if (items.length === 0) return
+    this.transaction(() => {
+      const row = this.db
+        .prepare('SELECT items_json FROM thread_injected_items WHERE thread_id = ?')
+        .get(threadId) as { items_json: string } | undefined
+      const pending = row ? (JSON.parse(row.items_json) as unknown[]) : []
+      this.db
+        .prepare(
+          `INSERT INTO thread_injected_items (thread_id, items_json) VALUES (?, ?)
+           ON CONFLICT(thread_id) DO UPDATE SET items_json = excluded.items_json`,
+        )
+        .run(threadId, JSON.stringify([...pending, ...items]))
+    })
+  }
+
+  // Hands the pending items over once: the turn that takes them is the one
+  // that reads them.
+  takeInjectedItems(threadId: string): unknown[] {
+    return this.transaction(() => {
+      const row = this.db
+        .prepare('SELECT items_json FROM thread_injected_items WHERE thread_id = ?')
+        .get(threadId) as { items_json: string } | undefined
+      if (!row) return []
+      this.db.prepare('DELETE FROM thread_injected_items WHERE thread_id = ?').run(threadId)
+      return JSON.parse(row.items_json) as unknown[]
+    })
   }
 
   close(): void {

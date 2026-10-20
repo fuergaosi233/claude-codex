@@ -3864,7 +3864,12 @@ function leaderToolServer(sdk: ClaudeSdk, z: Zod, leader: LeaderToolHandlers) {
         THREAD_START_DESCRIPTION,
         {
           prompt: z.string().describe('The first message of the new chat, complete on its own.'),
-          title: z.string().optional().describe('A short title for the sidebar.'),
+          title: z
+            .string()
+            .optional()
+            .describe(
+              "A short title for the sidebar. Leave it out to let the Codex App title the chat from its prompt, as it titles the user's own chats.",
+            ),
           cwd: z
             .string()
             .optional()
