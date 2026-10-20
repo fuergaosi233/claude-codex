@@ -5,9 +5,11 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { rendersCompletedSubagentActivity, unverifiedAppWarning } from './app-compat.mjs'
+import { type InstalledAppPlugin, stopAppPluginServers } from './app-plugin-mcp.mjs'
 import {
   type AppPlugin,
   type AppSkill,
+  appMarketplacePlugin,
   appPluginSkills,
   claudeHookSource,
   claudeRunnableAppPlugin,
@@ -453,6 +455,9 @@ export class CodexClaudeAppServer {
   private configOverrides: Record<string, unknown> = {}
   // Codex App plugins whose skills Claude can run, as the App installed them.
   private appPlugins: AppPlugin[] = []
+  // Every App plugin the App installed, by its <plugin>@<marketplace> id, for
+  // the plugin MCP servers the App calls through the host.
+  private installedAppPlugins: InstalledAppPlugin[] = []
   private readonly configPath = join(adapterHome(), 'config.json')
   private idleCheckHandler: (() => void) | null = null
   private stopped = false
@@ -529,6 +534,7 @@ export class CodexClaudeAppServer {
     } finally {
       // A store that can no longer be written must not keep the Claude
       // processes running.
+      stopAppPluginServers()
       try {
         await this.runtime.stop()
       } finally {
@@ -896,6 +902,7 @@ export class CodexClaudeAppServer {
           stringOr(asRecord(params).tool, ''),
           asRecord(params).arguments ?? {},
           this.mcpScope(params),
+          asRecord(params)._meta ?? null,
         )
       case 'windowsSandbox/setupStart':
         return { started: false }
@@ -6733,19 +6740,40 @@ export class CodexClaudeAppServer {
   private pluginInstall(params: Record<string, unknown>): unknown {
     const plugin = claudeRunnableAppPlugin(params.marketplacePath, params.pluginName)
     const known = this.appPlugins.find((candidate) => candidate.name === plugin?.name)
+    let changed = false
     if (plugin && known?.root !== plugin.root) {
       this.appPlugins = [...this.appPlugins.filter((candidate) => candidate !== known), plugin]
-      this.persistConfig()
+      changed = true
     }
+    // App rule: code-review-plugin-server
+    const installed = appMarketplacePlugin(params.marketplacePath, params.pluginName)
+    if (installed?.marketplace) {
+      const id = `${installed.name}@${installed.marketplace}`
+      const was = this.installedAppPlugins.find((candidate) => candidate.id === id)
+      if (was?.root !== installed.root) {
+        this.installedAppPlugins = [
+          ...this.installedAppPlugins.filter((candidate) => candidate !== was),
+          { id, root: installed.root },
+        ]
+        changed = true
+      }
+    }
+    if (changed) this.persistConfig()
     return { authPolicy: 'ON_USE', appsNeedingAuth: [] }
   }
 
   private pluginUninstall(params: Record<string, unknown>): unknown {
     // Plugin ids read `<name>@<marketplace>`.
-    const name = stringOr(params.pluginId, '').split('@')[0]
+    const id = stringOr(params.pluginId, '')
+    const name = id.split('@')[0]
     const kept = this.appPlugins.filter((plugin) => plugin.name !== name)
-    if (kept.length !== this.appPlugins.length) {
+    const installed = this.installedAppPlugins.filter((plugin) => plugin.id !== id)
+    if (
+      kept.length !== this.appPlugins.length ||
+      installed.length !== this.installedAppPlugins.length
+    ) {
       this.appPlugins = kept
+      this.installedAppPlugins = installed
       this.persistConfig()
     }
     return {}
@@ -7348,7 +7376,10 @@ export class CodexClaudeAppServer {
   private mcpScope(params: unknown): McpConfigScope {
     const threadId = stringOr(asRecord(params).threadId, '')
     const thread = threadId ? this.store.getThread(threadId) : null
-    return { cwd: thread && thread.runtimeBackend !== 'codex' ? thread.cwd : null }
+    return {
+      cwd: thread && thread.runtimeBackend !== 'codex' ? thread.cwd : null,
+      appPlugins: this.installedAppPlugins,
+    }
   }
 
   // Ends a turn whose runtime run failed. The client leaves its running state
@@ -7501,6 +7532,14 @@ export class CodexClaudeAppServer {
             : []
         })
       }
+      if (Array.isArray(parsed.installedAppPlugins)) {
+        this.installedAppPlugins = parsed.installedAppPlugins.flatMap((entry) => {
+          const plugin = asRecord(entry)
+          return typeof plugin.id === 'string' && typeof plugin.root === 'string'
+            ? [{ id: plugin.id, root: plugin.root }]
+            : []
+        })
+      }
       if (shouldRepair) this.persistConfig()
     } catch {}
   }
@@ -7516,6 +7555,7 @@ export class CodexClaudeAppServer {
             model_reasoning_effort: this.configReasoningEffort,
             overrides: this.configOverrides,
             appPlugins: this.appPlugins,
+            installedAppPlugins: this.installedAppPlugins,
           },
           null,
           2,

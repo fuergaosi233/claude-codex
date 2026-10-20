@@ -12,8 +12,9 @@ import { codexHome, debugLog } from './util.mjs'
 // project root down to the thread's folder, later files overriding earlier
 // ones key by key.
 //
-// Servers that plugins bring along (plugins.*.mcp_servers) are not read:
-// they belong to the Codex App's own tools.
+// Servers that plugins bring along (plugins.*.mcp_servers) are not read for
+// threads: they belong to the Codex App's own tools. The few the App calls
+// through the host itself run in app-plugin-mcp.mts.
 
 type Table = Record<string, unknown>
 

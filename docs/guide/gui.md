@@ -94,6 +94,55 @@ use it.
 The prompt asks Claude to save fragments in the thread's visualization folder,
 which meets the location rule. A fragment that breaks a rule does not render.
 
+## Pull Requests panel
+
+The App's Pull Requests panel is drawn by its bundled `code-review` plugin. The
+App turns the plugin's MCP server on with a `-c` setting when it starts the
+app-server, then calls it on server `code-review` with `mcpServerStatus/list`,
+`mcpServer/tool/call` and `mcpServer/resource/read`. A Codex app-server runs
+that server itself; the adapter does so only when asked:
+
+```bash
+export CLAUDE_CODEX_APP_PLUGIN_MCP=1
+```
+
+With it set, the adapter finds the plugin's servers from the plugins enabled in
+`CODEX_HOME/config.toml` (and the ones the App installs with `plugin/install`),
+the plugin's `.codex-plugin/plugin.json` and its `.mcp.json`, and runs a server
+the App's `-c` settings or `config.toml` turn on:
+
+- with the plugin's folder as its working directory and the command and
+  arguments from `.mcp.json`;
+- with `CODEX_MCP_NODE_PATH` passed on from the adapter's environment, or set to
+  the Node.js binary running the adapter;
+- with only `HOME`, `PATH`, `SHELL`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `TERM`,
+  `TMPDIR`, `TZ` and the variables the server's `env_vars` lists, leaving out
+  any whose name looks like a credential (`*TOKEN*`, `*SECRET*`, `*_KEY` and
+  the like);
+- as one long-lived process for the adapter, started on first use, restarted
+  if it exits, and stopped with the adapter.
+
+The plugin uses the host's GitHub credentials, for example an existing `gh`
+login (`gh auth login`); the adapter never reads, logs or passes on a token. The
+panel can then list pull requests, open one and show its checks and comments.
+Two parts depend on Codex itself:
+
+- **Starting a review** runs `codex exec` through `CODEX_CLI_PATH`, which the
+  App points at its own `codex`. With the adapter installed as that binary, the
+  review only runs when the real Codex CLI is reachable and signed in;
+  otherwise the panel shows the error. It never starts a Claude thread.
+- **The ChatGPT-backed GitHub connection** has the plugin start its own
+  `codex app-server` for the sign-in. The adapter refuses to start for it (a
+  second adapter would take over the first one's chats), so that connection
+  is unavailable and the plugin uses `gh`.
+
+`CLAUDE_CODEX_APP_PLUGIN_MCP` also takes a comma-separated list of plugin names
+(`code-review,other-plugin`), whose enabled stdio servers run the same way.
+The App's own `codex-app-tools` and `browser-use` plugins, and the `codex_app`
+server, are never run. The servers are only for the App's calls: Claude
+threads do not get them, and the App's MCP panel lists them next to the
+thread's own servers.
+
 ## Background work and the unread dot
 
 Claude can leave background subagents (`run_in_background` Agent calls) and
