@@ -53,6 +53,14 @@ export const APP_RULES: readonly AppRule[] = [
     verify: 'The model picker still lists the Claude models.',
   },
   {
+    id: 'model-efforts',
+    app: 'Offers each model the model/list efforts that are also enabled under Settings > Agent > Model features > Available reasoning efforts. Max is off there by default and listed once a model offers it. When a model does not list the current effort, its defaultReasoningEffort takes over; a model listing none gets "none".',
+    adapter:
+      "Lists each Claude model's efforts as Claude Code reports them (max where the model takes it, none on Haiku), and low to xhigh until Claude Code has reported.",
+    verify:
+      'After a Claude turn, Model features lists Max; with it on, Claude Opus offers Max and Claude Haiku offers no effort levels.',
+  },
+  {
     id: 'bedrock-auth-status',
     app: 'Publishes its feature flags under the auth method it derives from account/read (amazonBedrock for a Bedrock account), and its main process only reads flags published under the authMethod getAuthStatus returns. Without a match it keeps retrying a thread it resumes on its own, so a message queued while a turn ran is never sent and new chats get no title.',
     adapter:

@@ -360,11 +360,15 @@ export function modelDisplayName(model: string): string {
   return model
 }
 
+// model/list swaps this placeholder for Claude Code's own description of the
+// model once Claude Code has reported one.
+export const GENERIC_MODEL_DESCRIPTION = 'Claude Code runtime model'
+
 function modelDescription(model: string): string {
   if (model === 'opus-plan' || model === 'claude-opus-plan' || model === 'opusplan') {
     return 'Uses Opus in plan mode and Sonnet for execution; selecting this model does not enable plan mode.'
   }
-  return 'Claude Code runtime model'
+  return GENERIC_MODEL_DESCRIPTION
 }
 
 function scanDiscoveredRouterModels(): Set<string> {
@@ -582,10 +586,19 @@ function withoutSchemaDialect(schema: unknown): unknown {
   return rest
 }
 
+// The efforts a thread or the config can hold. Only Claude models list 'max';
+// 'none' (a model without efforts) keeps whatever was set before.
 export function normalizeCodexReasoningEffort(
   value: string | null | undefined,
-): 'low' | 'medium' | 'high' | 'xhigh' | null {
-  if (value === 'low' || value === 'medium' || value === 'high' || value === 'xhigh') return value
+): 'low' | 'medium' | 'high' | 'xhigh' | 'max' | null {
+  if (
+    value === 'low' ||
+    value === 'medium' ||
+    value === 'high' ||
+    value === 'xhigh' ||
+    value === 'max'
+  )
+    return value
   if (value === 'minimal') return 'low'
   return null
 }

@@ -16,6 +16,12 @@ import {
   listClaudeSkills,
 } from './claude-capabilities.mjs'
 import { onClaudeCommandsChanged, skillLinksToCommand } from './claude-commands.mjs'
+import {
+  DEFAULT_EFFORTS,
+  defaultReasoningEffort,
+  reasoningEffortOptions,
+  reportedClaudeModel,
+} from './claude-models.mjs'
 import { runCodexNotify } from './codex-notify.mjs'
 import {
   continuePrompt,
@@ -177,6 +183,7 @@ import {
   defaultAllowedTools,
   ensureParent,
   extractImageInputs,
+  GENERIC_MODEL_DESCRIPTION,
   isCodexOpenAiModel,
   newId,
   newThreadId,
@@ -2697,7 +2704,9 @@ export class CodexClaudeAppServer {
       const resolved = backend === 'codex' ? model : resolveClaudeModel(model)
       if (resolved) settings.model = resolved
     }
-    if (params.effort != null) {
+    // 'none' is the effort of a model that takes none (model/list gives it to
+    // Haiku), so it leaves the effort as it is.
+    if (params.effort != null && params.effort !== 'none') {
       const effort = resolveClaudeEffort(stringOr(params.effort, ''))
       if (!effort) throw new Error(`unsupported effort: ${String(params.effort)}`)
       settings.effort = effort
@@ -3909,7 +3918,7 @@ export class CodexClaudeAppServer {
             // already created so there's no real latency here).
             const spawnId = newId()
             // Codex v2 collabAgentToolCall.reasoningEffort is `ReasoningEffort | null`
-            // (strict enum: none|minimal|low|medium|high|xhigh). Same Oops trap as
+            // (strict enum: none|minimal|low|medium|high|xhigh|max). Same Oops trap as
             // threadSource — an empty string from a sloppy resume crashes the App.
             // Normalize here once and reuse for every stage of the lifecycle.
             const collabEffort = normalizeReasoningEffortEnum(thread.reasoningEffort)
@@ -6167,22 +6176,34 @@ export class CodexClaudeAppServer {
 
   private modelList(): unknown {
     const defaultModel = this.configModel
-    const claudeOptions = claudeModelOptions()
+    // Each Claude model offers the efforts Claude Code reported for it: 'max'
+    // where the model takes it, none on a model without effort. Ids and names
+    // stay the adapter's own; only the placeholder description gives way to
+    // Claude Code's.
+    // App rule: model-efforts
+    const claudeOptions = claudeModelOptions().map((option) => {
+      const reported = reportedClaudeModel(option.sdkModel)
+      return {
+        ...option,
+        description:
+          option.description === GENERIC_MODEL_DESCRIPTION && reported?.description
+            ? reported.description
+            : option.description,
+        efforts: reported?.efforts ?? DEFAULT_EFFORTS,
+      }
+    })
     // When a real Codex CLI binary is available on the host (CODEX_REAL env
     // or auto-discovered), expose its native models alongside Claude's so
     // the Codex App's per-thread model picker can route between backends
     // without any reconnect or shell flip. Picking gpt-* flips the thread
     // to runtimeBackend='codex' which the runtime router dispatches to
     // CodexProxyRuntime (shells out to `codex exec --json`).
-    const codexOptions = codexProxyModelOptions()
+    const codexOptions = codexProxyModelOptions().map((option) => ({
+      ...option,
+      efforts: DEFAULT_EFFORTS,
+    }))
     const options = [...claudeOptions, ...codexOptions]
     const hasConfiguredDefault = options.some((option) => option.id === defaultModel)
-    const reasoningEfforts = [
-      { reasoningEffort: 'low', description: 'Fast runtime response' },
-      { reasoningEffort: 'medium', description: 'Balanced runtime response' },
-      { reasoningEffort: 'high', description: 'Deeper runtime response' },
-      { reasoningEffort: 'xhigh', description: 'Maximum reasoning' },
-    ]
     return {
       data: options.map((option) => ({
         id: option.id,
@@ -6193,8 +6214,8 @@ export class CodexClaudeAppServer {
         displayName: option.displayName,
         description: option.description,
         hidden: false,
-        supportedReasoningEfforts: reasoningEfforts,
-        defaultReasoningEffort: this.configReasoningEffort,
+        supportedReasoningEfforts: reasoningEffortOptions(option.efforts),
+        defaultReasoningEffort: defaultReasoningEffort(option.efforts, this.configReasoningEffort),
         inputModalities: ['text', 'image'],
         supportsPersonality: false,
         additionalSpeedTiers: [],

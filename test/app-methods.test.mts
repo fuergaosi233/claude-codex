@@ -485,6 +485,9 @@ test('turn/settings/update switches model and effort for the running turn only',
     assert.deepEqual(await update({ model: 'Opus', effort: 'high' }), {
       status: 'applied',
     })
+    // 'none' is the effort of a model that takes none, such as Haiku. It
+    // leaves the effort as it was.
+    assert.deepEqual(await update({ effort: 'none' }), { status: 'applied' })
     await server.request('turn/steer', {
       threadId,
       expectedTurnId: turn.id,
