@@ -238,6 +238,56 @@ versioning or publishing metadata.
   SDK sessions since Claude Code 2.1.285, or the call's own `timeout` up to 2
   hours). `CLAUDE_CODEX_COMMAND_OUTPUT_POLL_MS=0` shows the output only when
   the command finishes, as before.
+- Claude's thinking shows in the Codex App. The CLI is asked for summarized
+  thinking (`--thinking-display summarized`), which recent models otherwise
+  redact, and it streams as the reasoning summary, the only part of a
+  reasoning item the App renders (`item/reasoning/summaryPartAdded`, then
+  `summaryTextDelta`). Thinking stored before as raw content reads back as
+  the summary. `CLAUDE_CODEX_REASONING_VISIBLE=0` or the App's Reasoning
+  summary setting set to None keeps the previous behavior.
+- API retries show in the turn as Codex shows a stream retry: each
+  `system/api_retry` of the main loop becomes an `error` notification with
+  `willRetry` and the message `Reconnecting... n/m`, which the App folds into
+  one passing row, and is not stored. Errors and failed turns carry a Codex
+  `codexErrorInfo` code from the CLI's terminal reason, error category and
+  HTTP status (`serverOverloaded` for a 529, `contextWindowExceeded`,
+  `rateLimitExceeded`, ...), never one the App answers with a ChatGPT account
+  flow. CLI notifications of high or immediate priority go out as `warning`
+  notifications, which the App opts out of, as it does with Codex.
+- Claude chats show their branch in the App sidebar. Threads carry Codex
+  `gitInfo` (commit, branch, and the `origin` remote without credentials),
+  looked up after `thread/start`, when a thread without it resumes and when a
+  turn ends, and stored, so `thread/list` and `thread/read` run no git.
+  `thread/metadata/update` patches it as Codex does, which the App uses after
+  creating a branch, and `getConversationSummary` returns it. Threads also
+  carry their `model` and `reasoningEffort`.
+- The context gauge moves while a turn runs, as it does for Codex: each API
+  call of the main loop sends `thread/tokenUsage/updated` as it streams, with
+  that call as `last` and on top of the settled total, once a result has
+  reported the context window for the thread or its model. The turn's result
+  still settles the total, so nothing is counted twice.
+- Notifications a client opts out of in `initialize`
+  (`capabilities.optOutNotificationMethods`) are no longer sent to it. The App
+  opts out of `turn/diff/updated`, so its threads also skip the whole-tree
+  `git diff` after every tool call. It also opts out of `warning`,
+  `thread/compacted`, `thread/closed`, `project/changed`,
+  `thread/project/updated` and `command/exec/outputDelta`, which it no longer
+  receives from the adapter, as from Codex.
+- `config/read` reports `web_search = "live"` instead of `"disabled"`, matching
+  the web search `modelProvider/capabilities/read` advertises;
+  `CLAUDE_CODEX_WEBSEARCH=0` turns both off.
+- Claude's file exploration folds into the App's "Explored" row, as Codex's
+  does. Read, Grep, Glob and LS calls are command items named after the tool
+  (`Read src/app.ts`) with Codex `read`, `search` and `listFiles` command
+  actions, and a Bash command that only reads, lists or searches files gets
+  its actions from a port of Codex's command parser, which unlike Codex's
+  never folds a command that can write files or start other programs, such
+  as `find -delete` or `| xargs rm`. The App keeps the first
+  30,000 characters of their output; Claude still gets all of it. A Read of
+  an image is an `imageView`, WebFetch a `webSearch` item opening the page,
+  and an MCP tool names its server, split by the turn's configured server
+  names. A Read, Grep, Glob or LS call Claude Code asks about asks on the
+  command card, and only a Bash command can be allowed for the session.
 
 ### Provider and multi-agent boundaries
 

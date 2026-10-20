@@ -93,6 +93,7 @@ import type {
   PermissionDecision,
   RecalledMemory,
   RuntimeBackgroundListener,
+  RuntimeFailure,
   RuntimeHandlers,
   RuntimeLiveTask,
   RuntimeSteerOptions,
@@ -170,12 +171,18 @@ interface PendingTurn {
   // still working (see noteSubagentProgress), on the monotonic clock: a wall
   // clock set back must not hold the reports back for as long.
   progressReportedAtMs: number
+  // The API error behind the main loop's latest response or retry, null
+  // once a response arrives without one.
+  apiError: { category: string | null; status: number | null } | null
+  // Keys of the CLI notifications already shown this turn.
+  notificationKeys: Set<string>
 }
 
 interface PendingTurnResult {
   success: boolean
   resultText: string | null
   claudeSessionId: string | null
+  failure?: RuntimeFailure | null
 }
 
 interface WorkflowTaskState {
@@ -810,9 +817,14 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (allowedTools.length > 0) opts.allowedTools = allowedTools
     if (context.disallowedTools && context.disallowedTools.length > 0)
       opts.disallowedTools = context.disallowedTools
+    const extraArgs: Record<string, string | null> = {}
     // The servers go to the CLI in a file, off its command line.
     const mcpConfig = writeCliMcpConfig(context.mcpServers)
-    if (mcpConfig) opts.extraArgs = { 'mcp-config': mcpConfig }
+    if (mcpConfig) extraArgs['mcp-config'] = mcpConfig
+    // Passed as a flag rather than the SDK's thinking option, which would
+    // also switch the model to adaptive thinking whatever the effort says.
+    if (context.thinkingDisplay) extraArgs['thinking-display'] = context.thinkingDisplay
+    if (Object.keys(extraArgs).length > 0) opts.extraArgs = extraArgs
     if (context.agents && Object.keys(context.agents).length > 0) opts.agents = context.agents
     // The source the CLI would give this session's SessionStart hooks.
     const origin = !resume ? 'startup' : opts.forkSession ? 'fork' : 'resume'
@@ -1372,6 +1384,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       workflowFailure: null,
       model: null,
       progressReportedAtMs: Number.NEGATIVE_INFINITY,
+      apiError: null,
+      notificationKeys: new Set(),
     }
   }
 
@@ -2231,6 +2245,42 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       await pending.handlers.onEvent({ type: 'hook_run', hookId, hookEvent, ...run })
       return
     }
+    if (subtype === 'api_retry') {
+      // A subagent's retries stay inside its own run.
+      if (message.parent_tool_use_id) return
+      const status = numberOrNull(message.error_status)
+      const category = stringOrNull(message.error)
+      pending.apiError = { category, status }
+      await pending.handlers.onEvent({
+        type: 'retrying',
+        attempt: numberOrNull(message.attempt) ?? 1,
+        maxRetries: numberOrNull(message.max_retries) ?? 1,
+        status,
+        category,
+        delayMs: numberOrNull(message.retry_delay_ms),
+      })
+      return
+    }
+    if (subtype === 'notification') {
+      // The CLI's own status line. What it would put in front of an
+      // interactive user at once (a failed compaction, a model the
+      // organization denies) becomes a warning, each key once a turn; the
+      // rest is noise here.
+      const key = String(message.key ?? '')
+      const text = stringOrNull(message.text)
+      const urgent = message.priority === 'high' || message.priority === 'immediate'
+      if (!text || !urgent || (key && pending.notificationKeys.has(key))) {
+        debugLog('native.notification', { key, priority: message.priority })
+        return
+      }
+      if (key) pending.notificationKeys.add(key)
+      await pending.handlers.onEvent({
+        type: 'notice',
+        level: message.color === 'error' ? 'error' : 'warning',
+        message: text,
+      })
+      return
+    }
     if (subtype === 'model_refusal_fallback') {
       const text = stringOrNull(message.content)
       // 'local' fell back for a subagent only, and 'revert' returns to the
@@ -2591,6 +2641,10 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (!nestedMessage) {
       await this.beginAssistantMessage(pending, stringOrNull(inner.id))
       pending.model = stringOrNull(inner.model) ?? pending.model
+      // The CLI answers a request that failed for good with an assistant
+      // message naming the error; the result then carries its HTTP status.
+      const apiError = stringOrNull(message.error)
+      pending.apiError = apiError ? { category: apiError, status: null } : null
       const usage = recordOrNull(inner.usage)
       const messageId = stringOrNull(inner.id)
       // Not final until the result, but enough to see a goal budget run out
@@ -3013,6 +3067,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         success: deferred.success,
         result: deferred.resultText,
         claudeSessionId: deferred.claudeSessionId,
+        ...(deferred.failure ? { failure: deferred.failure } : {}),
       })
       if (deferred.success) {
         pending.resolve()
@@ -3066,7 +3121,16 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (pending.context.outputFormat && pending.structuredBuffer) {
       await pending.handlers.onEvent({ type: 'text_delta', delta: pending.structuredBuffer.trim() })
     }
-    pending.deferredResult = { success, resultText, claudeSessionId }
+    // Why it failed, in the terms the server maps onto Codex error codes.
+    const failure: RuntimeFailure | null =
+      success || pending.workflowFailure != null
+        ? null
+        : {
+            terminalReason: stringOrNull(message.terminal_reason),
+            category: pending.apiError?.category ?? null,
+            status: numberOrNull(message.api_error_status) ?? pending.apiError?.status ?? null,
+          }
+    pending.deferredResult = { success, resultText, claudeSessionId, failure }
     if (!success) await this.stopWorkflowTasks(pending)
     await this.finishDeferredResult(pending)
   }
@@ -3551,6 +3615,7 @@ function sessionSignature(context: RuntimeTurnContext): string {
     context.autoMemory ?? null,
     context.modelProfileId ?? null,
     context.modelProfileFingerprint ?? null,
+    context.thinkingDisplay ?? null,
   ])
 }
 

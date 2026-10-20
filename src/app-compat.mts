@@ -257,6 +257,46 @@ export const APP_RULES: readonly AppRule[] = [
       'With Codex models in the menu, pick one in a Claude chat that has a reply: a toast says the model settings could not be updated and the menu shows the Claude model again; another Claude model still applies.',
   },
   {
+    id: 'reasoning-summary',
+    app: 'Shows a reasoning item only through its summary parts: one part as it is, several with the first in bold as a title, and an item with an empty summary not at all. Fills the parts from item/reasoning/summaryTextDelta by summaryIndex, and keeps the raw content of item/reasoning/textDelta without rendering it.',
+    adapter:
+      'Asks the Claude CLI for summarized thinking (--thinking-display summarized) on a chat\'s own turns and streams each thinking run into one summary part; history reads show content-only items stored before as their summary. CLAUDE_CODEX_REASONING_VISIBLE=0 or model_reasoning_summary = "none" keeps the thinking in content only.',
+    verify:
+      'Ask a question Claude thinks about: its thinking shows above the reply while it streams and after the chat is reopened.',
+  },
+  {
+    id: 'reconnecting-errors',
+    app: 'Shows an `error` notification with willRetry as a passing stream-error row in the turn that replaces the one before it, and reads the attempt count only from a message of the form "Reconnecting... n/m"; any other message shows as it is.',
+    adapter:
+      'Turns each retry the Claude CLI reports for a chat\'s main loop (system/api_retry) into an `error` with willRetry, the message "Reconnecting... n/m" and the HTTP status and wait in additionalDetails, and does not store it, as Codex does not. Retries inside a subagent or a structured-output helper turn show nothing.',
+    verify:
+      'Point the adapter at an API that answers 529 for a while: the turn shows "Reconnecting 1/10", counting up, and then the reply.',
+  },
+  {
+    id: 'error-codes',
+    app: 'Reads codexErrorInfo on `error` notifications and failed turns: serverOverloaded shows "Server is busy" and may offer a retry, usageLimitExceeded opens a ChatGPT plan upgrade card, cyberPolicy a safety notice, and unauthorized is only counted.',
+    adapter:
+      'Gives every error a code from what the Claude CLI reported: contextWindowExceeded, serverOverloaded, rateLimitExceeded, badRequest, internalServerError, httpConnectionFailed, responseStreamDisconnected with the HTTP status for a retry, and other for the rest. It never sends usageLimitExceeded or cyberPolicy, and an authentication failure stays other.',
+    verify:
+      'Let the API stay overloaded until Claude gives up: the failed turn says the server is busy instead of showing a bare error.',
+  },
+  {
+    id: 'thread-git-info',
+    app: "Shows a thread's gitInfo.branch in the sidebar and uses originUrl for the repository name and pull request flows. When thread/start answers with gitInfo null it looks the workspace up itself; a thread/list refresh keeps what it knows when a row has none, but thread/resume replaces it with the answer's gitInfo. After creating a branch for a thread it sends thread/metadata/update with gitInfo.branch.",
+    adapter:
+      "Stores gitInfo on the thread: looked up after thread/start, on a resume of a thread without it, and when a turn ends, so thread/list and thread/read never run git. thread/start answers with null as Codex does, and thread/metadata/update patches gitInfo with Codex's rules.",
+    verify:
+      'Start a chat in a git repository on a feature branch and send a message: after an App restart the sidebar still shows the branch, and it follows a branch Claude switches to once the turn ends.',
+  },
+  {
+    id: 'context-gauge',
+    app: "Fills the composer's context gauge from the thread's latest thread/tokenUsage/updated, as last.totalTokens over modelContextWindow, and hides it when either is null.",
+    adapter:
+      "Reports each main-loop API call as it streams, with that call as last and on top of the settled total, once a result has reported the window for the thread or its model; the turn's result then settles the total. A subagent's tokens add to the total and leave last alone.",
+    verify:
+      'Ask for a task with many tool calls in a chat that has finished a turn: the context gauge moves while Claude works instead of jumping when the turn ends.',
+  },
+  {
     id: 'prewarmed-threads',
     app: "Starts the thread of a new chat with thread/start before the user sends anything, keeps it out of thread/list and holds back its thread/started until it sends turn/start there, and deletes it with thread/delete once the chat goes unused for 10 minutes. It forgets such threads when the app-server connection drops or the App quits. It sends the chat's first message to that thread whatever model was picked meanwhile, comparing only permissions, instructions and feature overrides.",
     adapter:
@@ -295,6 +335,30 @@ export const APP_RULES: readonly AppRule[] = [
       "Streams a background shell's output into the completed item of the Bash call that started it, also after its turn ended, and stores it cut the same way.",
     verify:
       'Ask Claude to start a background command that prints a line every second: after the turn ends, its command item keeps showing new lines.',
+  },
+  {
+    id: 'explored-commands',
+    app: 'Folds consecutive commandExecution items whose commandActions are all read, listFiles or search into one "Explored" row counting the files, searches and lists, labelling a search "Searched for <query> in <path>" and a list "Listed files in <path>". An item with no actions, an unknown one, or a declined one shows as its command.',
+    adapter:
+      "Shows Claude's Read, Grep, Glob and LS calls as commandExecution items with one matching action, and gives a Bash command the actions Codex's own parser would; a command it cannot parse is one unknown action.",
+    verify:
+      'Ask Claude to look around a repository: its Read, Grep and Glob calls and a `cat` or `rg` it runs fold into one "Explored" row.',
+  },
+  {
+    id: 'command-approval-actions',
+    app: "Shows a command approval as the commands of its commandActions joined with ' && ' in place of command when it has any, and offers its own decisions whatever availableDecisions says.",
+    adapter:
+      'Sends the actions only when a single one spells out the whole command, else one unknown action with the command, so the card never hides part of what runs. Only a Bash command is remembered for the session; an acceptForSession on any other card accepts that call only.',
+    verify:
+      'With approvals on, have Claude run `cat README.md && touch x`: the card shows the whole command.',
+  },
+  {
+    id: 'item-completed-replaces',
+    app: 'Replaces the item with the same id on item/completed, whatever type it started as.',
+    adapter:
+      'Completes an image Read that fails or is stopped as its failed Read command in place of the imageView it started as.',
+    verify:
+      'Ask Claude to read an image file that does not exist: the turn shows the failed Read, not an empty image.',
   },
 ]
 

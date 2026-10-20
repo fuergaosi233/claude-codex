@@ -6,6 +6,7 @@ import type {
   ClaudeCheckpoint,
   ClaudeResumePoint,
   DynamicToolSpec,
+  GitInfo,
   ImportHistoryRecord,
   ProjectRecord,
   QueuedSubmission,
@@ -78,6 +79,17 @@ function checkpointFrom(sessionId: unknown, messageUuid: unknown): ClaudeCheckpo
   return typeof sessionId === 'string' && typeof messageUuid === 'string'
     ? { sessionId, messageUuid }
     : null
+}
+
+function parseGitInfo(json: unknown): GitInfo | null {
+  if (typeof json !== 'string') return null
+  try {
+    const value = JSON.parse(json)
+    const field = (key: string) => (typeof value?.[key] === 'string' ? value[key] : null)
+    return { sha: field('sha'), branch: field('branch'), originUrl: field('originUrl') }
+  } catch {
+    return null
+  }
 }
 
 export class SessionStore {
@@ -231,6 +243,8 @@ export class SessionStore {
     // Codex's per-thread memory mode; set when the thread is created, then
     // only by setThreadMemoryMode.
     this.ensureColumn('threads', 'memory_mode', 'TEXT')
+    // Codex GitInfo as JSON; written only by setThreadGitInfo.
+    this.ensureColumn('threads', 'git_info_json', 'TEXT')
     this.ensurePinnedSection()
     this.migrateLegacyPinState()
     this.sanitizeLegacyEnumColumns()
@@ -874,6 +888,15 @@ export class SessionStore {
   // read before the switch must not undo it.
   setThreadMemoryMode(threadId: string, mode: 'enabled' | 'disabled'): void {
     this.db.prepare('UPDATE threads SET memory_mode = ? WHERE id = ?').run(mode, threadId)
+  }
+
+  // Returns whether the thread's git info changed.
+  setThreadGitInfo(threadId: string, gitInfo: GitInfo | null): boolean {
+    const json = gitInfo ? JSON.stringify(gitInfo) : null
+    const result = this.db
+      .prepare('UPDATE threads SET git_info_json = ? WHERE id = ? AND git_info_json IS NOT ?')
+      .run(json, threadId, json)
+    return Number(result.changes) > 0
   }
 
   private projectIds(): string[] {
@@ -1690,6 +1713,7 @@ export class SessionStore {
       memoryMode:
         row.memory_mode === 'enabled' || row.memory_mode === 'disabled' ? row.memory_mode : null,
       projectId: row.project_id == null ? null : String(row.project_id),
+      gitInfo: parseGitInfo(row.git_info_json),
     }
   }
 

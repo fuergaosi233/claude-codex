@@ -1524,6 +1524,37 @@ bearer_token_env_var = "REMOTE_BEARER"
   }
 })
 
+test('summarized thinking reaches the CLI as a flag next to the MCP config file', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'thinking-display-argv-'))
+  try {
+    await withEnv({ CLAUDE_CODEX_HOME: join(root, 'adapter') }, async () => {
+      const docs = { type: 'stdio', command: 'docs-mcp' }
+      let spec: SpawnOptions | undefined
+      const options = await sessionOptions(
+        { mcpServers: { docs }, thinkingDisplay: 'summarized' },
+        async (options) => {
+          spec = await cliCommandLine(options)
+        },
+      )
+      assert.equal(options.extraArgs['thinking-display'], 'summarized')
+      assert.ok(options.extraArgs['mcp-config'])
+      // Not the SDK's thinking option, which would switch thinking to adaptive.
+      assert.equal(options.thinking, undefined)
+      const args = spec?.args ?? []
+      const at = args.indexOf('--thinking-display')
+      assert.ok(at > 0)
+      assert.equal(args[at + 1], 'summarized')
+      assert.ok(args.includes('--mcp-config'))
+      assert.ok(!args.includes('--thinking'))
+
+      const plain = await sessionOptions({ thinkingDisplay: null })
+      assert.equal(plain.extraArgs, undefined)
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('a Codex server setting with ${...} in it reaches the server as written', async () => {
   const root = await mkdtemp(join(tmpdir(), 'inherited-mcp-verbatim-'))
   const codexHome = join(root, 'codex-home')

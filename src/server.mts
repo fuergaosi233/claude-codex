@@ -26,6 +26,7 @@ import {
 } from './claude-models.mjs'
 import { configRequirements } from './cli-probes.mjs'
 import { runCodexNotify } from './codex-notify.mjs'
+import { parseCommandActions } from './command-actions.mjs'
 import { appendCommandOutput } from './command-output.mjs'
 import {
   DYNAMIC_TOOL_CANCELLED,
@@ -36,6 +37,7 @@ import {
   dynamicToolsEnabled,
   parseDynamicTools,
 } from './dynamic-tools.mjs'
+import { gitInfoFor, patchGitInfo } from './git-info.mjs'
 import {
   continuePrompt,
   goalBudgetExhausted,
@@ -103,6 +105,7 @@ import { recordRunEvent } from './run-registry.mjs'
 import { normalizeRuntimeType } from './runtime-config.mjs'
 import {
   addedFileDiff,
+  addTokenBreakdowns,
   allSelectableModelOptions,
   asRecord,
   buildSystemPromptAddendum,
@@ -138,7 +141,6 @@ import {
   numberOr,
   parseExitCodeFromResult,
   parseSubagentTrailer,
-  parseWebSearchAction,
   permissionProfileIdFromParams,
   permissionProfileList,
   permissionProfilePolicy,
@@ -149,6 +151,8 @@ import {
   REVIEW_FALLBACK,
   readConfigReasoningEffort,
   reasoningEffortFromParams,
+  reasoningSummariesVisible,
+  retryTurnError,
   reviewLabel,
   reviewPrompt,
   sandboxEnvelope,
@@ -163,6 +167,8 @@ import {
   todoWriteToPlanSteps,
   tokenBreakdownFromClaudeUsage,
   toolResultText,
+  turnErrorOf,
+  turnFailure,
   userInputAnswersAsContent,
   visualizationDirNote,
   wrapMcpToolError,
@@ -180,9 +186,17 @@ import {
   sortDirectionOr,
   threadSnippet,
 } from './thread-history.mjs'
+import {
+  capOutput,
+  exploreToolCommand,
+  imageReadPath,
+  isExploreTool,
+  splitMcpToolName,
+} from './tool-items.mjs'
 import type {
   ClaudeResumePoint,
   ClaudeRuntime,
+  CommandAction,
   DynamicToolCallRequest,
   DynamicToolCallResponse,
   ElicitationRequest,
@@ -380,7 +394,11 @@ const NO_PROGRESS_ITEM_TYPES = new Set([
 function goalTurnMadeProgress(turn: TurnRecord): boolean {
   return turn.items.some((item) => {
     if (NO_PROGRESS_ITEM_TYPES.has(item.type)) return false
-    return !(item.type === 'mcpToolCall' && item.tool.startsWith('mcp__codex_goal__'))
+    // Items from before MCP names were split keep the whole name as the tool.
+    return !(
+      item.type === 'mcpToolCall' &&
+      (item.server === 'codex_goal' || item.tool.startsWith('mcp__codex_goal__'))
+    )
   })
 }
 
@@ -444,6 +462,10 @@ interface PeerFeatures {
   supportsCompletedSubagentActivity: boolean
   // clientInfo.name from initialize, which Codex's notify event reports.
   clientName: string | null
+  // capabilities.optOutNotificationMethods from initialize: notifications
+  // Codex never sends to the connection. The App opts out of
+  // turn/diff/updated, among others.
+  optedOutNotifications: ReadonlySet<string>
 }
 
 function turnItemsView(value: unknown): TurnItemsView {
@@ -551,7 +573,14 @@ export class CodexClaudeAppServer {
   // the running turn; the second keeps the call last reported.
   private lastCallUsageByThread = new Map<string, TokenUsageBreakdown>()
   private lastUsageByThread = new Map<string, TokenUsageBreakdown>()
+  // The main loop's API calls since the turn's last result, by message id.
+  // Live updates add them to the settled total until the result replaces
+  // them.
+  private liveCallUsageByThread = new Map<string, Map<string, TokenUsageBreakdown>>()
   private contextWindowByThread = new Map<string, number>()
+  // The window a result last reported for each model, for a thread that has
+  // not had a result of its own yet.
+  private contextWindowByModel = new Map<string, number>()
   private configModel = defaultSelectableModelId()
   private configReasoningEffort =
     normalizeCodexReasoningEffort(process.env.CLAUDE_CODEX_DEFAULT_EFFORT) ?? 'medium'
@@ -725,6 +754,13 @@ export class CodexClaudeAppServer {
             process.env.CLAUDE_CODEX_SUBAGENT_COMPLETED === '1',
           clientName:
             typeof clientInfo.name === 'string' && clientInfo.name ? clientInfo.name : null,
+          optedOutNotifications: new Set(
+            Array.isArray(capabilities.optOutNotificationMethods)
+              ? capabilities.optOutNotificationMethods.filter(
+                  (method): method is string => typeof method === 'string',
+                )
+              : [],
+          ),
         })
         // The App lists config warnings in its settings, which is where an App
         // build nobody checked the App rules against gets reported.
@@ -764,8 +800,11 @@ export class CodexClaudeAppServer {
       }
       case 'thread/start':
         return this.threadStart(peer, asRecord(params))
-      case 'thread/resume':
-        return this.historyForPeer(peer, this.threadResume(peer, asRecord(params)))
+      case 'thread/resume': {
+        const resumeParams = asRecord(params)
+        await this.gitInfoForResume(resumeParams)
+        return this.historyForPeer(peer, this.threadResume(peer, resumeParams))
+      }
       case 'thread/fork':
         return this.historyForPeer(peer, this.threadFork(peer, asRecord(params)))
       case 'thread/list':
@@ -1256,6 +1295,10 @@ export class CodexClaudeAppServer {
     this.store.upsertThread(thread)
     if (projectId) this.store.setThreadProject(id, projectId)
     this.store.putDynamicTools(id, dynamicTools)
+    // Like Codex, thread/start answers without git info; the App looks the
+    // branch up itself, and thread/list has it once the lookup lands.
+    // App rule: thread-git-info
+    if (!thread.ephemeral) void this.captureGitInfo(id, cwd)
     recordRunEvent('thread.started', {
       threadId: thread.id,
       cwd: thread.cwd,
@@ -1536,6 +1579,7 @@ export class CodexClaudeAppServer {
           : parent.personality,
       runtimeBackend,
       codexSessionId: null,
+      gitInfo: cwd === parent.cwd ? (parent.gitInfo ?? null) : null,
     }
     this.store.upsertThread(thread)
     // A fork stays in its parent's project, and keeps its dynamic tools:
@@ -1546,6 +1590,8 @@ export class CodexClaudeAppServer {
     // thread/attachmentOwner/list names it too; an ephemeral fork holds none.
     if (!thread.ephemeral) this.store.copyThreadAttachments(parent.id, id)
     this.store.putDynamicTools(id, this.store.getDynamicTools(parent.id))
+    this.store.setThreadGitInfo(id, thread.gitInfo ?? null)
+    if (!thread.ephemeral && !thread.gitInfo) void this.captureGitInfo(id, cwd)
     if (forkPoint) {
       this.store.setForkCheckpoint(id, forkPoint)
       this.resumeClaudeAt(id, forkPoint)
@@ -2060,6 +2106,7 @@ export class CodexClaudeAppServer {
     this.tokenUsageByThread.delete(threadId)
     this.lastCallUsageByThread.delete(threadId)
     this.lastUsageByThread.delete(threadId)
+    this.liveCallUsageByThread.delete(threadId)
     this.contextWindowByThread.delete(threadId)
     this.goalIdleStreaks.delete(threadId)
     this.goalClockByThread.delete(threadId)
@@ -2309,12 +2356,17 @@ export class CodexClaudeAppServer {
   // Charges one main-loop API call as it streams. Its usage only grows, and
   // the turn's result reconciles whatever it charged.
   private recordUsageProgress(
+    peer: RpcPeer,
     threadId: string,
+    turnId: string,
     messageId: string,
     usage: Record<string, unknown>,
   ): void {
     const breakdown = tokenBreakdownFromClaudeUsage(usage)
-    if (breakdown.totalTokens > 0) this.lastCallUsageByThread.set(threadId, breakdown)
+    if (breakdown.totalTokens > 0) {
+      this.lastCallUsageByThread.set(threadId, breakdown)
+      this.publishLiveTokenUsage(peer, threadId, turnId, messageId, breakdown)
+    }
     const counted = breakdown.inputTokens + breakdown.outputTokens
     const progress = this.goalProgressByThread.get(threadId) ?? new Map<string, number>()
     const charged = progress.get(messageId) ?? 0
@@ -2322,6 +2374,52 @@ export class CodexClaudeAppServer {
     progress.set(messageId, counted)
     this.goalProgressByThread.set(threadId, progress)
     this.accrueGoalTokens(threadId, counted - charged, true)
+  }
+
+  // Codex reports token usage after every model request, so the App's context
+  // gauge moves while a turn runs. Each main-loop API call reports here once
+  // its usage grows (the CLI repeats it with every content block), as `last`
+  // and on top of the settled total; the turn's result then settles it.
+  private publishLiveTokenUsage(
+    peer: RpcPeer,
+    threadId: string,
+    turnId: string,
+    messageId: string,
+    breakdown: TokenUsageBreakdown,
+  ): void {
+    const calls = this.liveCallUsageByThread.get(threadId) ?? new Map<string, TokenUsageBreakdown>()
+    const reported = calls.get(messageId)
+    if (reported && reported.totalTokens >= breakdown.totalTokens) return
+    calls.set(messageId, breakdown)
+    this.liveCallUsageByThread.set(threadId, calls)
+    // The App hides its gauge for a null window, so wait for one rather than
+    // blank it.
+    const modelContextWindow = this.contextWindowFor(threadId)
+    if (!modelContextWindow) return
+    const tokenUsage: ThreadTokenUsage = {
+      total: this.liveTokenTotal(threadId),
+      last: breakdown,
+      modelContextWindow,
+    }
+    this.notify(peer, {
+      method: 'thread/tokenUsage/updated',
+      params: { threadId, turnId, tokenUsage },
+    })
+  }
+
+  // What results have settled plus the API calls reported since.
+  private liveTokenTotal(threadId: string): TokenUsageBreakdown {
+    const settled = this.tokenUsageByThread.get(threadId) ?? emptyTokenBreakdown()
+    const live = this.liveCallUsageByThread.get(threadId)?.values() ?? []
+    return addTokenBreakdowns([settled, ...live])
+  }
+
+  // App rule: context-gauge
+  private contextWindowFor(threadId: string): number | null {
+    const known = this.contextWindowByThread.get(threadId)
+    if (known) return known
+    const model = this.store.getThread(threadId)?.model
+    return (model && this.contextWindowByModel.get(model)) || null
   }
 
   // Bookkeeping for a turn that just left the thread: close the goal clock
@@ -2577,10 +2675,9 @@ export class CodexClaudeAppServer {
       if (head) {
         void this.dispatchQueued(peer, threadId, head).catch((error) => {
           debugLog('queue.dispatch.failed', { threadId, error: String(error) })
-          const message = error instanceof Error ? error.message : String(error)
           this.notify(peer, {
             method: 'error',
-            params: { threadId, turnId: null, willRetry: false, error: { message } },
+            params: { threadId, turnId: null, willRetry: false, error: turnErrorOf(error) },
           })
         })
         return this.activeTurnByThread.has(threadId)
@@ -2627,6 +2724,9 @@ export class CodexClaudeAppServer {
     // projectId: omitted or null leaves it, '' clears it, an id assigns it.
     const projectId = typeof params.projectId === 'string' ? params.projectId || null : undefined
     if (projectId) this.requireProject(projectId)
+    // The App sets the branch after it creates one for the thread.
+    const gitInfo =
+      params.gitInfo == null ? undefined : patchGitInfo(thread.gitInfo ?? null, params.gitInfo)
 
     // Support dynamic model, reasoning effort, approval policy and sandbox updates
     const model = this.requestedModelChange(thread, params)
@@ -2661,6 +2761,10 @@ export class CodexClaudeAppServer {
     if (projectId !== undefined) {
       this.assignThreadProject(threadId, projectId)
       thread.projectId = projectId
+    }
+    if (gitInfo !== undefined) {
+      this.store.setThreadGitInfo(threadId, gitInfo)
+      thread.gitInfo = gitInfo
     }
 
     thread.updatedAt = nowSeconds()
@@ -4066,6 +4170,11 @@ export class CodexClaudeAppServer {
         process.env.CLAUDE_CODEX_GOAL_TOOLS !== '0'
           ? this.goalToolsFor(thread.id)
           : null,
+      // Title and compaction turns never show their thinking.
+      thinkingDisplay:
+        reasoningSummariesVisible(this.configOverrides) && turnPurpose === 'normal'
+          ? 'summarized'
+          : null,
       dynamicTools: dynamicTools.length > 0 ? dynamicTools : null,
       leaderTools:
         turnPurpose === 'normal' && !isCodexThread && this.leaderThreads.allowed(thread)
@@ -4118,6 +4227,22 @@ export class CodexClaudeAppServer {
     // (interrupt, error, watchdog) drops the late result, so these are closed
     // as failed before the turn completes.
     const openToolItems = new Set<string>()
+    // Read, Grep, Glob and LS items, whose output the App keeps capped.
+    const exploreItemIds = new Set<string>()
+    // An image Read shows as an imageView. If Claude cannot read the image,
+    // the item becomes this failed Read command instead.
+    // App rule: item-completed-replaces
+    const imageReadFallbacks = new Map<string, ThreadItem>()
+    const failedImageRead = (
+      itemId: string,
+      output: string | null,
+      exitCode: number | null,
+      durationMs: number | null,
+    ): ThreadItem | null => {
+      const fallback = imageReadFallbacks.get(itemId)
+      if (fallback?.type !== 'commandExecution') return null
+      return { ...fallback, status: 'failed', aggregatedOutput: output, exitCode, durationMs }
+    }
     // What Claude's auto-memory recalled for the turn's prompts.
     const recalledMemories: RecalledMemory[] = []
     // The item/tool/call requests of dynamic tool items still open, by item.
@@ -4175,20 +4300,35 @@ export class CodexClaudeAppServer {
       })
       return agentItemId
     }
+    // The Codex App renders a reasoning item from its summary alone, so
+    // Claude's thinking streams as one summary part unless summaries are off;
+    // then it stays raw content, kept in history but not shown.
+    // App rule: reasoning-summary
+    const reasoningVisible = reasoningSummariesVisible(this.configOverrides)
     const ensureReasoningItem = (): string => {
       if (reasoningItemId) return reasoningItemId
       reasoningItemId = newId()
       const item: ThreadItem = {
         type: 'reasoning',
         id: reasoningItemId,
-        summary: [],
-        content: [''],
+        summary: reasoningVisible ? [''] : [],
+        content: reasoningVisible ? [] : [''],
       }
       this.store.appendItem(turn.id, item)
       this.notify(peer, {
         method: 'item/started',
         params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: nowMillis() },
       })
+      if (reasoningVisible)
+        this.notify(peer, {
+          method: 'item/reasoning/summaryPartAdded',
+          params: {
+            threadId: thread.id,
+            turnId: turn.id,
+            itemId: reasoningItemId,
+            summaryIndex: 0,
+          },
+        })
       return reasoningItemId
     }
     const completeReasoningItem = (): void => {
@@ -4245,6 +4385,8 @@ export class CodexClaudeAppServer {
       const durationMs = started == null ? null : Math.max(0, nowMillis() - started)
       const updated = this.store.updateItem(turn.id, itemId, (item) => {
         if (item.type === 'commandExecution') return { ...item, status: 'failed', durationMs }
+        if (item.type === 'imageView')
+          return failedImageRead(itemId, null, null, durationMs) ?? item
         if (item.type === 'fileChange') return { ...item, status: 'failed' }
         if (item.type === 'mcpToolCall')
           return { ...item, status: 'failed', error: { message }, durationMs }
@@ -4348,6 +4490,10 @@ export class CodexClaudeAppServer {
       prompt,
       params,
     )
+    // Tool items name the MCP server by these, as server names may hold `__`.
+    const toolItemOptions = {
+      mcpServers: Object.keys((context.mcpServers ?? {}) as Record<string, unknown>),
+    }
     let acceptRuntimeEvents = true
     let watchdogTimer: NodeJS.Timeout | null = null
     let resolveWatchdog: (() => void) | null = null
@@ -4940,22 +5086,21 @@ export class CodexClaudeAppServer {
             completeAgentItem('commentary')
             const itemId = ensureReasoningItem()
             this.store.updateItem(turn.id, itemId, (item) => {
-              if (item.type === 'reasoning') {
-                return {
-                  ...item,
-                  content: [(item.content[0] ?? '') + event.delta],
-                }
-              }
-              return item
+              if (item.type !== 'reasoning') return item
+              return reasoningVisible
+                ? { ...item, summary: [(item.summary[0] ?? '') + event.delta] }
+                : { ...item, content: [(item.content[0] ?? '') + event.delta] }
             })
             this.notify(peer, {
-              method: 'item/reasoning/textDelta',
+              method: reasoningVisible
+                ? 'item/reasoning/summaryTextDelta'
+                : 'item/reasoning/textDelta',
               params: {
                 threadId: thread.id,
                 turnId: turn.id,
                 itemId,
                 delta: event.delta,
-                contentIndex: 0,
+                ...(reasoningVisible ? { summaryIndex: 0 } : { contentIndex: 0 }),
               },
             })
             return
@@ -4994,12 +5139,19 @@ export class CodexClaudeAppServer {
               itemIds.set(event.toolUseId, '')
               return
             }
-            const item = this.toolUseToItem(event, thread.cwd)
+            const item = this.toolUseToItem(event, thread.cwd, toolItemOptions)
             itemIds.set(event.toolUseId, item.id)
             itemStartedAtMs.set(item.id, nowMillis())
             openToolItems.add(item.id)
-            if (item.type === 'commandExecution')
+            // Read, Grep, Glob and LS calls never run as background shells.
+            if (isExploreTool(event.toolName)) exploreItemIds.add(item.id)
+            else if (item.type === 'commandExecution')
               this.rememberCommandItem(event.toolUseId, thread.id, turn.id, item.id)
+            if (item.type === 'imageView')
+              imageReadFallbacks.set(item.id, {
+                ...this.toolUseToItem(event, thread.cwd, { imageView: false }),
+                id: item.id,
+              })
             this.store.appendItem(turn.id, item)
             this.notify(peer, {
               method: 'item/started',
@@ -5052,6 +5204,7 @@ export class CodexClaudeAppServer {
               return started == null ? null : Math.max(0, nowMillis() - started)
             })()
             const parsedExitCode = parseExitCodeFromResult(event.content) ?? (event.isError ? 1 : 0)
+            const output = exploreItemIds.has(itemId) ? capOutput(resultText) : resultText
             const updated = this.store.updateItem(turn.id, itemId, (item) => {
               if (item.type === 'commandExecution') {
                 return {
@@ -5060,13 +5213,15 @@ export class CodexClaudeAppServer {
                   // The result has all of the output, where what streamed in
                   // may have skipped some.
                   aggregatedOutput:
-                    commandOutputSeen.has(itemId) && resultText
-                      ? resultText
-                      : (item.aggregatedOutput ?? resultText),
+                    commandOutputSeen.has(itemId) && output
+                      ? output
+                      : (item.aggregatedOutput ?? output),
                   exitCode: parsedExitCode,
                   durationMs,
                 }
               }
+              if (item.type === 'imageView' && event.isError)
+                return failedImageRead(itemId, output, parsedExitCode, durationMs) ?? item
               if (item.type === 'fileChange')
                 return { ...item, status: event.isError ? 'failed' : 'completed' }
               if (item.type === 'mcpToolCall') {
@@ -5082,16 +5237,22 @@ export class CodexClaudeAppServer {
                   durationMs,
                 }
               }
-              if (item.type === 'webSearch') {
-                return { ...item, action: parseWebSearchAction(item.query, resultText) }
-              }
+              // A webSearch keeps the action it started with: its results
+              // always hold links, but a search is not a page open.
               return item
             })
             const item = updated?.items.find((candidate) => candidate.id === itemId)
-            if (item?.type === 'commandExecution' && resultText && !commandOutputSeen.has(itemId)) {
+            // A failed image Read was an imageView in the App until now; its
+            // output arrives with the completed item instead.
+            if (
+              item?.type === 'commandExecution' &&
+              output &&
+              !commandOutputSeen.has(itemId) &&
+              !imageReadFallbacks.has(itemId)
+            ) {
               this.notify(peer, {
                 method: 'item/commandExecution/outputDelta',
-                params: { threadId: thread.id, turnId: turn.id, itemId, delta: resultText },
+                params: { threadId: thread.id, turnId: turn.id, itemId, delta: output },
               })
             }
             if (item)
@@ -5099,6 +5260,11 @@ export class CodexClaudeAppServer {
                 method: 'item/completed',
                 params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
               })
+            // A whole-tree diff after every tool is wasted on a client that
+            // opted out of hearing it (every follower of the thread, when
+            // several are); the turn's end still records one.
+            const targets = this.targetsForParams(peer, { threadId: thread.id })
+            if (targets.every((target) => this.optedOut(target, 'turn/diff/updated'))) return
             const diff = await gitDiff(thread.cwd)
             if (this.stopped || this.store.getTurn(turn.id)?.status !== 'inProgress') return
             if (diff) {
@@ -5145,6 +5311,25 @@ export class CodexClaudeAppServer {
             }
             return
           }
+          if (event.type === 'retrying') {
+            debugLog('turn.runtime.retrying', { threadId: thread.id, turnId: turn.id, ...event })
+            // Codex reports a model request it will send again as an `error`
+            // with willRetry, which the App shows as a passing
+            // "Reconnecting" row; like Codex, it is not kept in history.
+            // Helper turns the App starts for structured output show nothing.
+            if (context.purpose === 'normal') {
+              this.notify(peer, {
+                method: 'error',
+                params: {
+                  threadId: thread.id,
+                  turnId: turn.id,
+                  willRetry: true,
+                  error: retryTurnError(event),
+                },
+              })
+            }
+            return
+          }
           if (event.type === 'usage') {
             this.recordTokenUsage(peer, thread.id, turn.id, event.usage, {
               contextWindow: event.contextWindow ?? null,
@@ -5153,7 +5338,7 @@ export class CodexClaudeAppServer {
             return
           }
           if (event.type === 'usage_progress') {
-            this.recordUsageProgress(thread.id, event.messageId, event.usage)
+            this.recordUsageProgress(peer, thread.id, turn.id, event.messageId, event.usage)
             return
           }
           if (event.type === 'hook_run') {
@@ -5252,7 +5437,8 @@ export class CodexClaudeAppServer {
                 this.store.updateClaudeSessionId(thread.id, event.claudeSessionId)
               }
             }
-            if (!event.success) throw new Error(event.result ?? 'Claude turn failed')
+            if (!event.success)
+              throw turnFailure(event.result ?? 'Claude turn failed', event.failure)
           }
           if (event.type === 'error') {
             throw new Error(event.message)
@@ -5274,10 +5460,14 @@ export class CodexClaudeAppServer {
                 input: event.input,
               },
               thread.cwd,
+              // The approval card asks about the Read command, so the item
+              // is that command, not the image it may show.
+              { ...toolItemOptions, imageView: false },
             )
             itemId = item.id
             itemIds.set(event.toolUseId, item.id)
             openToolItems.add(item.id)
+            if (isExploreTool(event.toolName)) exploreItemIds.add(item.id)
             this.store.appendItem(turn.id, item)
             this.notify(peer, {
               method: 'item/started',
@@ -5295,7 +5485,14 @@ export class CodexClaudeAppServer {
               })
             }
           }
-          const decision = await this.requestApproval(peer, thread.id, turn.id, itemId, event)
+          const decision = await this.requestApproval(
+            peer,
+            thread.id,
+            turn.id,
+            itemId,
+            event,
+            imageReadFallbacks.get(itemId),
+          )
           if (!turnIsActive()) return { decision: 'cancel' }
           if (decision.decision === 'acceptForSession') {
             const command = String(event.input.command ?? '')
@@ -5771,7 +5968,22 @@ export class CodexClaudeAppServer {
       const text = markVisualizeLines(record.text)
       return text === record.text ? item : { ...record, text }
     }
-    const itemForPeer = (item: unknown): unknown => withVisualizeMarks(unmarked(item))
+    // Thinking stored before it went to the summary shows as one, too.
+    // App rule: reasoning-summary
+    const visibleReasoning = reasoningSummariesVisible(this.configOverrides)
+    const withReasoningSummary = (item: unknown): unknown => {
+      const record = asRecord(item)
+      if (!visibleReasoning || record.type !== 'reasoning') return item
+      const filled = (parts: unknown): string[] =>
+        Array.isArray(parts)
+          ? parts.filter((part): part is string => typeof part === 'string' && part.length > 0)
+          : []
+      const content = filled(record.content)
+      if (filled(record.summary).length > 0 || content.length === 0) return item
+      return { ...record, summary: content }
+    }
+    const itemForPeer = (item: unknown): unknown =>
+      withReasoningSummary(withVisualizeMarks(unmarked(item)))
     const turnForPeer = (turn: unknown): unknown => {
       const record = asRecord(turn)
       return Array.isArray(record.items)
@@ -6597,6 +6809,9 @@ export class CodexClaudeAppServer {
     turnId: string,
     itemId: string,
     event: Extract<RuntimeEvent, { type: 'permission_request' }>,
+    // The command an item that is not one asks about, such as the Read
+    // behind an image the App shows.
+    commandFallback?: ThreadItem,
   ): Promise<PermissionDecision> {
     // Defensive: if Codex App selected approvalPolicy=never (or "Full access"
     // sandbox), auto-accept without bouncing the request to the user. The
@@ -6617,7 +6832,23 @@ export class CodexClaudeAppServer {
 
     this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: ['waitingOnApproval'] })
     const requestId = newId()
-    const isCommand = event.toolName === 'Bash'
+    // Bash and the file exploration tools ask on the command card, as the
+    // command their item shows; an image Read asks as its Read.
+    const item =
+      commandFallback ??
+      this.store.getTurn(turnId)?.items.find((candidate) => candidate.id === itemId)
+    const commandItem = item?.type === 'commandExecution' ? item : null
+    const isBash = event.toolName === 'Bash'
+    const isCommand = isBash || commandItem !== null
+    const cardCommand = isBash ? command : (commandItem?.command ?? command)
+    // The card lists the actions' commands in place of the command, so it
+    // gets them only when they spell out the whole command.
+    // App rule: command-approval-actions
+    const actions = commandItem?.commandActions ?? []
+    const commandActions: CommandAction[] =
+      actions.length === 1 && actions[0]?.command === cardCommand
+        ? actions
+        : [{ type: 'unknown', command: cardCommand }]
     const method = isCommand
       ? 'item/commandExecution/requestApproval'
       : 'item/fileChange/requestApproval'
@@ -6629,13 +6860,16 @@ export class CodexClaudeAppServer {
           startedAtMs: nowMillis(),
           approvalId: requestId,
           reason: null,
-          command,
-          cwd: String(event.input.cwd ?? ''),
-          commandActions: [],
+          command: cardCommand,
+          cwd: commandItem?.cwd ?? String(event.input.cwd ?? ''),
+          commandActions,
           additionalPermissions: null,
           proposedExecpolicyAmendment: null,
           proposedNetworkPolicyAmendments: null,
-          availableDecisions: ['accept', 'acceptForSession', 'decline', 'cancel'],
+          // Only a Bash command can be remembered for the session.
+          availableDecisions: isBash
+            ? ['accept', 'acceptForSession', 'decline', 'cancel']
+            : ['accept', 'decline', 'cancel'],
         }
       : {
           threadId,
@@ -6935,6 +7169,8 @@ export class CodexClaudeAppServer {
         ...this.publicConfigOverrides(),
         model: this.configModel,
         review_model: null,
+        // Codex reports a window here only when config.toml sets one; the App
+        // takes the window from thread/tokenUsage/updated.
         model_context_window: null,
         model_auto_compact_token_limit: null,
         model_provider: 'claude-code',
@@ -6944,7 +7180,12 @@ export class CodexClaudeAppServer {
         sandbox_workspace_write: this.configOverrides.sandbox_workspace_write ?? null,
         forced_chatgpt_workspace_id: null,
         forced_login_method: null,
-        web_search: this.configOverrides.web_search ?? 'disabled',
+        // Claude searches the web live with its WebSearch tool, which
+        // modelProvider/capabilities/read advertises unless
+        // CLAUDE_CODEX_WEBSEARCH=0.
+        web_search:
+          this.configOverrides.web_search ??
+          (process.env.CLAUDE_CODEX_WEBSEARCH === '0' ? 'disabled' : 'live'),
         tools: this.configOverrides.tools ?? null,
         profile: this.configOverrides.profile ?? null,
         profiles: {},
@@ -7302,29 +7543,32 @@ export class CodexClaudeAppServer {
     if (!child) {
       this.goalProgressByThread.delete(threadId)
       this.lastCallUsageByThread.delete(threadId)
+      // The result counts the calls reported live.
+      this.liveCallUsageByThread.delete(threadId)
     }
-    if (source.contextWindow) this.contextWindowByThread.set(threadId, source.contextWindow)
+    if (source.contextWindow) {
+      this.contextWindowByThread.set(threadId, source.contextWindow)
+      const model = this.store.getThread(threadId)?.model
+      if (model) this.contextWindowByModel.set(model, source.contextWindow)
+    }
     if (spent.totalTokens === 0) return
     const prior = this.tokenUsageByThread.get(threadId) ?? emptyTokenBreakdown()
-    const total: TokenUsageBreakdown = {
-      totalTokens: prior.totalTokens + spent.totalTokens,
-      inputTokens: prior.inputTokens + spent.inputTokens,
-      cachedInputTokens: prior.cachedInputTokens + spent.cachedInputTokens,
-      outputTokens: prior.outputTokens + spent.outputTokens,
-      reasoningOutputTokens: prior.reasoningOutputTokens + spent.reasoningOutputTokens,
-    }
-    this.tokenUsageByThread.set(threadId, total)
-    const measured = child ? this.lastUsageByThread.get(threadId) : lastCall
+    this.tokenUsageByThread.set(threadId, addTokenBreakdowns([prior, spent]))
+    // A child that reports while the main loop runs keeps its latest call in
+    // the gauge.
+    const measured = child
+      ? (this.lastCallUsageByThread.get(threadId) ?? this.lastUsageByThread.get(threadId))
+      : lastCall
     if (!child) {
       if (lastCall) this.lastUsageByThread.set(threadId, lastCall)
       else this.lastUsageByThread.delete(threadId)
     }
     const tokenUsage: ThreadTokenUsage = {
-      total,
+      total: this.liveTokenTotal(threadId),
       last: measured ?? (child ? emptyTokenBreakdown() : spent),
       // Only one call's usage measures the context; a whole turn's sum would
       // overfill the App's gauge.
-      modelContextWindow: measured ? (this.contextWindowByThread.get(threadId) ?? null) : null,
+      modelContextWindow: measured ? this.contextWindowFor(threadId) : null,
     }
     this.notify(peer, {
       method: 'thread/tokenUsage/updated',
@@ -8006,7 +8250,13 @@ export class CodexClaudeAppServer {
         cwd: thread?.cwd ?? process.cwd(),
         cliVersion: codexCliVersion(),
         source: normalizeSessionSource(thread?.source),
-        gitInfo: null,
+        gitInfo: thread?.gitInfo
+          ? {
+              sha: thread.gitInfo.sha,
+              branch: thread.gitInfo.branch,
+              origin_url: thread.gitInfo.originUrl,
+            }
+          : null,
       },
     }
   }
@@ -8092,30 +8342,44 @@ export class CodexClaudeAppServer {
     return {}
   }
 
+  // The thread item a Claude tool call shows as. `mcpServers` names the
+  // turn's configured MCP servers; `imageView: false` keeps an image Read a
+  // Read command.
   private toolUseToItem(
     event: Extract<RuntimeEvent, { type: 'tool_use' }>,
     cwd: string,
+    options: { mcpServers?: Iterable<string>; imageView?: boolean } = {},
   ): ThreadItem {
     const id = newId()
+    const command = (
+      text: string,
+      itemCwd: string,
+      commandActions: CommandAction[],
+    ): ThreadItem => ({
+      type: 'commandExecution',
+      id,
+      command: text,
+      cwd: itemCwd,
+      // Use the SDK's tool_use_id as a stable handle. Without a non-null
+      // processId the Codex App was treating these as "Background terminal"
+      // entries (no attached process) and hiding their output; with a
+      // synthetic id they render as inline command items like a normal
+      // foreground bash invocation.
+      processId: `claude:${event.toolUseId}`,
+      source: 'agent',
+      status: 'inProgress',
+      commandActions,
+      aggregatedOutput: null,
+      exitCode: null,
+      durationMs: null,
+    })
     if (event.toolName === 'Bash') {
-      return {
-        type: 'commandExecution',
-        id,
-        command: String(event.input.command ?? ''),
-        cwd: String(event.input.cwd ?? cwd),
-        // Use the SDK's tool_use_id as a stable handle. Without a non-null
-        // processId the Codex App was treating these as "Background terminal"
-        // entries (no attached process) and hiding their output; with a
-        // synthetic id they render as inline command items like a normal
-        // foreground bash invocation.
-        processId: `claude:${event.toolUseId}`,
-        source: 'agent',
-        status: 'inProgress',
-        commandActions: [],
-        aggregatedOutput: null,
-        exitCode: null,
-        durationMs: null,
-      }
+      const text = String(event.input.command ?? '')
+      const itemCwd = String(event.input.cwd ?? cwd)
+      // A command that only reads, lists or searches files joins the App's
+      // "Explored" group, as Codex's own commands do.
+      // App rule: explored-commands
+      return command(text, itemCwd, text ? parseCommandActions(text, itemCwd) : [])
     }
     if (['Edit', 'Write', 'MultiEdit'].includes(event.toolName)) {
       return {
@@ -8128,11 +8392,9 @@ export class CodexClaudeAppServer {
     if (event.toolName === 'WebSearch') {
       // Codex App has a dedicated `webSearch` ThreadItem with a structured
       // action — emit it instead of a generic mcpToolCall so the App can show
-      // the search badge (and follow-up open-page links) natively. The action
-      // is finalized when the tool_result arrives (see tool_result handler).
-      // The 'search' variant's `query` / `queries` are required (Option fields
-      // with no serde default), so always populate both even on the initial
-      // inProgress emit.
+      // the search badge natively. The 'search' variant's `query` / `queries`
+      // are required (Option fields with no serde default), so always
+      // populate both.
       const q = String(event.input.query ?? '')
       return {
         type: 'webSearch',
@@ -8141,40 +8403,30 @@ export class CodexClaudeAppServer {
         action: { type: 'search', query: q || null, queries: null },
       }
     }
-    let displayTool = event.toolName
-    if (event.toolName === 'Read') {
-      const raw = String(event.input.file_path || event.input.path || '')
-      if (raw) {
-        let displayPath = raw
-        try {
-          if (cwd && raw.startsWith(cwd)) {
-            displayPath = raw.slice(cwd.length).replace(/^\/+/, '')
-          } else {
-            const parts = raw.split(/\//).filter(Boolean)
-            displayPath = parts.length > 2 ? parts.slice(-2).join('/') : raw
-          }
-        } catch {}
-        displayTool = `Read ${displayPath || raw}`
-      }
-    } else if (event.toolName === 'Grep') {
-      const pat = String(event.input.pattern ?? '')
-      const rawPath = event.input.path ? String(event.input.path) : ''
-      let pathStr = ''
-      if (rawPath) {
-        const parts = rawPath.split(/\//).filter(Boolean)
-        pathStr = ` (${parts.length > 2 ? parts.slice(-2).join('/') : rawPath})`
-      }
-      if (pat) displayTool = `Grep ${pat}${pathStr}`
-    } else if (event.toolName === 'Glob') {
-      const pat = String(event.input.pattern ?? '')
-      if (pat) displayTool = `Glob ${pat}`
+    if (event.toolName === 'WebFetch') {
+      // Fetching a page is what Codex shows as opening it.
+      const url = String(event.input.url ?? '')
+      return { type: 'webSearch', id, query: url, action: { type: 'openPage', url: url || null } }
     }
-
+    const imagePath =
+      options.imageView === false ? null : imageReadPath(event.toolName, event.input, cwd)
+    if (imagePath) return { type: 'imageView', id, path: imagePath }
+    if (isExploreTool(event.toolName)) {
+      // Read, Grep, Glob and LS show as commands named after the tool, with
+      // the action Codex gives a shell command doing the same, so the App
+      // groups them under "Explored".
+      // App rule: explored-commands
+      const explored = exploreToolCommand(event.toolName, event.input, cwd)
+      return command(explored.command, cwd, explored.commandActions)
+    }
+    // MCP tools name their server; Claude Code's other tools are shown
+    // under a `claude-code` server.
+    const mcp = splitMcpToolName(event.toolName, options.mcpServers)
     return {
       type: 'mcpToolCall',
       id,
-      server: 'claude-code',
-      tool: displayTool,
+      server: mcp?.server ?? 'claude-code',
+      tool: mcp?.tool ?? event.toolName,
       status: 'inProgress',
       arguments: event.input,
       result: null,
@@ -8268,8 +8520,10 @@ export class CodexClaudeAppServer {
       threadSource: normalizeThreadSource(thread.threadSource),
       agentNickname,
       agentRole,
-      gitInfo: null,
+      gitInfo: thread.gitInfo ?? null,
       name: thread.name,
+      model: thread.model || null,
+      reasoningEffort: normalizeReasoningEffortEnum(thread.reasoningEffort),
       projectId: thread.projectId ?? null,
       turns: turns.map((turn) => this.toTurn(turn)),
     }
@@ -8398,13 +8652,18 @@ export class CodexClaudeAppServer {
       params: notification.params,
     }
     for (const target of targets) {
-      if (this.peerTakesNotification(target, notification)) target.send(message)
+      if (
+        !this.optedOut(target, notification.method) &&
+        this.peerTakesNotification(target, notification)
+      )
+        target.send(message)
     }
   }
 
   // To this peer only, whoever else follows the notification's thread.
   private sendNotification(peer: RpcPeer, notification: { method: string; params: unknown }): void {
     if (this.stopped) return
+    if (this.optedOut(peer, notification.method)) return
     debugLog('rpc.notify', {
       peerId: peer.id,
       originalPeerId: null,
@@ -8447,7 +8706,13 @@ export class CodexClaudeAppServer {
       params: summarizeRpcParams(notification.method, notification.params),
     })
     for (const peer of this.peers.values())
-      peer.send({ jsonrpc: '2.0', method: notification.method, params: notification.params })
+      if (!this.optedOut(peer, notification.method))
+        peer.send({ jsonrpc: '2.0', method: notification.method, params: notification.params })
+  }
+
+  // Whether the client asked in initialize not to hear `method`.
+  private optedOut(peer: RpcPeer, method: string): boolean {
+    return this.peerFeatures.get(peer)?.optedOutNotifications.has(method) === true
   }
 
   private notifyThread(threadId: string, notification: { method: string; params: unknown }): void {
@@ -8622,6 +8887,8 @@ export class CodexClaudeAppServer {
       this.unsteerableTurns.delete(turnId)
       this.dropPendingServerRequests(threadId, turnId)
     }
+    // A turn that ended without a result leaves its live calls unsettled.
+    this.liveCallUsageByThread.delete(threadId)
     let settled: TurnRecord | null = null
     try {
       settled = turnId ? this.store.getTurn(turnId) : null
@@ -8642,11 +8909,55 @@ export class CodexClaudeAppServer {
       return
     }
     if (existed) {
+      this.refreshGitInfoAfterTurn(threadId)
       setImmediate(() => {
         if (!this.startFollowUp(threadId, settled?.status) && this.activeTurnByThread.size === 0)
           this.idleCheckHandler?.()
       })
     }
+  }
+
+  // Stores the git info of the thread's workspace once the lookup lands. A
+  // failed lookup keeps what is stored unless `replace` says the workspace
+  // itself changed.
+  private async captureGitInfo(
+    threadId: string,
+    cwd: string,
+    options: { fresh?: boolean; replace?: boolean } = {},
+  ): Promise<void> {
+    try {
+      const gitInfo = await gitInfoFor(cwd, { fresh: options.fresh === true })
+      if (this.stopped || (!gitInfo && !options.replace)) return
+      this.store.setThreadGitInfo(threadId, gitInfo)
+    } catch (error) {
+      debugLog('thread.git_info.failed', {
+        threadId,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
+
+  // A turn can switch or create the branch, so the sidebar follows the branch
+  // the thread last worked on.
+  private refreshGitInfoAfterTurn(threadId: string): void {
+    try {
+      const thread = this.store.getThread(threadId)
+      if (thread && !thread.ephemeral)
+        void this.captureGitInfo(threadId, thread.cwd, { fresh: true })
+    } catch {
+      // Only the branch label waits for the next turn.
+    }
+  }
+
+  // Threads stored before the adapter kept git info, or resumed before their
+  // start-time lookup landed, get it before resuming; resuming in another
+  // directory replaces it.
+  private async gitInfoForResume(params: Record<string, unknown>): Promise<void> {
+    const thread = this.store.getThread(stringOr(params.threadId, ''))
+    if (!thread || thread.ephemeral) return
+    const cwd = typeof params.cwd === 'string' && params.cwd.length > 0 ? params.cwd : thread.cwd
+    if (cwd !== thread.cwd) await this.captureGitInfo(thread.id, cwd, { replace: true })
+    else if (!thread.gitInfo) await this.captureGitInfo(thread.id, cwd)
   }
 
   // The MCP servers an App request sees: a named thread's, its project's
@@ -8704,7 +9015,8 @@ export class CodexClaudeAppServer {
   // ended, e.g. through turn/interrupt.
   private failTurn(peer: RpcPeer, threadId: string, turn: TurnRecord, error: Error): boolean {
     this.exitReviewMode(peer, threadId, turn.id)
-    const completed = this.endTurn(turn, 'failed', { message: error.message })
+    const turnError = turnErrorOf(error)
+    const completed = this.endTurn(turn, 'failed', turnError)
     if (!completed) {
       // Its end was recorded, but whatever ended it never let go of the
       // thread.
@@ -8716,7 +9028,7 @@ export class CodexClaudeAppServer {
     }
     this.notify(peer, {
       method: 'error',
-      params: { threadId, turnId: turn.id, willRetry: false, error: { message: error.message } },
+      params: { threadId, turnId: turn.id, willRetry: false, error: turnError },
     })
     this.notify(peer, {
       method: 'turn/completed',

@@ -3870,48 +3870,226 @@ test('a review cut off by an interrupt or by the adapter stopping still exits re
   }
 })
 
-test('Claude thinking maps to Codex reasoning content without a duplicate summary', async () => {
+// Runs the mock thinking turn and returns what it sent about reasoning.
+async function runThinkingTurn(
+  reader: JsonLineReader,
+  proc: ChildProcessWithoutNullStreams,
+  threadId: string,
+  id: number,
+): Promise<{ reasoning: any[]; completed: any; text: string }> {
+  proc.stdin.write(
+    json({ id, method: 'turn/start', params: { threadId, input: textInput('thinking check') } }),
+  )
+  const seen = await readUntil(reader, (message) => message.method === 'turn/completed')
+  const reasoning = seen.filter(
+    (message) =>
+      message.method?.startsWith('item/reasoning/') ||
+      (message.method?.startsWith('item/') && message.params?.item?.type === 'reasoning'),
+  )
+  const completed = seen.find(
+    (message) => message.method === 'item/completed' && message.params.item.type === 'reasoning',
+  )?.params.item
+  const text = seen
+    .filter((message) => message.method === 'item/agentMessage/delta')
+    .map((message) => message.params.delta)
+    .join('')
+  return { reasoning, completed, text }
+}
+
+async function readReasoningItems(
+  reader: JsonLineReader,
+  proc: ChildProcessWithoutNullStreams,
+  threadId: string,
+  id: number,
+): Promise<any[]> {
+  proc.stdin.write(json({ id, method: 'thread/read', params: { threadId, includeTurns: true } }))
+  const read = await reader.nextResponse(id)
+  return read.result.thread.turns
+    .flatMap((turn: any) => turn.items)
+    .filter((item: any) => item.type === 'reasoning')
+}
+
+test('Claude thinking streams as the Codex reasoning summary', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
-  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
-    stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
-  })
+  const proc = spawnMockAdapter(home)
   const reader = new JsonLineReader(proc)
   try {
-    proc.stdin.write(
-      json({
-        id: 1,
-        method: 'thread/start',
-        params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false },
-      }),
+    const threadId = await startMockThread(reader, proc)
+    const { reasoning, completed, text } = await runThinkingTurn(reader, proc, threadId, 2)
+
+    // The CLI is asked for readable thinking, which the App shows only as a
+    // summary: the part opens first, then the text streams into it.
+    assert.equal(text, 'done thinkingDisplay=summarized')
+    assert.deepEqual(
+      reasoning.map((message) => message.method),
+      [
+        'item/started',
+        'item/reasoning/summaryPartAdded',
+        'item/reasoning/summaryTextDelta',
+        'item/completed',
+      ],
     )
-    const start = await reader.nextResponse(1)
-    const threadId = start.result.thread.id
+    assert.deepEqual(reasoning[0].params.item.summary, [''])
+    assert.deepEqual(reasoning[0].params.item.content, [])
+    assert.equal(reasoning[1].params.summaryIndex, 0)
+    assert.equal(reasoning[1].params.itemId, completed.id)
+    assert.equal(reasoning[2].params.summaryIndex, 0)
+    assert.equal(reasoning[2].params.delta, 'mock thinking')
+    assert.deepEqual(completed.summary, ['mock thinking'])
+    assert.deepEqual(completed.content, [])
+
+    const stored = await readReasoningItems(reader, proc, threadId, 3)
+    assert.deepEqual(
+      stored.map((item) => [item.summary, item.content]),
+      [[['mock thinking'], []]],
+    )
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('with reasoning summaries off Claude thinking stays raw reasoning content', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  let proc = spawnMockAdapter(home, { CLAUDE_CODEX_REASONING_VISIBLE: '0' })
+  let reader = new JsonLineReader(proc)
+  let threadId = ''
+  try {
+    threadId = await startMockThread(reader, proc)
+    const { reasoning, completed, text } = await runThinkingTurn(reader, proc, threadId, 2)
+    assert.equal(text, 'done thinkingDisplay=default')
+    assert.deepEqual(
+      reasoning.map((message) => message.method),
+      ['item/started', 'item/reasoning/textDelta', 'item/completed'],
+    )
+    assert.equal(reasoning[1].params.contentIndex, 0)
+    assert.deepEqual(completed.summary, [])
+    assert.deepEqual(completed.content, ['mock thinking'])
+  } finally {
+    proc.kill()
+    await once(proc, 'exit')
+  }
+
+  // Without the opt-out the thinking stored as content reads back as the
+  // summary, until model_reasoning_summary turns summaries off again.
+  proc = spawnMockAdapter(home)
+  reader = new JsonLineReader(proc)
+  try {
+    const shown = await readReasoningItems(reader, proc, threadId, 1)
+    assert.deepEqual(
+      shown.map((item) => [item.summary, item.content]),
+      [[['mock thinking'], ['mock thinking']]],
+    )
 
     proc.stdin.write(
       json({
         id: 2,
-        method: 'turn/start',
-        params: { threadId, input: [{ type: 'text', text: 'thinking check', text_elements: [] }] },
+        method: 'config/value/write',
+        params: { keyPath: 'model_reasoning_summary', value: 'none' },
       }),
     )
     await reader.nextResponse(2)
+    const hidden = await readReasoningItems(reader, proc, threadId, 3)
+    assert.deepEqual(
+      hidden.map((item) => [item.summary, item.content]),
+      [[[], ['mock thinking']]],
+    )
+    const { completed, text } = await runThinkingTurn(reader, proc, threadId, 4)
+    assert.equal(text, 'done thinkingDisplay=default')
+    assert.deepEqual(completed.summary, [])
+    assert.deepEqual(completed.content, ['mock thinking'])
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
 
-    let sawSummary = false
-    let sawContent = false
-    let completedReasoning: any = null
-    for (let i = 0; i < 500; i += 1) {
-      const message = await reader.next()
-      if (message.method === 'item/reasoning/summaryTextDelta') sawSummary = true
-      if (message.method === 'item/reasoning/textDelta') sawContent = true
-      if (message.method === 'item/completed' && message.params.item.type === 'reasoning')
-        completedReasoning = message.params.item
-      if (message.method === 'turn/completed') break
+test('API retries show as Reconnecting errors and a failed turn carries its Codex error code', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  try {
+    const threadId = await startMockThread(reader, proc)
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: textInput('api retry check') },
+      }),
+    )
+    const retried = await readUntil(reader, (message) => message.method === 'turn/completed')
+    const retries = retried.filter((message) => message.method === 'error')
+    const turnId = retried.at(-1)?.params.turn.id
+    // The App counts attempts only from a message of exactly this form.
+    assert.deepEqual(
+      retries.map((message) => message.params),
+      [
+        {
+          threadId,
+          turnId,
+          willRetry: true,
+          error: {
+            message: 'Reconnecting... 1/10',
+            codexErrorInfo: 'serverOverloaded',
+            additionalDetails: 'HTTP 529 overloaded; retrying in 1s',
+          },
+        },
+        {
+          threadId,
+          turnId,
+          willRetry: true,
+          error: {
+            message: 'Reconnecting... 2/10',
+            codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: null } },
+            additionalDetails: 'no response',
+          },
+        },
+      ],
+    )
+    for (const retry of retries) {
+      assert.match(retry.params.error.message, /^Reconnecting(?:\.\.\.)?\s+(\d+)\/(\d+)$/)
     }
-    assert.equal(sawSummary, false)
-    assert.equal(sawContent, true)
-    assert.deepEqual(completedReasoning.summary, [])
-    assert.deepEqual(completedReasoning.content, ['mock thinking'])
+    assert.equal(retried.at(-1)?.params.turn.status, 'completed')
+    assert.equal(retried.at(-1)?.params.turn.error, null)
+
+    proc.stdin.write(
+      json({
+        id: 3,
+        method: 'turn/start',
+        params: { threadId, input: textInput('overloaded failure check') },
+      }),
+    )
+    const failed = await readUntil(reader, (message) => message.method === 'turn/completed')
+    const expected = {
+      message: 'API Error: 529 Overloaded',
+      codexErrorInfo: 'serverOverloaded',
+      additionalDetails: 'HTTP 529 overloaded',
+    }
+    const errors = failed.filter((message) => message.method === 'error')
+    assert.deepEqual(
+      errors.map((message) => [message.params.willRetry, message.params.error]),
+      [[false, expected]],
+    )
+    assert.equal(failed.at(-1)?.params.turn.status, 'failed')
+    assert.deepEqual(failed.at(-1)?.params.turn.error, expected)
+
+    // History keeps the failure with its code, and none of the retries.
+    proc.stdin.write(
+      json({ id: 4, method: 'thread/read', params: { threadId, includeTurns: true } }),
+    )
+    const read = await reader.nextResponse(4)
+    const turns = read.result.thread.turns
+    assert.deepEqual(
+      turns.map((turn: any) => [turn.status, turn.error]),
+      [
+        ['completed', null],
+        ['failed', expected],
+      ],
+    )
+    assert.equal(
+      turns.flatMap((turn: any) => turn.items).some((item: any) => item.type === 'error'),
+      false,
+    )
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -3955,6 +4133,70 @@ test('the context gauge follows the last API call and child tokens add to the to
     assert.deepEqual(updates[1].last, lastCall, 'child tokens leave the gauge alone')
     assert.equal(updates[1].total.totalTokens, 1320)
     assert.equal(updates[1].modelContextWindow, 200_000)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('the context gauge moves with each API call once the window is known', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  // [last, total, window] of each token usage update of a turn.
+  const runTurn = async (id: number, threadId: string): Promise<unknown[]> => {
+    proc.stdin.write(
+      json({
+        id,
+        method: 'turn/start',
+        params: { threadId, input: textInput('context usage check') },
+      }),
+    )
+    const turn = await readUntil(
+      reader,
+      (message) => message.method === 'turn/completed' && message.params.threadId === threadId,
+    )
+    return turn
+      .filter((m) => m.method === 'thread/tokenUsage/updated' && m.params.threadId === threadId)
+      .map(({ params: { tokenUsage } }) => [
+        tokenUsage.last.totalTokens,
+        tokenUsage.total.totalTokens,
+        tokenUsage.modelContextWindow,
+      ])
+  }
+  try {
+    const threadId = await startMockThread(reader, proc)
+    // The window comes with the first result, so the first turn moves the
+    // gauge only at its end.
+    assert.deepEqual(await runTurn(2, threadId), [
+      [200, 320, 200_000],
+      [200, 1320, 200_000],
+    ])
+    // Then each call moves it as it streams, once however often it repeats
+    // its usage, on top of the settled total; the result settles the same
+    // total, counting nothing twice, and a child adds to the total only.
+    assert.deepEqual(await runTurn(3, threadId), [
+      [120, 1440, 200_000],
+      [200, 1640, 200_000],
+      [200, 1640, 200_000],
+      [200, 2640, 200_000],
+    ])
+
+    // A new thread on the same model starts with the window it reported.
+    proc.stdin.write(
+      json({
+        id: 4,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), experimentalRawEvents: false, persistExtendedHistory: false },
+      }),
+    )
+    const other = (await reader.nextResponse(4)).result.thread.id
+    assert.deepEqual(await runTurn(5, other), [
+      [120, 120, 200_000],
+      [200, 320, 200_000],
+      [200, 320, 200_000],
+      [200, 1320, 200_000],
+    ])
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -4728,7 +4970,7 @@ test('localImage user input becomes a multimodal Claude prompt + an imageView Th
   }
 })
 
-test('Claude WebSearch tool maps to native Codex webSearch ThreadItem with action', async () => {
+test('Claude WebSearch maps to a Codex webSearch item that stays a search', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -4772,32 +5014,49 @@ test('Claude WebSearch tool maps to native Codex webSearch ThreadItem with actio
     // (Option<...> with no serde default) — bare {type:'search'} would crash App.
     assert.deepEqual(webSearchItem.action, { type: 'search', query: 'mock query', queries: null })
     assert.ok(completedWebSearch, 'webSearch item should complete')
-    assert.equal(
-      completedWebSearch.action.type,
-      'openPage',
-      'tool_result with a URL should upgrade action to openPage',
-    )
-    assert.equal(completedWebSearch.action.url, 'https://example.com/article')
+    // Its results hold links, but the search opened no page.
+    assert.deepEqual(completedWebSearch.action, {
+      type: 'search',
+      query: 'mock query',
+      queries: null,
+    })
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
 
-test('modelProvider/capabilities/read advertises webSearch=true unless CLAUDE_CODEX_WEBSEARCH=0', async () => {
-  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
-  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
-    stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
-  })
-  const reader = new JsonLineReader(proc)
-  try {
-    proc.stdin.write(json({ id: 1, method: 'modelProvider/capabilities/read', params: {} }))
-    const cap = await reader.nextResponse(1)
-    assert.equal(cap.result.webSearch, true)
-  } finally {
-    proc.kill()
-    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+test('capabilities and config/read report live web search unless CLAUDE_CODEX_WEBSEARCH=0', async () => {
+  for (const [setting, webSearch, mode] of [
+    ['', true, 'live'],
+    ['0', false, 'disabled'],
+  ] as const) {
+    const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+    const proc = spawnMockAdapter(home, { CLAUDE_CODEX_WEBSEARCH: setting })
+    const reader = new JsonLineReader(proc)
+    try {
+      proc.stdin.write(json({ id: 1, method: 'modelProvider/capabilities/read', params: {} }))
+      assert.equal((await reader.nextResponse(1)).result.webSearch, webSearch)
+      proc.stdin.write(json({ id: 2, method: 'config/read', params: {} }))
+      const { config } = (await reader.nextResponse(2)).result
+      assert.equal(config.web_search, mode)
+      // Codex reports a context window only when config.toml sets one.
+      assert.equal(config.model_context_window, null)
+      // What the App's settings saved still wins.
+      proc.stdin.write(
+        json({
+          id: 3,
+          method: 'config/value/write',
+          params: { keyPath: 'web_search', value: 'cached' },
+        }),
+      )
+      await reader.nextResponse(3)
+      proc.stdin.write(json({ id: 4, method: 'config/read', params: {} }))
+      assert.equal((await reader.nextResponse(4)).result.config.web_search, 'cached')
+    } finally {
+      proc.kill()
+      await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+    }
   }
 })
 
@@ -7593,6 +7852,15 @@ test('approval requests round-trip through Codex server requests', {
       }
     }
     assert.equal(approvalRequest?.params.command, 'echo mock approval')
+    assert.deepEqual(approvalRequest?.params.commandActions, [
+      { type: 'unknown', command: 'echo mock approval' },
+    ])
+    assert.deepEqual(approvalRequest?.params.availableDecisions, [
+      'accept',
+      'acceptForSession',
+      'decline',
+      'cancel',
+    ])
     assert.equal(sawWaitingOnApproval, true)
     proc.stdin.write(json({ id: approvalRequest.id, result: { decision: 'accept' } }))
 
@@ -7616,7 +7884,7 @@ test('approval requests round-trip through Codex server requests', {
   }
 })
 
-test('generic Claude tools complete as Codex mcpToolCall items', async () => {
+test('Claude Code tools Codex has no item for complete as mcpToolCall items', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -7656,14 +7924,15 @@ test('generic Claude tools complete as Codex mcpToolCall items', async () => {
         completedTool = message.params.item
       if (message.method === 'turn/completed') break
     }
-    assert.equal(completedTool?.tool, 'Read README.md')
+    assert.equal(completedTool?.server, 'claude-code')
+    assert.equal(completedTool?.tool, 'ListMcpResourcesTool')
     assert.equal(completedTool?.status, 'completed')
     // Result must be wrapped in Codex v2 McpToolCallResult shape — {content[], structuredContent, _meta}.
-    // The mock runtime returns {text:'mock read result'} as the raw content, which we wrap as:
+    // The mock runtime returns {text:'mock tool result'} as the raw content, which we wrap as:
     //   content: [{type:'text', text:'<json>'}], structuredContent: <object>, _meta: null.
     assert.deepEqual(completedTool?.result, {
-      content: [{ type: 'text', text: JSON.stringify({ text: 'mock read result' }) }],
-      structuredContent: { text: 'mock read result' },
+      content: [{ type: 'text', text: JSON.stringify({ text: 'mock tool result' }) }],
+      structuredContent: { text: 'mock tool result' },
       _meta: null,
     })
     assert.equal(sawIdle, true)
@@ -7671,6 +7940,255 @@ test('generic Claude tools complete as Codex mcpToolCall items', async () => {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
+})
+
+// Runs one mock turn on a new thread and returns everything the adapter sent
+// until it completed.
+async function mockTurnMessages(
+  prompt: string,
+  env: NodeJS.ProcessEnv = {},
+  answer?: (request: any) => unknown,
+): Promise<any[]> {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home, env)
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(
+      json({
+        id: 1,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), permissions: ':workspace' },
+      }),
+    )
+    const threadId = (await reader.nextResponse(1)).result.thread.id
+    proc.stdin.write(
+      json({ id: 2, method: 'turn/start', params: { threadId, input: textInput(prompt) } }),
+    )
+    const seen: any[] = []
+    await awaitMessage(
+      reader,
+      (message) => {
+        if (message.method?.endsWith('/requestApproval') && message.id != null && answer)
+          proc.stdin.write(json({ id: message.id, result: answer(message) }))
+        return message.method === 'turn/completed'
+      },
+      seen,
+    )
+    proc.stdin.write(
+      json({ id: 3, method: 'thread/read', params: { threadId, includeTurns: true } }),
+    )
+    seen.push(await reader.nextResponse(3))
+    return seen
+  } finally {
+    await stopProcess(proc)
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+}
+
+const completedItems = (seen: any[]): any[] =>
+  seen
+    .filter((message) => message.method === 'item/completed')
+    .map((message) => message.params.item)
+
+const replayedItems = (seen: any[]): any[] =>
+  seen.find((message) => message.id === 3)?.result.thread.turns.at(-1).items ?? []
+
+test('file exploration shows as commands the Codex App groups under Explored', async () => {
+  const seen = await mockTurnMessages('explore tools check')
+  const cwd = process.cwd()
+  const commands = completedItems(seen).filter((item) => item.type === 'commandExecution')
+  assert.deepEqual(
+    commands.map(({ command, cwd, processId, status, commandActions }) => ({
+      command,
+      cwd,
+      processId,
+      status,
+      commandActions,
+    })),
+    [
+      {
+        command: 'Read README.md',
+        commandActions: [
+          {
+            type: 'read',
+            command: 'Read README.md',
+            name: 'README.md',
+            path: join(cwd, 'README.md'),
+          },
+        ],
+      },
+      {
+        command: 'Grep TODO in src',
+        commandActions: [
+          { type: 'search', command: 'Grep TODO in src', query: 'TODO', path: 'src' },
+        ],
+      },
+      {
+        command: 'Glob **/*.mts',
+        commandActions: [
+          { type: 'search', command: 'Glob **/*.mts', query: '**/*.mts', path: null },
+        ],
+      },
+      {
+        command: 'cat README.md',
+        commandActions: [
+          {
+            type: 'read',
+            command: 'cat README.md',
+            name: 'README.md',
+            path: join(cwd, 'README.md'),
+          },
+        ],
+      },
+      {
+        // The card shows the search; `head` only trims its output.
+        command: 'rg -n TODO src | head -n 5',
+        commandActions: [{ type: 'search', command: 'rg -n TODO src', query: 'TODO', path: 'src' }],
+      },
+    ].map((expected, index) => ({
+      command: expected.command,
+      cwd,
+      processId: `claude:explore-${index}`,
+      status: 'completed',
+      commandActions: expected.commandActions,
+    })),
+  )
+  assert.equal(
+    completedItems(seen).some((item) => item.type === 'mcpToolCall'),
+    false,
+  )
+  // A whole file stays with Claude; the App keeps the first 30,000 characters.
+  const capped = `${'x'.repeat(30_000)}\n… 10000 more characters not shown`
+  assert.equal(commands[0].aggregatedOutput, capped)
+  assert.deepEqual(
+    seen
+      .filter(
+        (message) =>
+          message.method === 'item/commandExecution/outputDelta' &&
+          message.params.itemId === commands[0].id,
+      )
+      .map((message) => message.params.delta),
+    [capped],
+  )
+  assert.deepEqual(
+    replayedItems(seen).filter((item: any) => item.type === 'commandExecution'),
+    commands,
+  )
+})
+
+test('an image Claude reads shows as an imageView, and a failed one as its Read', async () => {
+  const seen = await mockTurnMessages('image read check')
+  const cwd = process.cwd()
+  const started = seen
+    .filter((message) => message.method === 'item/started')
+    .map((message) => message.params.item)
+    .filter((item) => item.type !== 'userMessage')
+  assert.deepEqual(
+    started.map(({ type, path }) => ({ type, path })),
+    [
+      { type: 'imageView', path: join(cwd, 'diagram.png') },
+      { type: 'imageView', path: join(cwd, 'missing.png') },
+    ],
+  )
+  const [shown, missing] = started
+  const completed = completedItems(seen)
+  assert.deepEqual(
+    completed.find((item) => item.id === shown.id),
+    { type: 'imageView', id: shown.id, path: join(cwd, 'diagram.png') },
+  )
+  const failed = completed.find((item) => item.id === missing.id)
+  assert.deepEqual(
+    {
+      type: failed.type,
+      command: failed.command,
+      status: failed.status,
+      aggregatedOutput: failed.aggregatedOutput,
+      exitCode: failed.exitCode,
+      commandActions: failed.commandActions,
+    },
+    {
+      type: 'commandExecution',
+      command: 'Read missing.png',
+      status: 'failed',
+      aggregatedOutput: 'File does not exist.',
+      exitCode: 1,
+      commandActions: [
+        {
+          type: 'read',
+          command: 'Read missing.png',
+          name: 'missing.png',
+          path: join(cwd, 'missing.png'),
+        },
+      ],
+    },
+  )
+  // The output of an item that was an image comes with the completed item.
+  assert.equal(
+    seen.some((message) => message.method === 'item/commandExecution/outputDelta'),
+    false,
+  )
+  assert.deepEqual(
+    replayedItems(seen).filter((item: any) => item.type !== 'userMessage'),
+    [completed.find((item) => item.id === shown.id), failed],
+  )
+})
+
+test('Claude WebFetch shows as a Codex page open', async () => {
+  const seen = await mockTurnMessages('web fetch check')
+  const fetched = completedItems(seen).find((item) => item.type === 'webSearch')
+  assert.deepEqual(fetched, {
+    type: 'webSearch',
+    id: fetched?.id,
+    query: 'https://example.com/docs',
+    action: { type: 'openPage', url: 'https://example.com/docs' },
+  })
+})
+
+test('MCP tool calls name their server and tool, even a server named with __', async () => {
+  const seen = await mockTurnMessages('mcp tool check', {
+    CLAUDE_CODEX_MCP_SERVERS: JSON.stringify({
+      team__docs: { command: 'node', args: ['docs-server.mjs'] },
+    }),
+  })
+  assert.deepEqual(
+    completedItems(seen)
+      .filter((item) => item.type === 'mcpToolCall')
+      .map(({ server, tool, arguments: args, status }) => ({ server, tool, args, status })),
+    [
+      { server: 'github', tool: 'create_issue', args: { title: 'Bug' }, status: 'completed' },
+      { server: 'team__docs', tool: 'search', args: { query: 'setup' }, status: 'completed' },
+    ],
+  )
+})
+
+test('a Read Claude asks about asks on the command card, without a session allow', async () => {
+  const seen = await mockTurnMessages('outside read check', {}, () => ({ decision: 'accept' }))
+  const request = seen.find((message) => message.method === 'item/commandExecution/requestApproval')
+  assert.ok(request, 'the Read should ask on the command card')
+  assert.equal(
+    seen.some((message) => message.method === 'item/fileChange/requestApproval'),
+    false,
+  )
+  const item = completedItems(seen).find((candidate) => candidate.id === request.params.itemId)
+  assert.deepEqual(
+    {
+      command: request.params.command,
+      cwd: request.params.cwd,
+      commandActions: request.params.commandActions,
+      availableDecisions: request.params.availableDecisions,
+    },
+    {
+      command: 'Read /etc/hosts',
+      cwd: process.cwd(),
+      commandActions: [
+        { type: 'read', command: 'Read /etc/hosts', name: 'hosts', path: '/etc/hosts' },
+      ],
+      availableDecisions: ['accept', 'decline', 'cancel'],
+    },
+  )
+  assert.equal(item?.type, 'commandExecution')
+  assert.equal(item?.status, 'completed')
+  assert.equal(item?.aggregatedOutput, '127.0.0.1 localhost')
 })
 
 function spawnMockAdapter(

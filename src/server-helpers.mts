@@ -16,6 +16,7 @@ import type {
   PermissionDecision,
   RpcPeer,
   RuntimeEvent,
+  RuntimeFailure,
   ThreadItem,
   ThreadRecord,
   ThreadTokenUsage,
@@ -517,6 +518,109 @@ export function readConfigReasoningEffort(config: unknown): string | null {
   return null
 }
 
+// The Codex App shows a reasoning item only through its summary, so Claude's
+// thinking goes there unless the user turned summaries off, with
+// CLAUDE_CODEX_REASONING_VISIBLE=0 or Codex's model_reasoning_summary = "none".
+export function reasoningSummariesVisible(config: Record<string, unknown>): boolean {
+  return (
+    process.env.CLAUDE_CODEX_REASONING_VISIBLE !== '0' && config.model_reasoning_summary !== 'none'
+  )
+}
+
+// Codex's CodexErrorInfo: a camelCase code, or a one-key object for the codes
+// that carry the HTTP status.
+export type CodexErrorInfo = string | Record<string, { httpStatusCode: number | null }>
+
+// Codex's TurnError, as `error` notifications and failed turns carry it.
+export interface CodexTurnError {
+  message: string
+  codexErrorInfo: CodexErrorInfo | null
+  additionalDetails: string | null
+}
+
+// The Codex error code for a Claude failure. `retrying` describes a request
+// Claude will send again: Codex reports every such retry as a disconnected
+// stream with the HTTP status, except an overloaded API, which the App shows
+// as "Server is busy". Codes the App answers with ChatGPT account flows are
+// never used: usageLimitExceeded opens a plan upgrade card and cyberPolicy a
+// safety notice, and an authentication failure stays 'other' rather than
+// 'unauthorized'.
+// App rule: error-codes
+export function codexErrorInfo(
+  failure: RuntimeFailure | null | undefined,
+  retrying = false,
+): CodexErrorInfo {
+  const terminalReason = failure?.terminalReason ?? null
+  const category = failure?.category ?? null
+  const status = failure?.status ?? null
+  if (status === 529 || category === 'overloaded') return 'serverOverloaded'
+  if (retrying) return { responseStreamDisconnected: { httpStatusCode: status } }
+  if (terminalReason === 'prompt_too_long') return 'contextWindowExceeded'
+  if (status === 429 || category === 'rate_limit') return 'rateLimitExceeded'
+  if (category === 'invalid_request' || status === 400) return 'badRequest'
+  if (category === 'server_error' || (status != null && status >= 500)) {
+    return 'internalServerError'
+  }
+  // Nothing answered the request: the connection itself failed.
+  const unanswered = status == null && (category == null || category === 'unknown')
+  if (unanswered && terminalReason === 'api_error') {
+    return { httpConnectionFailed: { httpStatusCode: null } }
+  }
+  return 'other'
+}
+
+// The line under an error that says what the API answered.
+function apiErrorDetails(failure: RuntimeFailure | null | undefined): string | null {
+  const parts: string[] = []
+  if (failure?.status != null) parts.push(`HTTP ${failure.status}`)
+  if (failure?.category && failure.category !== 'unknown') {
+    parts.push(failure.category.replaceAll('_', ' '))
+  }
+  return parts.length > 0 ? parts.join(' ') : null
+}
+
+// The `error` notification for a model request Claude will retry. The App
+// folds a run of them into one "Reconnecting n/m" row, but only when the
+// message has exactly this form.
+// App rule: reconnecting-errors
+export function retryTurnError(event: Extract<RuntimeEvent, { type: 'retrying' }>): CodexTurnError {
+  const failure = { terminalReason: null, category: event.category, status: event.status }
+  const cause = apiErrorDetails(failure) ?? 'no response'
+  const wait = event.delayMs == null ? null : Math.max(1, Math.round(event.delayMs / 1000))
+  return {
+    message: `Reconnecting... ${event.attempt}/${event.maxRetries}`,
+    codexErrorInfo: codexErrorInfo(failure, true),
+    additionalDetails: wait == null ? cause : `${cause}; retrying in ${wait}s`,
+  }
+}
+
+// An Error for a failed turn that carries its Codex error code to failTurn.
+export function turnFailure(message: string, failure: RuntimeFailure | null | undefined): Error {
+  return Object.assign(new Error(message), {
+    codexErrorInfo: codexErrorInfo(failure),
+    additionalDetails: apiErrorDetails(failure),
+  })
+}
+
+// The Codex TurnError for whatever ended a turn. Errors turnFailure did not
+// build are 'other', as Codex reports an error it has no code for.
+export function turnErrorOf(error: unknown): CodexTurnError {
+  const carried =
+    typeof error === 'object' && error !== null
+      ? (error as { codexErrorInfo?: unknown; additionalDetails?: unknown })
+      : {}
+  const info = carried.codexErrorInfo
+  return {
+    message: error instanceof Error ? error.message : String(error),
+    codexErrorInfo:
+      typeof info === 'string' || (typeof info === 'object' && info !== null)
+        ? (info as CodexErrorInfo)
+        : 'other',
+    additionalDetails:
+      typeof carried.additionalDetails === 'string' ? carried.additionalDetails : null,
+  }
+}
+
 // Codex v2 `ThreadSource` is a strict 3-variant enum with no `serde(other)`
 // fallback. Anything outside this set (including an empty string) makes the
 // App's ts-rs deserializer panic on `thread/list` / `thread/read` — which the
@@ -717,6 +821,18 @@ export function emptyTokenBreakdown(): TokenUsageBreakdown {
   }
 }
 
+export function addTokenBreakdowns(breakdowns: Iterable<TokenUsageBreakdown>): TokenUsageBreakdown {
+  const sum = emptyTokenBreakdown()
+  for (const breakdown of breakdowns) {
+    sum.totalTokens += breakdown.totalTokens
+    sum.inputTokens += breakdown.inputTokens
+    sum.cachedInputTokens += breakdown.cachedInputTokens
+    sum.outputTokens += breakdown.outputTokens
+    sum.reasoningOutputTokens += breakdown.reasoningOutputTokens
+  }
+  return sum
+}
+
 // claude-agent-sdk's Task tool appends a fixed metadata trailer to the
 // subagent's tool_result content:
 //   `agentId: <hex> (use SendMessage with to: '<hex>', summary: ... to continue this agent)`
@@ -867,27 +983,6 @@ export function parseExitCodeFromResult(content: unknown): number | null {
   if (!match) return null
   const code = Number(match[1])
   return Number.isFinite(code) ? code : null
-}
-
-// Best-effort: when the WebSearch tool returns a result, sniff whether the
-// first result was an explicit page open vs a result list. Codex App's
-// `webSearch` ThreadItem renders the action badge accordingly.
-export function parseWebSearchAction(
-  query: string,
-  resultText: string,
-):
-  | { type: 'search'; query: string | null; queries: string[] | null }
-  | { type: 'openPage'; url: string | null }
-  | { type: 'findInPage'; pattern: string | null; url: string | null }
-  | { type: 'other' } {
-  // Codex v2 WebSearchAction variants are tagged but the inner fields are NOT
-  // optional in Rust — they're `Option<...>` with NO `#[serde(default)]`, so
-  // App rejects an item that ships a bare {type:'search'} (missing required
-  // fields). Always populate every field of the chosen variant, even if null.
-  if (!resultText) return { type: 'search', query: query || null, queries: null }
-  const urlMatch = resultText.match(/https?:\/\/[^\s)\]"'<]+/)
-  if (urlMatch && query) return { type: 'openPage', url: urlMatch[0] }
-  return { type: 'search', query: query || null, queries: null }
 }
 
 // Maps the raw Anthropic usage block carried on the Claude Agent SDK

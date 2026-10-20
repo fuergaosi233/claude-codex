@@ -125,6 +125,17 @@ export interface ThreadRecord {
   // alone, so a stale record saved after a turn cannot undo an assignment
   // made meanwhile. Assign through SessionStore.setThreadProject.
   projectId?: string | null
+  // Codex `GitInfo` of the thread's workspace: captured when the thread is
+  // created and refreshed when a turn ends. Read-only here like projectId;
+  // write through SessionStore.setThreadGitInfo.
+  gitInfo?: GitInfo | null
+}
+
+// Codex `GitInfo`. originUrl never carries credentials.
+export interface GitInfo {
+  sha: string | null
+  branch: string | null
+  originUrl: string | null
 }
 
 // Codex `Project`: a named group of threads with workspace roots. Times are
@@ -264,6 +275,15 @@ export interface RecalledMemory {
   content: string | null
 }
 
+// Codex v2 CommandAction: what a command does, as the App's "Explored" rows
+// and approval cards show it. A read path is absolute; listFiles and search
+// paths are short display paths.
+export type CommandAction =
+  | { type: 'read'; command: string; name: string; path: string }
+  | { type: 'listFiles'; command: string; path: string | null }
+  | { type: 'search'; command: string; query: string | null; path: string | null }
+  | { type: 'unknown'; command: string }
+
 export type ThreadItem =
   // clientId echoes turn/start's or turn/steer's clientUserMessageId so the
   // App can reconcile its optimistic copy of the message.
@@ -291,7 +311,7 @@ export type ThreadItem =
       processId: string | null
       source: string
       status: 'inProgress' | 'completed' | 'failed' | 'declined'
-      commandActions: unknown[]
+      commandActions: CommandAction[]
       aggregatedOutput: string | null
       exitCode: number | null
       durationMs: number | null
@@ -560,6 +580,10 @@ export interface RuntimeTurnContext {
   // prompt, wait on and read separate chats. Off unless the adapter enables
   // them; backends without in-process tools ignore it.
   leaderTools?: LeaderToolHandlers | null
+  // Ask Claude to return its thinking as readable summaries (the CLI's
+  // --thinking-display). Unset keeps the CLI's default, which recent models
+  // answer with redacted thinking. Backends without the flag ignore it.
+  thinkingDisplay?: 'summarized' | null
 }
 
 // Each handler returns the text of the tool result; a thrown Error becomes an
@@ -713,8 +737,37 @@ export type RuntimeEvent =
     }
   // Claude's auto-memory recalled these memories for the prompt.
   | { type: 'memory_recall'; memories: RecalledMemory[] }
-  | { type: 'completed'; claudeSessionId?: string | null; result?: string | null; success: boolean }
+  // A model request of the main loop failed and Claude will send it again
+  // after `delayMs`. `status` is the API's HTTP status (null when nothing
+  // answered) and `category` the SDK's error category ('overloaded', ...).
+  | {
+      type: 'retrying'
+      attempt: number
+      maxRetries: number
+      status: number | null
+      category: string | null
+      delayMs: number | null
+    }
+  | {
+      type: 'completed'
+      claudeSessionId?: string | null
+      result?: string | null
+      success: boolean
+      // Why a failed turn failed, when the backend can tell.
+      failure?: RuntimeFailure | null
+    }
   | { type: 'error'; message: string }
+
+// Why a Claude turn failed, in Claude's terms. The server maps it onto the
+// error codes the Codex App knows.
+export interface RuntimeFailure {
+  // The result's terminal_reason ('prompt_too_long', 'max_turns', ...).
+  terminalReason: string | null
+  // The SDK's API error category of the last response ('overloaded', ...).
+  category: string | null
+  // The HTTP status of the API error that ended the turn.
+  status: number | null
+}
 
 // Codex's request_user_input primitive — surfaces Claude's AskUserQuestion as a
 // native choice card in the App instead of a generic mcpToolCall blob. Matches

@@ -59,8 +59,9 @@ Codex App ──SSH──▶ login shell ──▶ codex (shim, earlier in PATH)
                   everything else  ──────▶ real Codex CLI (CODEX_REAL)
 ```
 
-Agent text and reasoning stream into the conversation; `Bash` becomes command
-approvals; `Edit`/`Write`/`MultiEdit` become file-change approvals with live
+Agent text and reasoning stream into the conversation, Claude's thinking as the
+reasoning summary the App shows (`CLAUDE_CODEX_REASONING_VISIBLE=0` hides it);
+`Bash` becomes command approvals; `Edit`/`Write`/`MultiEdit` become file-change approvals with live
 diffs. Runtime selection maps only to existing backend paths today: default
 in-process Claude Agent SDK, `agent-http`, `agentapi`, `claude-p`, `codex-proxy`,
 and `mock`.

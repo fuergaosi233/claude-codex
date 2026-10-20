@@ -10,6 +10,8 @@ Once the shim and exports are installed and the adapter is built:
    - `Bash` calls surface as Codex **command approvals**.
    - `Edit` / `Write` / `MultiEdit` surface as **file-change approvals** with a
      live diff that grows while Claude writes it.
+   - Files Claude reads, searches and lists fold into **Explored** rows; see
+     [How tool calls show](#how-tool-calls-show).
 3. Approve actions in the Codex App UI as usual.
 4. Disconnecting closes the proxy. Once no turn is active, the daemon idles out
    and the in-process Claude runtime is reclaimed.
@@ -56,6 +58,102 @@ family, or start a new chat for the other one. With
 `CLAUDE_CODEX_DISABLE_CODEX_PROXY=1` the menu lists no Codex models and a new chat
 on one is refused, while the App's own title and summary requests run on the
 Claude summary model.
+
+## Thinking and reasoning summaries
+
+With the default native Claude Agent SDK backend, Claude's thinking shows
+above its reply the way Codex shows a reasoning summary, while it streams and
+after the chat is reopened. The adapter asks the Claude CLI for summarized
+thinking (`--thinking-display summarized`), since recent models otherwise
+return their thinking redacted, and streams each run of thinking into the
+reasoning item's summary, the only part of it the App renders. Title and
+compaction turns do not ask for it.
+
+Thinking the adapter stored before it did this, as raw reasoning content,
+shows as the summary when history is read.
+
+To keep the thinking out of the conversation, set **Settings > Agent >
+Configuration > Reasoning summary** to **None** (`model_reasoning_summary =
+"none"`) or start the adapter with `CLAUDE_CODEX_REASONING_VISIBLE=0`. The
+setting applies from the next turn. The thinking is then kept as raw reasoning
+content, which the App does not show, and the CLI is not passed the flag; use
+the variable as well with a Claude CLI pinned through `CLAUDE_CODEX_CLI` that
+predates the flag. Whether a model or provider returns summarized thinking at
+all is up to them; when it returns none, nothing shows.
+
+## Retries and errors
+
+When the Claude API is overloaded or unreachable, the Claude CLI retries the
+request on its own. With the default native backend, each retry shows in the
+turn as Codex shows a stream retry: a passing **Reconnecting 1/10** row that
+counts up and leaves once Claude answers, with the HTTP status and the wait
+under it. Like Codex, the adapter does not store these rows, so they are gone
+when the chat is reopened. Retries inside a subagent do not show.
+
+A turn that fails tells the App why, with the error code Codex would send:
+the context window is full, the server is busy (HTTP 529), a rate limit, a bad
+request, a server error, or a failed connection; anything else is a plain
+error. An overloaded API shows as **Server is busy**. The adapter never sends
+the codes the App answers with ChatGPT account flows, so a Claude
+authentication or billing failure shows its message instead of a ChatGPT plan
+upgrade or sign-in prompt.
+
+Notices the Claude CLI would show an interactive user at once, such as a
+failed compaction, go out as `warning` notifications, each once a turn. The
+Codex App opts out of `warning` notifications in `initialize`, as it does with
+Codex, so it does not show them; other clients do get them.
+
+## The context gauge
+
+The composer's context gauge shows how full Claude's context window is: the
+size of Claude's latest request against the window of the chat's model. It
+moves while a turn runs, after each request Claude makes, as it does for
+Codex chats. Claude reports the window only when a turn ends, so in a chat's
+first turn after the adapter starts, the gauge appears once that turn ends,
+unless another chat on the same model has finished a turn since. Subagents'
+tokens count towards the chat's total but leave the gauge alone.
+
+## Branches in the sidebar
+
+A chat whose folder is a git repository shows its branch in the sidebar, as
+Codex chats do. The adapter looks up the commit, the branch and the `origin`
+remote, without any credentials in its URL, when the chat starts and again
+when each turn ends, so the label follows a branch Claude switches to or
+creates. Listing chats never runs git; switching branches by hand shows after
+the chat's next turn. Chats from before this version get their branch when
+they are next opened.
+
+## How tool calls show
+
+Claude's tool calls show as the items Codex uses for its own:
+
+- **Exploring files.** Claude's Read, Grep, Glob and LS calls show as commands
+  named after the tool, such as `Read src/app.ts` or `Grep TODO in src`, and
+  fold into an **Explored** row with the files read and the searches and
+  lists run. A Bash command that only reads, searches or lists files, such as
+  `cat`, `sed -n`, `rg`, `find` or `ls`, folds in the same way: the adapter
+  parses it as Codex parses its own commands, following `cd` and skipping
+  helpers such as `| head -n 20`. Anything else, including redirects,
+  variables and globs, shows as the plain command. So does a command that
+  can write files or start other programs, such as `find -delete`,
+  `| xargs rm` or `| tee out.txt`, even where Codex would fold it. The App
+  keeps the first 30,000 characters of a file or search result; Claude gets
+  all of it.
+- **Images.** A Read of an image file shows the image. If the Read fails, or
+  the turn stops before it ends, it shows as the failed Read instead.
+- **The web.** WebSearch shows as a web search, and WebFetch as opening the
+  page it fetches.
+- **MCP tools** show under their server's name. A server whose name contains
+  `__` is named right when the turn's MCP configuration lists it.
+- **Other Claude Code tools** show as tool calls of a `claude-code` server.
+
+When Claude Code asks before a Read, Grep, Glob or LS call, for a file outside
+the workspace for example, the App asks on the command card with the command
+the item shows. The card names a command's reads and searches only when one of
+them is the whole command, so it always shows everything that runs, and only a
+Bash command can be allowed for the rest of the session.
+
+Chats from before this version keep showing their earlier items.
 
 ## Inline visualizations
 
