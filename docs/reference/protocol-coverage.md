@@ -16,9 +16,10 @@ Implemented as real remote/runtime behavior:
   allowed tools, add dirs, file checkpointing.
 - **Turn input** — user input, and the `toolOutput` of a thread handoff as a
   `functionCallOutput` item.
-- **Approval bridge** — `Bash` → command approval; `Edit` / `Write` /
-  `MultiEdit` → file-change approval with diffs; MCP elicitation → the App's
-  form or link prompt.
+- **Approval bridge** — `Bash` and other tools → command approval; `Edit` /
+  `Write` / `MultiEdit` → file-change approval with diffs; MCP tool calls → the
+  App's MCP tool approval card; declined calls end `declined`, and cancel
+  interrupts the turn; MCP elicitation → the App's form or link prompt.
 - **Streaming** — turn started/completed, thread status changes, agent text
   deltas, reasoning deltas, command output deltas, file patches, generic tool
   item completion, hook runs, model reroutes, and aggregated git diff updates.

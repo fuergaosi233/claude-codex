@@ -6221,6 +6221,312 @@ test('approval requests round-trip through Codex server requests', {
   }
 })
 
+// A thread whose approvals reach the App, and a turn sent on it.
+async function startAskingThread(
+  reader: JsonLineReader,
+  proc: ChildProcessWithoutNullStreams,
+  id: number,
+): Promise<string> {
+  proc.stdin.write(
+    json({
+      id,
+      method: 'thread/start',
+      params: { cwd: process.cwd(), persistExtendedHistory: false, permissions: ':workspace' },
+    }),
+  )
+  return (await reader.nextResponse(id)).result.thread.id
+}
+
+function sendTurn(
+  proc: ChildProcessWithoutNullStreams,
+  id: number,
+  threadId: string,
+  text: string,
+): void {
+  proc.stdin.write(json({ id, method: 'turn/start', params: { threadId, input: textInput(text) } }))
+}
+
+function completedItem(messages: any[], itemId: string): any {
+  return messages.find(
+    (message) => message.method === 'item/completed' && message.params.item.id === itemId,
+  )?.params.item
+}
+
+test('a declined command approval ends the command declined and the turn goes on', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  try {
+    const threadId = await startAskingThread(reader, proc, 1)
+    sendTurn(proc, 2, threadId, 'please run approval bash')
+    const request = await awaitMessage(
+      reader,
+      (message) => message.method === 'item/commandExecution/requestApproval',
+    )
+    assert.equal(request.params.reason, 'mock approval reason')
+    assert.equal(request.params.cwd, process.cwd())
+    assert.deepEqual(request.params.availableDecisions, [
+      'accept',
+      'acceptForSession',
+      'decline',
+      'cancel',
+    ])
+    proc.stdin.write(json({ id: request.id, result: { decision: 'decline' } }))
+
+    const seen: any[] = []
+    const done = await awaitMessage(reader, (message) => message.method === 'turn/completed', seen)
+    assert.equal(done.params.turn.status, 'completed')
+    const item = completedItem(seen, request.params.itemId)
+    assert.equal(item.type, 'commandExecution')
+    assert.equal(item.status, 'declined')
+    assert.equal(item.exitCode, null)
+    assert.equal(item.aggregatedOutput, null)
+    assert.equal(
+      seen.some(
+        (message) =>
+          message.method === 'item/commandExecution/outputDelta' &&
+          message.params.itemId === request.params.itemId,
+      ),
+      false,
+      "Claude's refusal text is not shown as output",
+    )
+    assert.equal(
+      seen.filter(
+        (message) =>
+          message.method === 'item/completed' && message.params.item.id === request.params.itemId,
+      ).length,
+      1,
+    )
+  } finally {
+    await stopProcess(proc)
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('a cancelled approval declines the call and interrupts the turn', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  try {
+    const threadId = await startAskingThread(reader, proc, 1)
+    sendTurn(proc, 2, threadId, 'please run approval bash')
+    const request = await awaitMessage(
+      reader,
+      (message) => message.method === 'item/commandExecution/requestApproval',
+    )
+    proc.stdin.write(json({ id: request.id, result: { decision: 'cancel' } }))
+
+    const seen: any[] = []
+    const done = await awaitMessage(reader, (message) => message.method === 'turn/completed', seen)
+    assert.equal(done.params.turn.status, 'interrupted')
+    assert.equal(completedItem(seen, request.params.itemId)?.status, 'declined')
+    const late = await readQuiet(reader, 300)
+    assert.equal(
+      late.some((message) => message.method === 'turn/completed'),
+      false,
+      'the turn ends once',
+    )
+    assert.equal(completedItem(late, request.params.itemId), undefined)
+    assert.ok(
+      [...seen, ...late].some(
+        (message) =>
+          message.method === 'thread/status/changed' && message.params.status.type === 'idle',
+      ),
+    )
+
+    // The thread takes the next turn.
+    sendTurn(proc, 3, threadId, 'please run approval bash')
+    const next = await awaitMessage(
+      reader,
+      (message) => message.method === 'item/commandExecution/requestApproval',
+    )
+    proc.stdin.write(json({ id: next.id, result: { decision: 'accept' } }))
+    const nextDone = await awaitMessage(reader, (message) => message.method === 'turn/completed')
+    assert.equal(nextDone.params.turn.status, 'completed')
+  } finally {
+    await stopProcess(proc)
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('an MCP tool asks with the App tool approval card and keeps a session approval', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  try {
+    const threadId = await startAskingThread(reader, proc, 1)
+    sendTurn(proc, 2, threadId, 'mcp ask check')
+    const turnId = (await reader.nextResponse(2)).result.turn.id
+    const before: any[] = []
+    const request = await awaitMessage(
+      reader,
+      (message) => message.method === 'mcpServer/elicitation/request',
+      before,
+    )
+    assert.deepEqual(request.params, {
+      threadId,
+      turnId,
+      serverName: 'Docs Server',
+      mode: 'form',
+      message: 'Allow the Docs Server MCP server to run tool "lookup"?',
+      requestedSchema: { type: 'object', properties: {} },
+      _meta: {
+        codex_approval_kind: 'mcp_tool_call',
+        persist: 'session',
+        tool_name: 'lookup',
+        tool_params: { query: 'claude codex' },
+        reason: 'mock tool reason',
+      },
+    })
+    assert.ok(
+      before.some(
+        (message) =>
+          message.method === 'thread/status/changed' &&
+          message.params.status.activeFlags?.includes('waitingOnApproval'),
+      ),
+    )
+    proc.stdin.write(
+      json({
+        id: request.id,
+        result: { action: 'accept', content: null, _meta: { persist: 'session' } },
+      }),
+    )
+    const first: any[] = []
+    await awaitMessage(reader, (message) => message.method === 'turn/completed', first)
+    const call = first.find(
+      (message) =>
+        message.method === 'item/completed' && message.params.item.type === 'mcpToolCall',
+    )?.params.item
+    assert.equal(call?.status, 'completed')
+
+    // The same tool runs again without asking.
+    sendTurn(proc, 3, threadId, 'mcp ask check')
+    const second: any[] = []
+    await awaitMessage(reader, (message) => message.method === 'turn/completed', second)
+    assert.equal(
+      second.some((message) => message.method === 'mcpServer/elicitation/request'),
+      false,
+    )
+    assert.ok(
+      second.some(
+        (message) =>
+          message.method === 'item/completed' &&
+          message.params.item.type === 'mcpToolCall' &&
+          message.params.item.status === 'completed',
+      ),
+    )
+
+    // Another thread asks again; declining fails the call and Claude goes on.
+    const otherThreadId = await startAskingThread(reader, proc, 4)
+    sendTurn(proc, 5, otherThreadId, 'mcp ask check')
+    const again = await awaitMessage(
+      reader,
+      (message) => message.method === 'mcpServer/elicitation/request',
+    )
+    proc.stdin.write(json({ id: again.id, result: { action: 'decline', content: null } }))
+    const declined: any[] = []
+    const done = await awaitMessage(
+      reader,
+      (message) => message.method === 'turn/completed',
+      declined,
+    )
+    assert.equal(done.params.turn.status, 'completed')
+    const failed = declined.find(
+      (message) =>
+        message.method === 'item/completed' && message.params.item.type === 'mcpToolCall',
+    )?.params.item
+    assert.equal(failed?.status, 'failed')
+  } finally {
+    await stopProcess(proc)
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('other Claude tools ask as command approvals naming the tool', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  try {
+    const threadId = await startAskingThread(reader, proc, 1)
+    sendTurn(proc, 2, threadId, 'fetch ask check')
+    const before: any[] = []
+    const request = await awaitMessage(
+      reader,
+      (message) =>
+        message.method === 'item/commandExecution/requestApproval' ||
+        message.method === 'item/fileChange/requestApproval',
+      before,
+    )
+    assert.equal(request.method, 'item/commandExecution/requestApproval')
+    assert.equal(request.params.command, 'WebFetch https://example.com/docs')
+    assert.equal(request.params.reason, 'mock tool reason')
+    const item = before.find(
+      (message) =>
+        message.method === 'item/started' && message.params.item.id === request.params.itemId,
+    )?.params.item
+    assert.equal(item?.type, 'mcpToolCall')
+    proc.stdin.write(json({ id: request.id, result: { decision: 'acceptForSession' } }))
+    await awaitMessage(reader, (message) => message.method === 'turn/completed')
+
+    // The same call runs again without asking.
+    sendTurn(proc, 3, threadId, 'fetch ask check')
+    const second: any[] = []
+    await awaitMessage(reader, (message) => message.method === 'turn/completed', second)
+    assert.equal(
+      second.some((message) => message.method === 'item/commandExecution/requestApproval'),
+      false,
+    )
+
+    // A call Claude offers no "always allow" for gets no session choice.
+    const strictThreadId = await startAskingThread(reader, proc, 4)
+    sendTurn(proc, 5, strictThreadId, 'fetch ask check strict')
+    const strict = await awaitMessage(
+      reader,
+      (message) => message.method === 'item/commandExecution/requestApproval',
+    )
+    assert.deepEqual(strict.params.availableDecisions, ['accept', 'decline', 'cancel'])
+    proc.stdin.write(json({ id: strict.id, result: { decision: 'accept' } }))
+    await awaitMessage(reader, (message) => message.method === 'turn/completed')
+  } finally {
+    await stopProcess(proc)
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('a call Claude refuses without asking ends declined', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  try {
+    const threadId = await startAskingThread(reader, proc, 1)
+    sendTurn(proc, 2, threadId, 'denied ask check')
+    const seen: any[] = []
+    const done = await awaitMessage(reader, (message) => message.method === 'turn/completed', seen)
+    assert.equal(done.params.turn.status, 'completed')
+    assert.equal(
+      seen.some((message) => /requestApproval$/.test(String(message.method ?? ''))),
+      false,
+    )
+    const command = seen.find(
+      (message) =>
+        message.method === 'item/completed' && message.params.item.type === 'commandExecution',
+    )?.params.item
+    assert.equal(command?.command, 'rm -rf build')
+    assert.equal(command?.status, 'declined')
+    assert.equal(command?.exitCode, null)
+    assert.ok(
+      seen.some(
+        (message) =>
+          message.method === 'warning' &&
+          message.params.message === 'Permission denied for Bash: matches a deny rule',
+      ),
+    )
+  } finally {
+    await stopProcess(proc)
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('generic Claude tools complete as Codex mcpToolCall items', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {

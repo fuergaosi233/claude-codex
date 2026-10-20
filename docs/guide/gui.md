@@ -10,7 +10,9 @@ Once the shim and exports are installed and the adapter is built:
    - `Bash` calls surface as Codex **command approvals**.
    - `Edit` / `Write` / `MultiEdit` surface as **file-change approvals** with a
      live diff.
-3. Approve actions in the Codex App UI as usual.
+   - Other tools surface as command approvals naming the tool and what it
+     touches, and MCP tools as the App's **MCP tool approval** card.
+3. Approve actions in the Codex App UI as usual (see [Approvals](#approvals)).
 4. Disconnecting closes the proxy. Once no turn is active, the daemon idles out
    and the in-process Claude runtime is reclaimed.
 
@@ -43,6 +45,31 @@ which the App shows as a plan card. When the turn ends the App asks
 the plan as a new turn, in which Claude carries it out; writing feedback instead
 keeps Plan mode on for a revised plan. In Plan mode a tool call that would need
 your approval (a command, an edit) is refused rather than asked about.
+
+## Approvals
+
+Outside Full access, Claude asks before it runs a command, edits a file, or
+uses another tool its permission mode does not already allow, and the App
+shows the approval card a Codex chat would:
+
+- **Commands** (`Bash`) and other Claude tools ask as command approvals. A tool
+  that is not a shell command shows its name and what it touches, such as
+  `WebFetch https://example.com`. The card carries Claude's reason for asking
+  when it gives one.
+- **Edits** (`Edit`, `Write`, `MultiEdit`) ask as file-change approvals with the
+  diff.
+- **MCP tools** ask with the App's MCP tool approval card: "Allow the *server*
+  MCP server to run tool *name*?", with the call's arguments.
+
+**Allow for this session** approves the same command, the same tool call, or
+for an MCP tool every call of that tool, for the rest of the thread while the
+adapter runs; it is not saved, and "always allow" is not offered. For an edit it
+approves only that edit.
+
+**Decline** refuses the call: its card shows as declined, and Claude is told and
+goes on. **Cancel** refuses it and stops the turn, as the Stop button does. A
+call Claude refuses on its own (a deny rule, its permission mode) also shows as
+declined, with a warning saying why.
 
 ## Skills and the App's tools
 

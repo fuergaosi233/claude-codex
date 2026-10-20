@@ -1931,6 +1931,88 @@ test('native SDK permission allow result carries original input for SDK validati
   assert.equal(requests.length, 1)
 })
 
+test('native SDK approvals carry why Claude asks and how the user answered', async () => {
+  const runtime = new NativeClaudeRuntime()
+  const requests: any[] = []
+  const decisions: string[] = []
+  const context = { threadId: 'thread', turnId: 'turn' }
+  const current = {
+    context,
+    resolved: false,
+    handlers: {
+      onPermissionRequest: async (event: unknown) => {
+        requests.push(event)
+        return { decision: decisions.shift() }
+      },
+    },
+  }
+  const makeCanUseTool = Reflect.get(runtime, 'makeCanUseTool')
+  const canUseTool = makeCanUseTool.call(runtime, () => ({ current, lastContext: context }))
+  const signal = new AbortController().signal
+
+  // Decline refuses only this call; cancel also stops the turn.
+  decisions.push('decline', 'cancel')
+  assert.deepEqual(
+    await canUseTool('Bash', { command: 'rm -rf build' }, { toolUseID: 'tool-1', signal }),
+    { behavior: 'deny', message: 'declined by user' },
+  )
+  assert.deepEqual(
+    await canUseTool('Bash', { command: 'rm -rf build' }, { toolUseID: 'tool-2', signal }),
+    { behavior: 'deny', message: 'cancelled by user', interrupt: true },
+  )
+  assert.equal(requests[0].reason, null)
+  assert.equal(requests[0].mcpServer, null)
+  assert.equal(requests[0].suppressSessionApproval, undefined)
+
+  decisions.push('accept')
+  await canUseTool(
+    'mcp__docs__lookup',
+    { query: 'claude codex' },
+    {
+      toolUseID: 'tool-3',
+      signal,
+      decisionReason: ' Matches an ask rule ',
+      title: 'Claude wants to use lookup',
+      blockedPath: '/repo/notes.md',
+      mcpServer: { name: 'Docs Server', source: 'project' },
+      suppressAlwaysAllowRule: true,
+    },
+  )
+  assert.equal(requests[2].toolUseId, 'tool-3')
+  assert.equal(requests[2].reason, 'Matches an ask rule')
+  assert.equal(requests[2].title, 'Claude wants to use lookup')
+  assert.equal(requests[2].blockedPath, '/repo/notes.md')
+  assert.equal(requests[2].mcpServer, 'Docs Server')
+  assert.equal(requests[2].suppressSessionApproval, true)
+})
+
+test('native SDK auto-denials decline the call and say why', async () => {
+  const runtime = new NativeClaudeRuntime()
+  const events: any[] = []
+  const pending = { handlers: { onEvent: async (event: unknown) => events.push(event) } }
+  const handleSystem = Reflect.get(runtime, 'handleSystem')
+
+  await handleSystem.call(runtime, pending, {
+    subtype: 'permission_denied',
+    tool_name: 'Bash',
+    tool_use_id: 'tool-1',
+    decision_reason_type: 'rule',
+    decision_reason: 'matches a deny rule',
+    message: 'Permission to use Bash has been denied.',
+  })
+  await handleSystem.call(runtime, pending, { subtype: 'permission_denied', tool_name: 'Write' })
+
+  assert.deepEqual(events, [
+    { type: 'tool_denied', toolUseId: 'tool-1' },
+    {
+      type: 'notice',
+      level: 'warning',
+      message: 'Permission denied for Bash: matches a deny rule',
+    },
+    { type: 'notice', level: 'warning', message: 'Permission denied for Write' },
+  ])
+})
+
 test('native SDK permission request between turns falls back to the standing policy', async () => {
   const runtime = new NativeClaudeRuntime()
   const makeCanUseTool = Reflect.get(runtime, 'makeCanUseTool')

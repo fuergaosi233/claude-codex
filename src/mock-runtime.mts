@@ -231,6 +231,7 @@ export class MockRuntime implements ClaudeRuntime {
             toolUseId,
             toolName: 'Bash',
             input: { command: 'echo mock approval' },
+            reason: 'mock approval reason',
           })
       if (decision.decision === 'accept' || decision.decision === 'acceptForSession') {
         await handlers.onEvent({ type: 'tool_output_delta', toolUseId, delta: 'mock approval\n' })
@@ -276,6 +277,58 @@ export class MockRuntime implements ClaudeRuntime {
           isError: true,
         })
       }
+    }
+
+    // An MCP tool or a tool that is neither a command nor an edit asks for
+    // approval; "denied" has Claude refuse a command without asking.
+    const askTool = /(mcp|fetch|denied) ask check/i.exec(context.prompt)
+    if (askTool) {
+      const kind = (askTool[1] ?? '').toLowerCase()
+      const toolUseId = `tool-${Date.now()}`
+      const toolName =
+        kind === 'mcp' ? 'mcp__Docs_Server__lookup' : kind === 'fetch' ? 'WebFetch' : 'Bash'
+      const input: Record<string, unknown> =
+        kind === 'mcp'
+          ? { query: 'claude codex' }
+          : kind === 'fetch'
+            ? { url: 'https://example.com/docs', prompt: 'Summarize the page' }
+            : { command: 'rm -rf build' }
+      await handlers.onEvent({ type: 'tool_use', toolUseId, toolName, input })
+      if (kind === 'denied') {
+        await handlers.onEvent({ type: 'tool_denied', toolUseId })
+        await handlers.onEvent({
+          type: 'notice',
+          level: 'warning',
+          message: 'Permission denied for Bash: matches a deny rule',
+        })
+        await handlers.onEvent({
+          type: 'tool_result',
+          toolUseId,
+          content: 'Permission to use Bash has been denied.',
+          isError: true,
+        })
+      } else {
+        const decision = await handlers.onPermissionRequest({
+          type: 'permission_request',
+          requestId: `perm-${toolUseId}`,
+          toolUseId,
+          toolName,
+          input,
+          reason: 'mock tool reason',
+          ...(kind === 'mcp' ? { mcpServer: 'Docs Server' } : {}),
+          ...(/strict/i.test(context.prompt) ? { suppressSessionApproval: true } : {}),
+        })
+        const allowed = decision.decision === 'accept' || decision.decision === 'acceptForSession'
+        await handlers.onEvent({
+          type: 'tool_result',
+          toolUseId,
+          content: allowed ? `${toolName} ran` : `${decision.decision} by user`,
+          isError: !allowed,
+        })
+      }
+      await handlers.onEvent({ type: 'text_delta', delta: `${kind} ask done` })
+      await handlers.onEvent({ type: 'completed', success: true, result: `${kind} ask done` })
+      return
     }
 
     if (/todo|checklist|plan list/i.test(context.prompt)) {

@@ -1,7 +1,7 @@
 import { type ChildProcess, execFile, spawn } from 'node:child_process'
 import { existsSync, type FSWatcher, readFileSync, watch, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, isAbsolute, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { rendersCompletedSubagentActivity, unverifiedAppWarning } from './app-compat.mjs'
@@ -58,6 +58,7 @@ import { normalizeRuntimeType } from './runtime-config.mjs'
 import {
   addedFileDiff,
   allSelectableModelOptions,
+  approvalSessionKey,
   asRecord,
   buildSystemPromptAddendum,
   coerceStructuredValue,
@@ -117,6 +118,7 @@ import {
   threadPermissionProfileId,
   todoWriteToPlanSteps,
   tokenBreakdownFromClaudeUsage,
+  toolApprovalCommand,
   toolResultText,
   userInputAnswersAsContent,
   visualizationDirNote,
@@ -422,7 +424,9 @@ export class CodexClaudeAppServer {
   private pendingAutonomousTurns = new Set<string>()
   private lastTurnParamsByThread = new Map<string, Record<string, unknown>>()
   private fuzzySessions = new Map<string, { roots: string[] }>()
-  private commandSessionAllow = new Map<string, Set<string>>()
+  // Approvals the user gave "for this session", by thread: a command, a
+  // non-edit tool call, or an MCP tool (see approvalSessionKey).
+  private sessionApprovals = new Map<string, Set<string>>()
   private commandProcesses = new Map<string, ChildProcess>()
   private processHandles = new Map<string, ChildProcess>()
   private fsWatchers = new Map<string, FSWatcher>()
@@ -1737,12 +1741,12 @@ export class CodexClaudeAppServer {
     return {}
   }
 
-  // Drops per-thread in-memory state (session-scoped command approvals, token
+  // Drops per-thread in-memory state (session-scoped approvals, token
   // usage tallies, goal bookkeeping, elicitation counts) so an archived thread
   // does not leak entries for the lifetime of the process. The goal itself and
   // the queue stay persisted for an unarchive.
   private clearThreadState(threadId: string): void {
-    this.commandSessionAllow.delete(threadId)
+    this.sessionApprovals.delete(threadId)
     this.tokenUsageByThread.delete(threadId)
     this.lastCallUsageByThread.delete(threadId)
     this.lastUsageByThread.delete(threadId)
@@ -3527,6 +3531,37 @@ export class CodexClaudeAppServer {
       }
       openToolItems.clear()
     }
+    // App rule: declined-tool-items
+    // Tool calls the user declined or Claude refused without asking. Like a
+    // Codex thread's, a command or a patch ends declined, without output or
+    // an exit code, as soon as it is refused; Claude's refusal result is not
+    // shown. An MCP tool call has no declined state: its result ends it as
+    // failed.
+    const declinedToolUseIds = new Set<string>()
+    const declineToolItem = (toolUseId: string): void => {
+      const itemId = itemIds.get(toolUseId)
+      if (!itemId || !openToolItems.has(itemId)) return
+      const updated = this.store.updateItem(turn.id, itemId, (item) => {
+        if (item.type === 'commandExecution')
+          return {
+            ...item,
+            status: 'declined',
+            aggregatedOutput: null,
+            exitCode: null,
+            durationMs: null,
+          }
+        if (item.type === 'fileChange') return { ...item, status: 'declined' }
+        return item
+      })
+      const item = updated?.items.find((candidate) => candidate.id === itemId)
+      if (item?.type !== 'commandExecution' && item?.type !== 'fileChange') return
+      openToolItems.delete(itemId)
+      declinedToolUseIds.add(toolUseId)
+      this.notify(peer, {
+        method: 'item/completed',
+        params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
+      })
+    }
 
     // Allow per-turn override of policy (Codex App may attach updated values
     // when the user toggles Full access mid-conversation), then fall back to
@@ -4340,7 +4375,7 @@ export class CodexClaudeAppServer {
               if (activeSubagents.size === 0 && !workflowInFlight) disarmWatchdog()
             }
             const itemId = itemIds.get(event.toolUseId)
-            if (!itemId) return
+            if (!itemId || declinedToolUseIds.has(event.toolUseId)) return
             openToolItems.delete(itemId)
             const resultText = toolResultText(event.content)
             const durationMs = (() => {
@@ -4403,6 +4438,10 @@ export class CodexClaudeAppServer {
           }
           if (event.type === 'proposed_plan') {
             if (event.text.trim()) deliverPlan(event.text)
+            return
+          }
+          if (event.type === 'tool_denied') {
+            declineToolItem(event.toolUseId)
             return
           }
           if (event.type === 'notice') {
@@ -4567,13 +4606,14 @@ export class CodexClaudeAppServer {
           }
           const decision = await this.requestApproval(peer, thread.id, turn.id, itemId, event)
           if (!turnIsActive()) return { decision: 'cancel' }
-          if (decision.decision === 'acceptForSession') {
-            const command = String(event.input.command ?? '')
-            if (command) {
-              const set = this.commandSessionAllow.get(thread.id) ?? new Set<string>()
-              set.add(command)
-              this.commandSessionAllow.set(thread.id, set)
-            }
+          if (decision.decision === 'decline' || decision.decision === 'cancel')
+            declineToolItem(event.toolUseId)
+          if (decision.decision === 'cancel') {
+            // Cancel declines the call and stops the turn, as on a Codex
+            // thread. The turn ends interrupted now, so what Claude sends
+            // while it stops is dropped like after turn/interrupt.
+            this.settleInterruptedTurn(peer, thread.id, turn.id)
+            void this.runtime.interrupt(thread.id).catch(() => {})
           }
           return decision
         },
@@ -5721,40 +5761,58 @@ export class CodexClaudeAppServer {
     ) {
       return { decision: 'accept' }
     }
-    const command = String(event.input.command ?? '')
-    if (command && this.commandSessionAllow.get(threadId)?.has(command)) {
-      return { decision: 'accept' }
+    // App rule: mcp-tool-approval
+    const mcpTool = /^mcp__(.+?)__(.+)$/.exec(event.toolName)
+    if (mcpTool) {
+      const server = event.mcpServer || mcpTool[1] || ''
+      return this.requestMcpToolApproval(peer, threadId, turnId, event, server, mcpTool[2] ?? '')
     }
+    const sessionKey = approvalSessionKey(event.toolName, event.input)
+    if (this.sessionApprovals.get(threadId)?.has(sessionKey)) return { decision: 'accept' }
 
     this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: ['waitingOnApproval'] })
     const requestId = newId()
-    const isCommand = event.toolName === 'Bash'
-    const method = isCommand
-      ? 'item/commandExecution/requestApproval'
-      : 'item/fileChange/requestApproval'
-    const params = isCommand
+    const reason = event.reason || event.title || null
+    // App rule: command-approval-card
+    // The App draws a patch approval from the fileChange item it belongs to,
+    // so only an edit asks as one. Any other tool asks as a command, with the
+    // tool's name and what it touches in place of a shell command.
+    const isFileChange =
+      this.store.getTurn(turnId)?.items.find((item) => item.id === itemId)?.type === 'fileChange'
+    const method = isFileChange
+      ? 'item/fileChange/requestApproval'
+      : 'item/commandExecution/requestApproval'
+    const blockedPath = event.blockedPath ?? null
+    const params = isFileChange
       ? {
           threadId,
           turnId,
           itemId,
           startedAtMs: nowMillis(),
-          approvalId: requestId,
-          reason: null,
-          command,
-          cwd: String(event.input.cwd ?? ''),
-          commandActions: [],
-          additionalPermissions: null,
-          proposedExecpolicyAmendment: null,
-          proposedNetworkPolicyAmendments: null,
-          availableDecisions: ['accept', 'acceptForSession', 'decline', 'cancel'],
+          reason,
+          // The folder outside the workspace the edit asks to write in. The
+          // adapter grants no more than this edit, even for the session.
+          grantRoot: blockedPath && isAbsolute(blockedPath) ? dirname(blockedPath) : null,
         }
       : {
           threadId,
           turnId,
           itemId,
           startedAtMs: nowMillis(),
-          reason: null,
-          grantRoot: null,
+          approvalId: requestId,
+          reason,
+          command:
+            event.toolName === 'Bash'
+              ? String(event.input.command ?? '')
+              : toolApprovalCommand(event.toolName, event.input),
+          cwd: String(event.input.cwd ?? thread?.cwd ?? ''),
+          commandActions: [],
+          additionalPermissions: null,
+          proposedExecpolicyAmendment: null,
+          proposedNetworkPolicyAmendments: null,
+          availableDecisions: event.suppressSessionApproval
+            ? ['accept', 'decline', 'cancel']
+            : ['accept', 'acceptForSession', 'decline', 'cancel'],
         }
 
     let response: unknown
@@ -5765,7 +5823,69 @@ export class CodexClaudeAppServer {
       this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
     }
     const decision = normalizeDecision(response)
+    if (decision === 'acceptForSession' && !isFileChange && !event.suppressSessionApproval)
+      this.rememberSessionApproval(threadId, sessionKey)
     return { decision }
+  }
+
+  private rememberSessionApproval(threadId: string, key: string): void {
+    const approvals = this.sessionApprovals.get(threadId) ?? new Set<string>()
+    approvals.add(key)
+    this.sessionApprovals.set(threadId, approvals)
+  }
+
+  // A Claude MCP tool call asks as a Codex one does: an MCP elicitation the
+  // App draws as its tool approval card, with "Allow for this session" when
+  // Claude offers one. "Always allow" is not offered.
+  private async requestMcpToolApproval(
+    peer: RpcPeer,
+    threadId: string,
+    turnId: string,
+    event: Extract<RuntimeEvent, { type: 'permission_request' }>,
+    server: string,
+    tool: string,
+  ): Promise<PermissionDecision> {
+    const sessionKey = JSON.stringify(['mcp', event.toolName])
+    if (this.sessionApprovals.get(threadId)?.has(sessionKey)) return { decision: 'accept' }
+    const allowSession = !event.suppressSessionApproval
+    const reason = event.reason || event.title || null
+    let response: Record<string, unknown>
+    try {
+      response = await this.sendElicitation(
+        peer,
+        threadId,
+        newId(),
+        {
+          threadId,
+          turnId,
+          serverName: server,
+          mode: 'form',
+          message: `Allow the ${server} MCP server to run tool "${tool}"?`,
+          requestedSchema: { type: 'object', properties: {} },
+          _meta: {
+            codex_approval_kind: 'mcp_tool_call',
+            ...(allowSession ? { persist: 'session' } : {}),
+            tool_name: tool,
+            tool_params: event.input,
+            ...(reason ? { reason } : {}),
+          },
+        },
+        'waitingOnApproval',
+      )
+    } catch {
+      // The App could not answer: refuse this call and let Claude go on.
+      return { decision: 'decline' }
+    }
+    if (response.action === 'decline') return { decision: 'decline' }
+    if (response.action !== 'accept') return { decision: 'cancel' }
+    const meta = response._meta
+    const persist =
+      meta && typeof meta === 'object' ? (meta as Record<string, unknown>).persist : null
+    if (allowSession && persist === 'session') {
+      this.rememberSessionApproval(threadId, sessionKey)
+      return { decision: 'acceptForSession' }
+    }
+    return { decision: 'accept' }
   }
 
   private async requestUserInput(
@@ -5823,29 +5943,53 @@ export class CodexClaudeAppServer {
             mode: 'form',
             requestedSchema: { properties: {}, ...request.requestedSchema, type: 'object' },
           }
-    this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: ['waitingOnUserInput'] })
-    let response: unknown
+    let result: Record<string, unknown>
     try {
-      response = await this.sendServerRequest(
+      result = await this.sendElicitation(
         peer,
-        'mcpServer/elicitation/request',
+        threadId,
         requestId,
         params,
+        'waitingOnUserInput',
         signal,
       )
     } catch {
       return { action: 'cancel' }
-    } finally {
-      this.notify(peer, { method: 'serverRequest/resolved', params: { threadId, requestId } })
-      this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
     }
-    const result = (response ?? {}) as Record<string, unknown>
     const action =
       result.action === 'accept' || result.action === 'decline' ? result.action : 'cancel'
     const content = result.content
     return action === 'accept' && content && typeof content === 'object' && !Array.isArray(content)
       ? { action, content: content as Record<string, unknown> }
       : { action }
+  }
+
+  // Sends an mcpServer/elicitation/request and returns the App's answer. The
+  // thread waits on input for an MCP server's form or link, and on approval
+  // for a tool approval card.
+  private async sendElicitation(
+    peer: RpcPeer,
+    threadId: string,
+    requestId: string,
+    params: Record<string, unknown>,
+    flag: 'waitingOnApproval' | 'waitingOnUserInput',
+    signal?: AbortSignal,
+  ): Promise<Record<string, unknown>> {
+    this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [flag] })
+    try {
+      return asRecord(
+        await this.sendServerRequest(
+          peer,
+          'mcpServer/elicitation/request',
+          requestId,
+          params,
+          signal,
+        ),
+      )
+    } finally {
+      this.notify(peer, { method: 'serverRequest/resolved', params: { threadId, requestId } })
+      this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
+    }
   }
 
   private async turnInterrupt(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
@@ -5861,7 +6005,19 @@ export class CodexClaudeAppServer {
     // Neither does a foreground child: it runs inside its parent's turn.
     if (await this.stopForegroundSubagent(peer, threadId)) return {}
     const activeTurnId = this.activeTurnByThread.get(threadId)
-    const turnId = activeTurnId || requestedTurnId
+    this.settleInterruptedTurn(peer, threadId, activeTurnId || requestedTurnId)
+    // Persist the terminal state before asking the SDK to abort. A few SDK
+    // versions deliver one or two buffered tool events during interrupt; the
+    // runRuntimeTurn guard now rejects them because the turn is no longer
+    // active, so they cannot create an orphan child after this point.
+    const interrupting = this.runtime.interrupt(threadId)
+    await interrupting
+    return {}
+  }
+
+  // Ends a thread's running turn as interrupted and leaves the thread idle:
+  // for turn/interrupt, and for an approval the user cancelled.
+  private settleInterruptedTurn(peer: RpcPeer, threadId: string, turnId: string): void {
     if (turnId) {
       const turn = this.store.getTurn(turnId)
       if (turn?.status === 'inProgress') {
@@ -5893,13 +6049,6 @@ export class CodexClaudeAppServer {
     this.pendingAutonomousTurns.delete(threadId)
     this.clearActiveTurn(threadId)
     this.setThreadStatus(peer, threadId, { type: 'idle' })
-    // Persist the terminal state before asking the SDK to abort. A few SDK
-    // versions deliver one or two buffered tool events during interrupt; the
-    // runRuntimeTurn guard now rejects them because the turn is no longer
-    // active, so they cannot create an orphan child after this point.
-    const interrupting = this.runtime.interrupt(threadId)
-    await interrupting
-    return {}
   }
 
   private async turnSteer(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {

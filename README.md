@@ -59,9 +59,9 @@ Codex App ──SSH──▶ login shell ──▶ codex (shim, earlier in PATH)
                   everything else  ──────▶ real Codex CLI (CODEX_REAL)
 ```
 
-Agent text and reasoning stream into the conversation; `Bash` becomes command
-approvals; `Edit`/`Write`/`MultiEdit` become file-change approvals with live
-diffs. Runtime selection maps only to existing backend paths today: default
+Agent text and reasoning stream into the conversation; `Bash` and other tools
+become command approvals; `Edit`/`Write`/`MultiEdit` become file-change
+approvals with live diffs; MCP tool calls get the App's MCP tool approval card. Runtime selection maps only to existing backend paths today: default
 in-process Claude Agent SDK, `agent-http`, `agentapi`, `claude-p`, `codex-proxy`,
 and `mock`.
 

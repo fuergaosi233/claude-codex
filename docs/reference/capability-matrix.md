@@ -48,8 +48,11 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 | --- | --- | --- |
 | Claude Code tools | Supported | Not restricted by default; set `CLAUDE_CODEX_ALLOWED_TOOLS` to restrict. |
 | Approval policy / sandbox | Supported | App's approvalPolicy + sandbox persist on the thread and map to Claude permission_mode. "Full access" drops the can_use_tool callback; read-only restricts tools to read/search. |
-| Bash approval | Supported | can_use_tool → Codex `item/commandExecution/requestApproval`. Bypassed when approvalPolicy=never / Full access. |
-| File edit approval | Supported | Edit/Write/MultiEdit → Codex fileChange items with approval + diff updates. |
+| Bash approval | Supported | can_use_tool → Codex `item/commandExecution/requestApproval`, with Claude's reason for asking. Bypassed when approvalPolicy=never / Full access. "Allow for this session" approves the same command for the rest of the thread. |
+| File edit approval | Supported | Edit/Write/MultiEdit → Codex fileChange items with approval + diff updates, Claude's reason, and the folder outside the workspace as `grantRoot`; session approval grants no more than the edit. |
+| Other tool approval | Supported | Any other Claude tool (WebFetch, NotebookEdit, Skill, …) asks with a command approval naming the tool and what it touches ("WebFetch https://…"); session approval covers the same call. |
+| MCP tool approval | Supported | An `mcp__<server>__<tool>` call asks with the App's MCP tool approval card (`mcpServer/elicitation/request`, `_meta.codex_approval_kind: "mcp_tool_call"`), as Codex does. "Allow for this session" approves the tool for the rest of the thread while the adapter runs; "always allow" is not offered. |
+| Declined and cancelled calls | Supported | Declining ends a command or file-change item as `declined`, without output or an exit code, and Claude goes on; an MCP tool call ends failed. Cancel also stops the turn, which ends `interrupted`. A call Claude refuses without asking (a deny rule, the permission mode) ends declined too, next to a warning. |
 | Bash output | Supported | Forwarded as command output on completion (SDK has no incremental tool-output streaming). |
 | Generic Claude tools | Supported | Non-command/file tools → mcpToolCall items under the `claude-code` pseudo server. |
 | Subagent (Task) | Supported | Task spawns an ephemeral child thread and emits native `subAgentActivity` lifecycle events (capability-gated `completed`) plus `spawnAgent`/`wait` tool state; inner events are hidden, and the final result lands as one agentMessage on the child thread. |
@@ -147,7 +150,7 @@ codex.
   under the system temp dir.
 - git diff / file-listing failures are written to the debug log (distinguishing
   "not a git repository" from real errors) rather than swallowed.
-- Per-thread in-memory state (command approvals, token usage, goals, elicitation
+- Per-thread in-memory state (session approvals, token usage, goals, elicitation
   counts) is released when a thread is archived.
 - A Claude CLI that outlives its adapter (killed, or slow to exit after
   SIGTERM) is stopped by the next adapter on the same state dir before it

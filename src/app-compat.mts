@@ -238,6 +238,30 @@ export const APP_RULES: readonly AppRule[] = [
     verify:
       'Open a new chat without sending anything, restart the adapter and reload the App: no empty chat shows in the sidebar.',
   },
+  {
+    id: 'command-approval-card',
+    app: "Draws an item/commandExecution/requestApproval card from its params alone (command, cwd, reason, availableDecisions), but draws an item/fileChange/requestApproval card only for a fileChange item with the request's itemId; without one the request shows nothing and the turn waits.",
+    adapter:
+      'Asks for an Edit, Write or MultiEdit (a fileChange item) as a file change, and for any other Claude tool as a command: Bash with its command, other tools with their name and what they touch ("WebFetch https://…"). Claude\'s reason for asking is the card\'s reason.',
+    verify:
+      'In a Claude chat in the default permissions mode, have Claude fetch a web page: the approval card names WebFetch and the URL, and approving runs it.',
+  },
+  {
+    id: 'mcp-tool-approval',
+    app: 'Draws an mcpServer/elicitation/request whose _meta.codex_approval_kind is mcp_tool_call as a tool approval card: the message as its title, _meta.reason, the tool_params, and an "Allow for this session" choice when _meta.persist offers session. It answers accept, decline or cancel, with _meta.persist "session" for that choice.',
+    adapter:
+      'Asks for an mcp__<server>__<tool> call with that elicitation, as Codex does for its MCP tools, offering session approval unless Claude offers no "always allow" for the call. "Allow for this session" approves that tool for the rest of the thread in this adapter process; "always" is not offered.',
+    verify:
+      'Have Claude call a tool of a configured MCP server: the card asks to allow that server to run the tool, and after "Allow for this session" the next call of the tool does not ask.',
+  },
+  {
+    id: 'declined-tool-items',
+    app: 'Shows a commandExecution or fileChange item with status declined as declined: no output, no exit code, and a declined patch is not counted as changed files.',
+    adapter:
+      'Ends the item of a call the user declined or cancelled, or Claude refused without asking, as declined, and does not show the refusal text Claude gets as its result. Cancel also ends the turn as interrupted.',
+    verify:
+      'Decline a command approval in a Claude chat: the command shows as declined, not failed, and Claude goes on; cancel one: the turn stops.',
+  },
 ]
 
 // The methods the App starts calling, or sends new parameters to, once the

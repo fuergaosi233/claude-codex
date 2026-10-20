@@ -508,7 +508,23 @@ export type RuntimeEvent =
       toolUseId: string
       toolName: string
       input: Record<string, unknown>
+      // Why Claude asks (a matched rule, a hook, a path outside the
+      // workspace), shown on the approval card.
+      reason?: string | null
+      // Claude's own one-line prompt for the request ("Claude wants to read
+      // foo.txt"), used when it gives no reason.
+      title?: string | null
+      // The path outside the allowed folders that made Claude ask.
+      blockedPath?: string | null
+      // The MCP server an mcp__ tool belongs to.
+      mcpServer?: string | null
+      // Claude offers no "always allow" for this call, so the card offers no
+      // session approval either.
+      suppressSessionApproval?: boolean
     }
+  // Claude refused a tool call without asking (a deny rule, a hook, the
+  // permission mode).
+  | { type: 'tool_denied'; toolUseId: string }
   | {
       type: 'user_input_request'
       requestId: string

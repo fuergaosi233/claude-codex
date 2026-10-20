@@ -48,6 +48,9 @@ line a rule touches.
 | `additional-context` | attaches `additionalContext` entries (`untrusted` or `application`) to `turn/start` and `turn/steer`, for example after connecting a suggested plugin, and keeps them out of the user's message | the turn after connecting a plugin uses the context; the message shows none of it |
 | `app-tool-availability` | writes developer instructions describing its own tools (`create_thread`, `automation_update`, `create_worktree`, …) and gives them to Codex threads only | asked for a new thread or worktree, Claude points to the App; tool names new in the build's instructions are added to the list in `src/turn-context.mts` |
 | `prewarmed-threads` | starts a new chat's thread before anything is sent, hides it from `thread/list` until its first `turn/start`, and forgets it when the connection drops or the App quits | after an adapter restart, a new chat left empty does not show in the sidebar |
+| `command-approval-card` | draws a command approval from its params alone, but a file change approval only for a `fileChange` item with the request's `itemId` | a WebFetch approval in a Claude chat names the tool and the URL |
+| `mcp-tool-approval` | draws an `mcpServer/elicitation/request` with `_meta.codex_approval_kind` `mcp_tool_call` as a tool approval card, and answers "Allow for this session" with `_meta.persist` `session` | an MCP tool call asks to allow the server to run the tool; after "Allow for this session" the next call does not ask |
+| `declined-tool-items` | shows a `commandExecution` or `fileChange` item with status `declined` as declined, without output or an exit code | a declined command shows as declined and Claude goes on; a cancelled one stops the turn |
 
 The full text of each rule, including the adapter side, is in
 `src/app-compat.mts`.

@@ -683,9 +683,18 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     return async (
       toolName: string,
       input: Record<string, unknown>,
-      options: { toolUseID?: string; signal: AbortSignal },
+      options: {
+        toolUseID?: string
+        signal: AbortSignal
+        decisionReason?: string
+        title?: string
+        blockedPath?: string
+        mcpServer?: { name: string; source: string }
+        suppressAlwaysAllowRule?: boolean
+      },
     ): Promise<
-      { behavior: 'allow'; updatedInput?: unknown } | { behavior: 'deny'; message: string }
+      | { behavior: 'allow'; updatedInput?: unknown }
+      | { behavior: 'deny'; message: string; interrupt?: boolean }
     > => {
       if (toolName.startsWith(`mcp__${GOAL_MCP_SERVER}__`)) return { behavior: 'allow' }
       const toolUseId = options.toolUseID || `tool-${newId()}`
@@ -760,6 +769,11 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
             toolUseId,
             toolName,
             input,
+            reason: options.decisionReason?.trim() || null,
+            title: options.title?.trim() || null,
+            blockedPath: options.blockedPath || null,
+            mcpServer: options.mcpServer?.name || null,
+            ...(options.suppressAlwaysAllowRule ? { suppressSessionApproval: true } : {}),
           }),
         ).then((d) => {
           // The handler may resolve synchronously via the App's permission
@@ -772,7 +786,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       if (decision.decision === 'accept' || decision.decision === 'acceptForSession') {
         return { behavior: 'allow', updatedInput: decision.updatedInput ?? input }
       }
-      return { behavior: 'deny', message: 'denied by user' }
+      // Cancel stops the turn, as it does for a Codex thread; decline only
+      // refuses this call and lets Claude go on.
+      if (decision.decision === 'cancel') {
+        return { behavior: 'deny', message: 'cancelled by user', interrupt: true }
+      }
+      return { behavior: 'deny', message: 'declined by user' }
     }
   }
 
@@ -1769,12 +1788,18 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     }
     if (subtype === 'permission_denied') {
       // The SDK auto-denied a tool call (auto-mode classifier, deny rule, etc).
-      // Surface as a notice so the user sees why nothing happened.
-      const toolName = String((message as Record<string, unknown>).tool_name ?? 'tool')
+      // The call's item shows as declined, and a notice says why nothing
+      // happened.
+      const toolName = String(message.tool_name ?? 'tool')
+      const toolUseId = stringOrNull(message.tool_use_id)
+      if (toolUseId) await pending.handlers.onEvent({ type: 'tool_denied', toolUseId })
+      const reason = stringOrNull(message.decision_reason)?.trim()
       await pending.handlers.onEvent({
         type: 'notice',
         level: 'warning',
-        message: `Permission denied for ${toolName}`,
+        message: reason
+          ? `Permission denied for ${toolName}: ${reason}`
+          : `Permission denied for ${toolName}`,
       })
       return
     }

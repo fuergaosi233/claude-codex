@@ -1019,6 +1019,44 @@ export function normalizeDecision(response: unknown): PermissionDecision['decisi
   return 'decline'
 }
 
+// What an approval "for this session" covers: a shell command by its exact
+// text, any other tool by its exact input.
+export function approvalSessionKey(toolName: string, input: Record<string, unknown>): string {
+  if (toolName === 'Bash') return JSON.stringify(['command', String(input.command ?? '')])
+  return JSON.stringify(['tool', toolName, input])
+}
+
+const APPROVAL_SUMMARY_KEYS = [
+  'url',
+  'file_path',
+  'notebook_path',
+  'path',
+  'skill',
+  'pattern',
+  'query',
+  'description',
+  'prompt',
+  'command',
+]
+
+// The line a command approval card shows for a tool that is not a shell
+// command (WebFetch, NotebookEdit, Skill, ...): the tool's name and the
+// input that says what it will touch.
+export function toolApprovalCommand(toolName: string, input: Record<string, unknown>): string {
+  const key = APPROVAL_SUMMARY_KEYS.find(
+    (name) => typeof input[name] === 'string' && (input[name] as string).trim(),
+  )
+  let detail = key ? String(input[key]) : ''
+  if (!detail && Object.keys(input).length > 0) {
+    try {
+      detail = JSON.stringify(input)
+    } catch {}
+  }
+  detail = detail.replace(/\s+/g, ' ').trim()
+  if (detail.length > 200) detail = `${detail.slice(0, 199)}…`
+  return detail ? `${toolName} ${detail}` : toolName
+}
+
 export function fileChangeFromTool(
   toolName: string,
   input: Record<string, unknown>,
