@@ -120,6 +120,15 @@ versioning or publishing metadata.
 - The Claude Agent SDK is 0.3.304, which bundles Claude Code 2.1.304. The
   adapter always passes a permission mode, so the CLI's changed default for
   SDK sessions without one does not reach Claude threads.
+- Claude's Bash commands stream their output into the App's command item
+  while they run, read about once a second through the SDK's
+  `get_task_output` request: a foreground command once Claude Code makes it a
+  task, about two seconds in, and a background shell after its call returned,
+  also after the turn ended, followed by Claude Code's note when it was
+  stopped, failed or reached its background time limit (30 minutes in Agent
+  SDK sessions since Claude Code 2.1.285, or the call's own `timeout` up to 2
+  hours). `CLAUDE_CODEX_COMMAND_OUTPUT_POLL_MS=0` shows the output only when
+  the command finishes, as before.
 
 ### Provider and multi-agent boundaries
 
@@ -228,6 +237,5 @@ versioning or publishing metadata.
   browser cookie/session-token reuse, private provider endpoints, or provider
   bypass behavior.
 - The App's dynamic tools (the worktree tools of its `threadAttachments`
-  gate), MCP tool-call progress, incremental Bash output, and Claude Code
-  plugin skills in the "/" popup are not included. Hook runs are shown live
-  but not kept in history.
+  gate), MCP tool-call progress, and Claude Code plugin skills in the "/"
+  popup are not included. Hook runs are shown live but not kept in history.
