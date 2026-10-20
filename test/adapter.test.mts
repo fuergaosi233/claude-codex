@@ -3769,7 +3769,8 @@ test('review/start and thread/compact/start emit real turn items', async () => {
       reviewTurn.items.map((item: any) => item.type),
       ['userMessage', 'enteredReviewMode', 'reasoning', 'agentMessage', 'exitedReviewMode'],
     )
-    assert.equal(reviewTurn.items.at(-1).review, 'done')
+    // Reviews show Claude's thinking like any other turn.
+    assert.equal(reviewTurn.items.at(-1).review, 'done thinkingDisplay=summarized')
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
