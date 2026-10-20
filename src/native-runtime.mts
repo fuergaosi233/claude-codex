@@ -47,6 +47,7 @@ import { noteClaudeModels } from './claude-models.mjs'
 import { removeCliMcpConfig, writeCliMcpConfig } from './cli-mcp-config.mjs'
 import { recordCliChildren } from './cli-orphans.mjs'
 import { CronJobs } from './cron-jobs.mjs'
+import { dynamicToolCallResult } from './dynamic-tools.mjs'
 import {
   CREATE_GOAL_DESCRIPTION,
   GET_GOAL_DESCRIPTION,
@@ -59,6 +60,7 @@ import { readTaskResult } from './task-output.mjs'
 import { ToolInputPreviews } from './tool-input-preview.mjs'
 import type {
   ClaudeRuntime,
+  DynamicToolServer,
   ElicitationResponse,
   GoalToolHandlers,
   HookOutputEntry,
@@ -687,6 +689,24 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         [GOAL_MCP_SERVER]: goalToolServer(sdk, this.zod, context.goalTools),
       }
     }
+    // The client's dynamic tools, one in-process server per namespace.
+    const dynamicServers = registeredDynamicServers(context)
+    for (const server of context.dynamicTools ?? []) {
+      if (!dynamicServers.includes(server))
+        debugLog('dynamicTools.skipped', { server: server.server, reason: 'unavailable' })
+    }
+    if (dynamicServers.length > 0 && this.zod && typeof sdk.createSdkMcpServer === 'function') {
+      const z = this.zod
+      opts.mcpServers = {
+        ...((opts.mcpServers as Record<string, unknown> | undefined) ?? {}),
+        ...Object.fromEntries(
+          dynamicServers.map((server) => [
+            server.server,
+            this.dynamicToolServer(sdk, z, server, sessionRef),
+          ]),
+        ),
+      }
+    }
     if (context.outputFormat) opts.outputFormat = context.outputFormat
 
     // Codex App's pinned policies map onto Claude SDK's permissionMode. plan
@@ -755,8 +775,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       { behavior: 'allow'; updatedInput?: unknown } | { behavior: 'deny'; message: string }
     > => {
       if (toolName.startsWith(`mcp__${GOAL_MCP_SERVER}__`)) return { behavior: 'allow' }
-      const toolUseId = options.toolUseID || `tool-${newId()}`
       const session = sessionRef()
+      // As in Codex, a dynamic tool runs without an approval prompt: the
+      // client that registered it answers the call.
+      if (session && dynamicToolNames(session.lastContext).has(toolName))
+        return { behavior: 'allow' }
+      const toolUseId = options.toolUseID || `tool-${newId()}`
       const pending = session?.current
       if (!session || !pending || pending.resolved) {
         // A background task asked between turns. There is no turn to surface
@@ -863,6 +887,68 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       )
     } catch {
       return { action: 'cancel' }
+    }
+  }
+
+  // One namespace of the client's dynamic tools as an in-process MCP server.
+  // A tool the client marked deferLoading stays behind Claude Code's tool
+  // search; the others load up front, as in Codex.
+  private dynamicToolServer(
+    sdk: ClaudeSdk,
+    z: Zod,
+    server: DynamicToolServer,
+    sessionRef: () => LiveSession | null,
+  ) {
+    return sdk.createSdkMcpServer({
+      name: server.server,
+      version: '1.0.0',
+      ...(server.description ? { instructions: server.description } : {}),
+      tools: server.tools.map((tool) =>
+        sdk.tool(
+          tool.name,
+          tool.description,
+          // The client's JSON Schema, listed as given; the client checks
+          // the arguments. Typed as the shape of any object.
+          z.looseObject({}).meta(tool.inputSchema) as unknown as Record<
+            string,
+            ReturnType<Zod['unknown']>
+          >,
+          (args: unknown, extra: unknown) =>
+            this.callDynamicTool(sessionRef, server.namespace, tool.name, args, extra),
+          tool.deferLoading ? undefined : { alwaysLoad: true },
+        ),
+      ),
+    })
+  }
+
+  private async callDynamicTool(
+    sessionRef: () => LiveSession | null,
+    namespace: string | null,
+    tool: string,
+    args: unknown,
+    extra: unknown,
+  ) {
+    const meta = recordOrNull(recordOrNull(extra)?._meta)
+    const callId = stringOrNull(meta?.['claudecode/toolUseId']) ?? `call-${newId()}`
+    const signal = (recordOrNull(extra)?.signal as AbortSignal | undefined) ?? null
+    const pending = sessionRef()?.current
+    // Between turns (a background task's call) no client turn can answer.
+    if (!pending || pending.resolved || !pending.handlers.onDynamicToolCall)
+      return dynamicToolCallResult({
+        contentItems: [
+          { type: 'inputText', text: 'dynamic tools are only available during a turn' },
+        ],
+        success: false,
+      })
+    try {
+      const response = await pending.handlers.onDynamicToolCall(
+        { callId, namespace, tool, arguments: args },
+        signal ?? new AbortController().signal,
+      )
+      return dynamicToolCallResult(response)
+    } catch (error) {
+      const text = error instanceof Error ? error.message : String(error)
+      return dynamicToolCallResult({ contentItems: [{ type: 'inputText', text }], success: false })
     }
   }
 
@@ -2217,6 +2303,9 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
           // for the same question.
           continue
         }
+        // The server draws a dynamic tool call as a dynamicToolCall item
+        // when it runs (onDynamicToolCall).
+        if (dynamicToolNames(pending.context).has(name)) continue
         await pending.handlers.onEvent({ type: 'tool_use', toolUseId: id, toolName: name, input })
         if (isWorkflowTool(name)) pending.workflowToolUseIds.add(id)
       }
@@ -2898,6 +2987,27 @@ function goalToolServer(sdk: ClaudeSdk, z: Zod, goal: GoalToolHandlers) {
   })
 }
 
+// The dynamic tool servers a session offers. Plan mode runs no tool that acts,
+// and a configured MCP server keeps its name.
+function registeredDynamicServers(context: RuntimeTurnContext): DynamicToolServer[] {
+  if (!context?.dynamicTools?.length) return []
+  if (
+    derivePermissionMode(context.approvalPolicy, context.sandboxMode, context.planMode) === 'plan'
+  )
+    return []
+  const taken = new Set([GOAL_MCP_SERVER, ...Object.keys(recordOrNull(context.mcpServers) ?? {})])
+  return context.dynamicTools.filter((server) => !taken.has(server.server))
+}
+
+// Claude Code's names for the dynamic tools a session offers.
+function dynamicToolNames(context: RuntimeTurnContext): Set<string> {
+  return new Set(
+    registeredDynamicServers(context).flatMap((server) =>
+      server.tools.map((tool) => `mcp__${server.server}__${tool.name}`),
+    ),
+  )
+}
+
 // Codex's approval policy says "never ask" (or the sandbox is wide open) and
 // no explicit permission mode overrides it: tools run without a prompt.
 function autoAllowsTools(context: RuntimeTurnContext): boolean {
@@ -2957,6 +3067,7 @@ function sessionSignature(context: RuntimeTurnContext): string {
     context.systemPromptAddendum ?? '',
     context.mcpServers ?? null,
     context.goalTools ? GOAL_MCP_SERVER : null,
+    context.dynamicTools ?? null,
     context.addDirs ?? [],
     context.allowedTools ?? [],
     inheritedAllowedTools(context),

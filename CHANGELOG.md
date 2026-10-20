@@ -201,6 +201,13 @@ versioning or publishing metadata.
 - CI checks the Rust protocol fixtures against `@openai/codex@0.163.0`, and
   the `turn/started` and `turn/completed` fixtures must carry exactly the
   fields of the generated `Turn`.
+- With `CLAUDE_CODEX_DYNAMIC_TOOLS=1`, Claude gets the dynamic tools a client
+  registers on `thread/start` (the Codex App's own tools, which it sends to
+  remote hosts), one in-process MCP server per namespace. A call goes back to
+  the client as `item/tool/call` and shows as a `dynamicToolCall` item; specs
+  Codex refuses fail `thread/start` with its messages, and a chat keeps its
+  tools across restarts, resumes and forks. Off by default, since the App's
+  tools act on the desktop without an approval prompt.
 
 ### Provider and multi-agent boundaries
 

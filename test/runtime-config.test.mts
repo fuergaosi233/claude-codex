@@ -27,7 +27,7 @@ import { NativeClaudeRuntime, sdkResumeSessionId } from '../src/native-runtime.m
 import { TurnInput } from '../src/native-turn-input.mjs'
 import { resolveRuntimeConfig } from '../src/runtime-config.mjs'
 import { buildSystemPromptAddendum } from '../src/server-helpers.mjs'
-import type { RuntimeTurnContext } from '../src/types.mjs'
+import type { DynamicToolServer, RuntimeTurnContext } from '../src/types.mjs'
 import { parseWorkflowCommand, workflowRuntimePrompt } from '../src/workflow-command.mjs'
 import {
   defaultWorkflowTranscriptRoots,
@@ -223,6 +223,175 @@ test('native SDK runtime approves goal tools without shadowing canUseTool', asyn
   const plan = build({ planMode: true })
   assert.equal(plan.canUseTool, undefined)
   assert.ok(plan.allowedTools.includes('mcp__codex_goal'))
+})
+
+test('native SDK runtime offers dynamic tools as MCP servers and routes calls to the turn', async () => {
+  const runtime = new NativeClaudeRuntime()
+  Reflect.set(runtime, 'zod', z)
+  const sdk = {
+    tool: (
+      name: string,
+      description: string,
+      schema: { meta: () => unknown },
+      handler: (args: unknown, extra: unknown) => Promise<unknown>,
+      extras: unknown,
+    ) => ({ name, description, schema, handler, extras }),
+    createSdkMcpServer: (config: Record<string, unknown>) => ({ type: 'sdk', ...config }),
+  }
+  const listSchema = {
+    type: 'object',
+    properties: { query: { type: 'string' } },
+    required: ['query'],
+  }
+  const dynamicTools: DynamicToolServer[] = [
+    {
+      server: 'codex_app',
+      namespace: 'codex_app',
+      description: 'Tools provided by the app.',
+      tools: [
+        {
+          name: 'list_artifacts',
+          description: 'List artifacts.',
+          inputSchema: listSchema,
+          deferLoading: false,
+        },
+        {
+          name: 'restore_worktree',
+          description: 'Restore a worktree.',
+          inputSchema: { type: 'object' },
+          deferLoading: true,
+        },
+      ],
+    },
+    {
+      server: 'dynamic_tools',
+      namespace: null,
+      description: '',
+      tools: [
+        {
+          name: 'echo',
+          description: 'Echo.',
+          inputSchema: { type: 'object' },
+          deferLoading: false,
+        },
+      ],
+    },
+    // A server the adapter already runs keeps its name.
+    {
+      server: 'codex_goal',
+      namespace: 'codex_goal',
+      description: '',
+      tools: [
+        { name: 'shadow', description: '', inputSchema: { type: 'object' }, deferLoading: false },
+      ],
+    },
+  ]
+  const context = nativeTurnContext({
+    approvalPolicy: 'on-request',
+    sandboxMode: 'workspace-write',
+    dynamicTools,
+  })
+  const calls: unknown[] = []
+  const pending = {
+    context,
+    resolved: false,
+    handlers: {
+      onDynamicToolCall: async (request: unknown, signal: AbortSignal) => {
+        calls.push({ request, aborted: signal.aborted })
+        return {
+          contentItems: [
+            { type: 'inputText', text: '2 artifacts' },
+            { type: 'inputImage', imageUrl: 'data:image/png;base64,AAAA' },
+            { type: 'inputImage', imageUrl: 'data:image/svg+xml;base64,AAAA' },
+          ],
+          success: true,
+        }
+      },
+    },
+  }
+  const session: { current: typeof pending | null; lastContext: RuntimeTurnContext } = {
+    current: pending,
+    lastContext: context,
+  }
+  const buildOptions = Reflect.get(runtime, 'buildOptions')
+  const options = buildOptions.call(runtime, sdk, context, new AbortController(), () => session)
+  assert.deepEqual(Object.keys(options.mcpServers), ['codex_app', 'dynamic_tools'])
+  const app = options.mcpServers.codex_app
+  assert.equal(app.name, 'codex_app')
+  assert.equal(app.instructions, 'Tools provided by the app.')
+  assert.equal('instructions' in options.mcpServers.dynamic_tools, false)
+  assert.deepEqual(
+    app.tools.map((tool: any) => [tool.name, tool.description, tool.extras]),
+    [
+      ['list_artifacts', 'List artifacts.', { alwaysLoad: true }],
+      // Deferred tools wait for Claude Code's tool search.
+      ['restore_worktree', 'Restore a worktree.', undefined],
+    ],
+  )
+  // The client's schema is what the server lists.
+  assert.deepEqual(app.tools[0].schema.meta(), listSchema)
+
+  // The tools run without an approval prompt, even where other tools ask.
+  const signal = new AbortController().signal
+  assert.deepEqual(await options.canUseTool('mcp__codex_app__list_artifacts', {}, { signal }), {
+    behavior: 'allow',
+  })
+  assert.deepEqual(await options.canUseTool('mcp__dynamic_tools__echo', {}, { signal }), {
+    behavior: 'allow',
+  })
+
+  // Claude Code's tool use id becomes the call id.
+  const result = await app.tools[0].handler(
+    { query: 'reports' },
+    { signal, _meta: { 'claudecode/toolUseId': 'toolu_1' } },
+  )
+  assert.deepEqual(result, {
+    content: [
+      { type: 'text', text: '2 artifacts' },
+      { type: 'image', data: 'AAAA', mimeType: 'image/png' },
+      { type: 'text', text: '[image omitted]' },
+    ],
+  })
+  await options.mcpServers.dynamic_tools.tools[0].handler({}, { signal })
+  assert.deepEqual(calls[0], {
+    request: {
+      callId: 'toolu_1',
+      namespace: 'codex_app',
+      tool: 'list_artifacts',
+      arguments: { query: 'reports' },
+    },
+    aborted: false,
+  })
+  const loose = (calls[1] as { request: Record<string, unknown> }).request
+  assert.match(String(loose.callId), /^call-/)
+  assert.equal(loose.namespace, null)
+  assert.equal(loose.tool, 'echo')
+
+  // A failed call is an error result; between turns nothing can answer.
+  pending.handlers.onDynamicToolCall = async () => ({
+    contentItems: [{ type: 'inputText', text: 'dynamic tool request failed' }],
+    success: false,
+  })
+  assert.deepEqual(await app.tools[0].handler({ query: 'x' }, { signal }), {
+    content: [{ type: 'text', text: 'dynamic tool request failed' }],
+    isError: true,
+  })
+  session.current = null
+  assert.deepEqual(await app.tools[0].handler({ query: 'x' }, { signal }), {
+    content: [{ type: 'text', text: 'dynamic tools are only available during a turn' }],
+    isError: true,
+  })
+  assert.equal(calls.length, 2)
+
+  // Plan mode offers none of them.
+  const plan = buildOptions.call(
+    runtime,
+    sdk,
+    { ...context, planMode: true },
+    new AbortController(),
+    () => session,
+  )
+  assert.equal(plan.mcpServers, undefined)
 })
 
 test('explicit native SDK bypass includes the required dangerous opt-in flag', () => {

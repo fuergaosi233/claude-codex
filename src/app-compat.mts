@@ -246,6 +246,14 @@ export const APP_RULES: readonly AppRule[] = [
     verify:
       'With CLAUDE_CODEX_MEMORIES=1, turn Memories on in Settings > Personalization: the switch stays on after a reload, and /memories shows in the composer of a chat. Without it, Settings > Personalization shows no Memories settings.',
   },
+  {
+    id: 'dynamic-tools',
+    app: 'Registers its own tools (the codex_app namespace) as thread/start dynamicTools only on hosts that do not use its desktop MCP server, such as remote hosts, and runs an item/tool/call request only while the turn it names is in progress, answering with contentItems and success.',
+    adapter:
+      'With CLAUDE_CODEX_DYNAMIC_TOOLS=1, checks and stores the dynamicTools of thread/start, offers each namespace to Claude as an MCP server, and sends each call as item/tool/call with the running turn and a dynamicToolCall item around it. Local hosts get no tools, as the App sends none.',
+    verify:
+      'On a remote host with the switch on, start a chat and ask Claude to list the chat artifacts: a dynamic tool call card shows the App tool and its result.',
+  },
 ]
 
 // The methods the App starts calling, or sends new parameters to, once the
