@@ -326,11 +326,16 @@ class App {
   }
 
   // Runs a turn to its end; returns the turn id and the messages it brought.
-  async turn(threadId: string, text: string): Promise<{ turnId: string; messages: any[] }> {
+  async turn(
+    threadId: string,
+    text: string,
+    params: Record<string, unknown> = {},
+  ): Promise<{ turnId: string; messages: any[] }> {
     const from = this.messages.length
     const { turn } = await this.request('turn/start', {
       threadId,
       input: [{ type: 'text', text, text_elements: [] }],
+      ...params,
     })
     await this.waitFor(
       (message) => message.method === 'turn/completed' && message.params.turn.id === turn.id,
@@ -526,7 +531,15 @@ test('a failed, refused or unanswered call reaches Claude as Codex reports it', 
         message.method === 'serverRequest/resolved' && message.params.requestId === request.id,
       from,
     )
-    ;[completed] = dynamicItems(app.messages.slice(from), 'item/completed')
+    // The card closes before the turn does, as the App needs.
+    const after = app.messages.slice(from)
+    const closed = after.findIndex(
+      (message) =>
+        message.method === 'item/completed' && message.params.item.type === 'dynamicToolCall',
+    )
+    const ended = after.findIndex((message) => message.method === 'turn/completed')
+    assert.ok(closed >= 0 && closed < ended)
+    completed = after[closed].params.item
     assert.deepEqual(
       {
         status: completed.status,
@@ -562,6 +575,38 @@ test('dynamic tools outlive a restart and pass to a fork', async () => {
     await app.close()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
+})
+
+test('helper threads and structured-output turns offer no dynamic tools', async () => {
+  await withApp(true, async (app, home) => {
+    // An ephemeral helper thread, like the App's title threads.
+    const { thread: helper } = await app.request('thread/start', {
+      cwd: home,
+      ephemeral: true,
+      dynamicTools: appTools,
+    })
+    let turn = await app.turn(helper.id, 'dynamic tool check')
+    assert.equal(agentText(turn.messages), 'tools=none')
+
+    // The ephemeral fork the App describes a chat in.
+    const { thread } = await app.request('thread/start', { cwd: home, dynamicTools: appTools })
+    const { thread: described } = await app.request('thread/fork', {
+      threadId: thread.id,
+      ephemeral: true,
+    })
+    turn = await app.turn(described.id, 'dynamic tool check')
+    assert.equal(agentText(turn.messages), 'tools=none')
+
+    // A turn that asks for structured output.
+    turn = await app.turn(thread.id, 'dynamic tool check', {
+      outputSchema: { type: 'object', properties: {} },
+    })
+    assert.equal(agentText(turn.messages), 'tools=none')
+    assert.equal(
+      app.messages.some((message) => message.method === 'item/tool/call'),
+      false,
+    )
+  })
 })
 
 test('with the switch on, thread/start refuses specs Codex refuses', async () => {
