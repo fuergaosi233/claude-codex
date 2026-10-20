@@ -150,6 +150,7 @@ import type {
   RuntimeSteerOptions,
   RuntimeTaskEvent,
   RuntimeTaskUsage,
+  RuntimeTurnContext,
   RuntimeTurnSettings,
   ThreadAttachmentRecord,
   ThreadGoal,
@@ -398,6 +399,8 @@ export class CodexClaudeAppServer {
   // Closes the message, reasoning and plan items a turn is still streaming,
   // so an interrupt that ends the turn from outside leaves none open.
   private closeStreamingItemsByTurn = new Map<string, () => void>()
+  // Turns review/start and thread/compact/start run, which take no steering.
+  private unsteerableTurns = new Map<string, 'review' | 'compact'>()
   // Keyed by child thread id. Entries outlive the run so SendMessage can
   // still find (and resume) an agent that already reported back.
   private backgroundSubagents = new Map<string, BackgroundSubagent>()
@@ -2761,6 +2764,7 @@ export class CodexClaudeAppServer {
       purpose: params.outputSchema == null ? 'normal' : 'summary',
     })
     this.activeTurnByThread.set(threadId, turnId)
+    this.unsteerableTurns.set(turnId, 'review')
     this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
     // The review/start RESPONSE carries the synthesized userMessage item (the
     // real app-server's build_review_turn does the same, with itemsView
@@ -2799,6 +2803,7 @@ export class CodexClaudeAppServer {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
     if (!thread) throw new Error(`unknown thread: ${threadId}`)
+    this.activePeerByThread.set(threadId, peer)
     const turnId = newId()
     const compactItem: ThreadItem = { type: 'contextCompaction', id: newId() }
     const turn: TurnRecord = {
@@ -2819,9 +2824,10 @@ export class CodexClaudeAppServer {
       cwd: thread.cwd,
       model: thread.model,
       runtimeBackend: thread.runtimeBackend,
-      purpose: params.outputSchema == null ? 'normal' : 'summary',
+      purpose: 'compact',
     })
     this.activeTurnByThread.set(threadId, turnId)
+    this.unsteerableTurns.set(turnId, 'compact')
     this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
     setImmediate(() => {
       // stop() has already settled this turn; starting it now would launch
@@ -2835,80 +2841,222 @@ export class CodexClaudeAppServer {
         method: 'item/started',
         params: { threadId, turnId, item: compactItem, startedAtMs: nowMillis() },
       })
-      const agentItem: ThreadItem = {
+      void this.compactThread(peer, thread, turn, compactItem).catch((error) => {
+        debugLog('thread.compact.failed', {
+          threadId,
+          error: error instanceof Error ? error.message : String(error),
+        })
+      })
+    })
+    return {}
+  }
+
+  // Compacts the thread like Codex's /compact: Claude compacts the thread's
+  // own session, so the next turn goes on from its summary. A thread with no
+  // Claude session yet, or whose compaction fails, gets a summary written in
+  // a session of its own instead, and keeps its session as it was.
+  private async compactThread(
+    peer: RpcPeer,
+    thread: ThreadRecord,
+    turn: TurnRecord,
+    compactItem: ThreadItem,
+  ): Promise<void> {
+    const threadId = thread.id
+    const turnId = turn.id
+    let compactOpen = true
+    const completeCompactItem = (): void => {
+      if (!compactOpen) return
+      compactOpen = false
+      this.notify(peer, {
+        method: 'item/completed',
+        params: { threadId, turnId, item: compactItem, completedAtMs: nowMillis() },
+      })
+    }
+    let agentItem: ThreadItem | null = null
+    const completeAgentItem = (): void => {
+      if (!agentItem) return
+      let item: ThreadItem = agentItem
+      agentItem = null
+      try {
+        const id = item.id
+        item = this.store.getTurn(turnId)?.items.find((candidate) => candidate.id === id) ?? item
+      } catch {}
+      this.notify(peer, {
+        method: 'item/completed',
+        params: { threadId, turnId, item, completedAtMs: nowMillis() },
+      })
+    }
+    // An interrupt ends the turn from outside. Like Codex's, the compaction
+    // it cuts short stays open, which the App shows as interrupted.
+    this.closeStreamingItemsByTurn.set(turnId, () => {
+      completeAgentItem()
+    })
+    const active = (): boolean =>
+      !this.stopped &&
+      this.store.getTurn(turnId)?.status === 'inProgress' &&
+      this.activeTurnByThread.get(threadId) === turnId
+    try {
+      const current = this.store.getThread(threadId) ?? thread
+      let compacted = false
+      if (
+        current.runtimeBackend !== 'codex' &&
+        current.claudeSessionId &&
+        this.runtime.compactsSessions?.() === true
+      ) {
+        compacted = await this.runSessionCompaction(
+          peer,
+          current,
+          turnId,
+          active,
+          completeCompactItem,
+        ).catch((error) => {
+          debugLog('thread.compact.session_failed', {
+            threadId,
+            error: error instanceof Error ? error.message : String(error),
+          })
+          return false
+        })
+      }
+      if (compacted || !active()) return
+      const item: ThreadItem = {
         type: 'agentMessage',
         id: newId(),
         text: '',
         phase: null,
         memoryCitation: null,
       }
-      this.store.appendItem(turnId, agentItem)
+      agentItem = item
+      this.store.appendItem(turnId, item)
       this.notify(peer, {
         method: 'item/started',
-        params: { threadId, turnId, item: agentItem, startedAtMs: nowMillis() },
+        params: { threadId, turnId, item, startedAtMs: nowMillis() },
       })
-
-      // Drive an actual Claude (summary model) turn to compact the thread
-      // instead of just stringifying the last 12 snippets locally — the
-      // local fallback still kicks in if the runtime errors.
-      void this.runCompactTurn(peer, thread, turnId, agentItem.id, compactItem)
-        .catch((error) => {
-          debugLog('thread.compact.fallback', { threadId, error: error?.message ?? String(error) })
-          const fallback = compactSummary(thread, this.store.listTurns(threadId))
-          this.store.updateItem(turnId, agentItem.id, (item) =>
-            item.type === 'agentMessage' ? { ...item, text: fallback } : item,
-          )
-          this.notify(peer, {
-            method: 'item/agentMessage/delta',
-            params: { threadId, turnId, itemId: agentItem.id, delta: fallback },
-          })
+      try {
+        await this.runCompactTurn(peer, current, turnId, item.id, active)
+      } catch (error) {
+        debugLog('thread.compact.fallback', {
+          threadId,
+          error: error instanceof Error ? error.message : String(error),
         })
-        .finally(() => {
-          this.notify(peer, {
-            method: 'item/completed',
-            params: { threadId, turnId, item: compactItem, completedAtMs: nowMillis() },
-          })
-          let finalAgent: ThreadItem = agentItem
-          try {
-            finalAgent =
-              this.store.getTurn(turnId)?.items.find((i) => i.id === agentItem.id) ?? agentItem
-          } catch {}
-          this.notify(peer, {
-            method: 'item/completed',
-            params: { threadId, turnId, item: finalAgent, completedAtMs: nowMillis() },
-          })
-          // An interrupt already ended the turn and told the client.
-          const completed = this.endTurn(turn, 'completed', null)
-          if (!completed) return
+        if (!active()) return
+        const fallback = compactSummary(current, this.store.listTurns(threadId))
+        this.store.updateItem(turnId, item.id, (entry) =>
+          entry.type === 'agentMessage' ? { ...entry, text: fallback } : entry,
+        )
+        this.notify(peer, {
+          method: 'item/agentMessage/delta',
+          params: { threadId, turnId, itemId: item.id, delta: fallback },
+        })
+      }
+    } finally {
+      // stop() has already settled the turn and closes SQLite.
+      if (!this.stopped) {
+        if (active()) completeCompactItem()
+        completeAgentItem()
+        // An interrupt already ended the turn and told the client.
+        const completed = this.endTurn(turn, 'completed', null)
+        if (completed) {
           this.clearActiveTurn(threadId)
           this.setThreadStatus(peer, threadId, { type: 'idle' })
           this.notify(peer, {
             method: 'turn/completed',
             params: { threadId, turn: this.toLifecycleTurn(completed) },
           })
-          this.notify(peer, { method: 'thread/compacted', params: { threadId } })
-        })
-        // The fallback writes to the store too; the turn has still ended above.
-        .catch((error) => {
-          debugLog('thread.compact.fallback_failed', {
-            threadId,
-            error: error instanceof Error ? error.message : String(error),
+          this.notify(peer, { method: 'thread/compacted', params: { threadId, turnId } })
+        }
+      }
+    }
+  }
+
+  // Sends `/compact` to the thread's Claude session the way the thread's
+  // next turn would reach it: into the live session when one is up, else by
+  // resuming it. True once Claude reports the conversation compacted.
+  private async runSessionCompaction(
+    peer: RpcPeer,
+    thread: ThreadRecord,
+    turnId: string,
+    active: () => boolean,
+    completeCompactItem: () => void,
+  ): Promise<boolean> {
+    // The settings of the thread's last turn keep its session's signature,
+    // so the live session takes the command instead of a new one opening.
+    const params = this.lastTurnParamsByThread.get(thread.id) ?? {}
+    const built = this.runtimeTurnContext(thread, turnId, '/compact', params)
+    // thread/compact/start carries no instructions: a bare /compact, which
+    // no side-conversation note may precede either.
+    const context: RuntimeTurnContext = { ...built.context, prompt: '/compact', imageInputs: [] }
+    const noticesSeen = new Set<string>()
+    let compacted = false
+    let failure: string | null = null
+    await this.runtime.runTurn(context, {
+      onEvent: async (event) => {
+        // As in a user turn, where Claude's session ends up is where a
+        // rewind to this turn resumes.
+        if (event.type === 'checkpoint') {
+          this.store.setTurnCheckpoint(turnId, {
+            sessionId: event.claudeSessionId,
+            messageUuid: event.messageUuid,
           })
-        })
+          return
+        }
+        if (!active()) return
+        if (event.type === 'session') {
+          this.store.updateClaudeSessionId(thread.id, event.claudeSessionId)
+          if (built.resumeSessionAt) this.store.clearClaudeResumeAt(thread.id)
+          return
+        }
+        if (event.type === 'compaction_completed') {
+          compacted = true
+          completeCompactItem()
+          this.recordCompactedContext(peer, thread.id, turnId, event.postTokens, false)
+          return
+        }
+        if (event.type === 'notice') {
+          if (event.level !== 'info' && !noticesSeen.has(event.message)) {
+            noticesSeen.add(event.message)
+            this.notify(peer, {
+              method: 'warning',
+              params: { threadId: thread.id, message: event.message },
+            })
+          }
+          return
+        }
+        if (event.type === 'completed') {
+          if (event.claudeSessionId)
+            this.store.updateClaudeSessionId(thread.id, event.claudeSessionId)
+          if (!event.success) failure = event.result ?? 'Claude did not compact the conversation'
+          return
+        }
+        if (event.type === 'error') failure = event.message
+        // What the command prints, and the usage of the summary it wrote,
+        // are not part of the conversation.
+      },
+      // The command runs no tools and asks nothing.
+      onPermissionRequest: async () => ({ decision: 'cancel' }),
+      onUserInputRequest: async (event) => ({
+        answers: Object.fromEntries(event.questions.map((q) => [q.id, { answers: [] }])),
+      }),
     })
-    return {}
+    if (!compacted)
+      debugLog('thread.compact.session_incomplete', {
+        threadId: thread.id,
+        turnId,
+        failure,
+      })
+    return compacted
   }
 
   // Calls into the runtime with a structured "give me a 1-paragraph summary"
-  // prompt against the summary model alias (haiku). Streams the text into the
-  // placeholder agent message via item/agentMessage/delta. Errors propagate
-  // so the threadCompactStart fallback can substitute the local snippet.
+  // prompt against the summary model alias (haiku), in a session of its own.
+  // Streams the text into the placeholder agent message via
+  // item/agentMessage/delta. Errors propagate so compactThread can
+  // substitute the local snippet.
   private async runCompactTurn(
     peer: RpcPeer,
     thread: ThreadRecord,
     turnId: string,
     agentItemId: string,
-    compactItem: ThreadItem,
+    active: () => boolean,
   ): Promise<void> {
     const turns = this.store.listTurns(thread.id)
     const promptBody = compactSummary(thread, turns)
@@ -2946,7 +3094,7 @@ export class CodexClaudeAppServer {
       },
       {
         onEvent: async (event) => {
-          if (event.type === 'text_delta' && event.delta) {
+          if (event.type === 'text_delta' && event.delta && active()) {
             collected += event.delta
             this.store.updateItem(turnId, agentItemId, (item) =>
               item.type === 'agentMessage' ? { ...item, text: item.text + event.delta } : item,
@@ -2973,10 +3121,7 @@ export class CodexClaudeAppServer {
 
     // If Claude produced nothing usable, surface the local fallback so the
     // caller's catch path runs and the user still gets a summary.
-    if (!collected.trim()) {
-      void compactItem
-      throw new Error('compaction returned no content')
-    }
+    if (!collected.trim()) throw new Error('compaction returned no content')
   }
 
   private async turnStart(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
@@ -3304,6 +3449,193 @@ export class CodexClaudeAppServer {
     return lines.join('\n')
   }
 
+  // What the runtime gets for a turn of the thread: the policy, instructions,
+  // model and session a user turn with these params runs with.
+  private runtimeTurnContext(
+    thread: ThreadRecord,
+    turnId: string,
+    prompt: string,
+    params: Record<string, unknown>,
+  ): {
+    context: RuntimeTurnContext
+    isCodexThread: boolean
+    resumeSessionAt: string | null
+    turnCwd: string
+  } {
+    // Allow per-turn override of policy (Codex App may attach updated values
+    // when the user toggles Full access mid-conversation), then fall back to
+    // the thread-level setting captured at start/resume. turn/start ships a
+    // sandboxPolicy struct (e.g. {type:"dangerFullAccess"}); thread/start uses
+    // the simpler sandbox string. Both are honoured.
+    const permissionProfile = permissionProfilePolicy(permissionProfileIdFromParams(params))
+    const approvalPolicy =
+      permissionProfile?.approvalPolicy ??
+      (typeof params.approvalPolicy === 'string'
+        ? normalizeApprovalPolicy(params.approvalPolicy)
+        : null) ??
+      thread.approvalPolicy
+    const sandboxMode =
+      permissionProfile?.sandboxMode ?? sandboxFromTurnParams(params) ?? thread.sandboxMode
+    // Per-turn instruction overrides: Codex App may resend its instruction
+    // panel state when the user toggles personality mid-thread. Falls back to
+    // whatever was captured at thread/start.
+    const baseInstructions =
+      (typeof params.baseInstructions === 'string' ? params.baseInstructions : null) ??
+      thread.baseInstructions
+    const developerInstructions =
+      (typeof params.developerInstructions === 'string' ? params.developerInstructions : null) ??
+      thread.developerInstructions
+    const personality =
+      (typeof params.personality === 'string' ? normalizePersonality(params.personality) : null) ??
+      thread.personality
+    const turnPurpose = params.outputSchema == null ? 'normal' : 'summary'
+    const continuation = params._continuation === true
+    const desktopPresentation = turnPurpose === 'normal' && thread.runtimeBackend !== 'codex'
+    const appSkills = this.appSkillsFor(desktopPresentation ? thread.id : null)
+    // Codex reads AGENTS.md itself; Claude gets it, and the Claude Code files
+    // its CLI skips, in the prompt.
+    const instructions = desktopPresentation ? projectInstructions(thread.cwd).prompt : null
+    // If this is a forked side-conversation (sidechat) that has different
+    // developerInstructions from its parent, appending them to systemPromptAddendum
+    // would mutate the system prompt prefix and invalidate the prefix KV cache
+    // for all inherited history (80k+ tokens).
+    // Instead, preserve the parent's system prompt addendum to guarantee 100% cache hits,
+    // and prepend side-conversation instructions directly into the turn's user prompt.
+    let systemPromptAddendum: string | null = null
+    let effectivePrompt = prompt
+    if (thread.forkedFromId != null && developerInstructions) {
+      const parentThread = this.store.getThread(thread.forkedFromId)
+      const parentDev = parentThread?.developerInstructions ?? null
+      if (developerInstructions !== parentDev) {
+        const parentSkills = this.appSkillsFor(desktopPresentation ? thread.forkedFromId : null)
+        systemPromptAddendum = buildSystemPromptAddendum({
+          baseInstructions: parentThread?.baseInstructions ?? baseInstructions,
+          developerInstructions: parentDev,
+          personality: parentThread?.personality ?? personality,
+          desktopPresentation,
+          projectInstructions: instructions,
+          ...parentSkills,
+        })
+        // The parent's prompt names the parent's visualization directory.
+        const sideInstructions = [developerInstructions]
+        if (parentSkills.visualizationDir && appSkills.visualizationDir)
+          sideInstructions.push(visualizationDirNote(appSkills.visualizationDir))
+        effectivePrompt = `<side-conversation-instructions>\n${sideInstructions.join('\n\n')}\n</side-conversation-instructions>\n\n${prompt}`
+      } else {
+        systemPromptAddendum = buildSystemPromptAddendum({
+          baseInstructions,
+          developerInstructions,
+          personality,
+          desktopPresentation,
+          projectInstructions: instructions,
+          ...appSkills,
+        })
+      }
+    } else {
+      systemPromptAddendum = buildSystemPromptAddendum({
+        baseInstructions,
+        developerInstructions,
+        personality,
+        desktopPresentation,
+        projectInstructions: instructions,
+        ...appSkills,
+      })
+    }
+
+    const rawTurnModel = stringOr(params.model, thread.model)
+    const isCodexThread = thread.runtimeBackend === 'codex' && process.env.CLAUDE_CODEX_MOCK !== '1'
+    const resolvedModel = isCodexThread
+      ? rawTurnModel
+      : resolveClaudeModel(rawTurnModel, params.outputSchema == null ? 'normal' : 'summary')
+    const resolvedEffort = resolveClaudeEffort(
+      typeof params.effort === 'string'
+        ? params.effort
+        : (thread.reasoningEffort ?? process.env.CLAUDE_CODEX_EFFORT ?? null),
+    )
+    // Log the effective Claude SDK model+effort per turn so when a user
+    // reports "switching model didn't work" we can diff App's payload against
+    // what actually reached the SDK in one grep.
+    debugLog('turn.runtime.applied', {
+      threadId: thread.id,
+      turnId,
+      paramsModel: params.model ?? null,
+      paramsEffort: params.effort ?? null,
+      threadModel: thread.model,
+      threadEffort: thread.reasoningEffort,
+      envDefaultModel: process.env.CLAUDE_CODEX_DEFAULT_MODEL ?? null,
+      envDefaultEffort:
+        process.env.CLAUDE_CODEX_DEFAULT_EFFORT ?? process.env.CLAUDE_CODEX_EFFORT ?? null,
+      resolvedModel,
+      resolvedEffort,
+    })
+    const forkSession =
+      thread.forkedFromId != null &&
+      thread.claudeSessionId != null &&
+      this.store.listTurns(thread.id).length <= 1
+    // Set after a rewind or fork: this turn resumes the session only up to a
+    // checkpoint. It stays pending until Claude starts the forked session.
+    const resumeSessionAt = isCodexThread ? null : this.store.claudeResumeAt(thread.id)
+    const turnCwd = stringOr(params.cwd, thread.cwd)
+    // A Claude thread's own turns also get the MCP servers, subagents,
+    // permission rules and hooks the Codex and Claude Code configs bring.
+    const inheritConfig = desktopPresentation && !isCodexThread
+    const mcp = readMcpConfig({ cwd: turnCwd, inherit: inheritConfig })
+    const permissionRules = inheritConfig ? inheritedPermissionRules(turnCwd) : null
+    // For codex-backed threads, force the per-turn runtimeType to 'codex-proxy'
+    // so the SelectableRuntime dispatches to CodexProxyRuntime instead of
+    // the default Claude SDK runtime. Also route the codex session id (stored
+    // separately from Claude's) through the existing claudeSessionId slot —
+    // CodexProxyRuntime consumes it as the resume id. In mock mode the
+    // mock runtime handles everything regardless of model id — bypass the
+    // codex-proxy override so unit tests stay deterministic.
+    const context: RuntimeTurnContext = {
+      threadId: thread.id,
+      turnId,
+      purpose: turnPurpose,
+      prompt: effectivePrompt,
+      cwd: turnCwd,
+      runtimeType: isCodexThread ? 'codex-proxy' : null,
+      model: resolvedModel,
+      effort: resolvedEffort,
+      claudeSessionId: isCodexThread ? thread.codexSessionId : thread.claudeSessionId,
+      forkSession,
+      resumeSessionAt,
+      // createdAt is in whole seconds: the history a fork copies from its
+      // parent is older than the second after it.
+      forkedAt:
+        !isCodexThread && thread.forkedFromId != null ? (thread.createdAt + 1) * 1000 : null,
+      mcpServers: mcp.sdkValue,
+      allowedTools: defaultAllowedTools(),
+      inheritedAllowedTools: permissionRules?.allow ?? null,
+      inheritedAskRules: permissionRules?.ask ?? null,
+      disallowedTools: [...mcp.toolRules.disallowedTools, ...(permissionRules?.deny ?? [])],
+      mcpEnabledTools: mcp.toolRules.enabledTools,
+      agents: inheritConfig ? inheritedAgents(turnCwd) : null,
+      claudeHooks: inheritConfig ? inheritedHooks(turnCwd) : null,
+      addDirs: stringListFromEnv('CLAUDE_CODEX_ADD_DIRS', []),
+      enableFileCheckpointing: process.env.CLAUDE_CODEX_ENABLE_FILE_CHECKPOINTING === '1',
+      outputFormat: claudeOutputFormat(params.outputSchema),
+      approvalPolicy,
+      sandboxMode,
+      systemPromptAddendum,
+      readableRoots: [
+        ...appSkills.appSkills.map((skill) => dirname(skill.path)),
+        ...(appSkills.visualizationDir ? [appSkills.visualizationDir] : []),
+      ],
+      planMode: params.planMode === true,
+      imageInputs: Array.isArray(params._imageInputs) ? (params._imageInputs as ImageInput[]) : [],
+      goalTools:
+        turnPurpose === 'normal' &&
+        !isCodexThread &&
+        !thread.ephemeral &&
+        process.env.CLAUDE_CODEX_GOAL_TOOLS !== '0'
+          ? this.goalToolsFor(thread.id)
+          : null,
+      ...(continuation ? { continuation: true } : {}),
+    }
+    return { context, isCodexThread, resumeSessionAt, turnCwd }
+  }
+
   private async runRuntimeTurn(
     peer: RpcPeer,
     thread: ThreadRecord,
@@ -3355,10 +3687,6 @@ export class CodexClaudeAppServer {
       costUsd: null,
       set: false,
     }
-    const forkSession =
-      thread.forkedFromId != null &&
-      thread.claudeSessionId != null &&
-      this.store.listTurns(thread.id).length <= 1
     // Plan mode: Claude SDK runs with permissionMode='plan' — it produces
     // planning text but does not execute tools. We surface the planning
     // output as Codex's native `plan` ThreadItem (instead of agentMessage)
@@ -3475,126 +3803,47 @@ export class CodexClaudeAppServer {
       }
       openToolItems.clear()
     }
-
-    // Allow per-turn override of policy (Codex App may attach updated values
-    // when the user toggles Full access mid-conversation), then fall back to
-    // the thread-level setting captured at start/resume. turn/start ships a
-    // sandboxPolicy struct (e.g. {type:"dangerFullAccess"}); thread/start uses
-    // the simpler sandbox string. Both are honoured.
-    const permissionProfile = permissionProfilePolicy(permissionProfileIdFromParams(params))
-    const approvalPolicy =
-      permissionProfile?.approvalPolicy ??
-      (typeof params.approvalPolicy === 'string'
-        ? normalizeApprovalPolicy(params.approvalPolicy)
-        : null) ??
-      thread.approvalPolicy
-    const sandboxMode =
-      permissionProfile?.sandboxMode ?? sandboxFromTurnParams(params) ?? thread.sandboxMode
-    // Per-turn instruction overrides: Codex App may resend its instruction
-    // panel state when the user toggles personality mid-thread. Falls back to
-    // whatever was captured at thread/start.
-    const baseInstructions =
-      (typeof params.baseInstructions === 'string' ? params.baseInstructions : null) ??
-      thread.baseInstructions
-    const developerInstructions =
-      (typeof params.developerInstructions === 'string' ? params.developerInstructions : null) ??
-      thread.developerInstructions
-    const personality =
-      (typeof params.personality === 'string' ? normalizePersonality(params.personality) : null) ??
-      thread.personality
-    const turnPurpose = params.outputSchema == null ? 'normal' : 'summary'
-    const continuation = params._continuation === true
-    // A turn Claude starts on its own inherits the last user turn's policy,
-    // model and instructions.
-    if (turnPurpose === 'normal' && !continuation && params._hiddenPrompt == null) {
-      const { _imageInputs: _images, _emitUserMessage: _emit, ...rest } = params
-      this.lastTurnParamsByThread.set(thread.id, rest)
+    // Claude compacting the conversation within the turn, on its own when
+    // the context fills up, shows as Codex's contextCompaction item. Like
+    // Codex's, a compaction an interrupt or a failed turn cuts short stays
+    // open, which the App shows as interrupted.
+    let compactionItemId: string | null = null
+    const startCompactionItem = (): void => {
+      if (compactionItemId) return
+      compactionItemId = newId()
+      const item: ThreadItem = { type: 'contextCompaction', id: compactionItemId }
+      this.store.appendItem(turn.id, item)
+      this.notify(peer, {
+        method: 'item/started',
+        params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: nowMillis() },
+      })
     }
-    const desktopPresentation = turnPurpose === 'normal' && thread.runtimeBackend !== 'codex'
-    const appSkills = this.appSkillsFor(desktopPresentation ? thread.id : null)
-    // Codex reads AGENTS.md itself; Claude gets it, and the Claude Code files
-    // its CLI skips, in the prompt.
-    const instructions = desktopPresentation ? projectInstructions(thread.cwd).prompt : null
-    // If this is a forked side-conversation (sidechat) that has different
-    // developerInstructions from its parent, appending them to systemPromptAddendum
-    // would mutate the system prompt prefix and invalidate the prefix KV cache
-    // for all inherited history (80k+ tokens).
-    // Instead, preserve the parent's system prompt addendum to guarantee 100% cache hits,
-    // and prepend side-conversation instructions directly into the turn's user prompt.
-    let systemPromptAddendum: string | null = null
-    let effectivePrompt = prompt
-    if (thread.forkedFromId != null && developerInstructions) {
-      const parentThread = this.store.getThread(thread.forkedFromId)
-      const parentDev = parentThread?.developerInstructions ?? null
-      if (developerInstructions !== parentDev) {
-        const parentSkills = this.appSkillsFor(desktopPresentation ? thread.forkedFromId : null)
-        systemPromptAddendum = buildSystemPromptAddendum({
-          baseInstructions: parentThread?.baseInstructions ?? baseInstructions,
-          developerInstructions: parentDev,
-          personality: parentThread?.personality ?? personality,
-          desktopPresentation,
-          projectInstructions: instructions,
-          ...parentSkills,
-        })
-        // The parent's prompt names the parent's visualization directory.
-        const sideInstructions = [developerInstructions]
-        if (parentSkills.visualizationDir && appSkills.visualizationDir)
-          sideInstructions.push(visualizationDirNote(appSkills.visualizationDir))
-        effectivePrompt = `<side-conversation-instructions>\n${sideInstructions.join('\n\n')}\n</side-conversation-instructions>\n\n${prompt}`
-      } else {
-        systemPromptAddendum = buildSystemPromptAddendum({
-          baseInstructions,
-          developerInstructions,
-          personality,
-          desktopPresentation,
-          projectInstructions: instructions,
-          ...appSkills,
-        })
-      }
-    } else {
-      systemPromptAddendum = buildSystemPromptAddendum({
-        baseInstructions,
-        developerInstructions,
-        personality,
-        desktopPresentation,
-        projectInstructions: instructions,
-        ...appSkills,
+    const completeCompactionItem = (): void => {
+      if (!compactionItemId) return
+      const item: ThreadItem = { type: 'contextCompaction', id: compactionItemId }
+      compactionItemId = null
+      this.notify(peer, {
+        method: 'item/completed',
+        params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
       })
     }
 
-    const rawTurnModel = stringOr(params.model, thread.model)
-    const isCodexThread = thread.runtimeBackend === 'codex' && process.env.CLAUDE_CODEX_MOCK !== '1'
-    const resolvedModel = isCodexThread
-      ? rawTurnModel
-      : resolveClaudeModel(rawTurnModel, params.outputSchema == null ? 'normal' : 'summary')
-    const resolvedEffort = resolveClaudeEffort(
-      typeof params.effort === 'string'
-        ? params.effort
-        : (thread.reasoningEffort ?? process.env.CLAUDE_CODEX_EFFORT ?? null),
+    // A turn Claude starts on its own inherits the last user turn's policy,
+    // model and instructions.
+    if (
+      params.outputSchema == null &&
+      params._continuation !== true &&
+      params._hiddenPrompt == null
+    ) {
+      const { _imageInputs: _images, _emitUserMessage: _emit, ...rest } = params
+      this.lastTurnParamsByThread.set(thread.id, rest)
+    }
+    const { context, isCodexThread, resumeSessionAt, turnCwd } = this.runtimeTurnContext(
+      thread,
+      turn.id,
+      prompt,
+      params,
     )
-    // Log the effective Claude SDK model+effort per turn so when a user
-    // reports "switching model didn't work" we can diff App's payload against
-    // what actually reached the SDK in one grep.
-    debugLog('turn.runtime.applied', {
-      threadId: thread.id,
-      turnId: turn.id,
-      paramsModel: params.model ?? null,
-      paramsEffort: params.effort ?? null,
-      threadModel: thread.model,
-      threadEffort: thread.reasoningEffort,
-      envDefaultModel: process.env.CLAUDE_CODEX_DEFAULT_MODEL ?? null,
-      envDefaultEffort:
-        process.env.CLAUDE_CODEX_DEFAULT_EFFORT ?? process.env.CLAUDE_CODEX_EFFORT ?? null,
-      resolvedModel,
-      resolvedEffort,
-    })
-    // For codex-backed threads, force the per-turn runtimeType to 'codex-proxy'
-    // so the SelectableRuntime dispatches to CodexProxyRuntime instead of
-    // the default Claude SDK runtime. Also route the codex session id (stored
-    // separately from Claude's) through the existing claudeSessionId slot —
-    // CodexProxyRuntime consumes it as the resume id. In mock mode the
-    // mock runtime handles everything regardless of model id — bypass the
-    // codex-proxy override so unit tests stay deterministic.
     this.subagentStateByTurn.set(turn.id, {
       thread,
       turn,
@@ -3643,64 +3892,10 @@ export class CodexClaudeAppServer {
       acceptRuntimeEvents &&
       this.store.getTurn(turn.id)?.status === 'inProgress' &&
       this.activeTurnByThread.get(thread.id) === turn.id
-    // Set after a rewind or fork: this turn resumes the session only up to a
-    // checkpoint. It stays pending until Claude starts the forked session.
-    const resumeSessionAt = isCodexThread ? null : this.store.claudeResumeAt(thread.id)
     let resumedAtCheckpoint = false
-    const turnCwd = stringOr(params.cwd, thread.cwd)
-    // A Claude thread's own turns also get the MCP servers, subagents,
-    // permission rules and hooks the Codex and Claude Code configs bring.
-    const inheritConfig = desktopPresentation && !isCodexThread
-    const mcp = readMcpConfig({ cwd: turnCwd, inherit: inheritConfig })
-    const permissionRules = inheritConfig ? inheritedPermissionRules(turnCwd) : null
     const runtimeTurn = this.runtime.runTurn(
-      {
-        threadId: thread.id,
-        turnId: turn.id,
-        purpose: turnPurpose,
-        prompt: effectivePrompt,
-        cwd: turnCwd,
-        runtimeType: isCodexThread ? 'codex-proxy' : null,
-        model: resolvedModel,
-        effort: resolvedEffort,
-        claudeSessionId: isCodexThread ? thread.codexSessionId : thread.claudeSessionId,
-        forkSession,
-        resumeSessionAt,
-        // createdAt is in whole seconds: the history a fork copies from its
-        // parent is older than the second after it.
-        forkedAt:
-          !isCodexThread && thread.forkedFromId != null ? (thread.createdAt + 1) * 1000 : null,
-        mcpServers: mcp.sdkValue,
-        allowedTools: defaultAllowedTools(),
-        inheritedAllowedTools: permissionRules?.allow ?? null,
-        inheritedAskRules: permissionRules?.ask ?? null,
-        disallowedTools: [...mcp.toolRules.disallowedTools, ...(permissionRules?.deny ?? [])],
-        mcpEnabledTools: mcp.toolRules.enabledTools,
-        agents: inheritConfig ? inheritedAgents(turnCwd) : null,
-        claudeHooks: inheritConfig ? inheritedHooks(turnCwd) : null,
-        addDirs: stringListFromEnv('CLAUDE_CODEX_ADD_DIRS', []),
-        enableFileCheckpointing: process.env.CLAUDE_CODEX_ENABLE_FILE_CHECKPOINTING === '1',
-        outputFormat: claudeOutputFormat(params.outputSchema),
-        approvalPolicy,
-        sandboxMode,
-        systemPromptAddendum,
-        readableRoots: [
-          ...appSkills.appSkills.map((skill) => dirname(skill.path)),
-          ...(appSkills.visualizationDir ? [appSkills.visualizationDir] : []),
-        ],
-        planMode: params.planMode === true,
-        imageInputs: Array.isArray(params._imageInputs)
-          ? (params._imageInputs as ImageInput[])
-          : [],
-        goalTools:
-          turnPurpose === 'normal' &&
-          !isCodexThread &&
-          !thread.ephemeral &&
-          process.env.CLAUDE_CODEX_GOAL_TOOLS !== '0'
-            ? this.goalToolsFor(thread.id)
-            : null,
-        ...(continuation ? { continuation: true } : {}),
-      },
+      context,
+      // What Claude streams, and the approvals and answers it waits on.
       {
         onEvent: async (event) => {
           // Interrupts, watchdog expiry, and a peer reconnect can leave a few
@@ -4360,6 +4555,24 @@ export class CodexClaudeAppServer {
             }
             return
           }
+          if (event.type === 'compaction_started') {
+            // What Claude said so far stays above the compaction.
+            completeMessage()
+            startCompactionItem()
+            return
+          }
+          if (event.type === 'compaction_completed') {
+            // A boundary can arrive without the status before it.
+            completeMessage()
+            startCompactionItem()
+            completeCompactionItem()
+            this.notify(peer, {
+              method: 'thread/compacted',
+              params: { threadId: thread.id, turnId: turn.id },
+            })
+            this.recordCompactedContext(peer, thread.id, turn.id, event.postTokens, true)
+            return
+          }
           if (event.type === 'notice') {
             debugLog('turn.runtime.notice', { threadId: thread.id, turnId: turn.id, ...event })
             // Runtime status is not assistant prose. Keep genuine warnings
@@ -4666,6 +4879,9 @@ export class CodexClaudeAppServer {
     }
     if (this.store.getTurn(turn.id)?.status === 'inProgress') {
       completeOpenToolItems('Claude finished the turn without a result for this tool.')
+      // A compaction that failed never reached its boundary; the turn
+      // went on without it and completes.
+      completeCompactionItem()
       this.finalizeOrphanedSubagents(peer, thread, turn, subagentContexts, activeSubagents)
     }
     this.subagentStateByTurn.delete(turn.id)
@@ -5869,13 +6085,18 @@ export class CodexClaudeAppServer {
     if (!activeTurnId) throw new Error('no active turn to steer')
     if (expectedTurnId && expectedTurnId !== activeTurnId)
       throw new Error(`expected active turn id \`${expectedTurnId}\` but found \`${activeTurnId}\``)
-    const turn = this.store.getTurn(activeTurnId)
-    if (
-      turn?.items.some(
-        (item) => item.type === 'enteredReviewMode' || item.type === 'contextCompaction',
-      )
-    )
-      throw new Error('cannot steer a review or compaction turn')
+    // Like Codex, a review or a compaction the user started takes no input
+    // until it ends; a turn Claude compacted on its own still does.
+    const turnKind = this.unsteerableTurns.get(activeTurnId)
+    if (turnKind) {
+      const message = `cannot steer a ${turnKind} turn`
+      throw new RpcError(message, {
+        message,
+        codexErrorInfo: { activeTurnNotSteerable: { turnKind } },
+        additionalDetails: null,
+        misalignment: null,
+      })
+    }
     const input = turnInput(params)
     const { textPrompt, images } = extractImageInputs(input)
     // App rule: quiet-turn-heartbeat
@@ -6191,6 +6412,37 @@ export class CodexClaudeAppServer {
     // notification was empty noise. The initial snapshot still fires once
     // post-handshake in `initialize` so the UI populates on first connect.
     // App rule: rate-limit-banner
+  }
+
+  // Claude compacted the thread's context down to a summary of `postTokens`
+  // tokens: like Codex's after a compaction, the context meter drops to it.
+  // Within a turn the next call's usage measures the context again; after a
+  // compaction turn, which makes no further call, the meter keeps it.
+  private recordCompactedContext(
+    peer: RpcPeer,
+    threadId: string,
+    turnId: string,
+    postTokens: number | null,
+    midTurn: boolean,
+  ): void {
+    if (postTokens == null || postTokens <= 0) return
+    const last: TokenUsageBreakdown = {
+      ...emptyTokenBreakdown(),
+      totalTokens: postTokens,
+      inputTokens: postTokens,
+    }
+    if (midTurn) this.lastCallUsageByThread.set(threadId, last)
+    else this.lastCallUsageByThread.delete(threadId)
+    this.lastUsageByThread.set(threadId, last)
+    const tokenUsage: ThreadTokenUsage = {
+      total: this.tokenUsageByThread.get(threadId) ?? emptyTokenBreakdown(),
+      last,
+      modelContextWindow: this.contextWindowByThread.get(threadId) ?? null,
+    }
+    this.notify(peer, {
+      method: 'thread/tokenUsage/updated',
+      params: { threadId, turnId, tokenUsage },
+    })
   }
 
   private async fsReadFile(params: Record<string, unknown>): Promise<unknown> {
@@ -7315,7 +7567,10 @@ export class CodexClaudeAppServer {
   private clearActiveTurn(threadId: string): void {
     const turnId = this.activeTurnByThread.get(threadId)
     const existed = this.activeTurnByThread.delete(threadId)
-    if (turnId) this.closeStreamingItemsByTurn.delete(turnId)
+    if (turnId) {
+      this.closeStreamingItemsByTurn.delete(turnId)
+      this.unsteerableTurns.delete(turnId)
+    }
     let settled: TurnRecord | null = null
     try {
       settled = turnId ? this.store.getTurn(turnId) : null

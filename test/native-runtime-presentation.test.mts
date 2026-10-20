@@ -335,6 +335,51 @@ test('native refusal fallbacks and warning banners surface without ending the tu
   ])
 })
 
+test('Claude compacting the conversation becomes compaction events; a subagent compacting does not', async () => {
+  const events = await collect([
+    system('status', { status: 'compacting' }),
+    system('compact_boundary', {
+      compact_metadata: { trigger: 'auto', pre_tokens: 180_000, post_tokens: 21_000 },
+    }),
+    system('status', { status: null, compact_result: 'success' }),
+    // A boundary alone, from a CLI that reports no status, without the size
+    // of the summary.
+    system('compact_boundary', { compact_metadata: { trigger: 'manual', pre_tokens: 90_000 } }),
+    system('status', { status: 'compacting', parent_tool_use_id: 'agent' }),
+    system('compact_boundary', {
+      parent_tool_use_id: 'agent',
+      compact_metadata: { trigger: 'auto', pre_tokens: 50_000, post_tokens: 4_000 },
+    }),
+    system('status', { status: 'requesting' }),
+    system('status', { status: 'compacting' }),
+    system('status', { status: null, compact_result: 'failed', compact_error: 'prompt too long' }),
+    system('status', { status: null, compact_result: 'failed' }),
+  ])
+  assert.deepEqual(events, [
+    { type: 'compaction_started' },
+    { type: 'compaction_completed', trigger: 'auto', preTokens: 180_000, postTokens: 21_000 },
+    { type: 'compaction_completed', trigger: 'manual', preTokens: 90_000, postTokens: null },
+    { type: 'compaction_started' },
+    {
+      type: 'notice',
+      level: 'warning',
+      message: 'Claude could not compact the conversation: prompt too long',
+    },
+    { type: 'notice', level: 'warning', message: 'Claude could not compact the conversation.' },
+  ])
+  // /compact compacts the session, unless Claude Code has the command off.
+  const disabled = process.env.DISABLE_COMPACT
+  try {
+    delete process.env.DISABLE_COMPACT
+    assert.equal(new NativeClaudeRuntime().compactsSessions(), true)
+    process.env.DISABLE_COMPACT = '1'
+    assert.equal(new NativeClaudeRuntime().compactsSessions(), false)
+  } finally {
+    if (disabled === undefined) delete process.env.DISABLE_COMPACT
+    else process.env.DISABLE_COMPACT = disabled
+  }
+})
+
 test('native MCP elicitations reach the turn handler, and are declined without one', async () => {
   const elicit = async (handled: boolean) => {
     const runtime = new NativeClaudeRuntime()

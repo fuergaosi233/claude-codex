@@ -2697,13 +2697,17 @@ test('review/start and thread/compact/start emit real turn items', async () => {
     proc.stdin.write(json({ id: 2, method: 'thread/compact/start', params: { threadId } }))
     await reader.nextResponse(2)
     let sawCompaction = false
+    let summary = ''
     for (let i = 0; i < 100; i += 1) {
       const message = await reader.next()
       if (message.method === 'item/completed' && message.params.item.type === 'contextCompaction')
         sawCompaction = true
+      if (message.method === 'item/agentMessage/delta') summary += message.params.delta
       if (message.method === 'turn/completed') break
     }
     assert.equal(sawCompaction, true)
+    // No Claude session to compact yet: the summary model writes a summary.
+    assert.match(summary, /MOCK_COMPACT_SUMMARY/)
 
     proc.stdin.write(
       json({
@@ -3134,61 +3138,411 @@ for (const mode of ['form', 'url'] as const) {
   })
 }
 
-test('thread/compact/start drives Claude (summary model) instead of the local stringified summary', async () => {
+// Runs `text` as a turn of the thread and returns what arrived until it ended.
+async function runCompactionTestTurn(
+  reader: JsonLineReader,
+  proc: ChildProcessWithoutNullStreams,
+  id: number,
+  threadId: string,
+  text: string,
+): Promise<{ turnId: string; seen: any[] }> {
+  proc.stdin.write(json({ id, method: 'turn/start', params: { threadId, input: textInput(text) } }))
+  const seen: any[] = []
+  const response = await awaitMessage(reader, (message) => message.id === id, seen)
+  await awaitMessage(reader, (message) => message.method === 'turn/completed', seen)
+  return { turnId: response.result.turn.id, seen }
+}
+
+// Starts thread/compact/start and returns the compaction turn's id and what
+// arrived until `done`.
+async function compactTestThread(
+  reader: JsonLineReader,
+  proc: ChildProcessWithoutNullStreams,
+  id: number,
+  threadId: string,
+  done: (message: any) => boolean,
+): Promise<{ turnId: string; seen: any[] }> {
+  proc.stdin.write(json({ id, method: 'thread/compact/start', params: { threadId } }))
+  const seen: any[] = []
+  const response = await awaitMessage(reader, (message) => message.id === id, seen)
+  assert.deepEqual(response.result, {})
+  const started = await awaitMessage(reader, (message) => message.method === 'turn/started', seen)
+  await awaitMessage(reader, done, seen)
+  return { turnId: started.params.turn.id, seen }
+}
+
+function compactionItemEvents(seen: any[], method: string): any[] {
+  return seen.filter(
+    (message) => message.method === method && message.params.item?.type === 'contextCompaction',
+  )
+}
+
+test('thread/compact/start compacts the Claude session of a thread that has one', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
-  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
-    stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
-  })
+  const proc = spawnMockAdapter(home)
   const reader = new JsonLineReader(proc)
   try {
-    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
-    const start = await reader.nextResponse(1)
-    const threadId = start.result.thread.id
+    const threadId = await startMockThread(reader, proc)
+    await runCompactionTestTurn(reader, proc, 2, threadId, 'hello world')
 
-    // Need a turn or two of content for compactSummary to have snippets.
+    const { turnId, seen } = await compactTestThread(
+      reader,
+      proc,
+      3,
+      threadId,
+      (message) => message.method === 'thread/compacted',
+    )
+    // Claude compacts its own session: one contextCompaction item, and no
+    // summary message of the adapter's.
+    const started = compactionItemEvents(seen, 'item/started')
+    const completed = compactionItemEvents(seen, 'item/completed')
+    assert.equal(started.length, 1)
+    assert.equal(completed.length, 1)
+    assert.equal(completed[0].params.item.id, started[0].params.item.id)
+    assert.equal(completed[0].params.turnId, turnId)
+    const ofTurn = seen.filter((message) => message.params?.turnId === turnId)
+    assert.equal(
+      ofTurn.some(
+        (message) =>
+          message.method === 'item/started' && message.params.item.type === 'agentMessage',
+      ),
+      false,
+    )
+    assert.equal(
+      ofTurn.some((message) => message.method === 'item/agentMessage/delta'),
+      false,
+    )
+    // The context meter drops to the summary Claude goes on from.
+    const usage = ofTurn.filter((message) => message.method === 'thread/tokenUsage/updated')
+    assert.equal(usage.length, 1)
+    assert.equal(usage[0].params.turnId, turnId)
+    assert.equal(usage[0].params.tokenUsage.last.totalTokens, 12_000)
+    const turnCompleted = seen.find((message) => message.method === 'turn/completed')
+    assert.equal(turnCompleted.params.turn.id, turnId)
+    assert.equal(turnCompleted.params.turn.status, 'completed')
+    assert.deepEqual(seen.at(-1).params, { threadId, turnId })
+
+    // The thread goes on in the session it compacted.
+    const next = await runCompactionTestTurn(reader, proc, 4, threadId, 'rewind check')
+    const text = next.seen
+      .filter((message) => message.method === 'item/agentMessage/delta')
+      .map((message) => message.params.delta)
+      .join('')
+    assert.equal(text, `resumed mock-${threadId} at end after 0 resets`)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('thread/compact/start writes a summary when Claude cannot compact, and keeps the session', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  try {
+    const threadId = await startMockThread(reader, proc)
+    await runCompactionTestTurn(reader, proc, 2, threadId, 'next compaction fails')
+
+    const { turnId, seen } = await compactTestThread(
+      reader,
+      proc,
+      3,
+      threadId,
+      (message) => message.method === 'thread/compacted',
+    )
+    const warning = seen.find((message) => message.method === 'warning')
+    assert.equal(
+      warning?.params.message,
+      'Claude could not compact the conversation: mock compaction failure',
+    )
+    // The summary model's summary, not the local template.
+    const text = seen
+      .filter((message) => message.method === 'item/agentMessage/delta')
+      .map((message) => message.params.delta)
+      .join('')
+    assert.match(text, /MOCK_COMPACT_SUMMARY/)
+    assert.doesNotMatch(text, /Context compacted for thread/)
+    assert.equal(compactionItemEvents(seen, 'item/completed').length, 1)
+    assert.equal(
+      seen.some(
+        (message) =>
+          message.method === 'thread/tokenUsage/updated' && message.params.turnId === turnId,
+      ),
+      false,
+    )
+    const turnCompleted = seen.find((message) => message.method === 'turn/completed')
+    assert.equal(turnCompleted.params.turn.id, turnId)
+    assert.equal(turnCompleted.params.turn.status, 'completed')
+
+    const next = await runCompactionTestTurn(reader, proc, 4, threadId, 'rewind check')
+    const resumed = next.seen
+      .filter((message) => message.method === 'item/agentMessage/delta')
+      .map((message) => message.params.delta)
+      .join('')
+    assert.equal(resumed, `resumed mock-${threadId} at end after 0 resets`)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('Claude compacting on its own within a turn shows as a contextCompaction item', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  try {
+    const threadId = await startMockThread(reader, proc)
+    const { turnId, seen } = await runCompactionTestTurn(
+      reader,
+      proc,
+      2,
+      threadId,
+      'auto compaction check',
+    )
+    const index = (predicate: (message: any) => boolean): number => seen.findIndex(predicate)
+    const firstMessageDone = index(
+      (message) =>
+        message.method === 'item/completed' &&
+        message.params.item.type === 'agentMessage' &&
+        message.params.item.text === 'Reading the files.',
+    )
+    const compactionStarted = index(
+      (message) =>
+        message.method === 'item/started' && message.params.item.type === 'contextCompaction',
+    )
+    const compactionDone = index(
+      (message) =>
+        message.method === 'item/completed' && message.params.item.type === 'contextCompaction',
+    )
+    const compacted = index((message) => message.method === 'thread/compacted')
+    const laterMessage = index(
+      (message) =>
+        message.method === 'item/agentMessage/delta' &&
+        message.params.delta === 'Done after compacting.',
+    )
+    // What Claude said before compacting stays above the compaction.
+    assert.ok(firstMessageDone >= 0)
+    assert.ok(firstMessageDone < compactionStarted)
+    assert.ok(compactionStarted < compactionDone)
+    assert.ok(compactionDone < laterMessage)
+    assert.deepEqual(seen[compacted].params, { threadId, turnId })
+    assert.equal(seen[compactionDone].params.item.id, seen[compactionStarted].params.item.id)
+    assert.equal(compactionItemEvents(seen, 'item/started').length, 1)
+    // The meter drops to the compacted context right away, and the turn's
+    // result does not fill it back up with the whole turn's sum.
+    const usage = seen.filter((message) => message.method === 'thread/tokenUsage/updated')
+    assert.equal(usage[0].params.tokenUsage.last.totalTokens, 20_000)
+    assert.equal(usage.at(-1).params.tokenUsage.last.totalTokens, 20_000)
+    assert.equal(usage.at(-1).params.tokenUsage.modelContextWindow, 200_000)
+    assert.equal(usage.at(-1).params.tokenUsage.total.totalTokens, 550)
+    assert.equal(seen.at(-1).params.turn.status, 'completed')
+
+    proc.stdin.write(
+      json({ id: 3, method: 'thread/turns/items/list', params: { threadId, turnId } }),
+    )
+    const items = await reader.nextResponse(3)
+    assert.deepEqual(
+      items.result.data.map((item: any) => item.type),
+      ['userMessage', 'agentMessage', 'contextCompaction', 'agentMessage'],
+    )
+
+    // A boundary that comes without the status before it starts and ends
+    // the item at once.
+    const boundaryOnly = await runCompactionTestTurn(
+      reader,
+      proc,
+      4,
+      threadId,
+      'auto compaction check, boundary only',
+    )
+    const started = compactionItemEvents(boundaryOnly.seen, 'item/started')
+    const completed = compactionItemEvents(boundaryOnly.seen, 'item/completed')
+    assert.equal(started.length, 1)
+    assert.equal(completed.length, 1)
+    assert.equal(completed[0].params.item.id, started[0].params.item.id)
+    assert.ok(boundaryOnly.seen.some((message) => message.method === 'thread/compacted'))
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('a compaction an interrupt cuts short stays open, like Codex shows it interrupted', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  try {
+    const threadId = await startMockThread(reader, proc)
     proc.stdin.write(
       json({
         id: 2,
         method: 'turn/start',
-        params: { threadId, input: [{ type: 'text', text: 'hello world', text_elements: [] }] },
+        params: { threadId, input: textInput('auto compaction check, stalls') },
       }),
     )
-    await reader.nextResponse(2)
-    let firstTurnDone = false
-    for (let i = 0; i < 200 && !firstTurnDone; i += 1) {
-      const message = await reader.next()
-      if (message.method === 'turn/completed') firstTurnDone = true
-    }
-
-    proc.stdin.write(json({ id: 3, method: 'thread/compact/start', params: { threadId } }))
-    await reader.nextResponse(3)
-
-    let agentText = ''
-    let sawCompacted = false
-    let sawTurnCompleted = false
-    for (let i = 0; i < 300 && !(sawCompacted && sawTurnCompleted); i += 1) {
-      const message = await reader.next()
-      if (message.method === 'item/agentMessage/delta')
-        agentText += String(message.params.delta ?? '')
-      if (message.method === 'thread/compacted') sawCompacted = true
-      if (message.method === 'turn/completed') sawTurnCompleted = true
-    }
-    assert.match(
-      agentText,
-      /MOCK_COMPACT_SUMMARY/,
-      'compact turn should stream the runtime-produced summary, not the local template',
+    const turnId = (await reader.nextResponse(2)).result.turn.id
+    const seen: any[] = []
+    await awaitMessage(
+      reader,
+      (message) =>
+        message.method === 'item/started' && message.params.item.type === 'contextCompaction',
+      seen,
     )
-    assert.doesNotMatch(
-      agentText,
-      /Context compacted for thread/,
-      'local fallback should not have fired when the runtime succeeded',
-    )
+    proc.stdin.write(json({ id: 3, method: 'turn/interrupt', params: { threadId, turnId } }))
+    const done = await awaitMessage(reader, (message) => message.method === 'turn/completed', seen)
+    assert.equal(done.params.turn.status, 'interrupted')
+    seen.push(...(await readQuiet(reader, 300)))
+    assert.equal(compactionItemEvents(seen, 'item/completed').length, 0)
     assert.equal(
-      sawCompacted,
-      true,
-      'thread/compacted notification should still fire after compaction',
+      seen.some((message) => message.method === 'thread/compacted'),
+      false,
     )
+    // The message before it is still completed.
+    assert.ok(
+      seen.some(
+        (message) =>
+          message.method === 'item/completed' && message.params.item.type === 'agentMessage',
+      ),
+    )
+
+    // The same for a compaction the user started.
+    await runCompactionTestTurn(reader, proc, 4, threadId, 'next compaction holds')
+    const compaction = await compactTestThread(
+      reader,
+      proc,
+      5,
+      threadId,
+      (message) =>
+        message.method === 'item/started' && message.params.item.type === 'contextCompaction',
+    )
+    proc.stdin.write(
+      json({ id: 6, method: 'turn/interrupt', params: { threadId, turnId: compaction.turnId } }),
+    )
+    const interrupted = await awaitMessage(
+      reader,
+      (message) => message.method === 'turn/completed',
+      compaction.seen,
+    )
+    assert.equal(interrupted.params.turn.status, 'interrupted')
+    compaction.seen.push(...(await readQuiet(reader, 300)))
+    assert.equal(compactionItemEvents(compaction.seen, 'item/completed').length, 0)
+    assert.equal(
+      compaction.seen.some(
+        (message) =>
+          message.method === 'thread/compacted' ||
+          (message.method === 'item/started' && message.params.item.type === 'agentMessage'),
+      ),
+      false,
+    )
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('turn/steer reaches a turn Claude compacted on its own, not a compaction or review turn', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  try {
+    const threadId = await startMockThread(reader, proc)
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: textInput('auto compaction check, then hold') },
+      }),
+    )
+    const turnId = (await reader.nextResponse(2)).result.turn.id
+    const seen: any[] = []
+    await awaitMessage(
+      reader,
+      (message) =>
+        message.method === 'item/completed' && message.params.item.type === 'contextCompaction',
+      seen,
+    )
+    proc.stdin.write(
+      json({
+        id: 3,
+        method: 'turn/steer',
+        params: { threadId, expectedTurnId: turnId, input: textInput('release') },
+      }),
+    )
+    const steer = await awaitMessage(reader, (message) => message.id === 3, seen)
+    assert.equal(steer.error, undefined)
+    assert.equal(steer.result.turnId, turnId)
+    await awaitMessage(reader, (message) => message.method === 'turn/completed', seen)
+    assert.ok(
+      seen.some(
+        (message) =>
+          message.method === 'item/agentMessage/delta' &&
+          message.params.delta === 'Released after compacting.',
+      ),
+    )
+
+    // A compaction the user started takes no steering, like Codex's.
+    await runCompactionTestTurn(reader, proc, 4, threadId, 'next compaction holds')
+    const compaction = await compactTestThread(
+      reader,
+      proc,
+      5,
+      threadId,
+      (message) =>
+        message.method === 'item/started' && message.params.item.type === 'contextCompaction',
+    )
+    proc.stdin.write(
+      json({
+        id: 6,
+        method: 'turn/steer',
+        params: { threadId, expectedTurnId: compaction.turnId, input: textInput('more') },
+      }),
+    )
+    const rejected = await reader.nextResponse(6)
+    assert.equal(rejected.error.message, 'cannot steer a compact turn')
+    assert.deepEqual(rejected.error.data, {
+      message: 'cannot steer a compact turn',
+      codexErrorInfo: { activeTurnNotSteerable: { turnKind: 'compact' } },
+      additionalDetails: null,
+      misalignment: null,
+    })
+    proc.stdin.write(
+      json({ id: 7, method: 'turn/interrupt', params: { threadId, turnId: compaction.turnId } }),
+    )
+    await awaitMessage(reader, (message) => message.method === 'turn/completed')
+    await readQuiet(reader, 200)
+
+    // Nor does a review.
+    proc.stdin.write(
+      json({
+        id: 8,
+        method: 'review/start',
+        params: {
+          threadId,
+          delivery: 'inline',
+          target: { type: 'custom', instructions: 'hold this turn until released' },
+        },
+      }),
+    )
+    // The review holds until it is released or interrupted.
+    const review = await reader.nextResponse(8)
+    proc.stdin.write(
+      json({
+        id: 9,
+        method: 'turn/steer',
+        params: { threadId, expectedTurnId: review.result.turn.id, input: textInput('release') },
+      }),
+    )
+    const reviewSteer = await reader.nextResponse(9)
+    assert.equal(reviewSteer.error.message, 'cannot steer a review turn')
+    assert.equal(reviewSteer.error.data.codexErrorInfo.activeTurnNotSteerable.turnKind, 'review')
+    proc.stdin.write(
+      json({
+        id: 10,
+        method: 'turn/interrupt',
+        params: { threadId, turnId: review.result.turn.id },
+      }),
+    )
+    await awaitMessage(reader, (message) => message.method === 'turn/completed')
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
