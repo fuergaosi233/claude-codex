@@ -57,6 +57,8 @@ const PROFILE_ENV = [
   'CLAUDE_CODEX_MODEL_PROFILES_FILE',
   'CLAUDE_CODEX_MODEL_PROFILES',
   'CLAUDE_CODEX_MODELS',
+  'CLAUDE_CODEX_DEFAULT_MODEL',
+  'CLAUDE_CODEX_MODEL_ALIASES',
   'CLAUDE_CODEX_SUMMARY_MODEL',
   'CLAUDE_CODEX_TITLE_MODEL',
   'CLAUDE_CODEX_DISABLE_CODEX_PROXY',
@@ -764,6 +766,8 @@ test('without model profiles nothing changes', async () => {
   delete process.env.CLAUDE_CODEX_MODEL_PROFILES
   delete process.env.CLAUDE_CODEX_SUMMARY_MODEL
   delete process.env.CLAUDE_CODEX_TITLE_MODEL
+  delete process.env.CLAUDE_CODEX_DEFAULT_MODEL
+  delete process.env.CLAUDE_CODEX_MODEL_ALIASES
   process.env.CLAUDE_CODEX_MODELS = 'sonnet,opus'
   process.env.CLAUDE_CODEX_CLI = '/usr/local/bin/claude'
   process.env.ANTHROPIC_API_KEY = 'adapter-key'
