@@ -499,6 +499,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     for (const session of this.sessions.values()) {
       this.clearSessionTimers(session)
       session.closed = true
+      session.commandOutputs.close()
       session.abort.abort()
       session.input.close()
     }

@@ -210,14 +210,15 @@ export class CommandOutputs {
     background: BackgroundSink | null,
     live: (taskId: string) => boolean,
   ): void {
-    this.calls.delete(toolUseId)
+    // Results of other tools come here too; only a Bash call can leave a shell.
+    const bash = this.calls.delete(toolUseId)
     const ambiguous = this.ambiguous.delete(toolUseId)
     const taskId = this.taskByCall.get(toolUseId)
     const stream = taskId === undefined ? undefined : this.streams.get(taskId)
     // Already answered.
     if (stream?.background) return
     if (!stream) {
-      if (background && !ambiguous && this.enabled()) {
+      if (bash && background && !ambiguous && this.enabled()) {
         this.backgroundCalls.set(toolUseId, background)
         if (this.backgroundCalls.size > MAX_BACKGROUND_CALLS) {
           const oldest = this.backgroundCalls.keys().next().value

@@ -349,3 +349,32 @@ test('without get_task_output, with polling off or once closed, nothing is read'
   }
   assert.deepEqual(cli.reads, [])
 })
+
+test("other tools' results do not crowd out a Bash call waiting for its background task", async () => {
+  const cli = fakeCli()
+  const outputs = new CommandOutputs(cli.read, 5)
+  const thread = recordingSink()
+  outputs.call('bash', recordingSink())
+  outputs.callEnded(
+    'bash',
+    () => thread,
+    () => false,
+  )
+  // Reads, edits and agent calls of the same turn end here too.
+  for (let index = 0; index < 40; index += 1)
+    outputs.callEnded(
+      `other-${index}`,
+      () => recordingSink(),
+      () => false,
+    )
+  cli.outputs.set('task', 'listening\n')
+  outputs.taskStarted('task', 'bash', true)
+  await waitFor(() => thread.deltas.length === 1, 'output')
+  assert.deepEqual(thread.deltas, ['\nlistening\n'])
+  // A task that names one of those other calls is not a shell of the main loop.
+  cli.outputs.set('other', 'x\n')
+  outputs.taskStarted('other', 'other-39', true)
+  await sleep(20)
+  assert.ok(!cli.reads.includes('other'))
+  outputs.close()
+})

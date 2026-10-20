@@ -98,8 +98,10 @@ class FakeQuery implements AsyncIterable<Record<string, unknown>> {
 // `outputs` printed so far.
 class ShellQuery extends FakeQuery {
   readonly outputs = new Map<string, string>()
+  reads = 0
 
   async getTaskOutput(taskId: string): Promise<unknown> {
+    this.reads += 1
     const output = this.outputs.get(taskId)
     if (output === undefined) throw new Error(`No task found with ID: ${taskId}`)
     return { output, total_bytes: Buffer.byteLength(output), truncated: false }
@@ -1412,6 +1414,79 @@ test('native background shell reports its output to the thread after its call re
     assert.equal(shellOutput()[1]?.delta, `[${limit}]\n`)
     // None of it went to the turn, which had ended.
     assert.deepEqual(outputDeltas(events, 'bash-bg'), [])
+    await runtime.stop()
+  })
+})
+
+test('native stops reading a background shell when its idle session closes or the adapter stops', async () => {
+  const previous = process.env.CLAUDE_CODEX_BACKGROUND_IDLE_MS
+  process.env.CLAUDE_CODEX_BACKGROUND_IDLE_MS = '150'
+  try {
+    await withCommandOutputPollMs(5, async () => {
+      for (const ending of ['idle', 'stop'] as const) {
+        const { runtime, queries } = fakeRuntime((prompt) => new ShellQuery(prompt))
+        const listener = recordingListener()
+        runtime.setBackgroundListener(listener)
+        const turn = runtime.runTurn(context, handlers([]))
+        const query = await waitFor(() => queries[0], 'session')
+        query.outputs.set('b1', 'ready\n')
+        query.push(
+          assistant('m1', [bash('bash-bg', 'npm run dev', true)]),
+          bashTask('b1', 'bash-bg', true),
+          toolResult('bash-bg', 'Command running in background with ID: b1'),
+          { type: 'result', subtype: 'success', result: 'started' },
+        )
+        await turn
+        await waitFor(() => listener.tasks.some((event) => event.type === 'task_output'), 'output')
+        // Reading the shell's output is no activity: the session still
+        // closes once it has been idle for its time.
+        if (ending === 'idle') await waitFor(() => query.closed, 'idle close')
+        else await runtime.stop()
+        await sleep(20)
+        const reads = query.reads
+        await sleep(60)
+        assert.equal(query.reads, reads, `no reads after ${ending}`)
+        await runtime.stop()
+      }
+    })
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_CODEX_BACKGROUND_IDLE_MS
+    else process.env.CLAUDE_CODEX_BACKGROUND_IDLE_MS = previous
+  }
+})
+
+test('native with CLAUDE_CODEX_COMMAND_OUTPUT_POLL_MS=0 never reads command output', async () => {
+  await withCommandOutputPollMs(0, async () => {
+    const { runtime, queries } = fakeRuntime((prompt) => new ShellQuery(prompt))
+    const listener = recordingListener()
+    runtime.setBackgroundListener(listener)
+    const events: RuntimeEvent[] = []
+    const turn = runtime.runTurn(context, handlers(events))
+    const query = await waitFor(() => queries[0], 'session')
+    query.outputs.set('t1', 'compiling\n')
+    query.outputs.set('b1', 'ready\n')
+    query.push(
+      assistant('m1', [bash('bash-a', 'make'), bash('bash-bg', 'npm run dev', true)]),
+      bashTask('t1', 'bash-a', false),
+      bashTask('b1', 'bash-bg', true),
+    )
+    await sleep(30)
+    query.push(
+      toolResult('bash-a', 'compiling\n'),
+      toolResult('bash-bg', 'Command running in background with ID: b1'),
+      { type: 'result', subtype: 'success', result: 'done' },
+    )
+    await turn
+    await sleep(30)
+    assert.equal(query.reads, 0)
+    assert.deepEqual(
+      events.filter((event) => event.type === 'tool_output_delta'),
+      [],
+    )
+    assert.deepEqual(
+      listener.tasks.filter((event) => event.type === 'task_output'),
+      [],
+    )
     await runtime.stop()
   })
 })
