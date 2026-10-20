@@ -827,6 +827,77 @@ test('native auto review keeps the user as reviewer where auto mode is unavailab
   await runtime.stop()
 })
 
+test('native model switch mid-turn sends the permission mode again for the new model', async () => {
+  // A Plan turn stays in plan mode, whatever the CLI did with the switch.
+  {
+    const { runtime, queries } = fakeRuntime()
+    const turn = runtime.runTurn(
+      { ...autoReviewContext, autoReview: false, planMode: true },
+      handlers([]),
+    )
+    const query = await waitFor(() => queries[0], 'plan session')
+    await waitFor(() => query.prompts.length === 1, 'plan prompt')
+    assert.equal(query.modes.length, 0, 'the session opens in plan mode')
+    assert.equal(await runtime.updateTurnSettings('thread', 'turn-1', { model: 'opus' }), true)
+    assert.deepEqual(
+      query.modes.map((entry) => entry.mode),
+      ['plan'],
+    )
+    finishTurn(query)
+    await turn
+    await runtime.stop()
+  }
+
+  // Auto review asks again whether the new model has auto mode: one without
+  // it hands the approvals back to the user.
+  {
+    const { runtime, queries } = fakeRuntime((query) => {
+      query.models = [
+        { value: 'sonnet', displayName: 'Sonnet', supportsAutoMode: true },
+        { value: 'haiku', displayName: 'Haiku', supportsAutoMode: false },
+      ]
+    })
+    const events: RuntimeEvent[] = []
+    const turn = runtime.runTurn(autoReviewContext, handlers(events))
+    const query = await waitFor(() => queries[0], 'auto session')
+    await waitFor(() => query.prompts.length === 1, 'auto prompt')
+    assert.equal(await runtime.updateTurnSettings('thread', 'turn-1', { model: 'haiku' }), true)
+    assert.deepEqual(
+      query.modes.map((entry) => entry.mode),
+      ['auto', 'default'],
+    )
+    assert.deepEqual(
+      events.filter((event) => event.type === 'auto_review_unavailable'),
+      [{ type: 'auto_review_unavailable', reason: 'Haiku does not support auto mode' }],
+    )
+    finishTurn(query)
+    await turn
+    await runtime.stop()
+  }
+
+  // A reviewer handed back mid-turn stays handed back through a later switch.
+  {
+    const { runtime, queries } = fakeRuntime((query) => {
+      query.models = [
+        { value: 'sonnet', displayName: 'Sonnet', supportsAutoMode: true },
+        { value: 'opus', displayName: 'Opus', supportsAutoMode: true },
+      ]
+    })
+    const turn = runtime.runTurn(autoReviewContext, handlers([]))
+    const query = await waitFor(() => queries[0], 'handed back session')
+    await waitFor(() => query.prompts.length === 1, 'handed back prompt')
+    assert.equal(await runtime.updateTurnSettings('thread', 'turn-1', { autoReview: false }), true)
+    assert.equal(await runtime.updateTurnSettings('thread', 'turn-1', { model: 'opus' }), true)
+    assert.deepEqual(
+      query.modes.map((entry) => entry.mode),
+      ['auto', 'default', 'default'],
+    )
+    finishTurn(query)
+    await turn
+    await runtime.stop()
+  }
+})
+
 test('native drops the turn Claude starts only to acknowledge a task the user stopped', async () => {
   await withSettleMs(30, async () => {
     const { runtime, queries } = fakeRuntime()

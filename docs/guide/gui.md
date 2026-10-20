@@ -46,6 +46,10 @@ the plan as a new turn, in which Claude carries it out; writing feedback instead
 keeps Plan mode on for a revised plan. In Plan mode a tool call that would need
 your approval (a command, an edit) is refused rather than asked about.
 
+A chat keeps its mode after a restart. A fork starts in Default, as a Codex
+fork does; when you fork a chat from the App, the App keeps the mode it showed
+and sends it with the fork's messages.
+
 ## Approvals
 
 Outside Full access, Claude asks before it runs a command, edits a file, or

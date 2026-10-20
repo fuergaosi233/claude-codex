@@ -9992,6 +9992,55 @@ test('thread/settings/update keeps the Plan toggle and thread/resume reports it'
   }
 })
 
+test('a Plan thread comes back in Plan after a restart, and its fork starts in Default', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  let proc = spawnMockAdapter(home)
+  let reader = new JsonLineReader(proc)
+  // Runs a turn that names no mode and returns whether it ran in plan mode.
+  const planTurn = async (id: number, threadId: string) => {
+    sendTurn(proc, id, threadId, 'plan mode check')
+    let text = ''
+    for (;;) {
+      const message = await reader.next()
+      if (message.method === 'item/agentMessage/delta') text += message.params.delta
+      if (message.method === 'turn/completed') break
+    }
+    return /^planMode=true/.test(text)
+  }
+  try {
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const threadId = (await reader.nextResponse(1)).result.thread.id
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'thread/settings/update',
+        params: { threadId, collaborationMode: { mode: 'plan', settings: {} } },
+      }),
+    )
+    await reader.nextResponse(2)
+    await stopProcess(proc)
+
+    proc = spawnMockAdapter(home)
+    reader = new JsonLineReader(proc)
+    proc.stdin.write(json({ id: 1, method: 'thread/resume', params: { threadId } }))
+    assert.equal((await reader.nextResponse(1)).result.collaborationMode.mode, 'plan')
+    assert.equal(await planTurn(2, threadId), true)
+
+    // As a Codex fork does, the fork starts in the default mode; the App
+    // sends the mode it shows for the fork with the fork's turns.
+    proc.stdin.write(json({ id: 3, method: 'thread/fork', params: { threadId } }))
+    const forkId = (await reader.nextResponse(3)).result.thread.id
+    proc.stdin.write(json({ id: 4, method: 'thread/resume', params: { threadId: forkId } }))
+    assert.equal((await reader.nextResponse(4)).result.collaborationMode.mode, 'default')
+    assert.equal(await planTurn(5, forkId), false)
+    // The parent keeps its own.
+    assert.equal(await planTurn(6, threadId), true)
+  } finally {
+    await stopProcess(proc)
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('thread sections paginate without losing entries at page boundaries', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {

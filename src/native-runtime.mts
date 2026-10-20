@@ -369,10 +369,13 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       setModel?: (model?: string) => Promise<void>
       applyFlagSettings?: (settings: { effortLevel?: string | null }) => Promise<void>
     }
+    let modelSwitched = false
     if (settings.model && settings.model !== session.model) {
       if (!query.setModel) throw new Error('this Claude Code cannot switch models mid-turn')
       session.model = settings.model
       await sessionControl(query.setModel(settings.model), 'model switch')
+      forgetPermissionMode(session)
+      modelSwitched = true
     }
     if (settings.effort && settings.effort !== session.effort) {
       if (!query.applyFlagSettings)
@@ -383,11 +386,15 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         'effort change',
       )
     }
+    // The rest of the turn keeps the reviewer it switched to, and the mode is
+    // put back for the model it runs now.
     // App rule: auto-review
     if (settings.autoReview != null)
+      pending.context = { ...pending.context, autoReview: settings.autoReview }
+    if (settings.autoReview != null || modelSwitched)
       await this.applyPermissionMode(
         session,
-        { ...pending.context, autoReview: settings.autoReview },
+        { ...pending.context, model: session.model },
         pending.handlers,
       )
     return true
@@ -1117,6 +1124,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         query.setModel(context.model).catch(() => {}),
         SESSION_CONTROL_TIMEOUT_MS,
       )
+      forgetPermissionMode(session)
     }
     // Effort is part of the session signature, so only a turn pinned to this
     // session by background work, or one after a mid-turn change, gets here
@@ -2996,6 +3004,13 @@ function autoModeFor(context: RuntimeTurnContext): 'enter' | 'skip' | { reason: 
     return { reason: 'A read-only sandbox keeps every approval with the user' }
   }
   return 'enter'
+}
+
+// After a model switch the session's permission mode is no longer known: the
+// CLI may have left it (auto mode exists for some models only), so the next
+// applyPermissionMode sends the turn's mode again. Bypass stays as it is.
+function forgetPermissionMode(session: LiveSession): void {
+  if (session.permissionMode !== 'bypassPermissions') session.permissionMode = 'unconfirmed'
 }
 
 // The entry for `model` in Claude Code's model list; a thread on no explicit

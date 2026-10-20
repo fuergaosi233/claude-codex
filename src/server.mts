@@ -1250,8 +1250,11 @@ export class CodexClaudeAppServer {
       // The App forks a thread to describe it and asks for an ephemeral fork;
       // like any helper thread, it stays out of the thread list.
       ephemeral: params.ephemeral === true || parent.ephemeral,
-      // A helper fork never inherits the Plan toggle or the reviewer.
-      collaborationMode: params.ephemeral === true ? null : (parent.collaborationMode ?? null),
+      // A fork starts in the default mode, as a Codex fork does: Codex
+      // carries the parent's reviewer into a fork but not its mode. The App
+      // sends the mode it shows for the fork with each of its turns.
+      // A helper fork does not inherit the reviewer either.
+      collaborationMode: null,
       approvalsReviewer:
         params.ephemeral === true
           ? null

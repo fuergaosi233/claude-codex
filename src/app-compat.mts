@@ -194,7 +194,7 @@ export const APP_RULES: readonly AppRule[] = [
     id: 'collaboration-modes',
     app: "Enables /plan and the composer's Plan toggle only when collaborationMode/list returns a preset with mode plan, and keeps only the plan and default presets. Sends the chosen mode as collaborationMode through thread/settings/update and on turn/start, where it sets the top-level model and effort to null and puts the picker's model and effort in collaborationMode.settings. Adopts the collaborationMode of thread/settings/updated and of the thread/resume response as the composer's mode.",
     adapter:
-      "Lists a Plan and a Default preset without a model or effort, takes a turn's model and effort from collaborationMode.settings, keeps the mode per thread for turns that name none, and reports the thread's real mode in thread/settings/updated and thread/resume.",
+      "Lists a Plan and a Default preset without a model or effort, takes a turn's model and effort from collaborationMode.settings, keeps the mode per thread for turns that name none, also across a restart, and reports the thread's real mode in thread/settings/updated and thread/resume. A fork starts in Default, as a Codex fork does; the App sends the mode it shows for the fork on the fork's turns.",
     verify:
       'In a Claude chat, /plan is enabled; turn the Plan toggle on and send a message: the toggle stays on and the model picker keeps its choice.',
   },

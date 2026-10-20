@@ -479,4 +479,30 @@ test('turn settings switch the running turn in place, and the next turn restores
     ['applyFlagSettings', { effortLevel: null }],
   ])
   assert.equal(session.effort, null)
+
+  // The model switch may have left the CLI in another permission mode, so
+  // the turn's mode goes back with it; without a switch nothing is sent.
+  const modes: string[] = []
+  const planned = {
+    query: {
+      setModel: async () => {},
+      setPermissionMode: async (mode: string) => {
+        modes.push(mode)
+      },
+    },
+    model: 'opus',
+    effort: null,
+    permissionMode: 'plan',
+  }
+  const planTurn: RuntimeTurnContext = {
+    ...context,
+    model: 'sonnet',
+    approvalPolicy: 'on-request',
+    sandboxMode: 'workspace-write',
+    planMode: true,
+  }
+  await apply.call(runtime, planned, planTurn)
+  assert.deepEqual(modes, ['plan'])
+  await apply.call(runtime, planned, planTurn)
+  assert.deepEqual(modes, ['plan'])
 })
