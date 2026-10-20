@@ -266,7 +266,7 @@ test('profile fingerprints reject configuration drift without hashing secret val
     assert.notEqual(modelProfileFingerprint('main-model', env), fingerprint)
     assert.throws(
       () => resolveClaudeModelProcess('main-model', env, fingerprint),
-      /model process profile configuration changed for main-model; start a new thread/,
+      /model process profile main-model changed since this chat started, so this chat cannot continue; start a new chat/,
     )
   } finally {
     await rm(root, { recursive: true, force: true })
@@ -573,11 +573,9 @@ test('a chat keeps its profile once it has a conversation; a new chat takes any'
   }
 })
 
-test('a thread refuses to continue once its profile changed or went away', async () => {
+test('a chat whose profile changed or went away still opens, but nothing starts Claude for it', async () => {
   const harness = await profileServer(TWO_PROFILES)
   const { call, runTurn } = harness
-  const turnStart = (threadId: string) =>
-    call('turn/start', { threadId, input: [{ type: 'text', text: 'Continue.' }] })
   try {
     const { result: talked } = await call('thread/start', {
       cwd: harness.root,
@@ -597,32 +595,77 @@ test('a thread refuses to continue once its profile changed or went away', async
         { id: 'second-model', sdkModel: 'vendor/second-1' },
       ],
     })
-    const drifted = await turnStart(talked.thread.id)
-    assert.match(
-      drifted.error?.message ?? '',
-      /model process profile configuration changed for main-model; start a new thread/,
+    await assertOpensButStartsNothing(
+      harness,
+      talked.thread.id,
+      /model process profile main-model changed since this chat started, so this chat cannot continue; start a new chat$/,
     )
-    const resume = await call('thread/resume', { threadId: talked.thread.id })
-    assert.match(resume.error?.message ?? '', /configuration changed/)
-    const compact = await call('thread/compact/start', { threadId: talked.thread.id })
-    assert.match(compact.error?.message ?? '', /configuration changed/)
     // A chat with nothing said yet just takes the new configuration.
     const fresh = await runTurn(unsent.thread.id)
     assert.equal(fresh?.model, 'vendor/main-2')
     assert.equal(fresh?.modelProfileFingerprint, fingerprint('main-model'))
 
-    // Profiles removed: a thread pinned to one cannot go on elsewhere.
-    delete process.env.CLAUDE_CODEX_MODEL_PROFILES_FILE
-    const removed = await turnStart(unsent.thread.id)
-    assert.match(removed.error?.message ?? '', /model process profiles are no longer configured/)
+    // Its profile deleted: the chat cannot go on in another one.
+    await harness.writeProfiles({
+      defaultModel: 'second-model',
+      models: [{ id: 'second-model', sdkModel: 'vendor/second-1' }],
+    })
+    await assertOpensButStartsNothing(
+      harness,
+      unsent.thread.id,
+      /model process profile main-model is no longer configured, so this chat cannot continue; start a new chat$/,
+    )
 
-    // A thread started without profiles predates the pinning.
-    const { result: plain } = await call('thread/start', { cwd: harness.root, model: 'main-model' })
-    assert.equal(harness.store.getThread(plain.thread.id)?.modelProfileFingerprint, null)
-    await runTurn(plain.thread.id)
+    // Profiles removed: a chat pinned to one cannot go on without one either.
+    delete process.env.CLAUDE_CODEX_MODEL_PROFILES_FILE
+    await assertOpensButStartsNothing(
+      harness,
+      unsent.thread.id,
+      /model process profiles are no longer configured, so this chat on main-model cannot continue; start a new chat$/,
+    )
+    // Not even by picking a model, which would drop the pin.
+    const picked = await call('thread/settings/update', {
+      threadId: unsent.thread.id,
+      model: 'claude-sonnet-4-5',
+    })
+    assert.match(picked.error?.message ?? '', /model process profiles are no longer configured/)
+    assert.equal(harness.store.getThread(unsent.thread.id)?.model, 'main-model')
+  } finally {
+    await harness.close()
+  }
+})
+
+test('a chat from before model profiles still opens, but nothing starts Claude for it', async () => {
+  const harness = await profileServer(TWO_PROFILES)
+  const { call, runTurn } = harness
+  try {
+    delete process.env.CLAUDE_CODEX_MODEL_PROFILES_FILE
+    const { result: onProfileId } = await call('thread/start', {
+      cwd: harness.root,
+      model: 'main-model',
+    })
+    await runTurn(onProfileId.thread.id)
+    const { result: onOther } = await call('thread/start', {
+      cwd: harness.root,
+      model: 'claude-sonnet-4-5',
+    })
+    await runTurn(onOther.thread.id)
+    assert.equal(harness.store.getThread(onProfileId.thread.id)?.modelProfileFingerprint, null)
+    assert.equal(harness.store.getThread(onOther.thread.id)?.modelProfileFingerprint, null)
+
+    // Profiles turned on: neither session lives in a profile's process.
     process.env.CLAUDE_CODEX_MODEL_PROFILES_FILE = harness.configFile
-    const predates = await turnStart(plain.thread.id)
-    assert.match(predates.error?.message ?? '', /predates model process profile identity pinning/)
+    const preProfile =
+      /this chat started before model process profiles were configured, so it cannot continue on one; start a new chat$/
+    await assertOpensButStartsNothing(harness, onProfileId.thread.id, preProfile)
+    await assertOpensButStartsNothing(harness, onOther.thread.id, preProfile)
+    // Picking a profile does not move it onto one.
+    const picked = await call('thread/settings/update', {
+      threadId: onOther.thread.id,
+      model: 'second-model',
+    })
+    assert.match(picked.error?.message ?? '', preProfile)
+    assert.equal(harness.store.getThread(onOther.thread.id)?.modelProfileFingerprint, null)
   } finally {
     await harness.close()
   }
@@ -752,7 +795,7 @@ test('configured model profiles drive the model picker and native SDK process op
           modelProfileId: 'second-model',
           modelProfileFingerprint: 'stale',
         }),
-      /configuration changed for second-model/,
+      /model process profile second-model changed since this chat started/,
     )
   } finally {
     restore()
@@ -993,7 +1036,7 @@ test('the native runtime starts each profile turn in its own process', async () 
         { ...context, turnId: 'turn-2', modelProfileFingerprint: 'stale' },
         runtimeHandlers(),
       ),
-      /configuration changed for main-model/,
+      /model process profile main-model changed since this chat started/,
     )
     assert.equal(launches.length, 1)
   } finally {
@@ -1090,11 +1133,13 @@ async function profileServer(
   const server = new CodexClaudeAppServer(store, runtime)
   const responses = new Map<unknown, any>()
   const startedThreads: string[] = []
+  const notifications: Array<{ method: string; params: any }> = []
   const peer: RpcPeer = {
     id: 'model-profiles-test',
     close: () => {},
     send: (message) => {
       if ('id' in message) responses.set(message.id, message)
+      else if ('method' in message) notifications.push(message as { method: string; params: any })
       if ('method' in message && message.method === 'turn/completed') {
         completed.add((message.params as { turn: { id: string } }).turn.id)
       }
@@ -1127,7 +1172,89 @@ async function profileServer(
     restore()
     await rm(root, { recursive: true, force: true })
   }
-  return { root, configFile, store, startedThreads, call, runTurn, writeProfiles, close }
+  return {
+    root,
+    configFile,
+    store,
+    contexts,
+    notifications,
+    startedThreads,
+    call,
+    runTurn,
+    writeProfiles,
+    close,
+  }
+}
+
+// The App can still open and read the chat, while every request that would
+// start Claude for it, and every turn the adapter would start on its own, is
+// refused with `refusal` and launches nothing. Its profile pin stays put.
+async function assertOpensButStartsNothing(
+  harness: Awaited<ReturnType<typeof profileServer>>,
+  threadId: string,
+  refusal: RegExp,
+): Promise<void> {
+  const { call, contexts, notifications, store } = harness
+  const launched = contexts.length
+  const pinned = store.getThread(threadId)?.modelProfileFingerprint ?? null
+  const turns = store.listTurns(threadId).length
+  assert.ok(turns > 0)
+
+  const resumed = await call('thread/resume', { threadId })
+  assert.equal(resumed.error, undefined, resumed.error?.message)
+  assert.equal(resumed.result.thread.id, threadId)
+  assert.equal(resumed.result.thread.turns.length, turns)
+  // A model the resume names does not re-pin the chat either.
+  const renamed = await call('thread/resume', {
+    threadId,
+    model: store.getThread(threadId)?.model,
+  })
+  assert.equal(renamed.error, undefined, renamed.error?.message)
+  const read = await call('thread/read', { threadId, includeTurns: true })
+  assert.equal(read.error, undefined, read.error?.message)
+  assert.equal(read.result.thread.turns.length, turns)
+
+  const turn = await call('turn/start', { threadId, input: [{ type: 'text', text: 'Continue.' }] })
+  assert.match(turn.error?.message ?? '', refusal)
+  const review = await call('review/start', {
+    threadId,
+    delivery: 'inline',
+    target: { type: 'custom', instructions: 'Review.' },
+  })
+  assert.match(review.error?.message ?? '', refusal)
+  const compact = await call('thread/compact/start', { threadId })
+  assert.match(compact.error?.message ?? '', refusal)
+  const fork = await call('thread/fork', { threadId })
+  assert.match(fork.error?.message ?? '', refusal)
+
+  // Turns the adapter starts by itself say why they did not.
+  const refused = async (method: string, params: Record<string, unknown>) => {
+    const before = notifications.filter((entry) => entry.method === 'error').length
+    const response = await call(method, { threadId, ...params })
+    assert.equal(response.error, undefined, response.error?.message)
+    for (let waited = 0; ; waited += 10) {
+      const errors = notifications.filter((entry) => entry.method === 'error')
+      if (errors.length > before) {
+        assert.match(errors.at(-1)?.params.error.message ?? '', refusal)
+        return response.result
+      }
+      assert.ok(waited < 5_000, `${method} reported no refusal`)
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+  }
+  await refused('thread/goal/set', { objective: 'Keep going.', status: 'active' })
+  await call('thread/goal/clear', { threadId })
+  const queued = await refused('thread/queue/add', { input: [{ type: 'text', text: 'Later.' }] })
+  // The queued message stays queued.
+  assert.deepEqual(
+    store.listQueue(threadId).map((entry) => entry.id),
+    [queued.queuedSubmission.id],
+  )
+  await call('thread/queue/delete', { threadId, queuedSubmissionId: queued.queuedSubmission.id })
+
+  assert.equal(contexts.length, launched)
+  assert.equal(store.listTurns(threadId).length, turns)
+  assert.equal(store.getThread(threadId)?.modelProfileFingerprint ?? null, pinned)
 }
 
 function saveEnv(keys: string[]): () => void {

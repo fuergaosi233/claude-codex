@@ -28,6 +28,8 @@ default Claude list when you need to customize it. With
 [model process profiles](/guide/configuration#model-process-profiles), the
 Claude list is the profiles, each running its own Claude Code; a chat then
 keeps its profile once it has a conversation, and picking another one asks for
+a new chat. A chat whose profile changed or went away, or one from before
+profiles were set up, still opens to be read, but sending it a message asks for
 a new chat.
 
 Each Claude model offers the reasoning efforts Claude Code reports for it:

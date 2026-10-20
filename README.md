@@ -92,9 +92,10 @@ the picker runs a Claude Code process of its own instead: its own executable,
 provider environment and Claude config folder, with none of the adapter's
 provider credentials. Secrets stay in the environment or in private env files;
 the profiles file only references them. A chat stays on the profile it started
-on, and asks for a new thread once that profile's configuration changes rather
-than resuming its session somewhere else. Without a profiles file nothing
-changes. See
+on. Once that profile's configuration changes, or for a chat from before
+profiles were set up, the chat still opens to be read, but a new message asks
+for a new chat rather than resuming its session somewhere else. Without a
+profiles file nothing changes. See
 [Model process profiles](https://fuergaosi233.github.io/claude-codex/guide/configuration#model-process-profiles)
 for the file format, its safety rules and how it relates to
 `CLAUDE_CODEX_MODELS`.

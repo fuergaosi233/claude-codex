@@ -189,9 +189,13 @@ database.
 
 - Once a thread has a conversation (a turn ran, or it is a fork), its Claude
   session lives in that profile's process and config folder. If the profile's
-  fingerprint changed, the profiles file is gone, or the thread started before
-  profiles were set up, a turn, resume, fork, compaction or review of it fails
-  and asks for a new thread instead of resuming the session somewhere else.
+  fingerprint changed, the profile or the profiles file is gone, or the thread
+  started before profiles were set up, the chat still opens (`thread/resume`,
+  `thread/read`) so it can be read, but nothing starts Claude for it: a turn,
+  fork, compaction, review or model change fails, saying what happened and to
+  start a new chat, instead of resuming the session somewhere else. A queued
+  message or an active goal reports the same error and does not run; the
+  queued message stays queued.
 - A thread with nothing said yet, such as the one the App opens for a new chat
   before its first message, takes the profile's current configuration and can
   still move to any profile.

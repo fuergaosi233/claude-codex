@@ -193,9 +193,7 @@ export function resolveClaudeModelProcess(
   const envFileAssignments = profile.envFile ? readPrivateEnvAssignments(profile.envFile) : {}
   const fingerprint = fingerprintForProfile(profile, env, envFileAssignments)
   if (expectedFingerprint && fingerprint !== expectedFingerprint) {
-    throw new Error(
-      `model process profile configuration changed for ${profile.id}; start a new thread`,
-    )
+    throw modelProfileChangedError(profile.id)
   }
   const childEnv: Record<string, string> = {}
   if (profile.inheritEnv.includes('*')) {
@@ -240,6 +238,43 @@ export function modelProfileFingerprint(
   if (!profile) return null
   const envFileAssignments = profile.envFile ? readPrivateEnvAssignments(profile.envFile) : {}
   return fingerprintForProfile(profile, env, envFileAssignments)
+}
+
+// Why a conversation on `modelId`, pinned to `pinnedFingerprint` (null when it
+// pinned none), cannot go on in a Claude Code process, or null when it can.
+// Its session lives in the process and config dir of the profile it pinned, so
+// it must not resume anywhere else. A broken profiles file still throws.
+export function modelProfileBindingError(
+  modelId: string,
+  pinnedFingerprint: string | null,
+  env: Environment = process.env,
+): Error | null {
+  const profiles = loadClaudeModelProfiles(env)
+  const id = modelId.trim()
+  if (profiles.length === 0) {
+    if (pinnedFingerprint === null) return null
+    return new Error(
+      `model process profiles are no longer configured, so this chat on ${id} cannot continue; start a new chat`,
+    )
+  }
+  if (pinnedFingerprint === null) {
+    return new Error(
+      'this chat started before model process profiles were configured, so it cannot continue on one; start a new chat',
+    )
+  }
+  if (!profiles.some((profile) => profile.id === id)) {
+    return new Error(
+      `model process profile ${id} is no longer configured, so this chat cannot continue; start a new chat`,
+    )
+  }
+  if (modelProfileFingerprint(id, env) !== pinnedFingerprint) return modelProfileChangedError(id)
+  return null
+}
+
+function modelProfileChangedError(profileId: string): Error {
+  return new Error(
+    `model process profile ${profileId} changed since this chat started, so this chat cannot continue; start a new chat`,
+  )
 }
 
 // A thread stays on the profile it started with: switching profiles would

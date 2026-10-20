@@ -44,6 +44,7 @@ import {
 } from './mcp.mjs'
 import {
   assertModelProfileTransition,
+  modelProfileBindingError,
   modelProfileFingerprint,
   resolveClaudeModelProfile,
 } from './model-profiles.mjs'
@@ -421,28 +422,12 @@ function claudeHelperModel(model: string): string {
 }
 
 // A Claude thread's session lives in its model process profile (executable,
-// provider, CLAUDE_CONFIG_DIR). Refuse to continue it once that profile is
-// gone or its configuration changed, instead of resuming somewhere else.
-function assertThreadModelProfileBinding(thread: ThreadRecord): void {
-  if (thread.runtimeBackend !== 'claude') return
-  const pinned = thread.modelProfileFingerprint ?? null
-  const currentFingerprint = modelProfileFingerprint(thread.model)
-  if (currentFingerprint === null) {
-    if (pinned !== null) {
-      throw new Error('model process profiles are no longer configured; start a new thread')
-    }
-    return
-  }
-  if (pinned === null) {
-    throw new Error(
-      `thread ${thread.id} predates model process profile identity pinning; start a new thread`,
-    )
-  }
-  if (currentFingerprint !== pinned) {
-    throw new Error(
-      `model process profile configuration changed for ${thread.model}; start a new thread`,
-    )
-  }
+// provider, CLAUDE_CONFIG_DIR). Once that profile is gone or its configuration
+// changed, or the thread started before profiles were set up, nothing may
+// start Claude for it: that would resume the session somewhere else.
+function threadModelProfileBindingError(thread: ThreadRecord): Error | null {
+  if (thread.runtimeBackend !== 'claude') return null
+  return modelProfileBindingError(thread.model, thread.modelProfileFingerprint ?? null)
 }
 
 // A Codex model with Codex routing off has nowhere to run.
@@ -1175,7 +1160,12 @@ export class CodexClaudeAppServer {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
     if (!thread) throw new Error('unknown thread: ' + threadId)
-    this.checkModelProfileBinding(thread)
+    // A chat its model process profile can no longer run still opens, so it
+    // can be read; a turn, review, compaction or fork of it is refused.
+    const unbound = this.modelProfileUnbound(thread)
+    if (unbound) {
+      debugLog('thread.resume.modelProfileUnbound', { threadId, message: unbound.message })
+    }
     if (typeof params.cwd === 'string' && params.cwd.length > 0) thread.cwd = params.cwd
     const rawModel = modelFromParams(params, null)
     const model = rawModel ? normalizeSelectableModelId(rawModel, thread.model) : null
@@ -1190,8 +1180,10 @@ export class CodexClaudeAppServer {
       const newBackend = isCodexOpenAiModel(model) ? 'codex' : 'claude'
       if (newBackend === thread.runtimeBackend) {
         // A Claude conversation also stays on its model process profile; the
-        // picker's choice is ignored rather than failing the resume.
+        // picker's choice is ignored rather than failing the resume. One no
+        // profile can run keeps its model and pin, so it stays refused.
         try {
+          if (unbound) throw unbound
           if (newBackend === 'claude' && this.threadHasConversation(thread))
             assertModelProfileTransition(thread.model, model)
           thread.modelProfileFingerprint = profileFingerprintForModel(model, newBackend)
@@ -2356,6 +2348,22 @@ export class CodexClaudeAppServer {
     if (settled === 'failed' || !this.canContinueGoal(threadId)) return false
     const goal = this.store.getGoal(threadId)
     if (!goal) return false
+    // Nor does a goal go on in a chat its model process profile can no longer
+    // run; say why, as a refused queued message does.
+    let unbound: Error | null = null
+    try {
+      unbound = this.modelProfileUnbound(thread)
+    } catch {
+      // An unreadable profiles file fails the turn start below.
+    }
+    if (unbound) {
+      debugLog('goal.continue.failed', { threadId, error: unbound.message })
+      this.notify(peer, {
+        method: 'error',
+        params: { threadId, turnId: null, willRetry: false, error: { message: unbound.message } },
+      })
+      return false
+    }
     void this.turnStart(peer, {
       ...this.followUpParams(threadId),
       input: [],
@@ -6207,6 +6215,8 @@ export class CodexClaudeAppServer {
   // With model process profiles configured, a Claude conversation likewise
   // stays on its profile, since its session lives in that profile's process
   // and config dir; a thread with no conversation yet can take any profile.
+  // A conversation no profile can run any more keeps its model, so a model
+  // change cannot pin it to a profile, or to none, and resume it there.
   private setThreadModel(thread: ThreadRecord, model: string): void {
     let runtimeBackend = thread.runtimeBackend
     if (this.crossesRuntimeBackend(thread, model)) {
@@ -6219,6 +6229,8 @@ export class CodexClaudeAppServer {
       if (codexModel && this.codexRoutingDisabled()) throw codexRoutingDisabledError(model)
       runtimeBackend = codexModel ? 'codex' : 'claude'
     } else if (runtimeBackend === 'claude' && this.threadHasConversation(thread)) {
+      const unbound = threadModelProfileBindingError(thread)
+      if (unbound) throw unbound
       assertModelProfileTransition(thread.model, model)
     }
     const profileFingerprint = profileFingerprintForModel(model, runtimeBackend)
@@ -6229,14 +6241,19 @@ export class CodexClaudeAppServer {
 
   // A Claude thread's conversation lives in its model process profile: it
   // continues only while that profile is configured as it was (see
-  // assertThreadModelProfileBinding). A thread with no conversation yet has
-  // nothing to lose and takes the profile's current configuration.
+  // threadModelProfileBindingError). Anything that would start Claude for it
+  // checks this first: turns, reviews, compaction and forks.
   private checkModelProfileBinding(thread: ThreadRecord): void {
-    if (thread.runtimeBackend !== 'claude') return
-    if (this.threadHasConversation(thread)) {
-      assertThreadModelProfileBinding(thread)
-      return
-    }
+    const unbound = this.modelProfileUnbound(thread)
+    if (unbound) throw unbound
+  }
+
+  // Why the thread's conversation cannot go on in a Claude Code process, or
+  // null when it can. A thread with no conversation yet has nothing to lose
+  // and takes the profile's current configuration.
+  private modelProfileUnbound(thread: ThreadRecord): Error | null {
+    if (thread.runtimeBackend !== 'claude') return null
+    if (this.threadHasConversation(thread)) return threadModelProfileBindingError(thread)
     let fingerprint: string | null
     try {
       fingerprint = profileFingerprintForModel(thread.model, 'claude')
@@ -6245,9 +6262,10 @@ export class CodexClaudeAppServer {
       // a turn on this model fails naming it.
       fingerprint = null
     }
-    if (fingerprint === (thread.modelProfileFingerprint ?? null)) return
+    if (fingerprint === (thread.modelProfileFingerprint ?? null)) return null
     thread.modelProfileFingerprint = fingerprint
     this.store.upsertThread(thread)
+    return null
   }
 
   private providerLoopSelectionInput(): ProviderLoopSelectionInput {
