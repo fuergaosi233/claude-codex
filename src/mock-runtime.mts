@@ -75,11 +75,13 @@ export class MockRuntime implements ClaudeRuntime {
         ? `${context.claudeSessionId}~${context.turnId}`
         : (context.claudeSessionId ?? `mock-${context.threadId}`)
     await handlers.onEvent({ type: 'session', claudeSessionId: sessionId })
-    await handlers.onEvent({
-      type: 'checkpoint',
-      claudeSessionId: sessionId,
-      messageUuid: `${context.turnId}-entry`,
-    })
+    // A turn from before the adapter kept checkpoints left none.
+    if (!/no checkpoint/i.test(context.prompt))
+      await handlers.onEvent({
+        type: 'checkpoint',
+        claudeSessionId: sessionId,
+        messageUuid: `${context.turnId}-entry`,
+      })
 
     // Claude Code's /compact in the thread's session: the summary replaces
     // the conversation, reported by the status and compact_boundary messages.

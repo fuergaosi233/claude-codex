@@ -33,7 +33,14 @@ import {
   isGoalStatus,
   MODEL_GOAL_STATUSES,
 } from './goal-prompts.mjs'
-import { accountUsage, hostMethod, RpcError } from './host-methods.mjs'
+import {
+  accountUsage,
+  hostMethod,
+  INVALID_REQUEST,
+  methodNotFound,
+  RpcError,
+  SERVER_ERROR,
+} from './host-methods.mjs'
 import { inheritedAgents, inheritedHooks, inheritedPermissionRules } from './inherited-config.mjs'
 import {
   callMcpTool,
@@ -128,6 +135,7 @@ import {
 import { PINNED_SECTION_ID, type SessionStore, settledTurn } from './store.mjs'
 import {
   findOccurrences,
+  forkTurns,
   offsetCursor,
   pageItems,
   pageLimit,
@@ -137,7 +145,7 @@ import {
   threadSnippet,
 } from './thread-history.mjs'
 import type {
-  ClaudeCheckpoint,
+  ClaudeResumePoint,
   ClaudeRuntime,
   ElicitationRequest,
   ElicitationResponse,
@@ -583,9 +591,9 @@ export class CodexClaudeAppServer {
         stack: error instanceof Error ? error.stack : null,
       })
       this.sendResponse(peer, request.id, undefined, {
-        code: error instanceof RpcError ? error.code : -32000,
+        code: error instanceof RpcError ? error.code : SERVER_ERROR,
         message: error instanceof Error ? error.message : String(error),
-        ...(error instanceof RpcError ? { data: error.data } : {}),
+        ...(error instanceof RpcError && error.data !== undefined ? { data: error.data } : {}),
       })
     }
   }
@@ -672,6 +680,8 @@ export class CodexClaudeAppServer {
         return this.threadAttachmentList(asRecord(params))
       case 'thread/attachment/remove':
         return this.threadAttachmentRemove(asRecord(params))
+      case 'thread/attachmentOwner/list':
+        return this.threadAttachmentOwnerList(asRecord(params))
       case 'thread/name/set':
         return this.threadNameSet(asRecord(params))
       case 'thread/archive':
@@ -857,8 +867,8 @@ export class CodexClaudeAppServer {
         return { effectiveEnabled: asRecord(params).enabled === true }
       case 'plugin/share/list':
         return { data: [] }
-      // Stub the three RPC methods Codex App may call but our dispatcher
-      // previously threw "method not implemented" on. Stubs return the
+      // Stub the three RPC methods Codex App may call that our dispatcher
+      // would otherwise answer as unknown. Stubs return the
       // schema-correct empty shape so the App's call sites don't surface an
       // RPC error toast.
       case 'plugin/share/checkout':
@@ -998,9 +1008,16 @@ export class CodexClaudeAppServer {
         return this.fuzzySessionUpdate(peer, asRecord(params))
       case 'fuzzyFileSearch/sessionStop':
         return this.fuzzySessionStop(peer, asRecord(params))
+      // Requests of the protocol that no App build sends. Codex itself answers
+      // thread/prediction/request with method not found, and
+      // thread/readState/update too when it keeps no read state.
+      case 'thread/items/read':
+      case 'thread/prediction/request':
+      case 'thread/readState/update':
+        throw methodNotFound(method)
       default: {
         const result = hostMethod(method, asRecord(params))
-        if (result === undefined) throw new Error(`method not implemented: ${method}`)
+        if (result === undefined) throw methodNotFound(method)
         return result
       }
     }
@@ -1043,6 +1060,9 @@ export class CodexClaudeAppServer {
       cwd,
       model,
       reasoningEffort,
+      // Never openai: the App would fork a Claude thread for its composer
+      // predictions.
+      // App rule: prediction-provider
       modelProvider: 'claude-code',
       claudeSessionId: null,
       // v2 SessionSource is camelCase; the old `app_server` falls through to
@@ -1168,6 +1188,10 @@ export class CodexClaudeAppServer {
     const parentId = stringOr(params.threadId, '')
     const parent = this.store.getThread(parentId)
     if (!parent) throw new Error(`unknown thread: ${parentId}`)
+    // A fork from one of the parent's turns keeps the history up to it, and
+    // Claude's context with it.
+    const parentTurns = this.store.listTurns(parent.id)
+    const kept = forkTurns(parentTurns, params)
     const now = nowSeconds()
     const id = newThreadId()
     const requestedModel = modelFromParams(params, parent.model)
@@ -1189,7 +1213,15 @@ export class CodexClaudeAppServer {
       : 'claude'
     const requestedCwd = stringOr(params.cwd, parent.cwd)
     const cwd = maybeCreateThreadWorktree(id, requestedCwd).cwd
-    const forkPoint = runtimeBackend === 'claude' ? this.forkPointOf(parent) : null
+    let forkPoint = runtimeBackend === 'claude' ? this.forkPointOf(parent, kept) : null
+    // Turns from before checkpoints give Claude's context no place to stop
+    // at the fork point: the fork keeps all of it, as a whole fork does.
+    const uncut =
+      kept !== null &&
+      forkPoint === null &&
+      runtimeBackend === 'claude' &&
+      parent.runtimeBackend !== 'codex'
+    if (uncut) forkPoint = this.forkPointOf(parent, null)
     const thread: ThreadRecord = {
       ...parent,
       id,
@@ -1203,7 +1235,8 @@ export class CodexClaudeAppServer {
       cwd,
       model: forkModel,
       reasoningEffort: reasoningEffortFromParams(params, parent.reasoningEffort),
-      claudeSessionId: forkPoint?.sessionId ?? parent.claudeSessionId,
+      claudeSessionId:
+        forkPoint === 'new' ? null : (forkPoint?.sessionId ?? parent.claudeSessionId),
       createdAt: now,
       updatedAt: now,
       status: { type: 'idle' },
@@ -1253,9 +1286,13 @@ export class CodexClaudeAppServer {
     this.store.upsertThread(thread)
     // A fork stays in its parent's project.
     if (parent.projectId) this.store.setThreadProject(id, parent.projectId)
+    // As in Codex, a fork that is kept holds its parent's attachments (the
+    // worktree it ran in, the pull requests opened from it), so
+    // thread/attachmentOwner/list names it too; an ephemeral fork holds none.
+    if (!thread.ephemeral) this.store.copyThreadAttachments(parent.id, id)
     if (forkPoint) {
       this.store.setForkCheckpoint(id, forkPoint)
-      this.store.rewindClaudeSession(id, forkPoint.sessionId, forkPoint.messageUuid)
+      this.resumeClaudeAt(id, forkPoint)
     }
     recordRunEvent('thread.forked', {
       threadId: thread.id,
@@ -1265,20 +1302,31 @@ export class CodexClaudeAppServer {
       runtimeBackend: thread.runtimeBackend,
       threadSource: thread.threadSource,
       ephemeral: thread.ephemeral,
+      keptTurns: kept?.length ?? null,
     })
     this.activePeerByThread.set(id, peer)
     this.notify(peer, { method: 'thread/started', params: { thread: this.toThread(thread, []) } })
-    return this.threadEnvelope(
-      thread,
-      params.excludeTurns === true ? [] : this.store.listTurns(parent.id),
-    )
+    // App rule: config-warnings
+    if (uncut && kept.length < parentTurns.length) {
+      this.notify(peer, {
+        method: 'configWarning',
+        params: {
+          summary: 'Claude in a forked chat still remembers the turns after the fork point',
+          details: `Thread ${parent.id} has no Claude checkpoint up to the turn it was forked at (its turns predate checkpoints), so its fork ${id} resumes the whole Claude session, later turns included.`,
+        },
+      })
+    }
+    return this.threadEnvelope(thread, params.excludeTurns === true ? [] : (kept ?? parentTurns))
   }
 
-  // Where a fork of `thread` picks up Claude's context: the checkpoint the
-  // thread itself resumes at next if it was just rewound, else the end of its
-  // newest settled turn. Null for legacy threads, which fork the whole session.
-  private forkPointOf(thread: ThreadRecord): ClaudeCheckpoint | null {
+  // Where a fork of `thread` picks up Claude's context. A fork that keeps
+  // only `kept`, the thread's turns up to some turn, takes the context after
+  // them. A whole fork takes the checkpoint the thread itself resumes at next
+  // if it was just rewound, else the end of its newest settled turn. Null when
+  // the turns predate checkpoints; a whole fork then resumes the whole session.
+  private forkPointOf(thread: ThreadRecord, kept: TurnRecord[] | null): ClaudeResumePoint | null {
     if (thread.runtimeBackend === 'codex') return null
+    if (kept) return this.claudeContextAfter(thread, kept)
     const resumeAt = this.store.claudeResumeAt(thread.id)
     if (thread.claudeSessionId && resumeAt)
       return { sessionId: thread.claudeSessionId, messageUuid: resumeAt }
@@ -1656,6 +1704,28 @@ export class CodexClaudeAppServer {
     return {
       data: attachments.slice(0, limit),
       nextCursor: attachments.length > limit ? String(offset + limit) : null,
+    }
+  }
+
+  // The threads holding an attachment, by thread id: the App keeps the
+  // worktree of a thread it archives while another thread still holds it.
+  // archived false lists the live threads only, true the archived ones.
+  private threadAttachmentOwnerList(params: Record<string, unknown>): unknown {
+    const attachmentType = stringOr(params.attachmentType, '')
+    const identityKey = stringOr(params.identityKey, '')
+    if (!attachmentType.trim()) throw new Error('attachmentType must not be empty')
+    if (!identityKey.trim()) throw new Error('identityKey must not be empty')
+    const archived = typeof params.archived === 'boolean' ? params.archived : null
+    const offset = offsetCursor(params.cursor, 'attachment owner')
+    const limit = pageLimit(params.limit, 200) ?? 25
+    const owners = this.store.listAttachmentOwners(
+      { attachmentType, identityKey, archived },
+      limit + 1,
+      offset,
+    )
+    return {
+      data: owners.slice(0, limit),
+      nextCursor: owners.length > limit ? String(offset + limit) : null,
     }
   }
 
@@ -2217,12 +2287,15 @@ export class CodexClaudeAppServer {
 
   // Settings for a turn the adapter starts on the user's behalf: whatever the
   // last user turn used, minus its input. Queued messages never carry a
-  // collaboration mode (the App keeps those in the window queue).
+  // collaboration mode (the App keeps those in the window queue). Nor the
+  // lineage of a turn started for another turn: such a turn is its own root.
   private followUpParams(threadId: string): Record<string, unknown> {
     const {
       input: _input,
       clientUserMessageId: _clientId,
       outputSchema: _schema,
+      parentTurnId: _parent,
+      rootTurnId: _root,
       ...rest
     } = this.lastTurnParamsByThread.get(threadId) ?? {}
     return { ...rest, threadId, planMode: false }
@@ -2462,27 +2535,40 @@ export class CodexClaudeAppServer {
       return dropped
     }
     this.runtime.resetSession?.(thread.id)
-    for (const turn of remaining.toReversed()) {
-      const checkpoint = this.store.turnCheckpoint(turn.id)
-      if (checkpoint) {
-        this.store.rewindClaudeSession(thread.id, checkpoint.sessionId, checkpoint.messageUuid)
-        return dropped
-      }
+    const point = this.claudeContextAfter(thread, remaining)
+    if (point) {
+      this.resumeClaudeAt(thread.id, point)
+      return dropped
     }
     if (remaining.length === 0) {
-      // Back to where the thread began: its fork point, or a new session.
-      const fork = this.store.forkCheckpoint(thread.id)
+      // A fork from before fork points goes back to its parent's session.
       const parent = thread.forkedFromId ? this.store.getThread(thread.forkedFromId) : null
-      this.store.rewindClaudeSession(
-        thread.id,
-        fork?.sessionId ?? parent?.claudeSessionId ?? null,
-        fork?.messageUuid ?? null,
-      )
+      this.store.rewindClaudeSession(thread.id, parent?.claudeSessionId ?? null, null)
       return dropped
     }
     // The remaining turns predate checkpoints: Claude keeps its context.
     debugLog('thread.rewind.unanchored', { threadId: thread.id, dropped })
     return dropped
+  }
+
+  // Where Claude's context stands once a thread has run `turns`, its first
+  // turns: the newest of their checkpoints, or with no turns, where the thread
+  // began (its fork point, or a new session). Null when the turns, or the fork
+  // they start from, predate checkpoints.
+  private claudeContextAfter(thread: ThreadRecord, turns: TurnRecord[]): ClaudeResumePoint | null {
+    for (const turn of turns.toReversed()) {
+      const checkpoint = this.store.turnCheckpoint(turn.id)
+      if (checkpoint) return checkpoint
+    }
+    if (turns.length > 0) return null
+    return thread.forkedFromId ? this.store.forkCheckpoint(thread.id) : 'new'
+  }
+
+  // Points a thread's next turn at `point`: a forked session resumed there,
+  // or a new session.
+  private resumeClaudeAt(threadId: string, point: ClaudeResumePoint): void {
+    if (point === 'new') this.store.rewindClaudeSession(threadId, null, null)
+    else this.store.rewindClaudeSession(threadId, point.sessionId, point.messageUuid)
   }
 
   // thread/delete removes a thread for good: its turns, goal and queue, and
@@ -3246,6 +3332,9 @@ export class CodexClaudeAppServer {
     // thread, filtered from listings), so the short-circuit was just forcing a
     // hardcoded "处理X" string instead of the real model output. Now every turn
     // — including the structured title turn on Claude Haiku — runs end-to-end.
+    // Work started on behalf of another turn names that turn's root; as in
+    // Codex, without one (or with a blank one) the turn is its own root.
+    const rootTurnId = stringOr(params.rootTurnId, '')
     const turn: TurnRecord = {
       id: turnId,
       threadId,
@@ -3256,6 +3345,7 @@ export class CodexClaudeAppServer {
       items: initialItems,
       diff: '',
       error: null,
+      rootTurnId: rootTurnId.trim() ? rootTurnId : null,
     }
     this.store.upsertTurn(turn)
     recordRunEvent('turn.started', {
@@ -4044,6 +4134,8 @@ export class CodexClaudeAppServer {
               ],
               diff: '',
               error: null,
+              // A spawned agent works for the turn that spawned it, as in Codex.
+              rootTurnId: turn.rootTurnId ?? turn.id,
             }
             this.store.upsertTurn(childTurn)
             this.notify(peer, {
@@ -5668,14 +5760,17 @@ export class CodexClaudeAppServer {
       this.settleBackgroundSubagent(entry, 'interrupted', 'Stopped by the parent agent.', null)
       return
     }
-    this.resumeBackgroundChild(entry, pending.message, event.toolUseId)
+    this.resumeBackgroundChild(entry, pending.message, event.toolUseId, turn.rootTurnId ?? turn.id)
     this.emitSubagentActivity(peer, thread.id, turn.id, entry.context, 'interacted')
   }
 
+  // rootTurnId: the root of the parent turn that sent the message, which a
+  // turn it starts in the child works for, as in Codex.
   private resumeBackgroundChild(
     entry: BackgroundSubagent,
     message: string,
     sendToolUseId: string,
+    rootTurnId: string,
   ): void {
     const { context } = entry
     const peer = this.peerForThread(context.childThreadId)
@@ -5700,6 +5795,7 @@ export class CodexClaudeAppServer {
         items: [userItem],
         diff: '',
         error: null,
+        rootTurnId,
       }
       this.store.upsertTurn(turn)
       this.setThreadStatus(peer, context.childThreadId, { type: 'active', activeFlags: [] })
@@ -6096,7 +6192,7 @@ export class CodexClaudeAppServer {
       throw new Error(`expected active turn id \`${expectedTurnId}\` but found \`${activeTurnId}\``)
     // Like Codex, a review or a compaction the user started takes no input
     // until it ends; a turn Claude compacted on its own still does. The
-    // refusal is Codex's invalid-request error (-32600) with the turn kind in
+    // refusal is Codex's invalid-request error with the turn kind in
     // `data`, which App builds that queue a message sent during a compaction
     // match on.
     const turnKind = this.unsteerableTurns.get(activeTurnId)
@@ -6110,7 +6206,7 @@ export class CodexClaudeAppServer {
           additionalDetails: null,
           misalignment: null,
         },
-        -32600,
+        INVALID_REQUEST,
       )
     }
     const input = turnInput(params)
@@ -7366,10 +7462,13 @@ export class CodexClaudeAppServer {
 
   // Full turn payload for history reads (thread/read, turns/list) — carries the
   // loaded items. The Codex v2 `Turn` schema has no api/cost metadata fields, so
-  // the adapter's internal metrics are not serialized onto the wire.
+  // the adapter's internal metrics are not serialized onto the wire. Every
+  // payload carries rootTurnId (0.163), the turn itself unless it was started
+  // for another turn's work.
   private toTurn(turn: TurnRecord): unknown {
     return {
       id: turn.id,
+      rootTurnId: turn.rootTurnId ?? turn.id,
       items: turn.items,
       itemsView: 'full',
       status: turn.status,
@@ -7392,6 +7491,7 @@ export class CodexClaudeAppServer {
     if (lastAgent && lastAgent.id !== firstUser?.id) items.push(lastAgent)
     return {
       id: turn.id,
+      rootTurnId: turn.rootTurnId ?? turn.id,
       items,
       itemsView: 'summary',
       status: turn.status,
@@ -7408,6 +7508,7 @@ export class CodexClaudeAppServer {
   private toLifecycleTurn(turn: TurnRecord, items: ThreadItem[] = []): unknown {
     return {
       id: turn.id,
+      rootTurnId: turn.rootTurnId ?? turn.id,
       items,
       itemsView: 'notLoaded',
       status: turn.status,
@@ -7428,6 +7529,7 @@ export class CodexClaudeAppServer {
         : undefined
     return {
       id: turn.id,
+      rootTurnId: turn.rootTurnId ?? turn.id,
       items: lastAgent ? [lastAgent] : [],
       itemsView: lastAgent ? 'summary' : 'notLoaded',
       status: turn.status,

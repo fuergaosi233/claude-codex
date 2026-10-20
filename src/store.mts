@@ -3,6 +3,7 @@ import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import type {
   ClaudeCheckpoint,
+  ClaudeResumePoint,
   ImportHistoryRecord,
   ProjectRecord,
   QueuedSubmission,
@@ -16,7 +17,7 @@ import type {
   TurnRecord,
   TurnStatus,
 } from './types.mjs'
-import { adapterHome, jsonClone, nowSeconds } from './util.mjs'
+import { adapterHome, jsonClone, newId, nowSeconds } from './util.mjs'
 
 const require = createRequire(import.meta.url)
 
@@ -159,6 +160,8 @@ export class SessionStore {
         created_at INTEGER NOT NULL,
         UNIQUE(thread_id, attachment_type, identity_key)
       );
+      CREATE INDEX IF NOT EXISTS idx_thread_attachments_identity
+        ON thread_attachments(attachment_type, identity_key, thread_id);
       CREATE TABLE IF NOT EXISTS import_histories (
         id TEXT PRIMARY KEY,
         provider_id TEXT,
@@ -197,8 +200,11 @@ export class SessionStore {
     this.ensureColumn('threads', 'claude_resume_at', 'TEXT')
     this.ensureColumn('threads', 'claude_fork_session_id', 'TEXT')
     this.ensureColumn('threads', 'claude_fork_message_uuid', 'TEXT')
+    this.ensureColumn('threads', 'claude_fork_new_session', 'INTEGER NOT NULL DEFAULT 0')
     this.ensureColumn('turns', 'claude_session_id', 'TEXT')
     this.ensureColumn('turns', 'claude_message_uuid', 'TEXT')
+    // TurnRecord.rootTurnId; NULL when the turn is its own root.
+    this.ensureColumn('turns', 'root_turn_id', 'TEXT')
     // Project membership; written only by setThreadProject and deleteProject.
     this.ensureColumn('threads', 'project_id', 'TEXT')
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_threads_project ON threads(project_id)')
@@ -913,6 +919,53 @@ export class SessionStore {
     ).map((row) => this.rowToAttachment(row))
   }
 
+  // The threads holding an attachment with this type and key, by thread id;
+  // archived null lists archived and live threads alike.
+  listAttachmentOwners(
+    owner: { attachmentType: string; identityKey: string; archived: boolean | null },
+    limit: number,
+    offset: number,
+  ): { threadId: string; archived: boolean }[] {
+    const archived = owner.archived == null ? '' : 'AND t.archived = ?'
+    const params = owner.archived == null ? [] : [owner.archived ? 1 : 0]
+    const rows = this.db
+      .prepare(
+        `SELECT a.thread_id AS thread_id, t.archived AS archived
+         FROM thread_attachments a JOIN threads t ON t.id = a.thread_id
+         WHERE a.attachment_type = ? AND a.identity_key = ? ${archived}
+         ORDER BY a.thread_id LIMIT ? OFFSET ?`,
+      )
+      .all(owner.attachmentType, owner.identityKey, ...params, limit, offset) as Array<{
+      thread_id: string
+      archived: unknown
+    }>
+    return rows.map((row) => ({ threadId: row.thread_id, archived: Number(row.archived) === 1 }))
+  }
+
+  // A fork holds what its parent held when it forked, as in Codex: each
+  // attachment is copied with its type, key, payload and time under a new id.
+  copyThreadAttachments(fromThreadId: string, toThreadId: string): void {
+    this.transaction(() => {
+      const rows = this.db
+        .prepare('SELECT * FROM thread_attachments WHERE thread_id = ? ORDER BY created_at, rowid')
+        .all(fromThreadId) as Array<Record<string, unknown>>
+      const insert = this.db.prepare(
+        `INSERT OR IGNORE INTO thread_attachments
+           (id, thread_id, attachment_type, identity_key, payload_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      for (const row of rows)
+        insert.run(
+          newId(),
+          toThreadId,
+          row.attachment_type,
+          row.identity_key,
+          row.payload_json,
+          row.created_at,
+        )
+    })
+  }
+
   // Returns the removed attachment, or null when there was none.
   removeThreadAttachment(
     threadId: string,
@@ -1023,8 +1076,8 @@ export class SessionStore {
   upsertTurn(turn: TurnRecord): void {
     this.db
       .prepare(`
-        INSERT INTO turns (id, thread_id, status, started_at, completed_at, duration_ms, items_json, diff, error_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO turns (id, thread_id, status, started_at, completed_at, duration_ms, items_json, diff, error_json, root_turn_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           status=excluded.status,
           started_at=excluded.started_at,
@@ -1032,7 +1085,8 @@ export class SessionStore {
           duration_ms=excluded.duration_ms,
           items_json=excluded.items_json,
           diff=excluded.diff,
-          error_json=excluded.error_json
+          error_json=excluded.error_json,
+          root_turn_id=COALESCE(excluded.root_turn_id, turns.root_turn_id)
       `)
       .run(
         turn.id,
@@ -1044,6 +1098,7 @@ export class SessionStore {
         JSON.stringify(turn.items),
         turn.diff,
         turn.error == null ? null : JSON.stringify(turn.error),
+        turn.rootTurnId ?? null,
       )
   }
 
@@ -1124,21 +1179,35 @@ export class SessionStore {
   }
 
   // Where a forked thread branched off its parent's Claude session; a rewind
-  // past the thread's own first turn returns there.
-  setForkCheckpoint(threadId: string, checkpoint: ClaudeCheckpoint | null): void {
+  // past the thread's own first turn returns there. A fork taken before
+  // anything Claude remembers starts at 'new'.
+  setForkCheckpoint(threadId: string, point: ClaudeResumePoint | null): void {
+    const checkpoint = point === 'new' ? null : point
     this.db
       .prepare(
-        'UPDATE threads SET claude_fork_session_id = ?, claude_fork_message_uuid = ? WHERE id = ?',
+        'UPDATE threads SET claude_fork_session_id = ?, claude_fork_message_uuid = ?, claude_fork_new_session = ? WHERE id = ?',
       )
-      .run(checkpoint?.sessionId ?? null, checkpoint?.messageUuid ?? null, threadId)
+      .run(
+        checkpoint?.sessionId ?? null,
+        checkpoint?.messageUuid ?? null,
+        point === 'new' ? 1 : 0,
+        threadId,
+      )
   }
 
-  forkCheckpoint(threadId: string): ClaudeCheckpoint | null {
+  forkCheckpoint(threadId: string): ClaudeResumePoint | null {
     const row = this.db
-      .prepare('SELECT claude_fork_session_id, claude_fork_message_uuid FROM threads WHERE id = ?')
+      .prepare(
+        'SELECT claude_fork_session_id, claude_fork_message_uuid, claude_fork_new_session FROM threads WHERE id = ?',
+      )
       .get(threadId) as
-      | { claude_fork_session_id?: unknown; claude_fork_message_uuid?: unknown }
+      | {
+          claude_fork_session_id?: unknown
+          claude_fork_message_uuid?: unknown
+          claude_fork_new_session?: unknown
+        }
       | undefined
+    if (Number(row?.claude_fork_new_session) === 1) return 'new'
     return checkpointFrom(row?.claude_fork_session_id, row?.claude_fork_message_uuid)
   }
 
@@ -1540,6 +1609,7 @@ export class SessionStore {
       items: JSON.parse(String(row.items_json)),
       diff: String(row.diff ?? ''),
       error: row.error_json == null ? null : JSON.parse(String(row.error_json)),
+      rootTurnId: row.root_turn_id == null ? null : String(row.root_turn_id),
     }
   }
 }

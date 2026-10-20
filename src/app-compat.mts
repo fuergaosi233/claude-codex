@@ -17,7 +17,7 @@ export interface AppRule {
 }
 
 // App builds every rule below was checked against.
-export const VERIFIED_APP_VERSIONS: readonly string[] = ['26.930.21537']
+export const VERIFIED_APP_VERSIONS: readonly string[] = ['26.930.21537', '26.1013.40934']
 
 // initialize.clientInfo.name of the desktop App. Its other app-server clients
 // (the LaTeX preview, for one) use their own names and versions.
@@ -40,9 +40,18 @@ export const APP_RULES: readonly AppRule[] = [
       'check:app-upgrade lists the gate table and the minimum next to the version the adapter reports.',
   },
   {
+    id: 'prediction-provider',
+    app: 'From 26.1013, with experimentalPredictionForkMode on, predicts the next composer message in a thread/fork with experimentalPredictionMode, only for a thread whose modelProvider is openai.',
+    adapter:
+      'Reports modelProvider claude-code for every thread, so the App never forks a Claude thread for a prediction.',
+    verify:
+      'In the bundle, the prediction path still gives up with unsupported_provider before its thread/fork when modelProvider is not openai.',
+  },
+  {
     id: 'config-warnings',
     app: 'Lists configWarning notifications under Settings > Agent > Configuration, keeping the last 20 per host.',
-    adapter: 'Reports an App build missing from VERIFIED_APP_VERSIONS there.',
+    adapter:
+      "Reports an App build missing from VERIFIED_APP_VERSIONS there, and a fork from one of a chat's turns whose Claude context keeps the later turns because they predate checkpoints.",
     verify:
       'Connect an App build that is not listed and look for the warning in that settings page.',
   },
@@ -59,6 +68,13 @@ export const APP_RULES: readonly AppRule[] = [
       "Lists each Claude model's efforts as Claude Code reports them (max where the model takes it, none on Haiku), and low to xhigh until Claude Code has reported.",
     verify:
       'After a Claude turn, Model features lists Max; with it on, Claude Opus offers Max and Claude Haiku offers no effort levels.',
+  },
+  {
+    id: 'bedrock-govcloud',
+    app: 'From 26.1013, checks a Bedrock account with account/bedrock/checkGovCloudRequirements at startup and shows an "AWS GovCloud guidance" modal until the user acknowledges it, unless the answer has isGovCloud false. An error leaves the check unverified, which shows the modal too.',
+    adapter: 'Answers isGovCloud false and shouldWarn false.',
+    verify:
+      'Start an App that never acknowledged the guidance: no "AWS GovCloud guidance" modal appears.',
   },
   {
     id: 'bedrock-auth-status',
@@ -211,18 +227,43 @@ export const APP_RULES: readonly AppRule[] = [
 // The methods the App starts calling, or sends new parameters to, once the
 // app-server version turns a feature gate on (the gate table is in its
 // bundle; see scripts/app-baseline.json). check:app-upgrade flags a gate the
-// adapter's version turns on while one of these has no case.
+// adapter's version turns on while one of these has no case. An empty list
+// is a gate checked to need no method: most of those only let a Codex feature
+// key through in the config the App sends, which Claude threads ignore.
 export const GATED_METHODS: Readonly<Record<string, readonly string[]>> = {
   appRead: ['app/read'],
+  asyncCompaction: [],
+  // For an attached audio file, looks the model up in model/list and adds
+  // localAudio input to turn/start or turn/steer only when the model takes
+  // audio, which no Claude model does.
+  audioInputs: ['model/list', 'turn/start', 'turn/steer'],
+  // An access-key option in the Bedrock sign-in form, which signs in with
+  // account/login/start; account/read already reports a Bedrock account.
+  bedrockAccessKeysLogin: ['account/login/start'],
   diagnostics: ['server/diagnostics'],
+  // Composer predictions fork only a thread whose modelProvider is openai;
+  // every thread here reports claude-code.
+  experimentalPredictionForkMode: [],
   gatewayOAuth: [
     'account/gatewayOAuth/read',
     'account/gatewayOAuth/login',
     'account/gatewayOAuth/cancel',
   ],
+  guardianV2DecisionsComparison: [],
+  incrementalTools: [],
+  instantInterrupt: [],
+  // Whether a configured application requirement still lets the App set up
+  // its search MCP (see searchMcpClient).
+  mcpApplicationNetworkPolicy: [],
   mcpEventStream: ['mcpServer/event/stream/start', 'mcpServer/event/stream/stop'],
   mcpResourceReadOriginCallId: ['mcpServer/resource/read'],
   mcpServerStatusByName: ['mcpServerStatus/list'],
+  // Reviews a turn that failed with codexErrorInfo
+  // misalignmentPolicyViolation, which no turn here reports.
+  misalignmentReviewTarget: [],
+  multiAgentWaitToolConfig: [],
+  outputTokenReplay: [],
+  preserveForkPrefix: [],
   projects: [
     'project/list',
     'project/read',
@@ -232,16 +273,32 @@ export const GATED_METHODS: Readonly<Record<string, readonly string[]>> = {
     'project/delete',
     'project/move',
   ],
-  // The verified App never reads this gate.
+  // 26.930 never reads this gate; 26.1013 only lets a Codex feature key
+  // through in the config it sends while it is on.
   reasoningEffortUpdates: [],
   rolloutCompression: ['rollout/compress'],
+  // Reads config/read, account/read and configRequirements/read as a thread
+  // starts. mcpServerStatus/list and the rest of its search MCP setup need a
+  // gpt- model and a ChatGPT account, which no thread here has.
+  searchMcpClient: [
+    'config/read',
+    'account/read',
+    'configRequirements/read',
+    'mcpServerStatus/list',
+  ],
   // A serviceTier on the heartbeat's turn/start, which Claude ignores.
   serviceTierForTurn: ['turn/start'],
+  // Keeps the worktree of an archived thread while another thread holds it.
+  threadAttachmentOwners: ['thread/attachmentOwner/list'],
   threadAttachments: [
     'thread/attachment/add',
     'thread/attachment/list',
     'thread/attachment/remove',
   ],
+  // thread/fork with beforeTurnId.
+  threadForkBeforeTurn: ['thread/fork'],
+  // thread/items/list with an { itemId } cursor.
+  threadItemAnchors: ['thread/items/list'],
   threadQueue: [
     'thread/queue/add',
     'thread/queue/list',
@@ -253,6 +310,9 @@ export const GATED_METHODS: Readonly<Record<string, readonly string[]>> = {
   threadRevert: ['thread/revert'],
   threadTimeline: ['thread/timeline/list'],
   turnApprovalsReviewer: ['turn/settings/update'],
+  // parentTurnId and rootTurnId on turn/start; the turn reports its
+  // rootTurnId back.
+  turnLineage: ['turn/start'],
   turnToolOutput: ['turn/start'],
 }
 

@@ -10,7 +10,7 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 | Area | Status | Notes |
 | --- | --- | --- |
 | Remote transport | Supported | SSH starts `codex app-server --listen unix://` + `proxy`; the shim reports a Codex-compatible version/user agent. |
-| Thread lifecycle | Supported | start/resume/fork/archive/list/read/delete + turn listing, backed by SQLite + Claude session ids. New threads, forks and subagents get UUIDv7 ids, as Codex issues them. As in Codex, `thread/list` and `thread/search` leave a thread out until it has a turn or a preview, except in the archive, a chosen section or a subagent query, so a new chat the App started but never used stays hidden. `thread/delete` also removes the thread's subagents, ending its running background agents first; an unknown thread fails with Codex's missing-rollout text so the App's `missingRolloutRecovery` retry succeeds. |
+| Thread lifecycle | Supported | start/resume/fork/archive/list/read/delete + turn listing, backed by SQLite + Claude session ids. New threads, forks and subagents get UUIDv7 ids, as Codex issues them. `thread/fork` with `lastTurnId` keeps the turns through that one and with `beforeTurnId` those before it, as in Codex: the response carries only those turns (none with `excludeTurns`), and the fork's Claude session resumes at the newest kept turn's checkpoint, or where the chat began (a new session, or its own fork point) when the fork keeps none. Both ids together, an unknown turn, or a `lastTurnId` that is still running fail with Codex's messages. When the kept turns predate checkpoints, Claude keeps the whole session and a `configWarning` says so. As in Codex, `thread/list` and `thread/search` leave a thread out until it has a turn or a preview, except in the archive, a chosen section or a subagent query, so a new chat the App started but never used stays hidden. `thread/delete` also removes the thread's subagents, ending its running background agents first; an unknown thread fails with Codex's missing-rollout text so the App's `missingRolloutRecovery` retry succeeds. |
 | Rollback / revert | Supported | `thread/rollback` and `thread/revert` drop turns and make Claude forget them: the next turn resumes the newest remaining turn's checkpoint in a forked session (a fork's own start point when none remain). Turns from before checkpoints keep Claude's context. |
 | History paging & search | Supported | `thread/turns/list` pages either way from a turn cursor; `thread/items/list` pages items, and `thread/timeline/list` pages turn events from the newest back, as Codex does. `thread/search` matches names, previews and visible message text; `thread/searchOccurrences` serves find-in-conversation. |
 | Projects | Supported | `project/*` keeps projects and thread membership in SQLite, with `project/changed` and `thread/project/updated` notifications. |
@@ -72,7 +72,7 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 | Filesystem RPCs | Supported | `fs/readFile`, write, metadata, list, remove, copy, watch/unwatch (Codex v2-shaped). |
 | Command/process RPCs | Supported | `command/exec` and `process/spawn` implemented. |
 | Background terminals | Supported | Claude's background Bash shells are listed by `thread/backgroundTerminals/list` and stopped by `terminate`/`clean`. The CLI runs them, so there is no OS pid or usage. |
-| Thread attachments | Supported | `thread/attachment/*` keeps the App's per-thread JSON (archived worktree, linked pull requests). |
+| Thread attachments | Supported | `thread/attachment/*` keeps the App's per-thread JSON (archived worktree, linked pull requests), and `thread/attachmentOwner/list` finds the threads holding one. As in Codex, a fork that is not ephemeral starts with copies of its parent's attachments. |
 | Running-turn settings | Supported | `turn/settings/update` switches the running turn's model and effort in place; the next turn runs on its own settings again. A model must be one `model/list` offers for the thread's backend; the effort `none`, which `model/list` gives a model without efforts, leaves the effort as it is. The reviewer is always the user, so only `approvalsReviewer: "user"` is accepted, and `summary` and `serviceTier` have no Claude counterpart. The verified App sends only the reviewer, when permissions change during a turn. |
 
 ## Not applicable / unsupported
@@ -91,19 +91,23 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 
 ## Protocol version
 
-The adapter advertises codex app-server protocol **v2 @ 0.159.0-alpha.12.1**
+The adapter advertises codex app-server protocol **v2 @ 0.163.0-alpha.10.2**
 (via `codex --version` and the `initialize` userAgent; override with
-`CLAUDE_CODEX_COMPAT_VERSION`), the Codex build of the verified App. The App
-turns its feature gates on by this version, so every gate that build knows is
-on; [Codex App compatibility](/reference/app-compat#feature-gates-and-claude-codex-compat-version)
-lists what they change. Every client request Codex App 26.930 can send has a
-handler; where Claude Code has no equivalent it answers with an empty,
-disabled or `unavailable` result rather than an error. Regenerate the
-reference schema under `generated/` with `npm run generate:schema` (needs a
-matching `codex` on PATH).
+`CLAUDE_CODEX_COMPAT_VERSION`), the Codex build of App 26.1013; Codex
+`0.163.0` has the same app-server protocol. The App turns its feature gates on
+by this version, so every gate App 26.1013 and App 26.930 know is on.
+[Codex App compatibility](/reference/app-compat#feature-gates-and-claude-codex-compat-version)
+lists what they change. Every turn carries the protocol's `rootTurnId`: the
+one its `turn/start` named, else its own id. Every client request Codex App
+26.1013 sends has a handler; where Claude Code has no equivalent it answers
+with an empty, disabled or `unavailable` result rather than an error. A
+request it does not know gets the JSON-RPC error `-32601` (method not found),
+and so do three requests of the 26.1013 protocol that the App never sends.
+Regenerate the reference schema under `generated/` with
+`npm run generate:schema` (needs a matching `codex` on PATH).
 
 Because the adapter reports the same version as a real `codex`, it appends a
-distinguishing suffix: `codex --version` prints `codex-cli 0.159.0-alpha.12.1
+distinguishing suffix: `codex --version` prints `codex-cli 0.163.0-alpha.10.2
 (claude-codex)` and the `initialize` userAgent carries `claude-codex` in its
 originator field. The version number stays first so the App's semver probe still
 parses it. Set `CLAUDE_CODEX_VERSION_SUFFIX=""` to behave exactly like upstream

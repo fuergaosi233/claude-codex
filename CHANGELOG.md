@@ -125,6 +125,43 @@ versioning or publishing metadata.
   state on `turn/completed` only, so such a turn kept the thread spinning for
   the rest of the connection — with the answer already written to Claude's
   transcript — until the user interrupted it by hand.
+- Codex App 26.1013 is a verified build. Its GovCloud check for a Bedrock
+  account is answered "not GovCloud", so the App no longer shows the GovCloud
+  modal; `thread/attachmentOwner/list` lists the threads holding a worktree,
+  by thread id and with the `archived` filter; and a request the adapter has
+  no case for fails with JSON-RPC `-32601` (method not found), the code the
+  App treats as unsupported, instead of the generic `-32000`.
+- As in Codex, a fork that is kept holds the thread attachments its parent
+  held (the worktree, pull requests), so `thread/attachmentOwner/list` names
+  it too and the App keeps a worktree a fork of an archived chat still holds.
+- `npm run check:app-upgrade` also takes an `app.asar` or an extracted App,
+  reads the protocol from a codex checkout with `--protocol-source` or skips
+  it with `--bundle-only`, and lists every request the App's scripts name that
+  the adapter would answer with method not found.
+- `thread/fork` honours `lastTurnId` (fork through that turn) and
+  `beforeTurnId` (fork before it), which the App sends to fork a chat from one
+  of its turns. The fork's history stops there, and so does Claude's context:
+  its first turn resumes at the newest kept turn's checkpoint, or where the
+  chat began when the fork keeps no turn, so the forked chat no longer
+  remembers what came after. As in Codex, the two ids together, an unknown
+  turn and a `lastTurnId` that is still running are rejected. When the kept
+  turns predate checkpoints, the fork keeps Claude's whole session, as before,
+  and a `configWarning` says so.
+- The adapter advertises app-server `0.163.0-alpha.10.2`, the Codex build of
+  Codex App 26.1013, instead of `0.159.0-alpha.12.1`, so every feature gate of
+  26.1013 is on as well; App 26.930 turns on the same features as before.
+  Codex `0.163.0` has the same app-server protocol. `CLAUDE_CODEX_COMPAT_VERSION`
+  still overrides it. The App's composer predictions, which that version turns
+  on, fork only a thread whose `modelProvider` is `openai`, so they leave
+  Claude threads (`claude-code`) alone.
+- Every turn carries `rootTurnId`, new in that protocol: the root a
+  `turn/start` names for work it starts on behalf of another turn, else the
+  turn's own id. A subagent's turn takes the root of the turn that spawned it,
+  and input that joins a running turn keeps that turn's root, as in Codex; a
+  queued message or goal turn the adapter starts afterwards is its own root.
+- CI checks the Rust protocol fixtures against `@openai/codex@0.163.0`, and
+  the `turn/started` and `turn/completed` fixtures must carry exactly the
+  fields of the generated `Turn`.
 
 ### Provider and multi-agent boundaries
 

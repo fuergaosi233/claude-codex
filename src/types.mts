@@ -181,6 +181,10 @@ export interface TurnRecord {
   items: ThreadItem[]
   diff: string
   error: unknown | null
+  // The first turn in the chain of work that led to this one, when that is
+  // another turn: the rootTurnId of turn/start, or for a subagent's turn the
+  // root of the turn that spawned it. Null or absent: the turn is its own root.
+  rootTurnId?: string | null
   // Claude Agent SDK ResultMessage metrics. Surface them in turn/completed
   // so Codex App's status bar can show real timing + cost instead of blanks.
   apiDurationMs?: number | null
@@ -475,6 +479,10 @@ export interface ClaudeCheckpoint {
   sessionId: string
   messageUuid: string
 }
+
+// Where a thread's Claude context starts over after a rewind or a fork: a
+// checkpoint, or 'new' for a new session that remembers nothing.
+export type ClaudeResumePoint = ClaudeCheckpoint | 'new'
 
 export type RuntimeEvent =
   | { type: 'session'; claudeSessionId: string }

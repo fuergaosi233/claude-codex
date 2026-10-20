@@ -20,9 +20,11 @@ line a rule touches.
 | --- | --- | --- |
 | `client-info` | identifies itself in `initialize` as `clientInfo.name` `codex_desktop`, with its build as the version | `check:app-upgrade` finds the name |
 | `feature-gates` | turns features on by the app-server version in the `initialize` userAgent, and rejects one below its minimum | `check:app-upgrade` lists the gates |
+| `prediction-provider` | from 26.1013, predicts the next composer message by forking the thread with `thread/fork` and `experimentalPredictionMode`, only when its `modelProvider` is `openai` | the bundle's prediction path still stops with `unsupported_provider` for another provider |
 | `config-warnings` | lists `configWarning` notifications under Settings > Agent > Configuration | an unlisted build shows the warning there |
 | `bedrock-account` | filters the model picker through its OpenAI allowlist unless `account/read` returns a Bedrock account | the picker lists the Claude models |
 | `model-efforts` | offers each model the `model/list` efforts that are also enabled under Settings > Agent > Model features (max is off by default and listed once a model offers it), and falls back to the model's `defaultReasoningEffort` | after a Claude turn, Max is listed there; with it on, Claude Opus offers Max and Claude Haiku no effort levels |
+| `bedrock-govcloud` | from 26.1013, checks a Bedrock account with `account/bedrock/checkGovCloudRequirements` at startup and shows an "AWS GovCloud guidance" modal until it is acknowledged, unless the answer has `isGovCloud: false`; an error shows it too | an App that never acknowledged the guidance starts without the modal |
 | `bedrock-auth-status` | reads its feature flags in the main process only when `getAuthStatus` names the auth method it derives from `account/read`; otherwise a thread it resumes on its own never becomes ready | a message queued during a turn is sent when the turn ends; a new chat gets a title |
 | `skills-popup` | fills the "/" popup from `skills/list` and sends a picked skill as a `[$name](path)` link | `/simplify` is listed and runs |
 | `optimistic-user-message` | draws its own user message for every `turn/start` it sends | a message shows once; a queued one when it starts |
@@ -63,28 +65,47 @@ checked.
 
 ## Checking a new App build
 
-Run the upgrade check against the new bundle. It needs the bundled `codex`
-binary, which it finds inside the bundle (pass `--codex` to point elsewhere):
+Run the upgrade check against the new build. `--app` takes the App bundle,
+its `app.asar`, or a directory `app.asar` was extracted to. The protocol comes
+from the bundled `codex` binary, which the check finds inside the bundle (pass
+`--codex` to point elsewhere). Where that binary cannot run (another platform,
+an extracted directory), `--protocol-source` reads the protocol from a codex
+checkout at the release tag of the App's codex instead, and `--bundle-only`
+reads no protocol at all and takes the baseline's:
 
 ```sh
 npm run check:app-upgrade -- --app /Applications/Codex.app
-# or compare two bundles directly
+# or compare two bundles directly (each with its own codex)
 npm run check:app-upgrade -- --app <new.app> --old <old.app>
+# the protocol from codex's source (codex-rs/app-server-protocol)
+npm run check:app-upgrade -- --app <new.app> --protocol-source <codex checkout>
+# the bundle alone
+npm run check:app-upgrade -- --app <new.app> --bundle-only
 ```
 
 It compares the build with `scripts/app-baseline.json`, the last verified one,
 and prints:
 
-- **Protocol** — client requests, server requests and server notifications the
-  bundled `codex` generates, added and removed. A new client request the adapter
-  has no `case` for will be answered with `method not implemented`; the report
-  lists every such method. A method the adapter sends that the schema dropped is
-  a problem.
+- **Protocol** — client requests, server requests and server notifications,
+  added and removed. A client request the adapter has no `case` for, or a
+  `case` that only throws `methodNotFound`, is answered with the JSON-RPC
+  error `-32601` (`method not found: <method>`), which the App takes as "not
+  supported here"; the report lists every such method. A method the adapter
+  sends that the schema dropped is a problem. `--bundle-only` skips this part.
+- **Methods the App names** — the method-shaped strings in the App's scripts:
+  the client requests among them, and the names in a protocol namespace that
+  the protocol does not have (methods of the App's other hosts, MIME types
+  such as `model/obj`). A client request the App names that the adapter
+  answers with `-32601` is a problem. With `--bundle-only`, so is a newly
+  named method outside the baseline's protocol that the adapter has no `case`
+  for, since it may be a new request; otherwise it is a note.
 - **Feature gates** — the App's gate table, each marked on or off for the
   version the adapter reports, with new, changed and removed gates, and the
-  minimum app-server version the App accepts. A gate that is on while one of
-  its methods in `GATED_METHODS` has no `case` is a problem; a new gate that is
-  on gets a note to find its methods and add them there.
+  minimum app-server version the App accepts. A gate that is on while the
+  adapter answers one of its methods in `GATED_METHODS` with `-32601` is a
+  problem; a new gate that is on and not in `GATED_METHODS` gets a note to
+  find its methods and add them there (an empty list for a gate that needs
+  none).
 - **clientInfo names** — the names the App sends in `initialize`.
 - **App rules** — the checklist above, to go through by hand with the App
   connected to the adapter.
@@ -95,19 +116,49 @@ is clean and the rules hold:
 1. Add the build to `VERIFIED_APP_VERSIONS` in `src/app-compat.mts`. If a rule
    changed, update it, the code it tags, and its tests.
 2. Rewrite the baseline:
-   `npm run check:app-upgrade -- --app <verified.app> --write-baseline`.
-   It refuses while there are problems or the build is not yet listed.
+   `npm run check:app-upgrade -- --app <verified.app> --write-baseline`,
+   with `--protocol-source` if the App's `codex` cannot run. It refuses while
+   there are problems, the build is not yet listed, or with `--bundle-only`.
 3. Commit both with the code changes.
 
 ## Feature gates and `CLAUDE_CODEX_COMPAT_VERSION`
 
 The App decides which features to use from the app-server version in the
 `initialize` userAgent, which the adapter takes from
-`CLAUDE_CODEX_COMPAT_VERSION`. The default, `0.159.0-alpha.12.1`, is the Codex
-build of the verified App (`codexVersion` in `scripts/app-baseline.json`), so
-every gate in its table is on and the App calls the methods behind them.
+`CLAUDE_CODEX_COMPAT_VERSION`. The default, `0.163.0-alpha.10.2`, is the Codex
+build of the baseline App, 26.1013 (`codexVersion` in
+`scripts/app-baseline.json`), so every gate that build knows is on. Codex
+`0.163.0` has the same app-server protocol. Every gate App 26.930 knows needs
+`0.159.0-alpha.12.1`, its own Codex build, or less, so it turns the same
+features on as before. Against the previous default, `0.159.0-alpha.12.1`,
+these gates of App 26.1013 are newly on:
+
+- `threadAttachmentOwners`: before removing the worktree of a chat it
+  archives, the App asks `thread/attachmentOwner/list` whether another chat
+  still holds it. The adapter answers it.
+- `turnLineage`: `parentTurnId` and `rootTurnId` on `turn/start`, and
+  `rootTurnId` on every turn. The adapter keeps the root a `turn/start`
+  names and reports it back (see the table below).
+- `experimentalPredictionForkMode` and `misalignmentReviewTarget`, which no
+  Claude thread reaches (see their entries in `GATED_METHODS`). Composer
+  predictions fork only a thread whose `modelProvider` is `openai`; every
+  thread here reports `claude-code`, and a test pins that.
+- `asyncCompaction`, `guardianV2DecisionsComparison`, `incrementalTools`,
+  `instantInterrupt`, `outputTokenReplay` and `preserveForkPrefix`, which only
+  let a Codex feature key through in the config the App sends.
+
+On macOS the App's LaTeX preview, a separate app-server client, needs
+`0.149.0-alpha.4` or newer, and `0.162.0-alpha.20` for a project under `/tmp`
+or `/var/tmp`; below that it says LaTeX previews need a newer Codex. The
+default meets both. Raising the default for a newer App changes
+`DEFAULT_CODEX_COMPAT_VERSION` in `src/util.mts` and the matching default in
+`scripts/codex-shim`; tests keep the two equal and the default at the
+baseline's `codexVersion`, and check:app-upgrade lists what each gate it
+turns on needs.
+
 `GATED_METHODS` in `src/app-compat.mts` maps each gate to the requests it adds
-or changes, and `test/app-compat.test.mts` checks that every one has a `case`.
+or changes, and `test/app-compat.test.mts` checks that the adapter answers
+every one.
 Gates follow from the version alone; they cannot be turned on or off one by
 one. Run the upgrade check with the variable set to see which gates a version
 turns on:
@@ -123,8 +174,12 @@ queue (`thread/queue/*`); the upgrade check notes this.
 Every client request the verified App can send has a `case`. Where Claude Code
 has no counterpart, the answer says so instead of failing: an empty list, a
 disabled status (remote control), an `unavailable` error the App knows
-(passkey verification), or `null` for what the adapter does not track (token
-counts in `account/usage/read`).
+(passkey verification), `null` for what the adapter does not track (token
+counts in `account/usage/read`), or a GovCloud check that finds nothing to
+warn about (rule `bedrock-govcloud`). Three requests of the 26.1013 protocol
+that the App itself never sends, `thread/items/read`,
+`thread/prediction/request` and `thread/readState/update`, get `-32601`, as
+from a Codex without those features.
 
 ### What the gates change
 
@@ -141,6 +196,12 @@ answers in a particular way:
 | `mcpResourceReadOriginCallId` | checks `originCallId` on a resource read from a hosted app | answers `null`; Claude's MCP servers are not hosted apps |
 | `serviceTierForTurn`, `turnTrigger` | add fields to the heartbeat's `turn/start` | ignores them |
 | `threadAttachments` | records a chat's managed worktrees as thread attachments, cleans them up when it is archived, and offers worktree tools | keeps the attachments; see below |
+| `threadAttachmentOwners` | asks `thread/attachmentOwner/list` which chats hold a worktree before it removes the worktree with an archived chat, and in the worktree settings | lists the threads holding the attachment by thread id, filtered by `archived` and paged by `cursor` and `limit` (25 by default). As in Codex, a fork holds the attachments its parent held when it forked (an ephemeral fork holds none), so it is listed too |
+| `turnLineage` | passes `rootTurnId` (and `parentTurnId`) on `turn/start` when it starts work for another turn, and reads `rootTurnId` on every turn | reports on every turn payload the `rootTurnId` the `turn/start` named, or the turn's own id; a blank one names nothing, input that joins a running turn keeps that turn's root, a subagent's turn takes the root of the turn that spawned it, and a queued message or goal turn the adapter starts afterwards is its own root. `parentTurnId` is accepted and not kept |
+| `threadForkBeforeTurn` | forks a chat from before one of its turns with `thread/fork` and `beforeTurnId`, instead of forking it whole and calling `thread/rollback` | forks the chat up to that turn: the fork's history and Claude's context stop before it (see Thread lifecycle in the capability matrix) |
+| `threadItemAnchors` | pages a turn's items with `thread/items/list` from an `{ itemId }` cursor | pages from that item; an unknown item is an error, as in Codex |
+| `audioInputs` | sends an attached audio file as `localAudio` input when `model/list` says the model takes audio | lists text and image input for every model, so the App sends no audio |
+| `searchMcpClient` | reads `config/read`, `account/read` and `configRequirements/read` as a thread starts, to set up its search MCP for a `gpt-` model on a ChatGPT account | answers them as always; no thread here qualifies |
 
 Two of them also depend on a flag the App reads from its server (Statsig),
 which the bundle does not show and which can change without an App release:

@@ -1,6 +1,13 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { accountUsage, dayStreaks, hostMethod, localDay, RpcError } from '../src/host-methods.mjs'
+import {
+  accountUsage,
+  dayStreaks,
+  hostMethod,
+  localDay,
+  methodNotFound,
+  RpcError,
+} from '../src/host-methods.mjs'
 
 test('hostMethod answers only the methods it owns', () => {
   assert.equal(hostMethod('thread/start', {}), undefined)
@@ -46,6 +53,22 @@ test('passkey verification is unavailable, with the reason the App reads', () =>
     )
   }
   assert.deepEqual(hostMethod('userVerification/cancel', {}), {})
+})
+
+test('a Bedrock account passes the GovCloud check of the App', () => {
+  assert.deepEqual(hostMethod('account/bedrock/checkGovCloudRequirements', {}), {
+    isGovCloud: false,
+    shouldWarn: false,
+  })
+})
+
+test('an unknown method is a JSON-RPC method-not-found error; others are server errors', () => {
+  const missing = methodNotFound('thread/prediction/request')
+  assert.ok(missing instanceof RpcError)
+  assert.equal(missing.code, -32601)
+  assert.equal(missing.message, 'method not found: thread/prediction/request')
+  assert.equal(missing.data, undefined)
+  assert.equal(new RpcError('failed', { reason: 'x' }).code, -32000)
 })
 
 test('dayStreaks counts consecutive days, the current run ending today or yesterday', () => {

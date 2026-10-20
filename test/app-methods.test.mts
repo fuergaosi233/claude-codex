@@ -13,10 +13,12 @@ import { setTimeout as delay } from 'node:timers/promises'
 const adapter = resolve('dist/src/adapter.mjs')
 
 class RpcError extends Error {
+  readonly code: number
   readonly data: unknown
 
-  constructor(message: string, data: unknown) {
+  constructor(code: number, message: string, data: unknown) {
     super(message)
+    this.code = code
     this.data = data
   }
 }
@@ -120,8 +122,10 @@ class AppServer {
       const pending = this.pending.get(message.id)
       if (!pending) continue
       this.pending.delete(message.id)
-      if (message.error) pending.reject(new RpcError(message.error.message, message.error.data))
-      else pending.resolve(message.result)
+      if (message.error) {
+        const { code, message: text, data } = message.error
+        pending.reject(new RpcError(code, text, data))
+      } else pending.resolve(message.result)
     }
   }
 }
@@ -433,6 +437,77 @@ test('thread attachments are kept per type and key, with notifications', async (
   })
 })
 
+test('attachment owners list the threads holding a worktree, by thread id', async () => {
+  await withServer(async (server) => {
+    const worktree = { attachmentType: 'worktree', identityKey: '/repo/wt-1' }
+    const attach = (threadId: string, attachment: Record<string, string>) =>
+      server.request('thread/attachment/add', { threadId, ...attachment, payload: {} })
+    const holders = [await server.startThread(), await server.startThread()]
+    const other = await server.startThread()
+    for (const threadId of holders) await attach(threadId, worktree)
+    await attach(other, { attachmentType: 'worktree', identityKey: '/repo/wt-2' })
+    await attach(other, { attachmentType: 'pullRequest', identityKey: '/repo/wt-1' })
+    const [first, second] = [...holders].sort()
+    await server.request('thread/archive', { threadId: second })
+
+    const owners = (params: Record<string, unknown>) =>
+      server.request('thread/attachmentOwner/list', { ...worktree, ...params })
+    assert.deepEqual(await owners({}), {
+      data: [
+        { threadId: first, archived: false },
+        { threadId: second, archived: true },
+      ],
+      nextCursor: null,
+    })
+    assert.deepEqual(await owners({ archived: false }), {
+      data: [{ threadId: first, archived: false }],
+      nextCursor: null,
+    })
+    assert.deepEqual(await owners({ archived: true }), {
+      data: [{ threadId: second, archived: true }],
+      nextCursor: null,
+    })
+
+    // The App pages with the cursor until it is null and stops on a cursor
+    // it saw before.
+    const page = await owners({ limit: 1 })
+    assert.deepEqual(page, { data: [{ threadId: first, archived: false }], nextCursor: '1' })
+    assert.deepEqual(await owners({ limit: 1, cursor: page.nextCursor }), {
+      data: [{ threadId: second, archived: true }],
+      nextCursor: null,
+    })
+    assert.deepEqual(await owners({ cursor: '2' }), { data: [], nextCursor: null })
+
+    // A fork holds what its parent held, as in Codex, so it is an owner too;
+    // an ephemeral fork holds nothing.
+    const { thread: fork } = await server.request('thread/fork', { threadId: first })
+    await server.request('thread/fork', { threadId: first, ephemeral: true })
+    assert.deepEqual(
+      (await owners({ archived: false })).data,
+      [first, fork.id].sort().map((threadId) => ({ threadId, archived: false })),
+    )
+    const held = async (threadId: string | undefined) =>
+      (await server.request('thread/attachment/list', { threadId })).data
+    const [original] = await held(first)
+    const [copy] = await held(fork.id)
+    assert.notEqual(copy.id, original.id)
+    assert.deepEqual({ ...copy, id: original.id }, original)
+
+    assert.deepEqual(
+      await server.request('thread/attachmentOwner/list', {
+        attachmentType: 'worktree',
+        identityKey: '/repo/none',
+        archived: false,
+        limit: 100,
+      }),
+      { data: [], nextCursor: null },
+    )
+    await assert.rejects(owners({ attachmentType: ' ' }), /attachmentType must not be empty/)
+    await assert.rejects(owners({ identityKey: '' }), /identityKey must not be empty/)
+    await assert.rejects(owners({ cursor: 'x' }), /invalid attachment owner cursor/)
+  })
+})
+
 test('background shells are listed and stopped as background terminals', async () => {
   await withServer(async (server) => {
     const threadId = await server.startThread()
@@ -613,13 +688,175 @@ test('toolOutput sent while a turn runs joins that turn as its input', async () 
   })
 })
 
+test('a turn reports the rootTurnId turn/start names, else its own id', async () => {
+  await withServer(async (server) => {
+    const threadId = await server.startThread()
+
+    // A turn the user starts is its own root, in every turn payload.
+    let from = server.mark()
+    const { turn: own } = await server.startTurn(threadId, 'first')
+    assert.equal(own.rootTurnId, own.id)
+    assert.equal(
+      (await server.waitFor('turn/started', (params) => params.turn.id === own.id, from)).turn
+        .rootTurnId,
+      own.id,
+    )
+    assert.equal(
+      (await server.waitFor('turn/completed', (params) => params.turn.id === own.id, from)).turn
+        .rootTurnId,
+      own.id,
+    )
+
+    // Work started for another turn reports that turn's root, and so does
+    // the agent it spawns.
+    from = server.mark()
+    const { turn: linked } = await server.request('turn/start', {
+      threadId,
+      input: [{ type: 'text', text: 'subagent check', text_elements: [] }],
+      parentTurnId: 'turn-in-another-thread',
+      rootTurnId: 'root-of-the-chain',
+    })
+    assert.equal(linked.rootTurnId, 'root-of-the-chain')
+    const completed = await server.waitFor(
+      'turn/completed',
+      (params) => params.turn.id === linked.id,
+      from,
+    )
+    assert.equal(completed.turn.rootTurnId, 'root-of-the-chain')
+    const child = server
+      .notified('turn/started', from)
+      .find((params) => params.threadId !== threadId)
+    assert.equal(child.turn.rootTurnId, 'root-of-the-chain')
+    const { thread: childThread } = await server.request('thread/read', {
+      threadId: child.threadId,
+      includeTurns: true,
+    })
+    assert.deepEqual(
+      childThread.turns.map((turn: any) => turn.rootTurnId),
+      ['root-of-the-chain'],
+    )
+
+    // History keeps it, in full and in summary.
+    const { thread } = await server.request('thread/read', { threadId, includeTurns: true })
+    assert.deepEqual(
+      thread.turns.map((turn: any) => turn.rootTurnId),
+      [own.id, 'root-of-the-chain'],
+    )
+    const summary = await server.request('thread/turns/list', { threadId, itemsView: 'summary' })
+    assert.deepEqual(
+      summary.data.map((turn: any) => turn.rootTurnId),
+      ['root-of-the-chain', own.id],
+    )
+
+    // A blank root names nothing.
+    const { turn: blank } = await server.request('turn/start', {
+      threadId,
+      input: [{ type: 'text', text: 'third', text_elements: [] }],
+      rootTurnId: ' ',
+    })
+    assert.equal(blank.rootTurnId, blank.id)
+    await server.waitFor('turn/completed', (params) => params.turn.id === blank.id, from)
+
+    // Input that joins a running turn keeps that turn's root, as in Codex.
+    from = server.mark()
+    const { turn: held } = await server.startTurn(threadId, 'hold this turn until released')
+    await server.waitFor('item/agentMessage/delta', (params) => params.turnId === held.id, from)
+    const joined = await server.request('turn/start', {
+      threadId,
+      input: [{ type: 'text', text: 'release', text_elements: [] }],
+      rootTurnId: 'root-of-the-chain',
+    })
+    assert.equal(joined.turn.id, held.id)
+    assert.equal(joined.turn.rootTurnId, held.id)
+    await server.waitFor('turn/completed', (params) => params.turn.id === held.id, from)
+
+    // A message queued behind work started for another turn is the user's
+    // own turn, its own root.
+    from = server.mark()
+    const { turn: linkedHeld } = await server.request('turn/start', {
+      threadId,
+      input: [{ type: 'text', text: 'hold this turn until released', text_elements: [] }],
+      rootTurnId: 'root-of-the-chain',
+    })
+    await server.waitFor(
+      'item/agentMessage/delta',
+      (params) => params.turnId === linkedHeld.id,
+      from,
+    )
+    await server.request('thread/queue/add', {
+      threadId,
+      input: [{ type: 'text', text: 'queued', text_elements: [] }],
+    })
+    await server.request('turn/steer', {
+      threadId,
+      expectedTurnId: linkedHeld.id,
+      input: [{ type: 'text', text: 'release', text_elements: [] }],
+    })
+    const queued = await server.waitFor(
+      'turn/started',
+      (params) => params.threadId === threadId && params.turn.id !== linkedHeld.id,
+      from,
+    )
+    assert.equal(queued.turn.rootTurnId, queued.turn.id)
+    await server.waitFor('turn/completed', (params) => params.turn.id === queued.turn.id, from)
+  })
+})
+
+test('Claude threads report the claude-code model provider', async () => {
+  await withServer(async (server) => {
+    // The App runs composer predictions (a thread/fork with
+    // experimentalPredictionMode) only for threads whose modelProvider is
+    // openai, so a Claude thread must never claim it.
+    const started = await server.request('thread/start', { cwd: server.home })
+    assert.equal(started.modelProvider, 'claude-code')
+    assert.equal(started.thread.modelProvider, 'claude-code')
+    const threadId = started.thread.id
+    await server.runTurn(threadId, 'first')
+
+    const resumed = await server.request('thread/resume', { threadId })
+    assert.equal(resumed.modelProvider, 'claude-code')
+    assert.equal(resumed.thread.modelProvider, 'claude-code')
+    const { thread } = await server.request('thread/read', { threadId })
+    assert.equal(thread.modelProvider, 'claude-code')
+    const forked = await server.request('thread/fork', { threadId })
+    assert.equal(forked.modelProvider, 'claude-code')
+    assert.equal(forked.thread.modelProvider, 'claude-code')
+  })
+})
+
 test('host methods answer truthfully: empty, disabled or unavailable', async () => {
   await withServer(async (server) => {
-    await assert.rejects(server.request('x/y'), /method not implemented: x\/y/)
+    // The App treats -32601 as "not supported here" and falls back quietly;
+    // these three are Codex methods its App builds do not use.
+    for (const method of [
+      'x/y',
+      'thread/items/read',
+      'thread/prediction/request',
+      'thread/readState/update',
+    ]) {
+      await assert.rejects(server.request(method), (error: unknown) => {
+        assert.ok(error instanceof RpcError)
+        assert.equal(error.code, -32601)
+        assert.equal(error.message, `method not found: ${method}`)
+        assert.equal(error.data, undefined)
+        return true
+      })
+    }
     await assert.rejects(server.request('userVerification/enroll'), (error: unknown) => {
       assert.ok(error instanceof RpcError)
+      assert.equal(error.code, -32000)
       assert.deepEqual(error.data, { type: 'unavailable', reason: 'providerUnavailable' })
       return true
+    })
+    await assert.rejects(server.request('remoteControl/enable'), (error: unknown) => {
+      assert.ok(error instanceof RpcError)
+      assert.equal(error.code, -32000)
+      assert.equal(error.data, undefined)
+      return true
+    })
+    assert.deepEqual(await server.request('account/bedrock/checkGovCloudRequirements', {}), {
+      isGovCloud: false,
+      shouldWarn: false,
     })
     assert.deepEqual(await server.request('app/read', { appIds: ['calendar'] }), {
       apps: [],
@@ -854,6 +1091,162 @@ test('a fork resumes at its fork point, and a full rollback returns there', asyn
       await server.reply(fork.id, again),
       `resumed mock-${parent} at ${forkPoint}-entry after 1 resets`,
     )
+  })
+})
+
+test('a fork from a turn keeps the turns up to it, and Claude resumes there', async () => {
+  await withServer(async (server) => {
+    const parent = await server.startThread()
+    const turns: string[] = []
+    for (const text of ['one', 'two', 'three']) turns.push(await server.runTurn(parent, text))
+
+    // lastTurnId keeps its turn; beforeTurnId stops short of it.
+    const forks: string[] = []
+    for (const cutoff of [{ lastTurnId: turns[0] }, { beforeTurnId: turns[1] }]) {
+      const { thread: fork } = await server.request('thread/fork', { threadId: parent, ...cutoff })
+      assert.deepEqual(ids({ data: fork.turns }), turns.slice(0, 1))
+      const check = await server.runTurn(fork.id, 'rewind check')
+      assert.equal(
+        await server.reply(fork.id, check),
+        `resumed mock-${parent} at ${turns[0]}-entry after 0 resets`,
+      )
+      forks.push(fork.id)
+    }
+
+    // excludeTurns still leaves the turns out of the response.
+    const { thread: bare } = await server.request('thread/fork', {
+      threadId: parent,
+      lastTurnId: turns[1],
+      excludeTurns: true,
+    })
+    assert.deepEqual(bare.turns, [])
+    const bareCheck = await server.runTurn(bare.id, 'rewind check')
+    assert.equal(
+      await server.reply(bare.id, bareCheck),
+      `resumed mock-${parent} at ${turns[1]}-entry after 0 resets`,
+    )
+
+    // A fork of a fork from before its own first turn branches where it did.
+    const [early] = forks
+    const [own] = ids(await server.request('thread/turns/list', { threadId: early }))
+    const { thread: inner } = await server.request('thread/fork', {
+      threadId: early,
+      beforeTurnId: own,
+    })
+    assert.deepEqual(inner.turns, [])
+    const innerCheck = await server.runTurn(inner.id, 'rewind check')
+    assert.equal(
+      await server.reply(inner.id, innerCheck),
+      `resumed mock-${parent} at ${turns[0]}-entry after 0 resets`,
+    )
+
+    // The parent keeps its turns and its whole session.
+    assert.deepEqual(
+      ids(await server.request('thread/turns/list', { threadId: parent, sortDirection: 'asc' })),
+      turns,
+    )
+    const parentCheck = await server.runTurn(parent, 'rewind check')
+    assert.equal(
+      await server.reply(parent, parentCheck),
+      `resumed mock-${parent} at end after 0 resets`,
+    )
+  })
+})
+
+test("a fork before a thread's first turn starts Claude over, and so does its full rollback", async () => {
+  await withServer(async (server) => {
+    const parent = await server.startThread()
+    const first = await server.runTurn(parent, 'one')
+    await server.runTurn(parent, 'two')
+    const { thread: fork } = await server.request('thread/fork', {
+      threadId: parent,
+      beforeTurnId: first,
+    })
+    assert.deepEqual(fork.turns, [])
+
+    const check = await server.runTurn(fork.id, 'rewind check')
+    assert.equal(await server.reply(fork.id, check), 'resumed nothing at end after 0 resets')
+    // Not the parent's session, which remembers the turns the fork left out.
+    await server.request('thread/rollback', { threadId: fork.id, numTurns: 1 })
+    const again = await server.runTurn(fork.id, 'rewind check')
+    assert.equal(await server.reply(fork.id, again), 'resumed nothing at end after 1 resets')
+  })
+})
+
+test('thread/fork rejects a fork point it cannot honor', async () => {
+  await withServer(async (server) => {
+    const parent = await server.startThread()
+    const done = await server.runTurn(parent, 'one')
+    for (const model of [undefined, 'gpt-5.4-mini']) {
+      const fork = (params: Record<string, unknown>) =>
+        server.request('thread/fork', { threadId: parent, model, ...params })
+      await assert.rejects(
+        fork({ lastTurnId: done, beforeTurnId: done }),
+        /`beforeTurnId` cannot be combined with `lastTurnId`/,
+      )
+      await assert.rejects(
+        fork({ lastTurnId: 'nope' }),
+        /lastTurnId 'nope' was not found in the source thread/,
+      )
+      await assert.rejects(
+        fork({ beforeTurnId: 'nope' }),
+        /beforeTurnId 'nope' was not found in the source thread/,
+      )
+    }
+
+    const from = server.mark()
+    const { turn } = await server.startTurn(parent, `busy ${'x'.repeat(300)}`)
+    await assert.rejects(
+      server.request('thread/fork', { threadId: parent, lastTurnId: turn.id }),
+      new RegExp(`lastTurnId '${turn.id}' identifies an in-progress turn`),
+    )
+    // A fork from before the running turn leaves it out.
+    const { thread: fork } = await server.request('thread/fork', {
+      threadId: parent,
+      beforeTurnId: turn.id,
+    })
+    assert.deepEqual(ids({ data: fork.turns }), [done])
+    await server.waitFor('turn/completed', (params) => params.turn.id === turn.id, from)
+    // The rejected forks made no threads.
+    assert.deepEqual(
+      ids(await server.request('thread/list')).toSorted(),
+      [parent, fork.id].toSorted(),
+    )
+  })
+})
+
+test('a fork from turns without checkpoints keeps all of Claude context and warns', async () => {
+  await withServer(async (server) => {
+    const parent = await server.startThread()
+    const turns: string[] = []
+    for (const text of ['no checkpoint one', 'no checkpoint two'])
+      turns.push(await server.runTurn(parent, text))
+
+    let from = server.mark()
+    const { thread: fork } = await server.request('thread/fork', {
+      threadId: parent,
+      lastTurnId: turns[0],
+    })
+    assert.deepEqual(ids({ data: fork.turns }), turns.slice(0, 1))
+    const warnings = server.notified('configWarning', from)
+    assert.equal(warnings.length, 1)
+    assert.match(warnings[0].summary, /remembers the turns after the fork point/)
+    assert.match(warnings[0].details, new RegExp(`${parent}.*${fork.id}`))
+    const check = await server.runTurn(fork.id, 'rewind check')
+    assert.equal(await server.reply(fork.id, check), `resumed mock-${parent} at end after 0 resets`)
+
+    // No warning when the fork leaves nothing out, or Claude has nothing to
+    // forget: a fork onto a Codex model starts its own session.
+    from = server.mark()
+    await server.request('thread/fork', { threadId: parent, lastTurnId: turns[1] })
+    await server.request('thread/fork', { threadId: parent })
+    const { thread: codexFork } = await server.request('thread/fork', {
+      threadId: parent,
+      beforeTurnId: turns[1],
+      model: 'gpt-5.4-mini',
+    })
+    assert.deepEqual(ids({ data: codexFork.turns }), turns.slice(0, 1))
+    assert.deepEqual(server.notified('configWarning', from), [])
   })
 })
 
