@@ -1529,7 +1529,7 @@ export class CodexClaudeAppServer {
     return {
       ...this.threadEnvelope(
         thread,
-        params.excludeTurns === true ? [] : this.store.listTurns(thread.id),
+        params.excludeTurns === true ? [] : this.store.historyTurns(thread.id),
       ),
       // Codex reports the thread's effective mode on resume.
       collaborationMode: collaborationModeEnvelope(thread),
@@ -1542,9 +1542,11 @@ export class CodexClaudeAppServer {
     if (!parent) throw new Error(`unknown thread: ${parentId}`)
     this.checkModelProfileBinding(parent)
     // A fork from one of the parent's turns keeps the history up to it, and
-    // Claude's context with it.
-    const parentTurns = this.store.listTurns(parent.id)
+    // Claude's context with it. The parent's history includes the turns it
+    // inherited itself, so a fork of a fork can start from one of those.
+    const parentTurns = this.store.historyTurns(parent.id)
     const kept = forkTurns(parentTurns, params)
+    const inheritedTurns = kept ?? parentTurns
     const now = nowSeconds()
     const id = newThreadId()
     const requestedModel = modelFromParams(params, parent.model)
@@ -1659,6 +1661,11 @@ export class CodexClaudeAppServer {
       gitInfo: cwd === parent.cwd ? (parent.gitInfo ?? null) : null,
     }
     this.store.upsertThread(thread)
+    // As in Codex, a fork that is kept holds a copy of the turns it was forked
+    // with, ids and all, and every history read returns them ahead of its own:
+    // the App resumes a new fork and shows what thread/resume returns. An
+    // ephemeral fork's history is in this response only, as in Codex.
+    if (!thread.ephemeral) this.store.copyInheritedHistory(id, parent.id, inheritedTurns.length)
     // A fork compacts like its parent unless its own config says otherwise.
     const parentLimit = this.threadAutoCompactLimits.get(parent.id)
     if (parentLimit != null) this.threadAutoCompactLimits.set(id, parentLimit)
@@ -1699,7 +1706,14 @@ export class CodexClaudeAppServer {
         },
       })
     }
-    return this.threadEnvelope(thread, params.excludeTurns === true ? [] : (kept ?? parentTurns))
+    return this.threadEnvelope(
+      thread,
+      params.excludeTurns === true
+        ? []
+        : thread.ephemeral
+          ? inheritedTurns
+          : this.store.historyTurns(id),
+    )
   }
 
   // Where a fork of `thread` picks up Claude's context. A fork that keeps
@@ -1832,7 +1846,7 @@ export class CodexClaudeAppServer {
         scanned = thread
         const snippet = threadSnippet(
           [thread.name, thread.preview],
-          () => this.store.listTurns(thread.id),
+          () => this.store.historyTurns(thread.id),
           searchTerm,
         )
         if (!snippet) continue
@@ -2011,7 +2025,7 @@ export class CodexClaudeAppServer {
     // child transcript so Prompt/Response and the terminal state can render.
     // App rule: subagent-read
     const includeTurns = params.includeTurns !== false || thread.threadSource === 'subagent'
-    const turns = includeTurns ? this.store.listTurns(threadId) : []
+    const turns = includeTurns ? this.store.historyTurns(threadId) : []
     return { thread: this.toThread(thread, turns) }
   }
 
@@ -2020,7 +2034,7 @@ export class CodexClaudeAppServer {
   private threadTurnsList(params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     const itemsView = turnItemsView(params.itemsView)
-    const page = pageTurns(this.store.listTurns(threadId), {
+    const page = pageTurns(this.store.historyTurns(threadId), {
       cursor: params.cursor,
       limit: pageLimit(params.limit),
       sortDirection: sortDirectionOr(params.sortDirection, 'desc'),
@@ -2029,7 +2043,7 @@ export class CodexClaudeAppServer {
   }
 
   private threadItemsList(params: Record<string, unknown>): unknown {
-    return pageItems(this.store.listTurns(stringOr(params.threadId, '')), {
+    return pageItems(this.store.historyTurns(stringOr(params.threadId, '')), {
       turnId: stringOr(params.turnId, '') || null,
       cursor: params.cursor,
       limit: pageLimit(params.limit),
@@ -2038,7 +2052,7 @@ export class CodexClaudeAppServer {
   }
 
   private threadTimelineList(params: Record<string, unknown>): unknown {
-    return pageTimeline(this.store.listTurns(stringOr(params.threadId, '')), {
+    return pageTimeline(this.store.historyTurns(stringOr(params.threadId, '')), {
       cursor: params.cursor,
       limit: pageLimit(params.limit),
     })
@@ -2050,7 +2064,7 @@ export class CodexClaudeAppServer {
     const threadId = stringOr(params.threadId, '')
     if (!this.store.getThread(threadId)) throw new Error(`unknown thread: ${threadId}`)
     const searchTerm = typeof params.searchTerm === 'string' ? params.searchTerm : ''
-    const occurrences = findOccurrences(this.store.listTurns(threadId), searchTerm)
+    const occurrences = findOccurrences(this.store.historyTurns(threadId), searchTerm)
     const start = offsetCursor(params.cursor, 'occurrence')
     const end = start + (pageLimit(params.limit, 1000) ?? 250)
     return {
@@ -2143,7 +2157,9 @@ export class CodexClaudeAppServer {
 
   private threadTurnItemsList(params: Record<string, unknown>): unknown {
     const turnId = stringOr(params.turnId, '')
-    const turn = this.store.getTurn(turnId)
+    const threadId = stringOr(params.threadId, '')
+    // A fork's inherited turns keep their ids, so the thread names which copy.
+    const turn = threadId ? this.store.historyTurn(threadId, turnId) : this.store.getTurn(turnId)
     return {
       data: turn?.items ?? [],
       nextCursor: null,
@@ -2172,7 +2188,7 @@ export class CodexClaudeAppServer {
     if (!archived) {
       const thread = this.store.getThread(threadId)
       if (!thread) throw new Error(`unknown thread: ${threadId}`)
-      return { thread: this.toThread(thread, this.store.listTurns(threadId)) }
+      return { thread: this.toThread(thread, this.store.historyTurns(threadId)) }
     }
     this.clearThreadState(threadId)
     return {}
@@ -2796,7 +2812,7 @@ export class CodexClaudeAppServer {
     thread.updatedAt = nowSeconds()
     this.store.upsertThread(thread)
 
-    return this.threadEnvelope(thread, this.store.listTurns(threadId))
+    return this.threadEnvelope(thread, this.store.historyTurns(threadId))
   }
 
   private threadSettingsUpdate(peer: RpcPeer, params: Record<string, unknown>): unknown {
@@ -2917,12 +2933,10 @@ export class CodexClaudeAppServer {
     const numTurns =
       typeof params.numTurns === 'number' && params.numTurns >= 1 ? Math.floor(params.numTurns) : 0
     if (numTurns > 0) {
-      const dropped = this.rewindThread(thread, () =>
-        this.store.deleteRecentTurns(threadId, numTurns),
-      )
+      const dropped = this.rewindThread(thread, () => this.dropNewestTurns(thread, numTurns))
       debugLog('thread.rollback', { threadId, requested: numTurns, dropped })
     }
-    return { thread: this.toThread(thread, this.store.listTurns(threadId)) }
+    return { thread: this.toThread(thread, this.store.historyTurns(threadId)) }
   }
 
   // thread/revert is the paginated-history form of rollback: drop a turn and
@@ -2933,13 +2947,11 @@ export class CodexClaudeAppServer {
     const beforeTurnId = stringOr(params.beforeTurnId, '')
     const thread = this.store.getThread(threadId)
     if (!thread) throw new Error(`unknown thread: ${threadId}`)
-    if (!this.store.listTurns(threadId).some((turn) => turn.id === beforeTurnId))
-      throw new Error(`unknown turn: ${beforeTurnId}`)
-    const dropped = this.rewindThread(thread, () =>
-      this.store.deleteTurnsFrom(threadId, beforeTurnId),
-    )
+    const index = this.store.historyTurns(threadId).findIndex((turn) => turn.id === beforeTurnId)
+    if (index < 0) throw new Error(`unknown turn: ${beforeTurnId}`)
+    const dropped = this.rewindThread(thread, () => this.dropTurnsFrom(thread, index))
     debugLog('thread.revert', { threadId, beforeTurnId, dropped })
-    const kept = this.store.listTurns(threadId)
+    const kept = this.store.historyTurns(threadId)
     const last = kept.at(-1)
     const lastItem = last?.items.at(-1)
     this.notify(peer, { method: 'thread/reverted', params: { threadId } })
@@ -2959,12 +2971,14 @@ export class CodexClaudeAppServer {
       throw new Error(`cannot rewind thread ${thread.id} while a turn is running`)
     const dropped = drop()
     if (dropped === 0) return 0
-    const remaining = this.store.listTurns(thread.id)
     if (thread.runtimeBackend === 'codex') {
-      // `codex exec resume` cannot truncate a session; only a full rewind is exact.
-      if (remaining.length === 0) this.store.updateCodexSessionId(thread.id, null)
+      // `codex exec resume` cannot truncate a session; only a full rewind is
+      // exact. A fork's Codex session starts with its own first turn.
+      if (this.store.listTurns(thread.id).length === 0)
+        this.store.updateCodexSessionId(thread.id, null)
       return dropped
     }
+    const remaining = this.store.historyTurns(thread.id)
     this.runtime.resetSession?.(thread.id)
     const point = this.claudeContextAfter(thread, remaining)
     if (point) {
@@ -2982,17 +2996,56 @@ export class CodexClaudeAppServer {
     return dropped
   }
 
-  // Where Claude's context stands once a thread has run `turns`, its first
-  // turns: the newest of their checkpoints, or with no turns, where the thread
-  // began (its fork point, or a new session). Null when the turns, or the fork
-  // they start from, predate checkpoints.
+  // Where Claude's context stands once a thread has run `turns`, the first
+  // turns of its history: the newest of their checkpoints, or with none of its
+  // own, where the thread began (its fork point, or a new session). Null when
+  // the turns, or the fork they start from, predate checkpoints. A fork's
+  // inherited turns carry the checkpoints they had in the thread they came
+  // from, so a point among them is found in the fork's copy.
   private claudeContextAfter(thread: ThreadRecord, turns: TurnRecord[]): ClaudeResumePoint | null {
-    for (const turn of turns.toReversed()) {
+    const inherited = this.store.inheritedTurnCount(thread.id)
+    if (turns.length < inherited) return this.store.contextAfterInherited(thread.id, turns.length)
+    for (const turn of turns.slice(inherited).toReversed()) {
       const checkpoint = this.store.turnCheckpoint(turn.id)
       if (checkpoint) return checkpoint
     }
-    if (turns.length > 0) return null
+    if (turns.length > inherited) return null
     return thread.forkedFromId ? this.store.forkCheckpoint(thread.id) : 'new'
+  }
+
+  // thread/rollback: the newest `count` turns of the thread's history go, its
+  // own turns first, then the turns it inherited. Returns how many went.
+  private dropNewestTurns(thread: ThreadRecord, count: number): number {
+    const own = this.store.deleteRecentTurns(thread.id, count)
+    if (own >= count) return own
+    const inherited = this.store.inheritedTurnCount(thread.id)
+    return own + this.truncateInheritedTurns(thread, inherited - (count - own))
+  }
+
+  // thread/revert: the turn at `index` in the thread's history and every
+  // later turn go. Returns how many went.
+  private dropTurnsFrom(thread: ThreadRecord, index: number): number {
+    const history = this.store.historyTurns(thread.id)
+    const turn = history[index]
+    if (!turn) return 0
+    const inherited = this.store.inheritedTurnCount(thread.id)
+    if (index >= inherited) return this.store.deleteTurnsFrom(thread.id, turn.id)
+    const own = this.store.deleteRecentTurns(thread.id, history.length)
+    return own + this.truncateInheritedTurns(thread, index)
+  }
+
+  // Keeps a fork's first `keep` inherited turns. Its fork point moves back to
+  // the end of what is left, so a rewind past its own turns lands there.
+  private truncateInheritedTurns(thread: ThreadRecord, keep: number): number {
+    const removed = this.store.truncateInheritedTurns(thread.id, keep)
+    if (removed > 0 && thread.runtimeBackend !== 'codex') {
+      const remaining = this.store.inheritedTurnCount(thread.id)
+      this.store.setForkCheckpoint(
+        thread.id,
+        this.store.contextAfterInherited(thread.id, remaining),
+      )
+    }
+    return removed
   }
 
   // Points a thread's next turn at `point`: a forked session resumed there,
@@ -3490,7 +3543,7 @@ export class CodexClaudeAppServer {
           error: error instanceof Error ? error.message : String(error),
         })
         if (!active()) return
-        const fallback = compactSummary(current, this.store.listTurns(threadId))
+        const fallback = compactSummary(current, this.store.historyTurns(threadId))
         this.store.updateItem(turnId, item.id, (entry) =>
           entry.type === 'agentMessage' ? { ...entry, text: fallback } : entry,
         )
@@ -3609,7 +3662,7 @@ export class CodexClaudeAppServer {
     agentItemId: string,
     active: () => boolean,
   ): Promise<void> {
-    const turns = this.store.listTurns(thread.id)
+    const turns = this.store.historyTurns(thread.id)
     const promptBody = compactSummary(thread, turns)
     const compactPrompt = [
       'You are summarizing a Codex / Claude Code conversation so the user can keep context after compaction.',

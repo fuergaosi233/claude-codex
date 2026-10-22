@@ -497,6 +497,20 @@ versioning or publishing metadata.
   Code says only the user may answer now asks in every mode, Full access
   included, and "Allow for this session" covers only that call.
 
+### Trustworthy history and settings
+
+- A forked chat shows the turns it was forked with on every read, as a Codex
+  fork does: `thread/resume`, `thread/read`, `thread/turns/list`,
+  `thread/items/list`, `thread/turns/items/list`, `thread/timeline/list` and
+  search return them ahead of the fork's own turns, under the same ids, after
+  a restart too. The adapter copies them into the fork when it is made, so a
+  rollback or delete of the parent leaves the fork's history alone; a fork of
+  a fork inherits the whole history and can branch from an inherited turn,
+  and a rollback or revert can reach back into the inherited turns. Forks
+  made by an earlier version get their history when first read if their
+  stored fork point says exactly where they branched off. Ephemeral forks
+  still carry their history in the `thread/fork` response only, as in Codex.
+
 ### Provider and multi-agent boundaries
 
 - `/workflows` runs turn workflows on with the CLI's `CLAUDE_CODE_WORKFLOWS`

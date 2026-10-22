@@ -139,6 +139,29 @@ creates. Listing chats never runs git; switching branches by hand shows after
 the chat's next turn. Chats from before this version get their branch when
 they are next opened.
 
+## Forks and rewinds
+
+A forked chat shows the conversation it was forked with, then its own
+messages, as a Codex fork does: when it opens, after the adapter restarts,
+when the App pages its history and in Find. Like Codex, the adapter keeps a
+copy of those turns with the fork, under the same turn and item ids, so
+rewinding or deleting the original chat leaves the fork as it was. Forking a
+fork carries the whole conversation along, and forking from one of its
+earlier messages works on the inherited ones too. Claude's context follows
+the same cut: the fork remembers what it shows and nothing after it.
+
+Rewinding a fork (editing an earlier message, or **Fork from here** on a
+message before the fork point) can reach back into the inherited
+conversation: those turns go from the fork only, and Claude resumes after the
+newest one left, or in a new session when none is left.
+
+Forks made by an earlier adapter version showed only their own messages. Such
+a fork gets its inherited conversation the first time it is opened, when the
+adapter can tell exactly where it branched off; when it cannot (the original
+chat was rewound past that point or deleted, or its turns predate Claude
+checkpoints) the fork keeps showing only its own messages. Side chats and the
+other temporary forks the App makes are not kept, as in Codex.
+
 ## How tool calls show
 
 Claude's tool calls show as the items Codex uses for its own:
