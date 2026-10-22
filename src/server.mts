@@ -6,6 +6,16 @@ import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { rendersCompletedSubagentActivity, unverifiedAppWarning } from './app-compat.mjs'
 import { type InstalledAppPlugin, stopAppPluginServers } from './app-plugin-mcp.mjs'
+import {
+  appMcpServerOrigins,
+  appMcpServers,
+  appMcpServersEnabled,
+  appMcpServerTable,
+  claudeSandboxWorkspaceWrite,
+  editMcpServers,
+  pruneLegacySettings,
+  unsupportedSettingWrite,
+} from './app-settings.mjs'
 import { AUTO_COMPACT_KEY, autoCompactTokenLimit, autoCompactWindow } from './auto-compact.mjs'
 import {
   type AppPlugin,
@@ -817,7 +827,7 @@ export class CodexClaudeAppServer {
             method: 'account/updated',
             params: { authMode: 'apikey', planType: null },
           })
-          for (const status of readMcpConfig().startupStatuses) {
+          for (const status of readMcpConfig(this.appMcpScope()).startupStatuses) {
             this.notify(peer, {
               method: 'mcpServer/startupStatus/updated',
               params: { name: status.name, status: status.status, error: status.error ?? null },
@@ -1094,7 +1104,7 @@ export class CodexClaudeAppServer {
         // sign-in, and every App window hears the servers configured now.
         resetMcpStatusCache()
         void this.runtime.reloadMcpServers?.()
-        for (const status of readMcpConfig().startupStatuses) {
+        for (const status of readMcpConfig(this.appMcpScope()).startupStatuses) {
           this.notifyAll({
             method: 'mcpServer/startupStatus/updated',
             params: { name: status.name, status: status.status, error: status.error ?? null },
@@ -4250,9 +4260,13 @@ export class CodexClaudeAppServer {
     const resumeSessionAt = isCodexThread ? null : this.store.claudeResumeAt(thread.id)
     const turnCwd = stringOr(params.cwd, thread.cwd)
     // A Claude thread's own turns also get the MCP servers, subagents,
-    // permission rules and hooks the Codex and Claude Code configs bring.
+    // permission rules and hooks the Codex and Claude Code configs bring, and
+    // the MCP servers added in the App's settings.
     const inheritConfig = desktopPresentation && !isCodexThread
-    const mcp = readMcpConfig({ cwd: turnCwd, inherit: inheritConfig })
+    const mcp = readMcpConfig({ ...this.appMcpScope(), cwd: turnCwd, inherit: inheritConfig })
+    // The App's Settings > Configuration > Web search. Claude has the one
+    // kind of search, so only turning it off changes what Claude may do.
+    const webSearchOff = !isCodexThread && this.configOverrides.web_search === 'disabled'
     const permissionRules = inheritConfig ? inheritedPermissionRules(turnCwd) : null
     // The tools the client registered when it started the thread.
     const dynamicTools =
@@ -4288,7 +4302,11 @@ export class CodexClaudeAppServer {
       allowedTools: defaultAllowedTools(),
       inheritedAllowedTools: permissionRules?.allow ?? null,
       inheritedAskRules: permissionRules?.ask ?? null,
-      disallowedTools: [...mcp.toolRules.disallowedTools, ...(permissionRules?.deny ?? [])],
+      disallowedTools: [
+        ...mcp.toolRules.disallowedTools,
+        ...(permissionRules?.deny ?? []),
+        ...(webSearchOff ? ['WebSearch'] : []),
+      ],
       mcpEnabledTools: mcp.toolRules.enabledTools,
       agents: inheritConfig ? inheritedAgents(turnCwd) : null,
       claudeHooks: inheritConfig ? inheritedHooks(turnCwd) : null,
@@ -7756,7 +7774,9 @@ export class CodexClaudeAppServer {
         approval_policy: this.configOverrides.approval_policy ?? 'on-request',
         approvals_reviewer: this.configOverrides.approvals_reviewer ?? 'user',
         sandbox_mode: this.configOverrides.sandbox_mode ?? 'workspace-write',
-        sandbox_workspace_write: this.configOverrides.sandbox_workspace_write ?? null,
+        // Claude threads have no network or filesystem sandbox; see
+        // app-settings.mts for the settings Claude has no counterpart for.
+        sandbox_workspace_write: claudeSandboxWorkspaceWrite(),
         forced_chatgpt_workspace_id: null,
         forced_login_method: null,
         // Claude searches the web live with its WebSearch tool, which
@@ -7768,13 +7788,13 @@ export class CodexClaudeAppServer {
         tools: this.configOverrides.tools ?? null,
         profile: this.configOverrides.profile ?? null,
         profiles: {},
-        instructions: this.configOverrides.instructions ?? null,
-        developer_instructions: this.configOverrides.developer_instructions ?? null,
-        compact_prompt: this.configOverrides.compact_prompt ?? null,
+        instructions: null,
+        developer_instructions: null,
+        compact_prompt: null,
         model_reasoning_effort: this.configReasoningEffort,
         model_reasoning_summary: this.configOverrides.model_reasoning_summary ?? null,
-        model_verbosity: this.configOverrides.model_verbosity ?? null,
-        service_tier: this.configOverrides.service_tier ?? null,
+        model_verbosity: null,
+        service_tier: null,
         analytics: this.configOverrides.analytics ?? null,
         apps: this.configOverrides.apps ?? null,
         // The App reads its memories switches from the table; the adapter
@@ -7784,6 +7804,7 @@ export class CodexClaudeAppServer {
           ? { memories: memoriesConfigTable(this.configOverrides) }
           : {}),
         model_providers: this.exposedModelProviders(),
+        ...(appMcpServersEnabled() ? { mcp_servers: appMcpServerTable(this.configOverrides) } : {}),
         provider_loop_config: projectProviderLoopConfig(
           undefined,
           this.providerLoopSelectionInput(),
@@ -7794,6 +7815,9 @@ export class CodexClaudeAppServer {
         'model_providers.claude-code': configLayerMetadata(),
         ...(codexProxyModelOptions().length > 0
           ? { 'model_providers.codex': configLayerMetadata() }
+          : {}),
+        ...(appMcpServersEnabled()
+          ? appMcpServerOrigins(this.configOverrides, configLayerMetadata())
           : {}),
       },
       layers: null,
@@ -7929,7 +7953,7 @@ export class CodexClaudeAppServer {
   private publicConfigOverrides(): Record<string, unknown> {
     return Object.fromEntries(
       Object.entries(this.configOverrides).filter(
-        ([key]) => !isProviderLoopSelectionConfigKey(key),
+        ([key]) => !isProviderLoopSelectionConfigKey(key) && key !== 'mcp_servers',
       ),
     )
   }
@@ -8705,26 +8729,37 @@ export class CodexClaudeAppServer {
     }
   }
 
+  // config/value/write and config/batchWrite. A write makes all of its edits
+  // or, when one fails, none: the App shows the error and its settings stay
+  // as they were. See app-settings.mts for what each setting does.
   private configWriteResponse(params: Record<string, unknown>): unknown {
+    const overrides = structuredClone(this.configOverrides)
+    let model = this.configModel
+    let effort = this.configReasoningEffort
     for (const edit of configEdits(params)) {
       const { keyPath, value } = edit
       if (keyPath === 'model' && typeof value === 'string' && value.length > 0) {
-        this.configModel = normalizeSelectableModelId(value, this.configModel)
+        model = normalizeSelectableModelId(value, model)
       } else if (keyPath === 'model_reasoning_effort' && typeof value === 'string') {
-        this.configReasoningEffort =
-          normalizeCodexReasoningEffort(value) ?? this.configReasoningEffort
+        effort = normalizeCodexReasoningEffort(value) ?? effort
+      } else if (keyPath === 'mcp_servers' || keyPath.startsWith('mcp_servers.')) {
+        editMcpServers(overrides, edit)
       } else {
-        // Unknown key — store in the generic overrides bag so it survives a
-        // restart even though we don't apply it to typed runtime state. This
-        // captures approvalPolicy, sandboxMode, instruction toggles, anything
-        // the App's settings sheet may emit. `null` value clears the entry.
-        if (value === null || value === undefined) {
-          delete this.configOverrides[keyPath]
+        const unsupported = unsupportedSettingWrite(edit)
+        if (unsupported instanceof RpcError) throw unsupported
+        // Any other key is kept as written, so it survives a restart and
+        // config/read reports it back: settings the adapter applies, and the
+        // App's own. null clears the entry.
+        if (unsupported === 'drop' || value === null || value === undefined) {
+          delete overrides[keyPath]
         } else {
-          this.configOverrides[keyPath] = value
+          overrides[keyPath] = value
         }
       }
     }
+    this.configOverrides = overrides
+    this.configModel = model
+    this.configReasoningEffort = effort
     this.persistConfig()
     const filePath = stringOr(params.filePath, `${codexHome()}/config.toml`)
     return {
@@ -9592,9 +9627,15 @@ export class CodexClaudeAppServer {
     const threadId = stringOr(asRecord(params).threadId, '')
     const thread = threadId ? this.store.getThread(threadId) : null
     return {
+      ...this.appMcpScope(),
       cwd: thread && thread.runtimeBackend !== 'codex' ? thread.cwd : null,
       appPlugins: this.installedAppPlugins,
     }
+  }
+
+  // The MCP servers added in the App's settings, which apply in every folder.
+  private appMcpScope(): McpConfigScope {
+    return { appServers: appMcpServers(this.configOverrides, this.configPath) }
   }
 
   // What the live Claude session of the thread a request names says of its
@@ -9807,6 +9848,7 @@ export class CodexClaudeAppServer {
         !Array.isArray(parsed.overrides)
       ) {
         this.configOverrides = parsed.overrides as Record<string, unknown>
+        if (pruneLegacySettings(this.configOverrides)) shouldRepair = true
       }
       if (Array.isArray(parsed.appPlugins)) {
         this.appPlugins = parsed.appPlugins.flatMap((entry) => {

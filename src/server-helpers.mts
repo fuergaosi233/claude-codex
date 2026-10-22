@@ -2,6 +2,7 @@ import { type ChildProcess, execFile, spawn } from 'node:child_process'
 import { type FSWatcher, readFileSync, watch, writeFileSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import { promisify } from 'node:util'
+import type { ConfigEdit } from './app-settings.mjs'
 import type { AppSkill } from './claude-capabilities.mjs'
 import { callMcpTool, readMcpConfig, readMcpResource } from './mcp.mjs'
 import { stripQuietTurnHeartbeat } from './quiet-turns.mjs'
@@ -68,19 +69,27 @@ export function stringOr(value: unknown, fallback: string): string {
   return typeof value === 'string' && value.length > 0 ? value : fallback
 }
 
-export function configEdits(
-  params: Record<string, unknown>,
-): Array<{ keyPath: string; value: unknown }> {
+// The edits of config/value/write (one) or config/batchWrite (each of
+// `edits`), in order. Codex's mergeStrategy is replace unless it says upsert.
+export function configEdits(params: Record<string, unknown>): ConfigEdit[] {
+  const strategy = (value: unknown): ConfigEdit['mergeStrategy'] =>
+    value === 'upsert' ? 'upsert' : 'replace'
   if (Array.isArray(params.edits)) {
     return params.edits
       .map((edit) => {
         const rec = asRecord(edit)
-        return { keyPath: String(rec.keyPath ?? rec.key ?? ''), value: rec.value }
+        return {
+          keyPath: String(rec.keyPath ?? rec.key ?? ''),
+          value: rec.value,
+          mergeStrategy: strategy(rec.mergeStrategy),
+        }
       })
       .filter((edit) => edit.keyPath.length > 0)
   }
   const keyPath = String(params.keyPath ?? params.key ?? '')
-  return keyPath ? [{ keyPath, value: params.value }] : []
+  return keyPath
+    ? [{ keyPath, value: params.value, mergeStrategy: strategy(params.mergeStrategy) }]
+    : []
 }
 
 export function configLayerMetadata(): unknown {

@@ -43,6 +43,10 @@ Implemented as real remote/runtime behavior:
 - **Remote utilities** — file read/write/list/metadata/copy/remove/watch,
   command exec with stdin/terminate, process spawn/stdin/kill, fuzzy file
   search, direct MCP stdio/HTTP tool and resource calls.
+- **App settings** — `config/value/write` and `config/batchWrite` keep the
+  settings Claude threads honor, MCP servers added in the App's settings
+  included, and refuse the ones they cannot with `INVALID_REQUEST`, all or
+  nothing per batch.
 - **Memories** (opt-in with `CLAUDE_CODEX_MEMORIES=1`) — the `memories`
   feature and each thread's memory mode decide whether Claude Code runs with
   its auto-memory.

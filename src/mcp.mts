@@ -7,6 +7,7 @@ import {
   type InstalledAppPlugin,
   startAppPluginServer,
 } from './app-plugin-mcp.mjs'
+import type { InheritedMcpServer } from './codex-config.mjs'
 import { inheritedMcpServers, type McpToolRules, mcpToolRules } from './inherited-config.mjs'
 import { ownVariable, remoteCredential } from './mcp-credentials.mjs'
 import type { RuntimeMcpServerStatus } from './types.mjs'
@@ -17,7 +18,8 @@ export interface McpConfigSnapshot {
   listStatuses: Array<Record<string, unknown>>
   // mcpServer/startupStatus/updated -> { name, status: McpServerStartupState, error }
   startupStatuses: Array<{ name: string; status: string; error: string | null }>
-  // The Codex config's tool lists for the inherited servers still in use.
+  // The Codex config's tool lists for the inherited servers still in use,
+  // and the App settings' for theirs.
   toolRules: McpToolRules
 }
 
@@ -25,20 +27,30 @@ export interface McpConfigScope {
   // The thread's folder, for the servers its project adds; null for the
   // servers that apply in every folder.
   readonly cwd?: string | null
-  // false leaves out the servers the Codex and Claude Code configs bring.
+  // false leaves out the servers the Codex and Claude Code configs bring, and
+  // the ones added in the App's MCP settings.
   readonly inherit?: boolean
+  // The servers added in the App's MCP settings (see app-settings.mts).
+  readonly appServers?: readonly InheritedMcpServer[]
   // The App plugins plugin/install named. Their MCP servers answer the App's
   // own requests when CLAUDE_CODEX_APP_PLUGIN_MCP names them (see
   // app-plugin-mcp.mts); a name the Claude config has stays Claude's.
   readonly appPlugins?: readonly InstalledAppPlugin[]
 }
 
-// CLAUDE_CODEX_MCP_SERVERS, over the servers the Codex and Claude Code
-// configs bring (see inherited-config.mts); it wins a name.
+// CLAUDE_CODEX_MCP_SERVERS, over the servers added in the App's MCP settings,
+// over the servers the Codex and Claude Code configs bring (see
+// inherited-config.mts); each wins a name from the ones below it.
 export function readMcpConfig(scope: McpConfigScope = {}): McpConfigSnapshot {
-  const inherited = scope.inherit === false ? [] : inheritedMcpServers(scope.cwd ?? null)
+  const inherited =
+    scope.inherit === false
+      ? []
+      : [...inheritedMcpServers(scope.cwd ?? null), ...(scope.appServers ?? [])]
   const servers: Record<string, unknown> = {}
-  for (const server of inherited) servers[server.name] = server.config
+  for (const server of inherited) {
+    delete servers[server.name]
+    servers[server.name] = server.config
+  }
   const raw = process.env.CLAUDE_CODEX_MCP_SERVERS
   let failure: string | null = null
   if (raw) {

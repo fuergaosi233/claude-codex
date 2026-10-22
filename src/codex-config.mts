@@ -217,19 +217,33 @@ export function codexMcpServers(cwd: string | null): InheritedMcpServer[] {
   }
   const servers: InheritedMcpServer[] = []
   for (const [name, { entry, source, base }] of merged) {
-    const config = sdkServerConfig(name, entry, base)
-    if (!config) continue
-    const enabledTools = stringList(entry.enabled_tools)
-    const disabledTools = stringList(entry.disabled_tools)
-    servers.push({
-      name,
-      source,
-      config,
-      ...(Array.isArray(entry.enabled_tools) ? { enabledTools } : {}),
-      ...(disabledTools.length > 0 ? { disabledTools } : {}),
-    })
+    const server = codexMcpServer(name, entry, source, base)
+    if (server) servers.push(server)
   }
   return servers
+}
+
+// One [mcp_servers.<name>] entry as a Claude thread runs it, or null when it
+// is turned off or has nothing to start. `base` is the folder a relative cwd
+// is relative to. The Codex App's MCP settings write entries of this shape
+// too (see app-settings.mts).
+export function codexMcpServer(
+  name: string,
+  entry: Table,
+  source: string,
+  base: string,
+): InheritedMcpServer | null {
+  const config = sdkServerConfig(name, entry, base)
+  if (!config) return null
+  const enabledTools = stringList(entry.enabled_tools)
+  const disabledTools = stringList(entry.disabled_tools)
+  return {
+    name,
+    source,
+    config,
+    ...(Array.isArray(entry.enabled_tools) ? { enabledTools } : {}),
+    ...(disabledTools.length > 0 ? { disabledTools } : {}),
+  }
 }
 
 // One Codex server entry in the SDK's terms. A value Codex takes from its
@@ -329,7 +343,7 @@ export function codexNotifyCommand(): string[] | null {
   return notify.length > 0 && notify[0] ? (notify as string[]) : null
 }
 
-function mergeTables(base: Table, over: Table): Table {
+export function mergeTables(base: Table, over: Table): Table {
   const out: Table = { ...base }
   for (const [key, value] of Object.entries(over)) {
     const prior = asTable(out[key])

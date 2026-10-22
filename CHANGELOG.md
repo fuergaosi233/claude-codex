@@ -510,6 +510,29 @@ versioning or publishing metadata.
   made by an earlier version get their history when first read if their
   stored fork point says exactly where they branched off. Ephemeral forks
   still carry their history in the `thread/fork` response only, as in Codex.
+- MCP servers added, edited, switched off or deleted in the App's Settings >
+  MCP servers now take effect in Claude threads. The App writes them with
+  `config/batchWrite` and `config/value/write`; the adapter keeps them in its
+  own settings (never in `config.toml`), checks them like `config.toml`
+  entries, passes them to every turn, `mcpServerStatus/list` and
+  `config/mcpServer/reload`, and reports them in `config/read` so the page
+  lists them after a restart. One of them wins a name over a server the
+  Codex or Claude Code config brings, and `CLAUDE_CODEX_MCP_SERVERS` wins
+  over it; the App's own desktop servers (`node_repl`, `cua_repl`) are
+  accepted and not kept.
+  `CLAUDE_CODEX_APP_MCP_SERVERS=0` turns this off and refuses the writes.
+- Settings a Claude thread cannot honor are refused with `INVALID_REQUEST`
+  instead of being saved and ignored, so the App shows "Couldn't update this
+  setting": `model_verbosity`, a service tier other than the default, network
+  access off and the other workspace sandbox fields, `instructions`,
+  `developer_instructions` and `compact_prompt`. `config/read` reports network
+  access on, as Claude threads have it. Writing the value Claude already has,
+  or clearing a key, still succeeds.
+- `web_search = "disabled"` saved in the App's settings takes WebSearch from
+  Claude threads; `cached`, `indexed` and `live` keep it.
+- A `config/batchWrite` is all or nothing: one refused edit leaves the
+  settings as they were. Keys earlier versions saved but never honored are
+  dropped from the adapter's settings when it starts.
 
 ### Provider and multi-agent boundaries
 

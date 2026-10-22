@@ -486,6 +486,27 @@ setting decides there.
 With or without `CLAUDE_CODEX_MEMORIES`, the adapter refuses `memory/reset`
 rather than delete Claude Code's notes.
 
+## MCP servers and other settings
+
+**Settings > MCP servers** works for Claude chats. A server you add, edit or
+switch off there is saved by the adapter (in its own config, not in
+`config.toml`) and used by Claude chats from their next turn; Claude can call
+its tools, and the App lists the server with its tools. A server without a
+command or URL is refused with an error. The App's own desktop servers, which
+it writes there for its Codex chats each time it starts, are not kept.
+`CLAUDE_CODEX_APP_MCP_SERVERS=0` leaves these servers out, and the App then
+says its MCP settings are unavailable. Servers from the Codex and Claude Code
+configs and from `CLAUDE_CODEX_MCP_SERVERS` are listed apart from the ones you
+added; see [MCP, tools & directories](/guide/configuration#mcp-tools-directories).
+
+**Settings > Configuration** shows what Claude chats do. Network access shows
+on, as Claude chats have no network sandbox, and turning it off, or picking a
+verbosity, says "Couldn't update this setting", since Claude models have
+neither setting. Web search off takes Claude's WebSearch tool away; the other
+search modes keep it. The approval policy and sandbox mode are saved and apply
+to the chats you start. The full list is under
+[App settings](/guide/configuration#app-settings).
+
 ## App tools
 
 On a remote connection the Codex App registers tools of its own when it starts
