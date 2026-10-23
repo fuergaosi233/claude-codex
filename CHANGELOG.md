@@ -54,9 +54,13 @@ versioning or publishing metadata.
 - Opt-in `CLAUDE_CODEX_PREVENT_IDLE_SLEEP=1` keeps a Mac from idle-sleeping
   while Claude works: the adapter holds `caffeinate -i -w <adapter pid>` while
   any turn, background agent or other background work runs, and stops it once
-  nothing does. Closing the lid still sleeps. A `caffeinate` that fails or
-  ends on its own is started again while work runs; the adapter stops trying
-  until it restarts only after three in a row end within a minute of starting.
+  nothing does. A command Claude runs in the background with Bash, such as a
+  dev server or file watcher, counts as background work and keeps the Mac
+  awake until its Claude session closes, `CLAUDE_CODEX_BACKGROUND_IDLE_MS`
+  (default 2 hours) after the session's last message. Closing the lid still
+  sleeps. A `caffeinate` that fails or ends on its own is started again while
+  work runs; the adapter stops trying until it restarts only after three in a
+  row end within a minute of starting.
   Off by default, and it does nothing on other platforms.
 - What Claude Code reports beside a turn (a compaction it could not do, a
   switch to a fallback model, an urgent CLI notification, a call it refused)

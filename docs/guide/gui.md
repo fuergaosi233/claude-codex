@@ -132,8 +132,11 @@ sleep with the lid closed (the App does not offer it on Windows). The error keep
 To have the adapter keep a Mac awake itself while Claude works, start it with
 `CLAUDE_CODEX_PREVENT_IDLE_SLEEP=1`: it then holds `caffeinate -i` while any
 turn, background agent or other background work runs, and lets go once nothing
-does. Closing the lid still sleeps. It is off by default and does nothing on
-other platforms.
+does. A command Claude runs in the background with Bash counts as background
+work, so a dev server or file watcher keeps the Mac awake until its Claude
+session closes, `CLAUDE_CODEX_BACKGROUND_IDLE_MS` (default 2 hours) after the
+session's last message. Closing the lid still sleeps. It is off by default and
+does nothing on other platforms.
 
 A turn waiting on a subagent or workflow does not fail because the computer
 slept, or while it waits on you for an approval, an answer, an MCP form or an
