@@ -531,7 +531,7 @@ test('Claude compacting the conversation becomes compaction events; a subagent c
   }
 })
 
-test('native API retries of the main loop become retrying events, and urgent CLI notifications warnings', async () => {
+test("native API retries become retrying events, a subagent's told by its Agent call, and urgent CLI notifications warnings", async () => {
   const notification = (key: string, fields: Record<string, unknown>) =>
     system('notification', { key, text: `${key} text`, priority: 'high', ...fields })
   const events = await collect([
@@ -542,7 +542,7 @@ test('native API retries of the main loop become retrying events, and urgent CLI
       error_status: 529,
       error: 'overloaded',
     }),
-    // A subagent's retries are its own.
+    // A subagent's retry is told against the Agent call that runs it.
     system('api_retry', {
       attempt: 1,
       max_retries: 10,
@@ -573,6 +573,15 @@ test('native API retries of the main loop become retrying events, and urgent CLI
       status: 529,
       category: 'overloaded',
       delayMs: 600,
+    },
+    {
+      type: 'retrying',
+      attempt: 1,
+      maxRetries: 10,
+      status: 500,
+      category: 'server_error',
+      delayMs: 600,
+      toolUseId: 'agent',
     },
     {
       type: 'retrying',
@@ -665,6 +674,32 @@ test('a failed native turn says why it failed, and a successful one carries no f
     result: 'Prompt is too long',
     claudeSessionId: null,
     failure: { terminalReason: 'prompt_too_long', category: null, status: null },
+  })
+
+  // A subagent's retry says nothing about why the main loop failed.
+  const afterSubagentRetry = await completedEvent([
+    system('api_retry', {
+      attempt: 10,
+      max_retries: 10,
+      retry_delay_ms: 30_000,
+      error_status: 529,
+      error: 'overloaded',
+      parent_tool_use_id: 'agent',
+    }),
+    {
+      type: 'result',
+      subtype: 'error_during_execution',
+      is_error: true,
+      result: 'Claude turn failed',
+      terminal_reason: 'api_error',
+    },
+  ])
+  assert.deepEqual(afterSubagentRetry.completed, {
+    type: 'completed',
+    success: false,
+    result: 'Claude turn failed',
+    claudeSessionId: null,
+    failure: { terminalReason: 'api_error', category: null, status: null },
   })
 
   // A CLI that refused to start names the reason; its stderr stays behind,

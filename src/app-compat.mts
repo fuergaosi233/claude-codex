@@ -184,6 +184,14 @@ export const APP_RULES: readonly AppRule[] = [
     verify: 'Stop a running subagent; it shows as done, not failed.',
   },
   {
+    id: 'subagent-failure-reason',
+    app: "Shows a failed turn's error.message as an error row at the end of that turn, unless the turn holds an `error` item that will not be retried; it shows nothing for an interrupted turn's error. A spawnAgent or sendInput row adds the agent's agentsStates message after its status; a wait is never drawn and a closeAgent row shows no state.",
+    adapter:
+      "Ends a child that failed, was stopped or was ended with its parent with a turn error saying why: the CLI's error text without its tags, usage trailer or stack frames, a JSON error body told by its message, or what ended it. The same reason is the agent's agentsStates message on its wait and closeAgent items. A parent turn that fails after agents of its own failed adds how many and the first one's reason to its error.",
+    verify:
+      "Have a subagent fail (a workflow agent that stalls, or one whose tool call errors): its thread ends with an error row naming the cause, without stack frames, and the parent's failed turn says a subagent failed and why.",
+  },
+  {
     id: 'subagent-read',
     app: 'Reads a child for the subagent panel with thread/read includeTurns:false, and shows a child without turns as still loading.',
     adapter: 'Returns the turns of a subagent thread even when they are not asked for.',
@@ -194,6 +202,14 @@ export const APP_RULES: readonly AppRule[] = [
     app: 'Creates the child conversation from thread/started with an empty turn and takes its history as loaded while the child runs.',
     adapter: "Replays the child's prompt as an item lifecycle.",
     verify: 'Open a running subagent before it answers: its prompt shows.',
+  },
+  {
+    id: 'subagent-titles',
+    app: "Titles a subagent thread from its thread/started announcement: it shows the thread's name if it has one; otherwise it generates a title from the spawnAgent prompt of the parent (or the thread's preview) with a model turn of its own and saves it with thread/name/set. The agent's row in the parent is named by agentNickname, not by the title.",
+    adapter:
+      "Names every subagent thread when it announces it, and keeps the name: the Agent tool's description, a workflow agent's label (or the first line of its task, not the harness header in front of it), else the agent's type and the first line of its prompt, with whitespace collapsed and at most 120 characters.",
+    verify:
+      'Run a subagent and a workflow: their threads show the description or label at once, and the App sends no title turn for them.',
   },
   {
     id: 'nested-subagent',
@@ -284,9 +300,9 @@ export const APP_RULES: readonly AppRule[] = [
     id: 'reconnecting-errors',
     app: 'Shows an `error` notification with willRetry as a passing stream-error row in the turn that replaces the one before it, and reads the attempt count only from a message of the form "Reconnecting... n/m"; any other message shows as it is.',
     adapter:
-      'Turns each retry the Claude CLI reports for a chat\'s main loop (system/api_retry) into an `error` with willRetry, the message "Reconnecting... n/m" and the HTTP status and wait in additionalDetails, and does not store it, as Codex does not. Retries inside a subagent or a structured-output helper turn show nothing.',
+      'Turns each retry the Claude CLI reports for a chat\'s main loop (system/api_retry) into an `error` with willRetry, the message "Reconnecting... n/m" and the HTTP status and wait in additionalDetails, and does not store it, as Codex does not. A retry inside a subagent (one with a parent_tool_use_id) shows the same way in that subagent\'s thread while its turn runs, and never in the parent; retries in a structured-output helper turn show nothing.',
     verify:
-      'Point the adapter at an API that answers 529 for a while: the turn shows "Reconnecting 1/10", counting up, and then the reply.',
+      'Point the adapter at an API that answers 529 for a while: the turn shows "Reconnecting 1/10", counting up, and then the reply; a subagent running then shows its own retries in its thread.',
   },
   {
     id: 'error-codes',

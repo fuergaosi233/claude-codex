@@ -383,6 +383,7 @@ Subagent threads. While a local workflow runs, the adapter tails its journal and
 inner agent through Codex's native `subAgentActivity` lifecycle (with `completed` sent only to
 clients that advertise it) plus `spawnAgent`/`wait` tool state; runtimes without journal metadata
 fall back to one aggregate workflow agent when the workflow reaches a terminal state.
+Each inner agent's thread is named by its workflow label (else the first line of its task).
 A bare `/workflows` lists workflow runs
 recorded in the current Codex thread.
 

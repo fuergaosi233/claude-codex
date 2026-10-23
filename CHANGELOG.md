@@ -668,6 +668,26 @@ versioning or publishing metadata.
   stale copy without the turns taken on another. A copy that is identical,
   newer or longer stays as it is; a new copy keeps the source's file mode
   and is a clone where the file system supports it.
+- Subagent threads are named when they start, after the Agent call's
+  `description` or a workflow agent's label, else the agent's type and the
+  first line of its prompt, and keep the name in `thread/read`,
+  `thread/list` and after a restart. The Codex App used to run a title turn
+  for every subagent, which named workflow agents after the workflow's
+  relayed user request; a workflow agent's prompt is now the task the
+  workflow computed for it. Names and failure reasons are one line of plain
+  text, without control characters, terminal escapes or bidirectional
+  overrides.
+- A subagent that fails says why: its thread's turn fails with the reason
+  Claude Code gave instead of "subagent failed", the agent's state on the
+  parent's wait carries the reason, and a parent turn that fails after its
+  subagents failed says how many did and why the first did, keeping its
+  error code. A background agent that fails tells the reason its task
+  notification gives (a stall, an API error), not the last thing it said.
+  Stopped, interrupted and orphaned subagents say how they ended and do not
+  count as failed. Stopping a foreground subagent whose Agent call returned
+  before Claude Code confirmed the stop no longer ends its thread twice.
+- A subagent's API retries show as **Reconnecting n/m** in the subagent's
+  thread while it runs, instead of not at all, and never in the parent.
 
 ### Rust-first protocol groundwork
 

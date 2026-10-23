@@ -2,6 +2,14 @@ import { constants } from 'node:fs'
 import { lstat, open, realpath } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, isAbsolute, join, normalize, resolve, sep } from 'node:path'
+import {
+  clipText,
+  collapseWhitespace,
+  firstPromptLine,
+  isRelayedUserRequest,
+  SUBAGENT_NAME_MAX_CHARS,
+  workflowAgentPrompt,
+} from './subagent-presentation.mjs'
 import { isPathInside } from './util.mjs'
 
 export interface WorkflowLaunchInfo {
@@ -37,6 +45,10 @@ interface WorkflowJournalEntry {
   type: 'started' | 'result'
   agentId: string
   result?: unknown
+  // The name the workflow script gave the agent (its `label`), which the CLI
+  // writes on the agent's started line: the script's own label, else one it
+  // makes from the prompt.
+  label?: string
 }
 
 const MAX_WORKFLOW_JOURNAL_BYTES = 8 * 1024 * 1024
@@ -197,9 +209,19 @@ export class WorkflowJournalMonitor {
     if (!transcriptDir || !this.isCurrent(generation)) return
     const entries = await readJournalEntries(join(transcriptDir, 'journal.jsonl'), transcriptDir)
     if (!this.isCurrent(generation)) return
+    const labels = new Map<string, string>()
+    for (const entry of entries) {
+      if (entry.type === 'started' && entry.label && !labels.has(entry.agentId))
+        labels.set(entry.agentId, entry.label)
+    }
     for (const entry of entries) {
       if (!this.isCurrent(generation)) return
-      const started = await this.ensureStarted(transcriptDir, entry.agentId, generation)
+      const started = await this.ensureStarted(
+        transcriptDir,
+        entry.agentId,
+        generation,
+        labels.get(entry.agentId),
+      )
       if (!this.isCurrent(generation)) return
       if (!started) continue
       if (entry.type !== 'result' || this.completedAgentIds.has(entry.agentId)) continue
@@ -215,6 +237,7 @@ export class WorkflowJournalMonitor {
     transcriptDir: string,
     agentId: string,
     generation: number,
+    label: string | undefined,
   ): Promise<boolean> {
     if (this.startedAgentIds.has(agentId)) return true
     const prompt = await readAgentPrompt(transcriptDir, agentId)
@@ -222,7 +245,7 @@ export class WorkflowJournalMonitor {
     await this.onStarted({
       agentId,
       prompt,
-      description: workflowAgentDescription(prompt, agentId),
+      description: workflowAgentDescription(prompt, agentId, label),
     })
     if (!this.isCurrent(generation)) return false
     this.startedAgentIds.add(agentId)
@@ -307,10 +330,12 @@ async function readJournalEntries(
     const type = String(entry.type ?? '')
     const agentId = stringValue(entry.agentId)
     if ((type !== 'started' && type !== 'result') || !isWorkflowAgentId(agentId)) continue
+    const label = type === 'started' ? collapseWhitespace(stringValue(entry.label)) : ''
     entries.push({
       type,
       agentId,
       ...(type === 'result' ? { result: entry.result } : {}),
+      ...(label ? { label } : {}),
     })
   }
   return entries
@@ -324,6 +349,9 @@ async function readAgentPrompt(transcriptDir: string, agentId: string): Promise<
   )
   if (text === null) return null
 
+  // The messages the agent was started with come before its first reply.
+  const userMessages: string[] = []
+  let replied = false
   for (const line of text.split('\n')) {
     if (!line.trim()) continue
     let parsed: unknown
@@ -334,11 +362,19 @@ async function readAgentPrompt(transcriptDir: string, agentId: string): Promise<
     }
     const record = recordOrNull(parsed)
     const message = recordOrNull(record?.message)
+    if (message?.role === 'assistant') {
+      replied = true
+      break
+    }
     if (message?.role !== 'user') continue
     const prompt = messageText(message.content)
-    if (prompt) return prompt
+    if (prompt) userMessages.push(prompt)
   }
-  return null
+  // The relayed user request comes first, the computed task right after it.
+  // Until the task is there too (and the agent has not answered), wait for it
+  // rather than show the relay as the agent's prompt.
+  if (!replied && userMessages.length > 0 && userMessages.every(isRelayedUserRequest)) return null
+  return workflowAgentPrompt(userMessages)
 }
 
 async function readRegularTextFile(
@@ -443,12 +479,15 @@ async function readAgentResult(transcriptDir: string, agentId: string): Promise<
   return finalText || null
 }
 
-function workflowAgentDescription(prompt: string, agentId: string): string {
-  const firstLine = prompt
-    .split('\n')
-    .map((line) => line.trim())
-    .find(Boolean)
-  return (firstLine || `Workflow agent ${agentId}`).slice(0, 120)
+// What the agent is called in the App: the workflow's label for it, else the
+// first line of its task.
+export function workflowAgentDescription(
+  prompt: string,
+  agentId: string,
+  label?: string | null,
+): string {
+  const name = collapseWhitespace(label ?? '') || firstPromptLine(prompt)
+  return clipText(name || `Workflow agent ${agentId}`, SUBAGENT_NAME_MAX_CHARS)
 }
 
 function resultText(value: unknown): string {

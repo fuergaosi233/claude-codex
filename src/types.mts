@@ -703,6 +703,11 @@ export type RuntimeEvent =
       // Claude Code's structured tool result (e.g. Agent `async_launched`,
       // SendMessage `resumedAgentId`) when the backend exposes it.
       structured?: Record<string, unknown> | null
+      // The runtime closed this agent's call because the turn is ending (it
+      // failed, was interrupted or stopped, or its session closed while the
+      // agent ran), not because the agent finished: the agent ends with the
+      // turn, for the turn's reason.
+      endedWithTurn?: boolean
     }
   | {
       type: 'permission_request'
@@ -809,9 +814,11 @@ export type RuntimeEvent =
     }
   // Claude's auto-memory recalled these memories for the prompt.
   | { type: 'memory_recall'; memories: RecalledMemory[] }
-  // A model request of the main loop failed and Claude will send it again
-  // after `delayMs`. `status` is the API's HTTP status (null when nothing
-  // answered) and `category` the SDK's error category ('overloaded', ...).
+  // A model request failed and Claude will send it again after `delayMs`.
+  // `status` is the API's HTTP status (null when nothing answered) and
+  // `category` the SDK's error category ('overloaded', ...). `toolUseId` is
+  // the Agent call of the subagent whose request it was; without it the
+  // request was the main loop's.
   | {
       type: 'retrying'
       attempt: number
@@ -819,6 +826,7 @@ export type RuntimeEvent =
       status: number | null
       category: string | null
       delayMs: number | null
+      toolUseId?: string
     }
   | {
       type: 'completed'

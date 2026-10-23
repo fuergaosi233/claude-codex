@@ -2594,11 +2594,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       return
     }
     if (subtype === 'api_retry') {
-      // A subagent's retries stay inside its own run.
-      if (message.parent_tool_use_id) return
       const status = numberOrNull(message.error_status)
       const category = stringOrNull(message.error)
-      pending.apiError = { category, status }
+      // A subagent's retry is told against its Agent call; it says nothing
+      // about why the main loop might fail.
+      const toolUseId = stringOrNull(message.parent_tool_use_id)
+      if (!toolUseId) pending.apiError = { category, status }
       await pending.handlers.onEvent({
         type: 'retrying',
         attempt: numberOrNull(message.attempt) ?? 1,
@@ -2606,6 +2607,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         status,
         category,
         delayMs: numberOrNull(message.retry_delay_ms),
+        ...(toolUseId ? { toolUseId } : {}),
       })
       return
     }
@@ -3317,6 +3319,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     state: WorkflowTaskState,
     message: string,
     isError: boolean,
+    // The turn is ending and takes the agents with it.
+    endedWithTurn = false,
   ): Promise<number> {
     let closed = 0
     for (const agentId of this.workflowProjectedAgentIds(pending, state)) {
@@ -3328,6 +3332,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         toolUseId,
         content: `${message}\nagentId: ${agentId}`,
         isError,
+        ...(endedWithTurn ? { endedWithTurn } : {}),
       })
       closed += 1
     }
@@ -3339,6 +3344,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     state: WorkflowTaskState,
     message: string,
     isError: boolean,
+    endedWithTurn = false,
   ): Promise<boolean> {
     const toolUseId = workflowTaskToolUseId(state.taskId)
     if (!pending.activeSubagents.delete(toolUseId)) return false
@@ -3348,6 +3354,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       toolUseId,
       content: message,
       isError,
+      ...(endedWithTurn ? { endedWithTurn } : {}),
     })
     return true
   }
@@ -3403,16 +3410,20 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       for (const state of tasks.values()) {
         state.terminal = true
         await state.monitor?.stop()
+        // The turn is ending: what still runs ends with it, and the server
+        // says why.
         await this.closeWorkflowAgentLifecycles(
           pending,
           state,
           'Workflow monitoring stopped before the agent published an individual result.',
+          true,
           true,
         )
         await this.closeWorkflowAggregateLifecycle(
           pending,
           state,
           'Workflow monitoring stopped before the workflow published a terminal result.',
+          true,
           true,
         )
       }
