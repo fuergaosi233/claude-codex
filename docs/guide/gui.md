@@ -357,9 +357,18 @@ including the ones the App offers only in some windows or chats (`/pin`,
 `/archive`, `/read-aloud`, `/hotkey-window-new`, …). Claude Code's plain
 built-ins such as `/cost` are not listed.
 
+A message that starts with a command, typed or picked, runs it with the rest
+of the message as its arguments, a file you mention included (as `@path`).
+Images, a skill you pick with it, a side chat's instructions and context the
+App sends along reach Claude with the command, ahead of it, and stay out of
+its arguments. A command you send while Claude is still working is not
+folded into the running answer the way other messages are: Claude Code runs
+it once that answer ends, and the turn ends after it.
+
 Context the App attaches to a message without showing it, such as the follow-up
-after you connect a suggested plugin, reaches Claude after the message, marked
-as data rather than instructions when the App does not vouch for it.
+after you connect a suggested plugin, reaches Claude after the message (before
+it for a command), marked as data rather than instructions when the App does
+not vouch for it.
 
 The App's instructions to the model describe tools only Codex chats have:
 starting and messaging other threads, worktrees, automations and the sidebar.

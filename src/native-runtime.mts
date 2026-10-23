@@ -83,6 +83,7 @@ import { appliedPermissionUpdates, permissionSuggestions } from './permission-su
 import { sdkHooks } from './sdk-hooks.mjs'
 import { readTaskResult } from './task-output.mjs'
 import { ToolInputPreviews } from './tool-input-preview.mjs'
+import { isCommandPrompt } from './turn-context.mjs'
 import type {
   ClaudeRuntime,
   DynamicToolServer,
@@ -440,7 +441,10 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       await session.firstPrompt
       if (session.closed) return false
     }
-    const uuid = this.send(session, this.buildUserMessage(prompt, options.imageInputs ?? []))
+    const uuid = this.send(
+      session,
+      this.buildUserMessage(prompt, options.imageInputs ?? [], options.promptContext ?? []),
+    )
     if (!uuid) return false
     // Accepted once the CLI starts consuming it (command_lifecycle `started`)
     // or, on CLIs without lifecycle frames, once a result echoes it.
@@ -814,30 +818,38 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   }
 
   private buildPromptMessage(context: RuntimeTurnContext): TurnInputMessage {
-    return this.buildUserMessage(context.prompt, context.imageInputs)
+    return this.buildUserMessage(context.prompt, context.imageInputs, context.promptContext ?? [])
   }
 
-  private buildUserMessage(prompt: string, images: ImageInput[] | undefined): TurnInputMessage {
+  private buildUserMessage(
+    prompt: string,
+    images: ImageInput[] | undefined,
+    context: readonly string[] = [],
+  ): TurnInputMessage {
     const text = workflowRuntimePrompt(prompt)
     // Pure text — keep the simple string form so the SDK doesn't have to
     // re-stitch content blocks.
-    if (!images || images.length === 0) return humanUserMessage(text)
+    if ((!images || images.length === 0) && context.length === 0) return humanUserMessage(text)
     // Multimodal — assemble the Anthropic MessageParam content array.
-    const content: unknown[] = []
-    if (text) content.push({ type: 'text', text })
-    for (const img of images) {
-      if (img.kind === 'base64') {
-        content.push({
-          type: 'image',
-          source: { type: 'base64', media_type: img.mediaType, data: img.data },
-        })
-      } else {
-        content.push({
-          type: 'image',
-          source: { type: 'url', url: img.data },
-        })
-      }
-    }
+    const imageBlocks = (images ?? []).map((img) =>
+      img.kind === 'base64'
+        ? {
+            type: 'image',
+            source: { type: 'base64', media_type: img.mediaType, data: img.data },
+          }
+        : { type: 'image', source: { type: 'url', url: img.data } },
+    )
+    const textBlocks = text ? [{ type: 'text', text }] : []
+    // Claude Code runs a command only from the text block a message ends
+    // with, so a command's context and images go before its text.
+    const content: unknown[] =
+      context.length > 0 || isCommandPrompt(text)
+        ? [
+            ...context.map((block) => ({ type: 'text', text: block })),
+            ...imageBlocks,
+            ...textBlocks,
+          ]
+        : [...textBlocks, ...imageBlocks]
     return humanUserMessage(content as TurnInputMessage['message']['content'])
   }
 

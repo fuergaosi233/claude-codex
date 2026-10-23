@@ -1,6 +1,12 @@
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import type { ClaudeRuntime, RuntimeHandlers, RuntimeTurnContext } from './types.mjs'
+import { flatPrompt } from './turn-context.mjs'
+import type {
+  ClaudeRuntime,
+  RuntimeHandlers,
+  RuntimeSteerOptions,
+  RuntimeTurnContext,
+} from './types.mjs'
 import { debugLog, sleep } from './util.mjs'
 
 const execFileAsync = promisify(execFile)
@@ -113,7 +119,12 @@ export class HttpAgentRuntime implements ClaudeRuntime {
       }
 
       try {
-        await this.postMessage(baseUrl, context.prompt, 'user', abort.signal)
+        await this.postMessage(
+          baseUrl,
+          flatPrompt(context.prompt, context.promptContext),
+          'user',
+          abort.signal,
+        )
       } catch (error) {
         if (this.options.kind === 'agentapi') {
           const latestMessages = await this.fetchMessages(baseUrl, abort.signal).catch(() => null)
@@ -162,10 +173,14 @@ export class HttpAgentRuntime implements ClaudeRuntime {
     }
   }
 
-  async steer(_threadId: string, prompt: string): Promise<undefined> {
+  async steer(
+    _threadId: string,
+    prompt: string,
+    options: RuntimeSteerOptions = {},
+  ): Promise<undefined> {
     await this.postMessage(
       this.active.get(_threadId)?.baseUrl ?? this.options.baseUrl,
-      prompt,
+      flatPrompt(prompt, options.promptContext),
       'user',
     )
   }

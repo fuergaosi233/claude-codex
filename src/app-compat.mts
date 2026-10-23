@@ -96,9 +96,9 @@ export const APP_RULES: readonly AppRule[] = [
     id: 'skills-popup',
     app: 'Fills the Skills group of the "/" popup from skills/list, refetches it on skills/changed, and sends a picked skill as a [$name](path) link inside the prompt text.',
     adapter:
-      "Lists the commands Claude Code reports as skills: its built-in skills, and per folder the user's, the project's, plugins' and MCP servers' commands. Turns the first such link back into `/name args`.",
+      "Lists the commands Claude Code reports as skills: its built-in skills, and per folder the user's, the project's, plugins' and MCP servers' commands. Turns the first such link back into `/name args`, and sends a message that starts with a command with that text as its last block, after the message's context and images, since Claude Code runs a command only from there.",
     verify:
-      'Type "/" in the composer: /simplify is listed, and so is a command from .claude/commands once a chat in that folder has run a turn; picking either runs it.',
+      'Type "/" in the composer: /simplify is listed, and so is a command from .claude/commands once a chat in that folder has run a turn; picking either runs it, in a side chat and with an image attached too.',
   },
   {
     id: 'optimistic-user-message',

@@ -609,6 +609,17 @@ versioning or publishing metadata.
   not one slash-command word and rows that share a
   name with one of Claude Code's own commands are left out, and a skill read
   from `.claude/skills` keeps its own entry.
+- A message that runs a Claude Code command (`/name args`, typed or picked)
+  runs it also when the App sends context with it. Claude Code runs a
+  command only from the last text block of a message, so that block is now
+  the text as typed. Everything else goes in blocks before it, so Claude
+  still reads it and the command's arguments leave it out: the items the App
+  injected, a side chat's instructions, the `SKILL.md` of a skill picked with
+  the command, the App's `additionalContext` and images. Before, any of
+  these made the message a plain prompt or ended up in the arguments. A file
+  mentioned with the command stays in its arguments as `@path`. A command
+  sent while a turn runs is not folded into it: Claude Code runs it once the
+  current answer ends, and the turn stays open until it is done.
 
 ### Provider and multi-agent boundaries
 

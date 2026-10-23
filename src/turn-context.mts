@@ -185,6 +185,43 @@ export function withTurnContext(
   return [injected ?? '', prompt, ...parts].filter((part) => part.trim()).join('\n\n')
 }
 
+// A message that runs a Claude Code command: `/name`, then its arguments,
+// with a name the way Claude Code tells a command from a path.
+const COMMAND_PROMPT = /^\/[A-Za-z0-9_][A-Za-z0-9:_-]*(?:\s|$)/
+
+export function isCommandPrompt(prompt: string): boolean {
+  return COMMAND_PROMPT.test(prompt)
+}
+
+// What Claude reads for a message: its text, and the context that goes
+// before it in text blocks of their own.
+export interface TurnPrompt {
+  prompt: string
+  context: string[]
+}
+
+// Claude Code runs a message as a command only when the last text block of
+// the message starts with `/name`, and passes the rest of that block on as
+// the command's arguments. Blocks before it reach Claude with the command
+// and stay out of its arguments. So a message that runs a command keeps its
+// text as typed and gets its context as blocks before it, in the order
+// withTurnContext puts it around any other message.
+export function turnPrompt(
+  prompt: string,
+  context: ReadonlyArray<string | null>,
+  injected: string | null = null,
+): TurnPrompt {
+  if (!isCommandPrompt(prompt))
+    return { prompt: withTurnContext(prompt, context, injected), context: [] }
+  const blocks = [injected, ...context].filter((part): part is string => !!part?.trim())
+  return { prompt, context: blocks }
+}
+
+// The prompt as one text, for a runtime that sends no content blocks.
+export function flatPrompt(prompt: string, context: readonly string[] | undefined): string {
+  return context && context.length > 0 ? [...context, prompt].join('\n\n') : prompt
+}
+
 // The App's instructions describe its own tools (threads, worktrees,
 // automations, the sidebar), which Codex threads get from the App. A Claude
 // thread has none of them, so its prompt says which of the named ones it

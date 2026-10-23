@@ -240,8 +240,10 @@ import {
   type AppToolNoteOptions,
   additionalContextBlocks,
   injectedItemsContext,
+  isCommandPrompt,
   skillInstructions,
-  withTurnContext,
+  type TurnPrompt,
+  turnPrompt,
 } from './turn-context.mjs'
 import {
   noticeRowsEnabled,
@@ -3673,7 +3675,12 @@ export class CodexClaudeAppServer {
     const built = this.runtimeTurnContext(thread, turnId, '/compact', params)
     // thread/compact/start carries no instructions: a bare /compact, which
     // no side-conversation note may precede either.
-    const context: RuntimeTurnContext = { ...built.context, prompt: '/compact', imageInputs: [] }
+    const context: RuntimeTurnContext = {
+      ...built.context,
+      prompt: '/compact',
+      promptContext: [],
+      imageInputs: [],
+    }
     let compacted = false
     let failure: string | null = null
     await this.runtime.runTurn(context, {
@@ -4012,14 +4019,17 @@ export class CodexClaudeAppServer {
         this.completeWorkflowListTurn(peer, thread, turn)
         return
       }
-      // Carry parsed images through the params bag so runRuntimeTurn can hand
-      // them to the runtime context without re-parsing user input.
-      this.launchRuntimeTurn(peer, thread, turn, this.modelPrompt(thread, prompt, params), {
+      // Carry parsed images, and the context a command's text goes after,
+      // through the params bag so runRuntimeTurn can hand them to the
+      // runtime context without re-parsing user input.
+      const model = this.modelPrompt(thread, prompt, params)
+      this.launchRuntimeTurn(peer, thread, turn, model.prompt, {
         ...params,
         ...collaborationModeSettings(params),
         ...(helperModel ? { model: helperModel } : {}),
         planMode,
         _imageInputs: images,
+        _promptContext: model.context,
       })
     })
     return { turn: publicTurn }
@@ -4229,6 +4239,9 @@ export class CodexClaudeAppServer {
     // and prepend side-conversation instructions directly into the turn's user prompt.
     let systemPromptAddendum: string | null = null
     let effectivePrompt = prompt
+    const promptContext = Array.isArray(params._promptContext)
+      ? params._promptContext.filter((block): block is string => typeof block === 'string')
+      : []
     if (thread.forkedFromId != null && developerInstructions) {
       const parentThread = this.store.getThread(thread.forkedFromId)
       const parentDev = parentThread?.developerInstructions ?? null
@@ -4247,7 +4260,10 @@ export class CodexClaudeAppServer {
         const sideInstructions = [developerInstructions]
         if (parentSkills.visualizationDir && appSkills.visualizationDir)
           sideInstructions.push(visualizationDirNote(appSkills.visualizationDir))
-        effectivePrompt = `<side-conversation-instructions>\n${sideInstructions.join('\n\n')}\n</side-conversation-instructions>\n\n${prompt}`
+        const side = `<side-conversation-instructions>\n${sideInstructions.join('\n\n')}\n</side-conversation-instructions>`
+        // A command's text stays the last block, as typed (see turnPrompt).
+        if (isCommandPrompt(prompt)) promptContext.unshift(side)
+        else effectivePrompt = `${side}\n\n${prompt}`
       } else {
         systemPromptAddendum = buildSystemPromptAddendum({
           baseInstructions,
@@ -4358,6 +4374,7 @@ export class CodexClaudeAppServer {
       turnId,
       purpose: turnPurpose,
       prompt: effectivePrompt,
+      promptContext,
       cwd: turnCwd,
       runtimeType: isCodexThread ? 'codex-proxy' : null,
       model: resolvedModel,
@@ -4831,7 +4848,12 @@ export class CodexClaudeAppServer {
       params._continuation !== true &&
       params._hiddenPrompt == null
     ) {
-      const { _imageInputs: _images, _emitUserMessage: _emit, ...rest } = params
+      const {
+        _imageInputs: _images,
+        _promptContext: _context,
+        _emitUserMessage: _emit,
+        ...rest
+      } = params
       this.lastTurnParamsByThread.set(thread.id, rest)
     }
     const { context, isCodexThread, resumeSessionAt, turnCwd } = this.runtimeTurnContext(
@@ -7895,9 +7917,12 @@ export class CodexClaudeAppServer {
       this.emitItemLifecycle(this.peerForThread(threadId), threadId, activeTurnId, item)
     }
     const thread = this.store.getThread(threadId)
-    const modelPrompt = thread ? this.modelPrompt(thread, prompt, params, { steer: true }) : prompt
-    const steered = await this.steerRunningTurn(threadId, activeTurnId, modelPrompt, {
+    const model = thread
+      ? this.modelPrompt(thread, prompt, params, { steer: true })
+      : { prompt, context: [] }
+    const steered = await this.steerRunningTurn(threadId, activeTurnId, model.prompt, {
       imageInputs: images,
+      promptContext: model.context,
       onAccepted: accept,
     })
     if (steered === false) throw new Error('no active turn to steer')
@@ -8973,7 +8998,8 @@ export class CodexClaudeAppServer {
   // skill it picks and the context the App attached to it. Helper turns and
   // the adapter's own prompts get none of it, and leave the injected items to
   // the next message. So does a steer: the App injects items only while no
-  // turn runs, for the turn it starts next.
+  // turn runs, for the turn it starts next. A message that runs a Claude
+  // Code command gets all of it before its text, in blocks of its own.
   // App rule: skill-injection
   // App rule: additional-context
   // App rule: injected-context
@@ -8982,13 +9008,14 @@ export class CodexClaudeAppServer {
     prompt: string,
     params: Record<string, unknown>,
     options: { steer?: boolean } = {},
-  ): string {
-    if (params.outputSchema != null || typeof params._hiddenPrompt === 'string') return prompt
+  ): TurnPrompt {
+    if (params.outputSchema != null || typeof params._hiddenPrompt === 'string')
+      return { prompt, context: [] }
     const skillDirs = [
       ...claudeSkillDirs(thread.cwd),
       ...this.appSkillsFor(thread.id).appSkills.map((skill) => dirname(skill.path)),
     ]
-    return withTurnContext(
+    return turnPrompt(
       prompt,
       [skillInstructions(prompt, skillDirs), additionalContextBlocks(params.additionalContext)],
       options.steer ? null : injectedItemsContext(this.store.takeInjectedItems(thread.id)),

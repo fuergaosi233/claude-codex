@@ -579,6 +579,11 @@ export interface RuntimeTurnContext {
   // encoded; image (URL) is passed through as-is. Sidecar reshapes the
   // Claude SDK query into a multimodal user message when this is non-empty.
   imageInputs: ImageInput[]
+  // Text Claude reads before `prompt`, in text blocks of the same message,
+  // for a prompt that runs a Claude Code command (see turnPrompt in
+  // src/turn-context.mts). A runtime that sends no content blocks puts it
+  // in front of the prompt.
+  promptContext?: string[]
   // Attach to a turn Claude already started on its own (a background task
   // reported back) instead of sending `prompt`. Only meaningful after the
   // runtime called RuntimeBackgroundListener.onAutonomousTurn for the thread.
@@ -1036,6 +1041,8 @@ export interface RuntimeBackgroundListener {
 
 export interface RuntimeSteerOptions {
   imageInputs?: ImageInput[]
+  // As RuntimeTurnContext.promptContext.
+  promptContext?: string[]
   // Fires once the backend starts consuming the message (Claude Code folds a
   // steer in at the next tool-round boundary, or runs it as its own turn).
   onAccepted?: () => void
