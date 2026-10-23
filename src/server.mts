@@ -4795,15 +4795,18 @@ export class CodexClaudeAppServer {
             return
           }
           if (!turnIsActive()) return
-          // Anything the turn still hears (a child's output, its progress, a
-          // projected workflow agent) shows it is moving; the watchdog only
-          // gives up after a whole window without any of it.
-          noteProgress()
-          if (event.type === 'subagent_progress') return
+          // A subagent's own work may be an agent's the turn handed off, which
+          // says nothing of those it waits on: the runtime reports their work
+          // as subagent_progress.
           if (event.type === 'subagent_output') {
             this.showSubagentOutput(peer, thread, subagentContexts, event, toolItemOptions)
             return
           }
+          // Anything else the turn still hears (a child's output, its
+          // progress, a projected workflow agent) shows it is moving; the
+          // watchdog only gives up after a whole window without any of it.
+          noteProgress()
+          if (event.type === 'subagent_progress') return
           if (event.type === 'session') {
             this.store.updateClaudeSessionId(thread.id, event.claudeSessionId)
             if (resumeSessionAt) {

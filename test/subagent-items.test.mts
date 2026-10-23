@@ -66,6 +66,8 @@ interface ServerOptions {
   items?: string
   // A runtime of its own instead of the script's.
   runtime?: ClaudeRuntime
+  // CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS for the run; unset when absent.
+  watchdogMs?: string
 }
 
 async function withServer(
@@ -78,6 +80,7 @@ async function withServer(
     CLAUDE_CODEX_HOME: process.env.CLAUDE_CODEX_HOME,
     CODEX_HOME: process.env.CODEX_HOME,
     CLAUDE_CODEX_SUBAGENT_ITEMS: process.env.CLAUDE_CODEX_SUBAGENT_ITEMS,
+    CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS: process.env.CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS,
   }
   const setEnv = (values: Record<string, string | undefined>) => {
     for (const [name, value] of Object.entries(values)) {
@@ -89,6 +92,7 @@ async function withServer(
     CLAUDE_CODEX_HOME: directory,
     CODEX_HOME: join(directory, 'codex-home'),
     CLAUDE_CODEX_SUBAGENT_ITEMS: options.items,
+    CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS: options.watchdogMs,
   })
   let listener: RuntimeBackgroundListener | undefined
   const stops = new Map<string, () => void>()
@@ -766,6 +770,51 @@ test("a background subagent's work between turns shows in its thread until it en
         false,
       )
     },
+  )
+})
+
+test('the work of an agent the turn handed off is no sign of life from a stuck one', async () => {
+  const steps = 40
+  let sent = 0
+  let done = false
+  const script: Script = async (context, handlers, tools) => {
+    await startAgent(context, handlers, tools, 'agent-bg', 'bg-task', 'survey', {
+      background: true,
+    })
+    await handlers.onEvent({
+      type: 'tool_result',
+      toolUseId: 'agent-bg',
+      content: 'Async agent launched successfully.\nagentId: bg-task',
+      structured: { isAsync: true, status: 'async_launched', agentId: 'bg-task', prompt: 'survey' },
+    })
+    await startAgent(context, handlers, tools, 'agent-stuck', 'stuck-task', 'never returns')
+    // The agent the turn handed off works on, faster than the window; the
+    // one the turn waits on says nothing.
+    while (!done && sent < steps) {
+      await handlers.onEvent(out('agent-bg', { type: 'text', text: `Step ${sent}.` }, 'bg-task'))
+      sent += 1
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+  }
+  await withServer(
+    script,
+    async ({ startThread, runTurn, request }) => {
+      const threadId = await startThread()
+      const messages = await runTurn(threadId, 'survey in the background, then check')
+      done = true
+      const completed = turnCompleted(messages, threadId)
+      assert.equal(completed.params.turn.status, 'failed')
+      assert.match(completed.params.turn.error.message, /did not publish a terminal result/)
+      assert.ok(sent < steps, `the turn fails while the handed-off agent still works (${sent})`)
+      // What that agent did still shows in its own thread.
+      const child = spawnedChild(messages, 'survey')
+      assert.ok(
+        (await threadItems(request, child)).some(
+          (item) => item.type === 'agentMessage' && item.text.startsWith('Step 0.'),
+        ),
+      )
+    },
+    { watchdogMs: '300' },
   )
 })
 
