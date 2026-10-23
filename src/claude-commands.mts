@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { adapterHome, debugLog } from './util.mjs'
 
@@ -12,9 +13,11 @@ import { adapterHome, debugLog } from './util.mjs'
 // adapter keeps the latest report under adapterHome, the second kind per
 // folder, and serves them through skills/list, which is what fills the
 // "Skills" group of the App's "/" popup. Each command gets a small SKILL.md the
-// App can open when the chip is clicked; the chip itself arrives in the prompt
-// as `[$name](<that SKILL.md>)` and is turned back into `/name args` for the
-// CLI, which runs it as it would a typed command.
+// App can open when the chip is clicked, a folder's own commands one per
+// folder, since two folders may have different commands of one name; the
+// chip itself arrives in the prompt as `[$name](<that SKILL.md>)` and is
+// turned back into `/name args` for the CLI, which runs it as it would a
+// typed command.
 // App rule: skills-popup
 
 export interface ClaudeCommand {
@@ -127,10 +130,20 @@ export function claudeCommandsDir(): string {
   return join(adapterHome(), 'claude-commands')
 }
 
+const FOLDER_MANIFESTS = '+folders'
+
 // A plugin command's `:` would be a path separator on some systems; `+` is
 // never part of a command name, so the folder name maps back to one name.
-export function claudeCommandManifest(name: string): string {
-  return join(claudeCommandsDir(), name.replaceAll(':', '+'), 'SKILL.md')
+// Claude Code's own commands are the same in every folder; the others are
+// kept apart per folder, under FOLDER_MANIFESTS, which no command is named.
+export function claudeCommandManifest(name: string, folder?: string): string {
+  const dir = folder === undefined ? claudeCommandsDir() : folderManifestDir(resolve(folder))
+  return join(dir, name.replaceAll(':', '+'), 'SKILL.md')
+}
+
+function folderManifestDir(folder: string): string {
+  const key = createHash('sha256').update(folder).digest('hex').slice(0, 16)
+  return join(claudeCommandsDir(), FOLDER_MANIFESTS, key)
 }
 
 function catalog(): Catalog {
@@ -153,7 +166,7 @@ function catalog(): Catalog {
     }
   }
   cache = { path, catalog: value }
-  for (const command of value.commands) writeManifest(command, 'builtin')
+  for (const command of value.commands) writeManifest(command)
   return value
 }
 
@@ -165,8 +178,9 @@ export function listClaudeCommands(): ClaudeCommand[] {
 // Code last reported for a session in `cwd`. A folder no Claude chat has run
 // in yet has none until its first turn starts.
 export function listFolderCommands(cwd: string): ClaudeCommand[] {
-  const commands = catalog().folders[resolve(cwd)]?.commands ?? []
-  for (const command of commands) writeManifest(command, 'folder')
+  const folder = resolve(cwd)
+  const commands = catalog().folders[folder]?.commands ?? []
+  for (const command of commands) writeManifest(command, folder)
   return commands
 }
 
@@ -192,7 +206,7 @@ export function noteClaudeCommands(
   if (sameCommands(current.commands, next)) return
   current.commands = next
   save(current)
-  for (const command of next) writeManifest(command, 'builtin')
+  for (const command of next) writeManifest(command)
   debugLog('claudeCommands.updated', { names: next.map((command) => command.name) })
   announce()
 }
@@ -219,10 +233,15 @@ export function noteFolderCommands(cwd: string, commands: readonly ReportedComma
   const kept = Object.entries(current.folders)
     .sort(([, a], [, b]) => b.at - a.at)
     .slice(0, MAX_FOLDERS)
+  const evicted = Object.keys(current.folders).filter(
+    (name) => !kept.some(([keptName]) => keptName === name),
+  )
   current.folders = Object.fromEntries(kept)
   save(current)
+  for (const name of evicted) pruneManifests(name, [])
   if (!changed) return
-  for (const command of next) writeManifest(command, 'folder')
+  pruneManifests(folder, next)
+  for (const command of next) writeManifest(command, folder)
   debugLog('claudeCommands.folderUpdated', {
     folder,
     names: next.map((command) => command.name),
@@ -263,13 +282,15 @@ function sameCommands(a: readonly ClaudeCommand[], b: readonly ClaudeCommand[]):
   return JSON.stringify(a) === JSON.stringify(b)
 }
 
-function writeManifest(command: ClaudeCommand, kind: 'builtin' | 'folder'): void {
-  const path = claudeCommandManifest(command.name)
+// The manifest of one of Claude Code's own commands, or of a command of
+// `folder`.
+function writeManifest(command: ClaudeCommand, folder?: string): void {
+  const path = claudeCommandManifest(command.name, folder)
   const usage = command.argumentHint
     ? `/${command.name} ${command.argumentHint}`
     : `/${command.name}`
   const origin =
-    kind === 'builtin'
+    folder === undefined
       ? 'Claude Code built-in command.'
       : 'Claude Code command from your Claude Code settings, the project, a plugin or an MCP server.'
   const content = [
@@ -284,7 +305,8 @@ function writeManifest(command: ClaudeCommand, kind: 'builtin' | 'folder'): void
     command.description,
     '',
   ].join('\n')
-  if (written.get(path) === content) return
+  // Another adapter sharing the home may have pruned it.
+  if (written.get(path) === content && existsSync(path)) return
   try {
     if (!existsSync(path) || readFileSync(path, 'utf8') !== content) {
       mkdirSync(dirname(path), { recursive: true })
@@ -294,6 +316,27 @@ function writeManifest(command: ClaudeCommand, kind: 'builtin' | 'folder'): void
   } catch (error) {
     debugLog('claudeCommands.manifestFailed', { path, message: (error as Error).message })
   }
+}
+
+// Removes the manifests of `folder`'s commands that are not in `commands`,
+// once its list changes or it is no longer kept.
+function pruneManifests(folder: string, commands: readonly ClaudeCommand[]): void {
+  const dir = folderManifestDir(folder)
+  const keep = new Set(commands.map((command) => command.name.replaceAll(':', '+')))
+  let entries: string[]
+  try {
+    entries = readdirSync(dir)
+  } catch {
+    return
+  }
+  const stale = entries.filter((entry) => !keep.has(entry))
+  try {
+    if (keep.size === 0) rmSync(dir, { recursive: true, force: true })
+    else for (const entry of stale) rmSync(join(dir, entry), { recursive: true, force: true })
+  } catch (error) {
+    debugLog('claudeCommands.pruneFailed', { folder, message: (error as Error).message })
+  }
+  for (const entry of stale) written.delete(join(dir, entry, 'SKILL.md'))
 }
 
 // "(e.g. /loop 5m)" must not end the sentence, so the next one has to start
@@ -338,7 +381,11 @@ export function skillLinksToCommand(text: string): string {
 function claudeSkillName(label: string, target: string): string | null {
   const path = target.trim().replace(/^<(.*)>$/, '$1')
   const skillDir = basename(path) === 'SKILL.md' ? dirname(path) : path
-  if (dirname(skillDir) !== claudeCommandsDir()) return null
+  const parent = dirname(skillDir)
+  const ofFolder =
+    basename(dirname(parent)) === FOLDER_MANIFESTS &&
+    dirname(dirname(parent)) === claudeCommandsDir()
+  if (parent !== claudeCommandsDir() && !ofFolder) return null
   const fromDir = basename(skillDir).replaceAll('+', ':')
   if (COMMAND_NAME.test(fromDir)) return fromDir
   const fromLabel = label.trim().replace(/^\$/, '').split('?')[0]?.trim() ?? ''

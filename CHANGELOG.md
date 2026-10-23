@@ -608,7 +608,10 @@ versioning or publishing metadata.
   `/read-aloud` and the hotkey-window and ChatGPT-chat ones), names that are
   not one slash-command word and rows that share a
   name with one of Claude Code's own commands are left out, and a skill read
-  from `.claude/skills` keeps its own entry.
+  from `.claude/skills` keeps its own entry. Each folder gets its own
+  `SKILL.md` per command, so a `/deploy` in two projects no longer shows the
+  description of whichever reported last; the files of commands a folder no
+  longer reports, and of folders no longer kept, are removed.
 - A message that runs a Claude Code command (`/name args`, typed or picked)
   runs it also when the App sends context with it. Claude Code runs a
   command only from the last text block of a message, so that block is now

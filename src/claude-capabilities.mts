@@ -92,7 +92,7 @@ export function listClaudeSkills(params: Record<string, unknown>): SkillsListEnt
           name: command.name,
           description: command.description,
           shortDescription: firstSentence(command.description),
-          path: claudeCommandManifest(command.name),
+          path: claudeCommandManifest(command.name, cwd),
           scope: 'user',
           enabled: true,
         }),

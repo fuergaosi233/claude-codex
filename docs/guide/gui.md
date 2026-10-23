@@ -345,11 +345,14 @@ The `/` popup also lists the commands Claude Code finds for a folder beyond
 its own: your and the project's `.claude/commands`, the commands and skills of
 your Claude Code plugins (`plugin:name`) and the prompts of MCP servers. They
 show as "Local file" skills and run as slash commands, with the rest of your
-message as their arguments. Claude Code reports them when a chat's turn
-starts, so a folder no Claude chat has worked in yet lists them after its
-first turn, and a command added later appears once the next turn starts in
-that folder. A Claude CLI started with its setting sources turned off (see
-`CLAUDE_CODEX_CLAUDE_CONFIG_DIR` in
+message as their arguments. A command's "Local file" is a short page the
+adapter writes for that folder with the description Claude Code reported
+there, so two projects with a `/deploy` of their own each show theirs; it is
+removed when the folder stops reporting the command. Claude Code reports
+them when a chat's turn starts, so a folder no Claude chat has worked in yet
+lists them after its first turn, and a command added later appears once the
+next turn starts in that folder. A Claude CLI started with its setting
+sources turned off (see `CLAUDE_CODEX_CLAUDE_CONFIG_DIR` in
 [Configuration](/guide/configuration#reference-table)) finds no user,
 project or plugin commands, so none are listed. Commands named like one of
 the App's own are left out: `/init`, `/compact`, `/review-mode` and the rest,
