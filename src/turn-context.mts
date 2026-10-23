@@ -185,9 +185,15 @@ export function withTurnContext(
   return [injected ?? '', prompt, ...parts].filter((part) => part.trim()).join('\n\n')
 }
 
-// A message that runs a Claude Code command: `/name`, then its arguments,
-// with a name the way Claude Code tells a command from a path.
-const COMMAND_PROMPT = /^\/[A-Za-z0-9_][A-Za-z0-9:_-]*(?:\s|$)/
+// A message that runs a Claude Code command: `/name`, then its arguments.
+// Claude Code runs any command it has under that name, such as
+// `release.notes` from a file release.notes.md, and only then checks an
+// unknown name's characters to tell it from a path. So a name here takes
+// every character a command name can have (see claude-commands.mts), dots
+// included; a path such as `/tmp/x` has a second `/` and is no command. Text
+// like `/notes.md says` gets a command's layout, and Claude Code reads it as
+// the plain message it is.
+const COMMAND_PROMPT = /^\/[A-Za-z0-9_][\w.:-]*(?:\s|$)/
 
 export function isCommandPrompt(prompt: string): boolean {
   return COMMAND_PROMPT.test(prompt)

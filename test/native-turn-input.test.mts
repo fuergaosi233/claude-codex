@@ -320,6 +320,10 @@ test('a native message that runs a command ends with its text, after its context
     [imageBlock, text('/review src')],
   ])
   assert.deepEqual(await sentContents({ prompt: '/review src' }), ['/review src'])
+  // So does one named with a dot, as a file release.notes.md names it.
+  assert.deepEqual(await sentContents({ prompt: '/release.notes', imageInputs: [image] }), [
+    [imageBlock, text('/release.notes')],
+  ])
   // Any other message keeps its text first.
   assert.deepEqual(await sentContents({ prompt: 'Look at this.', imageInputs: [image] }), [
     [text('Look at this.'), imageBlock],

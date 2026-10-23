@@ -498,6 +498,16 @@ test('a message that runs a Claude Code command keeps its text as typed, after i
         pageBlock,
       ])
 
+      // A command named with a dot, as a file release.notes.md names it, is
+      // one too: Claude Code runs any command it has before it checks a name.
+      const notesCommand = `[$release.notes](${claudeCommandManifest('release.notes')})`
+      const dotted = await turn(thread.id, {
+        input: [{ type: 'text', text: `${notesCommand} v2` }],
+        additionalContext: page,
+      })
+      assert.equal(dotted.prompt, '/release.notes v2')
+      assert.deepEqual(dotted.promptContext, [pageBlock])
+
       // A path is no command name: the message reads as any other.
       const path = await turn(thread.id, {
         input: [{ type: 'text', text: '/tmp/notes.md says what?' }],
@@ -534,6 +544,11 @@ test('a message that runs a Claude Code command keeps its text as typed, after i
         side.promptContext?.[0] ?? '',
         /^<side-conversation-instructions>\nFocus on the storage layer\.[\s\S]*<\/side-conversation-instructions>$/,
       )
+      const sideDotted = await turn(fork.thread.id, {
+        input: [{ type: 'text', text: '/release.notes' }],
+      })
+      assert.equal(sideDotted.prompt, '/release.notes')
+      assert.match(sideDotted.promptContext?.[0] ?? '', /^<side-conversation-instructions>/)
     },
   )
 })

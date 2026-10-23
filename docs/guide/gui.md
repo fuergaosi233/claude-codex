@@ -362,7 +362,8 @@ built-ins such as `/cost` are not listed.
 
 A message that starts with a command, typed or picked, runs it with the rest
 of the message as its arguments, a file you mention included (as `@path`).
-Images, a skill you pick with it, a side chat's instructions and context the
+That includes a command named with a dot, such as `/release.notes` from a
+file `release.notes.md`. Images, a skill you pick with it, a side chat's instructions and context the
 App sends along reach Claude with the command, ahead of it, and stay out of
 its arguments. A command you send while Claude is still working is not
 folded into the running answer the way other messages are: Claude Code runs

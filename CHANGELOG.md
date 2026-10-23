@@ -640,7 +640,9 @@ versioning or publishing metadata.
   these made the message a plain prompt or ended up in the arguments. A file
   mentioned with the command stays in its arguments as `@path`. A command
   sent while a turn runs is not folded into it: Claude Code runs it once the
-  current answer ends, and the turn stays open until it is done.
+  current answer ends, and the turn stays open until it is done. A name with
+  a dot, such as `/release.notes` from a file `release.notes.md`, counts as
+  a command too, as the `/` popup lists it.
   This is on the default Agent SDK backend. The `claude-p`, `agent-http` and
   `agentapi` backends get a message as one flat text, now with that context
   ahead of the command, so there a command sent with context does not run:
