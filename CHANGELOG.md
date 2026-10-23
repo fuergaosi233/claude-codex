@@ -554,7 +554,9 @@ versioning or publishing metadata.
   fork does: `thread/resume`, `thread/read`, `thread/turns/list`,
   `thread/items/list`, `thread/turns/items/list`, `thread/timeline/list` and
   search return them ahead of the fork's own turns, under the same ids, after
-  a restart too. The adapter copies them into the fork when it is made, so a
+  a restart too. So does a leader chat's `thread_read`, and its
+  `thread_list` names a fork's last inherited turn until the fork has one
+  of its own. The adapter copies them into the fork when it is made, so a
   rollback or delete of the parent leaves the fork's history alone; a fork of
   a fork inherits the whole history and can branch from an inherited turn,
   and a rollback or revert can reach back into the inherited turns. Forks

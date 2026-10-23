@@ -667,7 +667,7 @@ need the default native Claude Agent SDK backend:
 | `thread_list` | The chats this one started, each `working`, `blocked` (waiting on you), `done-unread` (finished a turn the leader has not read) or `idle`. `scope: "all"` adds your other recent chats. |
 | `thread_wait` | Waits until `any` (default) or `all` of the given chats finish their turn or get blocked, then returns each one's status and last agent message, truncated. |
 | `thread_prompt` | Sends a chat a message, as you would: into its running turn while it works (the App's default for follow-ups), otherwise as a new turn. `wait: true` also waits for that turn. |
-| `thread_read` | A chat's transcript as structured items in pages of bounded size, with a cursor for reading only what is new. |
+| `thread_read` | A chat's transcript as structured items in pages of bounded size, with a cursor for reading only what is new. A forked chat's transcript starts with the turns it was forked with, as the App shows it. |
 
 When Claude's reply repeats the `::created-thread{threadId="…"}` line, the
 Codex App shows a card for the new chat in the reply, as it does for chats Codex
