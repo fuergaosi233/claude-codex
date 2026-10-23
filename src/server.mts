@@ -3676,64 +3676,66 @@ export class CodexClaudeAppServer {
     const context: RuntimeTurnContext = { ...built.context, prompt: '/compact', imageInputs: [] }
     let compacted = false
     let failure: string | null = null
-    await this.runtime.runTurn(context, {
-      onEvent: async (event) => {
-        // As in a user turn, where Claude's session ends up is where a
-        // rewind to this turn resumes.
-        if (event.type === 'checkpoint') {
-          this.store.setTurnCheckpoint(turnId, {
-            sessionId: event.claudeSessionId,
-            messageUuid: event.messageUuid,
-          })
-          return
-        }
-        if (!active()) return
-        if (event.type === 'session') {
-          this.store.updateClaudeSessionId(thread.id, event.claudeSessionId)
-          if (built.resumeSessionAt) this.store.clearClaudeResumeAt(thread.id)
-          return
-        }
-        if (event.type === 'compaction_completed') {
-          compacted = true
-          completeCompactItem()
-          this.recordCompactedContext(peer, thread.id, turnId, event.postTokens, false)
-          return
-        }
-        if (event.type === 'compaction_failed') {
-          failure = event.message
-          this.publishNotice(peer, thread.id, turnId, event.message)
-          return
-        }
-        if (event.type === 'notice') {
-          if (event.level !== 'info') this.publishNotice(peer, thread.id, turnId, event.message)
-          return
-        }
-        if (event.type === 'completed') {
-          if (event.claudeSessionId)
+    await this.runtime
+      .runTurn(context, {
+        onEvent: async (event) => {
+          // As in a user turn, where Claude's session ends up is where a
+          // rewind to this turn resumes.
+          if (event.type === 'checkpoint') {
+            this.store.setTurnCheckpoint(turnId, {
+              sessionId: event.claudeSessionId,
+              messageUuid: event.messageUuid,
+            })
+            return
+          }
+          if (!active()) return
+          if (event.type === 'session') {
             this.store.updateClaudeSessionId(thread.id, event.claudeSessionId)
-          if (!event.success) failure = event.result ?? 'Claude did not compact the conversation'
-          return
-        }
-        if (event.type === 'error') failure = event.message
-        // What the command prints, and the usage of the summary it wrote,
-        // are not part of the conversation.
-      },
-      // The command runs no tools and asks nothing.
-      onPermissionRequest: async () => ({ decision: 'cancel' }),
-      onUserInputRequest: async (event) => ({
-        answers: Object.fromEntries(event.questions.map((q) => [q.id, { answers: [] }])),
-      }),
-    }).catch((error: unknown) => {
-      // Once Claude has compacted the session, a run that goes wrong after
-      // it does not undo that: the thread has compacted, and no summary is
-      // written in its place.
-      if (!compacted) throw error
-      debugLog('thread.compact.failed_after_compaction', {
-        threadId: thread.id,
-        turnId,
-        error: error instanceof Error ? error.message : String(error),
+            if (built.resumeSessionAt) this.store.clearClaudeResumeAt(thread.id)
+            return
+          }
+          if (event.type === 'compaction_completed') {
+            compacted = true
+            completeCompactItem()
+            this.recordCompactedContext(peer, thread.id, turnId, event.postTokens, false)
+            return
+          }
+          if (event.type === 'compaction_failed') {
+            failure = event.message
+            this.publishNotice(peer, thread.id, turnId, event.message)
+            return
+          }
+          if (event.type === 'notice') {
+            if (event.level !== 'info') this.publishNotice(peer, thread.id, turnId, event.message)
+            return
+          }
+          if (event.type === 'completed') {
+            if (event.claudeSessionId)
+              this.store.updateClaudeSessionId(thread.id, event.claudeSessionId)
+            if (!event.success) failure = event.result ?? 'Claude did not compact the conversation'
+            return
+          }
+          if (event.type === 'error') failure = event.message
+          // What the command prints, and the usage of the summary it wrote,
+          // are not part of the conversation.
+        },
+        // The command runs no tools and asks nothing.
+        onPermissionRequest: async () => ({ decision: 'cancel' }),
+        onUserInputRequest: async (event) => ({
+          answers: Object.fromEntries(event.questions.map((q) => [q.id, { answers: [] }])),
+        }),
       })
-    })
+      .catch((error: unknown) => {
+        // Once Claude has compacted the session, a run that goes wrong after
+        // it does not undo that: the thread has compacted, and no summary is
+        // written in its place.
+        if (!compacted) throw error
+        debugLog('thread.compact.failed_after_compaction', {
+          threadId: thread.id,
+          turnId,
+          error: error instanceof Error ? error.message : String(error),
+        })
+      })
     if (!compacted)
       debugLog('thread.compact.session_incomplete', {
         threadId: thread.id,

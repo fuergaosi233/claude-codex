@@ -493,6 +493,7 @@ test('the workflow agents a native turn closes as it ends are marked as ended wi
   const agent = 'workflow-agent:wf-task:a0123456789abcdef'
   const pending = {
     activeSubagents: new Set([agent, 'workflow-task:wf-task']),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowTasks: new Map([
       [
@@ -545,6 +546,7 @@ test('a workflow agent that fails ends its child turn with the reason the workfl
     const runtime = new NativeClaudeRuntime()
     const pending = {
       activeSubagents: new Set<string>(),
+      failedSubagentCalls: new Set<string>(),
       completedWorkflowTasks: new Set<string>(),
       workflowToolUseIds: new Set(['wf-launch']),
       workflowTranscriptRoots: [root],

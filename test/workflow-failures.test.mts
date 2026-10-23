@@ -276,6 +276,7 @@ test('native SDK runtime ends a failed workflow agent as failed, and the workflo
   const events: any[] = []
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowToolUseIds: new Set(['wf-launch']),
     workflowTranscriptRoots: [run.root],
