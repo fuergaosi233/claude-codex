@@ -3,6 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
+import { NativeClaudeRuntime } from '../src/native-runtime.mjs'
 import { CodexClaudeAppServer } from '../src/server.mjs'
 import { SessionStore } from '../src/store.mjs'
 import type {
@@ -422,6 +423,102 @@ test('agents a failed parent leaves running end with its reason, and do not coun
       'Claude   turn\nfailed hard',
     )
   })
+})
+
+test('workflow agents the runtime closes as their parent fails end with its reason, and do not count as failed', async () => {
+  const failure = { terminalReason: 'api_error', category: 'overloaded', status: 529 }
+  const broken = 'a0123456789abcdef'
+  const running = 'a1123456789abcdef'
+  const agent = (agentId: string) => `workflow-agent:wf-task:${agentId}`
+  const script: Script = async (_context, handlers) => {
+    for (const agentId of [broken, running]) {
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId: agent(agentId),
+        toolName: 'Agent',
+        input: { description: agentId, prompt: `step ${agentId}`, subagent_type: 'workflow' },
+      })
+    }
+    // One agent failed on its own.
+    await handlers.onEvent({
+      type: 'tool_result',
+      toolUseId: agent(broken),
+      content: `{"error":"Disk full"}\nagentId: ${broken}`,
+      isError: true,
+    })
+    // The turn fails, and the runtime closes the agent still running as it
+    // ends.
+    await handlers.onEvent({
+      type: 'tool_result',
+      toolUseId: agent(running),
+      content: `Workflow monitoring stopped before the agent published an individual result.\nagentId: ${running}`,
+      isError: true,
+      endedWithTurn: true,
+    })
+    await handlers.onEvent({
+      type: 'completed',
+      success: false,
+      result: 'API Error: 529 Overloaded',
+      failure,
+    })
+  }
+  await withScriptedServer(script, async ({ startThread, runTurn }) => {
+    const threadId = await startThread()
+    const live = await runTurn(threadId, 'run a workflow')
+    assert.equal(
+      turnCompleted(live, threadId).params.turn.error.message,
+      'API Error: 529 Overloaded. A subagent failed: Disk full',
+      'only the agent that failed on its own counts',
+    )
+    const brokenChild = spawnedChild(live, `step ${broken}`)
+    const runningChild = spawnedChild(live, `step ${running}`)
+    assert.deepEqual(turnCompleted(live, brokenChild).params.turn.error, turnError('Disk full'))
+    const reason = 'Ended because the parent turn failed: API Error: 529 Overloaded'
+    const ended = turnCompleted(live, runningChild).params.turn
+    assert.equal(ended.status, 'failed')
+    assert.deepEqual(ended.error, turnError(reason))
+    assert.deepEqual(
+      collabItems(live, 'wait').map((item) => item.agentsStates),
+      [
+        { [brokenChild]: { status: 'errored', message: 'Disk full' } },
+        { [runningChild]: { status: 'errored', message: reason } },
+      ],
+    )
+  })
+})
+
+test('the workflow agents a native turn closes as it ends are marked as ended with it', async () => {
+  const runtime = new NativeClaudeRuntime()
+  const events: any[] = []
+  const agent = 'workflow-agent:wf-task:a0123456789abcdef'
+  const pending = {
+    activeSubagents: new Set([agent, 'workflow-task:wf-task']),
+    completedWorkflowTasks: new Set<string>(),
+    workflowTasks: new Map([
+      [
+        'wf-task',
+        {
+          taskId: 'wf-task',
+          toolUseId: '',
+          workflowName: 'review',
+          description: '',
+          prompt: '',
+          monitor: null,
+          aggregateStarted: true,
+          terminal: false,
+        },
+      ],
+    ]),
+    handlers: { onEvent: async (event: unknown) => events.push(event) },
+  }
+  await Reflect.get(runtime, 'stopWorkflowTasks').call(runtime, pending)
+  assert.deepEqual(
+    events.map((event) => [event.type, event.toolUseId, event.isError, event.endedWithTurn]),
+    [
+      ['tool_result', agent, true, true],
+      ['tool_result', 'workflow-task:wf-task', true, true],
+    ],
+  )
 })
 
 test('a subagent the user stops says so in its turn and its state, and does not count as failed', async () => {

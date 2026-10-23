@@ -5126,6 +5126,11 @@ export class CodexClaudeAppServer {
           if (event.type === 'tool_result' && activeSubagents.has(event.toolUseId)) {
             const ctx = subagentContexts.get(event.toolUseId)
             if (!ctx) return
+            // The runtime closed the agent's call because this turn is ending.
+            // The agent did not fail on its own: it ends with the turn, below,
+            // saying why the turn ended.
+            // App rule: subagent-failure-reason
+            if (event.endedWithTurn) return
             if (!event.isError && isAsyncAgentLaunch(event.structured, event.content)) {
               // Claude backgrounded the agent: the call returned, the child
               // did not. It completes on its task notification instead.

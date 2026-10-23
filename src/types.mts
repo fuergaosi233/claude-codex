@@ -703,6 +703,11 @@ export type RuntimeEvent =
       // Claude Code's structured tool result (e.g. Agent `async_launched`,
       // SendMessage `resumedAgentId`) when the backend exposes it.
       structured?: Record<string, unknown> | null
+      // The runtime closed this agent's call because the turn is ending (it
+      // failed, was interrupted or stopped, or its session closed while the
+      // agent ran), not because the agent finished: the agent ends with the
+      // turn, for the turn's reason.
+      endedWithTurn?: boolean
     }
   | {
       type: 'permission_request'

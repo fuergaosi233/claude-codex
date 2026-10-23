@@ -3297,6 +3297,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     state: WorkflowTaskState,
     message: string,
     isError: boolean,
+    // The turn is ending and takes the agents with it.
+    endedWithTurn = false,
   ): Promise<number> {
     let closed = 0
     for (const agentId of this.workflowProjectedAgentIds(pending, state)) {
@@ -3308,6 +3310,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         toolUseId,
         content: `${message}\nagentId: ${agentId}`,
         isError,
+        ...(endedWithTurn ? { endedWithTurn } : {}),
       })
       closed += 1
     }
@@ -3319,6 +3322,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     state: WorkflowTaskState,
     message: string,
     isError: boolean,
+    endedWithTurn = false,
   ): Promise<boolean> {
     const toolUseId = workflowTaskToolUseId(state.taskId)
     if (!pending.activeSubagents.delete(toolUseId)) return false
@@ -3328,6 +3332,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       toolUseId,
       content: message,
       isError,
+      ...(endedWithTurn ? { endedWithTurn } : {}),
     })
     return true
   }
@@ -3383,16 +3388,20 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       for (const state of tasks.values()) {
         state.terminal = true
         await state.monitor?.stop()
+        // The turn is ending: what still runs ends with it, and the server
+        // says why.
         await this.closeWorkflowAgentLifecycles(
           pending,
           state,
           'Workflow monitoring stopped before the agent published an individual result.',
+          true,
           true,
         )
         await this.closeWorkflowAggregateLifecycle(
           pending,
           state,
           'Workflow monitoring stopped before the workflow published a terminal result.',
+          true,
           true,
         )
       }
