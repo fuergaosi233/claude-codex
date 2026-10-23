@@ -129,13 +129,18 @@ export function editMcpServers(settings: Table, edit: ConfigEdit): void {
       throw invalid(`mcp_servers.${name} must be a table`)
     servers = withPath(prior, [name, ...field], edit.value, upsert)
   }
-  const changed = Object.keys(servers).filter((key) => servers[key] !== prior[key])
+  // A server the edit removes is a change too: with the switch off, what was
+  // saved stays as it is.
+  const changed = [...new Set([...Object.keys(prior), ...Object.keys(servers)])].filter(
+    (key) => servers[key] !== prior[key],
+  )
   if (changed.length > 0 && !appMcpServersEnabled()) {
     throw invalid(
       'MCP servers from the App settings are turned off for Claude threads (CLAUDE_CODEX_APP_MCP_SERVERS=0)',
     )
   }
   for (const key of changed) {
+    if (!Object.hasOwn(servers, key)) continue
     if (!SERVER_NAME.test(key)) throw invalid(`invalid MCP server name: ${key}`)
     const entry = asTable(servers[key])
     if (!entry) throw invalid(`mcp_servers.${key} must be a table`)

@@ -421,6 +421,16 @@ test('CLAUDE_CODEX_APP_MCP_SERVERS=0 leaves the App MCP settings out', async () 
       )
       assert.equal(response.error?.code, INVALID_REQUEST)
       assert.match(response.error?.message ?? '', /CLAUDE_CODEX_APP_MCP_SERVERS=0/)
+      // Nor can a saved server be deleted, one by one or with the whole table.
+      for (const edit of [
+        { keyPath: 'mcp_servers.fixture', value: null, mergeStrategy: 'replace' },
+        { keyPath: 'mcp_servers', value: {}, mergeStrategy: 'replace' },
+        { keyPath: 'mcp_servers', value: null, mergeStrategy: 'replace' },
+      ]) {
+        const deleted = await app.send('config/batchWrite', { edits: [edit], filePath: null })
+        assert.equal(deleted.error?.code, INVALID_REQUEST, JSON.stringify(edit))
+        assert.match(deleted.error?.message ?? '', /CLAUDE_CODEX_APP_MCP_SERVERS=0/)
+      }
       // The desktop servers the App writes at startup are still accepted.
       await app.request('config/batchWrite', {
         edits: [
