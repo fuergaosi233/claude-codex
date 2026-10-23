@@ -91,8 +91,9 @@ request on its own. With the default native backend, each retry shows in the
 turn as Codex shows a stream retry: a passing **Reconnecting 1/10** row that
 counts up and leaves once Claude answers, with the HTTP status and the wait
 under it. Like Codex, the adapter does not store these rows, so they are gone
-when the chat is reopened. A subagent's retries show the same way in the
-subagent's own thread while it runs, never in the parent chat.
+when the chat is reopened. A foreground subagent's retries show the same way
+in the subagent's own thread while it runs, never in the parent chat; Claude
+Code does not report a background agent's retries.
 
 A turn that fails tells the App why, with the error code Codex would send:
 the context window is full, the server is busy (HTTP 529), a rate limit, a bad

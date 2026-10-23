@@ -895,7 +895,7 @@ for (const { summary, result, reason } of [
   })
 }
 
-const retry = (attempt: number, toolUseId?: string) => ({
+const retry = (attempt: number, toolUseId?: string, agentId?: string) => ({
   type: 'retrying' as const,
   attempt,
   maxRetries: 10,
@@ -903,24 +903,39 @@ const retry = (attempt: number, toolUseId?: string) => ({
   category: 'overloaded',
   delayMs: 2_000,
   ...(toolUseId ? { toolUseId } : {}),
+  ...(agentId ? { agentId } : {}),
 })
 
 test("a subagent's API retries show in its own thread while it runs, never in the parent", async () => {
-  const script: Script = async (_context, handlers) => {
+  const script: Script = async (context, handlers, tools) => {
     await handlers.onEvent({
       type: 'tool_use',
       toolUseId: 'agent-retrying',
       toolName: 'Agent',
       input: { description: 'Retrying', prompt: 'call the API' },
     })
-    await handlers.onEvent(retry(1, 'agent-retrying'))
+    await tools.listener().onTaskEvent(context.threadId, {
+      type: 'task_started',
+      taskId: 'retrying-task',
+      toolUseId: 'agent-retrying',
+      taskType: 'local_agent',
+      description: 'Retrying',
+      subagentType: null,
+      prompt: 'call the API',
+      backgrounded: false,
+    })
+    await handlers.onEvent(retry(1, 'agent-retrying', 'retrying-task'))
+    // One that names only the agent's task finds it too.
+    await handlers.onEvent(retry(2, undefined, 'retrying-task'))
     // An agent the turn does not know shows its retry nowhere.
-    await handlers.onEvent(retry(2, 'agent-unknown'))
+    await handlers.onEvent(retry(3, 'agent-unknown'))
+    await handlers.onEvent(retry(4, undefined, 'unknown-task'))
     // The main loop's own retry shows in the parent, as before.
-    await handlers.onEvent(retry(3))
+    await handlers.onEvent(retry(5))
     await handlers.onEvent({ type: 'tool_result', toolUseId: 'agent-retrying', content: 'done' })
     // A late retry of an agent that already finished shows nowhere.
-    await handlers.onEvent(retry(4, 'agent-retrying'))
+    await handlers.onEvent(retry(6, 'agent-retrying', 'retrying-task'))
+    await handlers.onEvent(retry(7, undefined, 'retrying-task'))
     await handlers.onEvent({ type: 'completed', success: true, result: 'done' })
   }
   await withScriptedServer(script, async ({ startThread, runTurn, request }) => {
@@ -943,10 +958,11 @@ test("a subagent's API retries show in its own thread while it runs, never in th
       ]),
       [
         [child, childTurnId, true, 'Reconnecting... 1/10'],
-        [threadId, parentTurnId, true, 'Reconnecting... 3/10'],
+        [child, childTurnId, true, 'Reconnecting... 2/10'],
+        [threadId, parentTurnId, true, 'Reconnecting... 5/10'],
       ],
     )
-    assert.deepEqual(errors[0].params.error.codexErrorInfo, errors[1].params.error.codexErrorInfo)
+    assert.deepEqual(errors[0].params.error.codexErrorInfo, errors[2].params.error.codexErrorInfo)
     // Like Codex, a retry is not kept: both turns end without an error.
     assert.equal(turnCompleted(live, child).params.turn.error, null)
     assert.equal(turnCompleted(live, threadId).params.turn.error, null)
@@ -955,9 +971,14 @@ test("a subagent's API retries show in its own thread while it runs, never in th
   })
 })
 
+// Claude Code reports no background agent's retries today; one that names the
+// agent, by its Agent call or its task, shows in its thread all the same.
 test("a background subagent's API retries show in its own thread", async () => {
   await withScriptedServer(
-    backgroundAgent((handlers) => handlers.onEvent(retry(3, 'agent-bg'))),
+    backgroundAgent(async (handlers) => {
+      await handlers.onEvent(retry(3, 'agent-bg'))
+      await handlers.onEvent(retry(4, undefined, 'bg-task'))
+    }),
     async ({ startThread, runTurn }) => {
       const threadId = await startThread()
       const live = await runTurn(threadId, 'background agent')
@@ -974,8 +995,106 @@ test("a background subagent's API retries show in its own thread", async () => {
             message.params.willRetry,
             message.params.error.message,
           ]),
-        [[child, childTurnId, true, 'Reconnecting... 3/10']],
+        [
+          [child, childTurnId, true, 'Reconnecting... 3/10'],
+          [child, childTurnId, true, 'Reconnecting... 4/10'],
+        ],
       )
     },
   )
+})
+
+test("a foreground subagent's API retries, as Claude Code reports them, show in its own thread", async () => {
+  const runtime = new NativeClaudeRuntime()
+  // The CLI tells a subagent's retry as its Agent call's tool_progress
+  // (parent_tool_use_id), with a tool_use_id of its own making.
+  const agentProgress = (subagentRetry?: Record<string, unknown>) => ({
+    type: 'tool_progress',
+    tool_use_id: 'agent_msg_child',
+    tool_name: 'Agent',
+    parent_tool_use_id: 'toolu_agent',
+    elapsed_time_seconds: 0,
+    subagent_type: 'general-purpose',
+    session_id: 'session-retry',
+    ...(subagentRetry ? { subagent_retry: subagentRetry } : {}),
+  })
+  const subagentRetry = (attempt: number) => ({
+    agent_id: 'a1b2c3d4e5f60718',
+    attempt,
+    max_retries: 10,
+    retry_delay_ms: 2_000,
+    error_status: 529,
+    error_category: 'overloaded',
+  })
+  const frames = [
+    {
+      type: 'assistant',
+      parent_tool_use_id: null,
+      message: {
+        id: 'msg_parent',
+        content: [
+          {
+            type: 'tool_use',
+            id: 'toolu_agent',
+            name: 'Agent',
+            input: { description: 'Survey', prompt: 'survey the API' },
+          },
+        ],
+      },
+    },
+    agentProgress(subagentRetry(1)),
+    agentProgress(subagentRetry(2)),
+    // The request went through.
+    agentProgress(),
+    {
+      type: 'user',
+      parent_tool_use_id: null,
+      message: {
+        content: [{ type: 'tool_result', tool_use_id: 'toolu_agent', content: 'Surveyed.' }],
+      },
+    },
+    {
+      type: 'assistant',
+      parent_tool_use_id: null,
+      message: { id: 'msg_end', content: [{ type: 'text', text: 'Surveyed.' }] },
+    },
+    { type: 'result', subtype: 'success', result: 'Surveyed.' },
+  ]
+  Reflect.set(runtime, 'sdk', {
+    query: async function* () {
+      yield* frames
+    },
+  })
+  try {
+    await withScriptedServer(
+      (context, handlers) => runtime.runTurn(context, handlers),
+      async ({ startThread, runTurn }) => {
+        const threadId = await startThread()
+        const live = await runTurn(threadId, 'survey with a subagent')
+        const child = spawnedChild(live, 'survey the API')
+        const childTurnId = live.find(
+          (message) => message.method === 'turn/started' && message.params.threadId === child,
+        ).params.turn.id
+        assert.deepEqual(
+          live
+            .filter((message) => message.method === 'error')
+            .map((message) => [
+              message.params.threadId,
+              message.params.turnId,
+              message.params.willRetry,
+              message.params.error.message,
+            ]),
+          [
+            [child, childTurnId, true, 'Reconnecting... 1/10'],
+            [child, childTurnId, true, 'Reconnecting... 2/10'],
+          ],
+        )
+        // The subagent's retries say nothing about the parent turn.
+        assert.equal(turnCompleted(live, threadId).params.turn.status, 'completed')
+        assert.equal(turnCompleted(live, child).params.turn.status, 'completed')
+      },
+    )
+  } finally {
+    await runtime.stop()
+  }
 })

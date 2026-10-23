@@ -5664,12 +5664,14 @@ export class CodexClaudeAppServer {
             if (context.purpose !== 'normal') return
             // A subagent's retry shows in its own thread, while its turn
             // runs; one whose agent is gone or unknown shows nowhere, never
-            // in this turn.
+            // in this turn. Its Agent call names it, else its task id.
             // App rule: reconnecting-errors
-            if (event.toolUseId) {
+            if (event.toolUseId || event.agentId) {
               const agent =
-                subagentContexts.get(event.toolUseId) ??
-                this.findBackgroundSubagent(thread.id, { toolUseId: event.toolUseId })?.context
+                (event.toolUseId
+                  ? (subagentContexts.get(event.toolUseId) ??
+                    this.findBackgroundSubagent(thread.id, { toolUseId: event.toolUseId })?.context)
+                  : undefined) ?? this.nestingHost(thread.id, subagentContexts, event.agentId)
               if (!agent || this.store.getTurn(agent.childTurnId)?.status !== 'inProgress') return
               this.notify(peer, {
                 method: 'error',
@@ -6607,9 +6609,10 @@ export class CodexClaudeAppServer {
 
   // The agent whose own Agent call this is, when the frame names it by task
   // id (agent_id, newer CLIs) and it is still working in this turn or in the
-  // background: the new child then hangs off that agent's child thread.
-  // Null for the main loop's calls, for an older CLI and for a host whose
-  // child turn is over, which leaves the child under the parent thread.
+  // background: the new child then hangs off that agent's child thread (and
+  // a retry the agent reports shows there). Null for the main loop's calls,
+  // for an older CLI and for a host whose child turn is over, which leaves
+  // the child under the parent thread.
   private nestingHost(
     threadId: string,
     contexts: Map<string, SubagentContext>,

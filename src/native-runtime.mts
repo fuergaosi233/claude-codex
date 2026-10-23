@@ -95,6 +95,7 @@ import type {
   PermissionDecision,
   RecalledMemory,
   RuntimeBackgroundListener,
+  RuntimeEvent,
   RuntimeFailure,
   RuntimeHandlers,
   RuntimeLiveTask,
@@ -2473,6 +2474,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       case 'result':
         await this.handleResult(pending, message)
         break
+      case 'tool_progress': {
+        // Beyond the heartbeat above, one may tell a subagent's retry.
+        const retry = subagentRetryEvent(message)
+        if (retry) await pending.handlers.onEvent(retry)
+        break
+      }
       default:
         // Rate-limit notifications and other non-system frames.
         await this.handleOther(pending, type, message)
@@ -2599,8 +2606,10 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (subtype === 'api_retry') {
       const status = numberOrNull(message.error_status)
       const category = stringOrNull(message.error)
-      // A subagent's retry is told against its Agent call; it says nothing
-      // about why the main loop might fail.
+      // The CLI tells only the main loop's retries this way (a subagent's
+      // come as tool_progress, see subagentRetryEvent). One that names an
+      // Agent call all the same is that subagent's, and says nothing about
+      // why the main loop might fail.
       const toolUseId = stringOrNull(message.parent_tool_use_id)
       if (!toolUseId) pending.apiError = { category, status }
       await pending.handlers.onEvent({
@@ -3575,6 +3584,33 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       })
       return
     }
+  }
+}
+
+// A foreground subagent's model request that failed and will be sent again.
+// The CLI tells it as the Agent call's tool_progress with subagent_retry:
+// parent_tool_use_id is the Agent call (tool_use_id is a made-up
+// `agent_<message id>`) and agent_id the subagent's task. The next such frame
+// without subagent_retry means the request went through, and is only a
+// heartbeat. A subagent's retry says nothing about why the main loop might
+// fail.
+function subagentRetryEvent(
+  message: Record<string, unknown>,
+): Extract<RuntimeEvent, { type: 'retrying' }> | null {
+  const retry = recordOrNull(message.subagent_retry)
+  if (!retry) return null
+  const toolUseId = stringOrNull(message.parent_tool_use_id)
+  const agentId = stringOrNull(retry.agent_id)
+  if (!toolUseId && !agentId) return null
+  return {
+    type: 'retrying',
+    attempt: numberOrNull(retry.attempt) ?? 1,
+    maxRetries: numberOrNull(retry.max_retries) ?? 1,
+    status: numberOrNull(retry.error_status),
+    category: stringOrNull(retry.error_category),
+    delayMs: numberOrNull(retry.retry_delay_ms),
+    ...(toolUseId ? { toolUseId } : {}),
+    ...(agentId ? { agentId } : {}),
   }
 }
 

@@ -701,8 +701,10 @@ versioning or publishing metadata.
   Stopped, interrupted and orphaned subagents say how they ended and do not
   count as failed. Stopping a foreground subagent whose Agent call returned
   before Claude Code confirmed the stop no longer ends its thread twice.
-- A subagent's API retries show as **Reconnecting n/m** in the subagent's
-  thread while it runs, instead of not at all, and never in the parent.
+- A foreground subagent's API retries show as **Reconnecting n/m** in the
+  subagent's thread while it runs, instead of not at all, and never in the
+  parent. Claude Code reports them as the Agent call's `tool_progress` with
+  `subagent_retry` (and none for a background agent).
 
 ### Rust-first protocol groundwork
 

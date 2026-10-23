@@ -300,9 +300,9 @@ export const APP_RULES: readonly AppRule[] = [
     id: 'reconnecting-errors',
     app: 'Shows an `error` notification with willRetry as a passing stream-error row in the turn that replaces the one before it, and reads the attempt count only from a message of the form "Reconnecting... n/m"; any other message shows as it is.',
     adapter:
-      'Turns each retry the Claude CLI reports for a chat\'s main loop (system/api_retry) into an `error` with willRetry, the message "Reconnecting... n/m" and the HTTP status and wait in additionalDetails, and does not store it, as Codex does not. A retry inside a subagent (one with a parent_tool_use_id) shows the same way in that subagent\'s thread while its turn runs, and never in the parent; retries in a structured-output helper turn show nothing.',
+      "Turns each retry the Claude CLI reports for a chat's main loop (system/api_retry) into an `error` with willRetry, the message \"Reconnecting... n/m\" and the HTTP status and wait in additionalDetails, and does not store it, as Codex does not. A foreground subagent's retry, which the CLI reports as its Agent call's tool_progress with subagent_retry, shows the same way in that subagent's thread while its turn runs, and never in the parent (the CLI reports none for a background agent); retries in a structured-output helper turn show nothing.",
     verify:
-      'Point the adapter at an API that answers 529 for a while: the turn shows "Reconnecting 1/10", counting up, and then the reply; a subagent running then shows its own retries in its thread.',
+      'Point the adapter at an API that answers 529 for a while: the turn shows "Reconnecting 1/10", counting up, and then the reply; a foreground subagent running then shows its own retries in its thread.',
   },
   {
     id: 'error-codes',

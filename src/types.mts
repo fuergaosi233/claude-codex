@@ -817,8 +817,8 @@ export type RuntimeEvent =
   // A model request failed and Claude will send it again after `delayMs`.
   // `status` is the API's HTTP status (null when nothing answered) and
   // `category` the SDK's error category ('overloaded', ...). `toolUseId` is
-  // the Agent call of the subagent whose request it was; without it the
-  // request was the main loop's.
+  // the Agent call of the subagent whose request it was, and `agentId` that
+  // subagent's task id; without either the request was the main loop's.
   | {
       type: 'retrying'
       attempt: number
@@ -827,6 +827,7 @@ export type RuntimeEvent =
       category: string | null
       delayMs: number | null
       toolUseId?: string
+      agentId?: string
     }
   | {
       type: 'completed'
