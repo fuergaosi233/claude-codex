@@ -1948,6 +1948,10 @@ export class CodexClaudeAppServer {
       typeof params.beforeThreadId === 'string' && params.beforeThreadId.length > 0
         ? params.beforeThreadId
         : null
+    // Checked here, not left to the store, so an unknown id is the caller's error.
+    if (!this.store.getThread(threadId)) throw unknownThread(threadId)
+    if (sectionId != null && !this.store.getSection(sectionId))
+      throw invalidRequest(`unknown section: ${sectionId}`)
     const moved = this.store.moveThreadToSection(threadId, sectionId, beforeThreadId)
     debugLog('thread.section.moved', {
       threadId,
@@ -1973,6 +1977,7 @@ export class CodexClaudeAppServer {
 
   private threadSectionCreate(params: Record<string, unknown>): unknown {
     const name = stringOr(params.name, '')
+    if (!name.trim()) throw invalidRequest('section name must not be empty')
     const section = this.store.createSection(
       newId(),
       name,
@@ -1986,6 +1991,8 @@ export class CodexClaudeAppServer {
     const existing = this.store.getSection(sectionId)
     if (!existing) throw invalidRequest(`unknown section: ${sectionId}`)
     const name = typeof params.name === 'string' ? params.name : existing.name
+    if (sectionId !== PINNED_SECTION_ID && !name.trim())
+      throw invalidRequest('section name must not be empty')
     const appearance =
       params.appearance === undefined
         ? existing.appearance
@@ -1994,7 +2001,10 @@ export class CodexClaudeAppServer {
   }
 
   private threadSectionDelete(params: Record<string, unknown>): unknown {
-    this.store.deleteSection(stringOr(params.sectionId, ''))
+    const sectionId = stringOr(params.sectionId, '')
+    if (sectionId === PINNED_SECTION_ID) throw invalidRequest('the pinned section is reserved')
+    if (!this.store.getSection(sectionId)) throw invalidRequest(`unknown section: ${sectionId}`)
+    this.store.deleteSection(sectionId)
     return {}
   }
 

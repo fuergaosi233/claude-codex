@@ -117,9 +117,11 @@ one its `turn/start` named, else its own id. Every client request Codex App
 with an empty, disabled or `unavailable` result rather than an error. A
 request it does not know gets the JSON-RPC error `-32601` (method not found),
 and so do three requests of the 26.1013 protocol that the App never sends. A
-request the user can put right (an unknown thread, turn or id, a bad cursor
-or parameter, a model the thread cannot take) fails with `-32600` (invalid
-request), as in Codex, and a failure inside the adapter with `-32000`.
+request the user can put right (an unknown thread, turn, section, queued
+message or process, a bad cursor or parameter, a model the thread cannot
+take) fails with `-32600` (invalid request), as in Codex, and a failure inside
+the adapter with `-32000`. Project errors stay `-32000`, with the texts the
+App matches.
 Regenerate the reference schema under `generated/` with
 `npm run generate:schema` (needs a matching `codex` on PATH).
 

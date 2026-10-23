@@ -91,7 +91,8 @@ versioning or publishing metadata.
   a model the chat cannot take; a rewind or queued start while a turn runs.
   The model menu's "Couldn't update model settings" toast now gives the
   reason, after the App's own "Check your config.toml." line. Failures inside
-  the adapter stay `-32000`.
+  the adapter stay `-32000`, and so do project errors, whose text the App
+  matches.
 - Model process profiles that fail to load fail with one line of at most 300
   characters that names the file (or `CLAUDE_CODEX_MODEL_PROFILES`) and says
   what is wrong. The message used to carry the JSON parser's excerpt of the

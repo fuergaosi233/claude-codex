@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { INVALID_REQUEST, SERVER_ERROR } from '../src/host-methods.mjs'
+import { PINNED_SECTION_ID } from '../src/store.mjs'
 import { type InProcessApp, scriptedRuntime, withInProcessApp } from './fixtures/in-process-app.mjs'
 
 // A request the user can put right (an unknown id, a bad parameter, an option
@@ -52,6 +53,7 @@ test('an unknown thread is an invalid request, whatever the method', async () =>
       ['thread/inject_items', { threadId, items: [] }],
       ['thread/searchOccurrences', { threadId, searchTerm: 'x' }],
       ['thread/attachment/list', { threadId }],
+      ['thread/section/move', { threadId, sectionId: null }],
     ] as const)
       await refused(app, method, params, /^unknown thread: nope$/)
   })
@@ -67,6 +69,36 @@ test('an unknown turn, cursor or id, and a bad parameter, are invalid requests',
     await refused(app, 'thread/items/list', { threadId, turnId: 'gone' }, /turn not found: gone/)
     await refused(app, 'thread/attachment/list', { threadId, cursor: '-1' }, /invalid attachment/)
     await refused(app, 'threadSection/update', { sectionId: 'gone' }, /unknown section: gone/)
+    await refused(
+      app,
+      'thread/section/move',
+      { threadId, sectionId: 'gone' },
+      /^unknown section: gone$/,
+    )
+    await refused(app, 'threadSection/delete', { sectionId: 'gone' }, /^unknown section: gone$/)
+    await refused(
+      app,
+      'threadSection/delete',
+      { sectionId: PINNED_SECTION_ID },
+      /^the pinned section is reserved$/,
+    )
+    await refused(app, 'threadSection/create', { name: ' ' }, /^section name must not be empty$/)
+    const created = await app.call('threadSection/create', { name: 'Work' })
+    const { section } = created.result as { section: { id: string } }
+    await refused(
+      app,
+      'threadSection/update',
+      { sectionId: section.id, name: ' ' },
+      /^section name must not be empty$/,
+    )
+    // Project errors keep the server error code; the App matches their text.
+    await refused(
+      app,
+      'project/read',
+      { projectId: 'gone' },
+      /^project not found: gone$/,
+      SERVER_ERROR,
+    )
     await refused(app, 'thread/goal/set', { threadId, status: 'bogus' }, /invalid goal status/)
     await refused(app, 'thread/goal/set', { threadId, objective: ' ' }, /must not be empty/)
     await refused(
