@@ -41,7 +41,8 @@ Implemented as real remote/runtime behavior:
   `error` notifications for API retries (`willRetry`; a subagent's in its own
   thread) and failed turns, with Codex error codes; Claude Code's notices as
   `warning` notifications and as `error` notifications with `willRetry` and no
-  code, which the App shows as rows under the turn.
+  code, which the App shows as rows under the turn. A subagent's own messages,
+  reasoning and tool calls stream as these items in its own thread's turn.
 - **Request errors** — `-32600` (invalid request) for requests the user can
   put right, `-32000` for failures inside the adapter, `-32601` for unknown
   methods.

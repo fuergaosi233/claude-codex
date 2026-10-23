@@ -1218,6 +1218,14 @@ export class SessionStore {
     return row ? this.rowToTurn(row) : null
   }
 
+  // A turn's status, without decoding its items.
+  turnStatus(id: string): TurnRecord['status'] | null {
+    const row = this.db.prepare('SELECT status FROM turns WHERE id = ?').get(id) as
+      | { status?: unknown }
+      | undefined
+    return typeof row?.status === 'string' ? (row.status as TurnRecord['status']) : null
+  }
+
   listTurns(threadId: string): TurnRecord[] {
     const rows = this.db
       .prepare('SELECT * FROM turns WHERE thread_id = ? ORDER BY started_at ASC')

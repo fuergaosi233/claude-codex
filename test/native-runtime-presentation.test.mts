@@ -213,17 +213,32 @@ test('native presentation recovers the unstreamed suffix of a partially streamed
 test('nested assistant events do not split or contaminate parent messages', async () => {
   const nestedStart = stream({ type: 'message_start', message: { id: 'child' } }, 'parent-tool')
   const nestedDelta = { ...delta('text', 'Hidden child prose'), parent_tool_use_id: 'parent-tool' }
-  assert.deepEqual(
-    await collect([
-      start('parent'),
-      delta('text', 'Parent'),
-      nestedStart,
-      nestedDelta,
-      { ...assistant('child', [text('Hidden child prose')]), parent_tool_use_id: 'parent-tool' },
-      assistant('parent', [text('Parent')]),
-    ]),
-    [{ type: 'message_boundary' }, { type: 'text_delta', delta: 'Parent' }],
-  )
+  const messages = [
+    start('parent'),
+    delta('text', 'Parent'),
+    nestedStart,
+    nestedDelta,
+    { ...assistant('child', [text('Hidden child prose')]), parent_tool_use_id: 'parent-tool' },
+    assistant('parent', [text('Parent')]),
+  ]
+  const parent = [{ type: 'message_boundary' }, { type: 'text_delta', delta: 'Parent' }]
+  // The child's prose is its own output, for its thread.
+  assert.deepEqual(await collect(messages), [
+    ...parent,
+    {
+      type: 'subagent_output',
+      toolUseId: 'parent-tool',
+      output: { type: 'text', text: 'Hidden child prose' },
+    },
+  ])
+  const previous = process.env.CLAUDE_CODEX_SUBAGENT_ITEMS
+  process.env.CLAUDE_CODEX_SUBAGENT_ITEMS = '0'
+  try {
+    assert.deepEqual(await collect(messages), parent)
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_CODEX_SUBAGENT_ITEMS
+    else process.env.CLAUDE_CODEX_SUBAGENT_ITEMS = previous
+  }
 })
 
 test('structured output remains a single deduplicated result', async () => {
@@ -988,6 +1003,17 @@ test('subagent and non-file tool input does not stream', async () => {
       toolUseId: 'write',
       toolName: 'Write',
       input: { file_path: '/tmp/b.txt' },
+    },
+    // The subagent's call shows once complete, in its own thread.
+    {
+      type: 'subagent_output',
+      toolUseId: 'agent',
+      output: {
+        type: 'tool_use',
+        toolUseId: 'child-edit',
+        toolName: 'Edit',
+        input: { file_path: '/tmp/child.txt' },
+      },
     },
     {
       type: 'tool_use',

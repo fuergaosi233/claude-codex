@@ -196,7 +196,8 @@ export const APP_RULES: readonly AppRule[] = [
     id: 'subagent-read',
     app: 'Reads a child for the subagent panel with thread/read includeTurns:false, and shows a child without turns as still loading.',
     adapter: 'Returns the turns of a subagent thread even when they are not asked for.',
-    verify: 'Open a finished subagent from the panel: its prompt and response render.',
+    verify:
+      'Open a finished subagent from the panel: its prompt, its work and its response render.',
   },
   {
     id: 'child-prompt',
