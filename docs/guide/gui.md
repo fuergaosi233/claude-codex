@@ -176,12 +176,12 @@ again in a new message.
 ### Request errors
 
 A request you can put right, such as a model the chat cannot take, an unknown
-chat or a bad parameter, fails with the JSON-RPC code Codex uses for it,
-`-32600` (invalid request), and its message says why. Picking a Codex model in
-a Claude chat that has a reply, for example, shows the **Couldn't update model
-settings** toast with the reason (below the App's own "Check your config.toml."
-line, which the App adds to every such error), and the menu goes back to the
-Claude model.
+chat or a bad parameter, fails with the JSON-RPC code `-32600` (invalid
+request), as Codex answers an unknown chat, and its message says why. Picking
+a Codex model in a Claude chat that has a reply, for example, shows the
+**Couldn't update model settings** toast with the reason (below the App's own
+"Check your config.toml." line, which the App adds to every such error), and
+the menu goes back to the Claude model.
 A failure inside the adapter stays a server error (`-32000`).
 
 ## The context gauge

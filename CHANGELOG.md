@@ -46,8 +46,8 @@ versioning or publishing metadata.
   from is not blamed (API retries, a subagent's included, notices, hooks, the
   message Claude Code writes to name the failed request and the failing result
   do not count as going on). The error code and details are unchanged, and
-  refusals such as usage limits, an overloaded API or startup failures are
-  left alone.
+  refusals such as usage limits, an overloaded API or a Claude Code start that
+  a retry cannot fix are left alone.
 - The subagent watchdog (`CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS`) no longer fails a
   turn over quiet that is not a stall. The wait is paused while the turn waits
   on the user (an approval, a question, an MCP elicitation or a client dynamic
@@ -89,9 +89,11 @@ versioning or publishing metadata.
   `/compact` (`thread/compact/start`) Claude Code could not do: its turn keeps
   only the summary written instead, and no `thread/compacted` is sent.
 - Requests the user can correct fail with JSON-RPC `-32600` (invalid request),
-  the code Codex uses, instead of `-32000`, with the same messages: an unknown
-  thread, turn, section, queued message or process; a bad cursor or parameter;
-  a model the chat cannot take; a rewind or queued start while a turn runs.
+  as Codex answers an unknown thread or turn and a bad cursor, instead of
+  `-32000`, with the same messages: an unknown thread, turn, section, queued
+  message or process; a bad cursor or parameter; a model the chat cannot
+  take; a rewind or queued start while a turn runs. (Codex answers some
+  section parameter errors with `-32602`, invalid params.)
   The model menu's "Couldn't update model settings" toast now gives the
   reason, after the App's own "Check your config.toml." line. Failures inside
   the adapter stay `-32000`, and so do project errors, whose text the App

@@ -5,8 +5,9 @@ import { PINNED_SECTION_ID } from '../src/store.mjs'
 import { type InProcessApp, scriptedRuntime, withInProcessApp } from './fixtures/in-process-app.mjs'
 
 // A request the user can put right (an unknown id, a bad parameter, an option
-// the thread cannot take) fails as an invalid request, as in Codex, and the
-// App shows its reason; a failure inside the server stays a server error.
+// the thread cannot take) fails as an invalid request, as Codex answers an
+// unknown thread, and the App shows its reason; a failure inside the server
+// stays a server error.
 
 async function refused(
   app: InProcessApp,
