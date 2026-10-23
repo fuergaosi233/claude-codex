@@ -798,6 +798,7 @@ test('native SDK runtime projects workflow journal agents into separate live Age
   const events: any[] = []
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowToolUseIds: new Set<string>(),
     workflowTranscriptRoots: [root],
@@ -969,6 +970,7 @@ test('native SDK runtime waits for a slightly delayed workflow journal result', 
   const events: any[] = []
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowToolUseIds: new Set(['delayed-workflow-launch']),
     workflowTranscriptRoots: [root],
@@ -1071,6 +1073,7 @@ test('native SDK parent result does not cap workflow runtime at three seconds', 
     context: nativeTurnContext({ turnId: 'parent-result-workflow-turn' }),
     input: new TurnInput(),
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowToolUseIds: new Set(['parent-result-workflow-launch']),
     workflowTranscriptRoots: [root],
@@ -1199,6 +1202,7 @@ test('native SDK runtime waits for the workflow agent prompt file before project
   const events: any[] = []
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowToolUseIds: new Set(['delayed-prompt-launch']),
     workflowTranscriptRoots: [root],
@@ -1278,6 +1282,7 @@ test('native SDK runtime attaches a deferred Workflow launch after task_started 
   const events: any[] = []
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowToolUseIds: new Set(['deferred-workflow-launch']),
     workflowTranscriptRoots: [root],
@@ -1343,6 +1348,7 @@ test('native SDK runtime falls back to aggregate Agent when workflow journal sta
   const events: any[] = []
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowToolUseIds: new Set(['empty-workflow-launch']),
     workflowTranscriptRoots: [root],
@@ -1406,6 +1412,7 @@ test('native SDK runtime settles an out-of-order workflow task notification', as
   const events: any[] = []
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowToolUseIds: new Set<string>(),
     workflowTranscriptRoots: [process.cwd()],
@@ -1440,6 +1447,7 @@ test('native SDK runtime accepts the declared SDK task_notification shape', asyn
   const events: any[] = []
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     // The real SDK notification may omit task_type/workflow_name. The
     // tool_use_id is the stable correlation key when the Workflow launch is
@@ -1493,6 +1501,7 @@ test('native SDK runtime accepts Workflow launch metadata after the old fallback
   const events: any[] = []
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowToolUseIds: new Set(['late-workflow-launch']),
     workflowTranscriptRoots: [root],
@@ -1568,6 +1577,7 @@ test('native SDK runtime hides skip_transcript workflow journals', async () => {
   const events: any[] = []
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowToolUseIds: new Set(['hidden-workflow-launch']),
     workflowTranscriptRoots: [root],
@@ -1651,6 +1661,7 @@ test('native SDK runtime ignores workflow-shaped metadata from a non-Workflow to
   const events: any[] = []
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowToolUseIds: new Set<string>(),
     workflowTranscriptRoots: [root],
@@ -1719,6 +1730,7 @@ test('native SDK runtime rejects Workflow launch metadata bound to a different t
   const events: any[] = []
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowToolUseIds: new Set(['mismatched-workflow-launch']),
     workflowTranscriptRoots: [root],
@@ -1787,6 +1799,7 @@ test('native SDK runtime rejects ambiguous batched Workflow tool results', async
   const events: any[] = []
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowToolUseIds: new Set(['workflow-launch']),
     workflowTranscriptRoots: [root],
@@ -1862,6 +1875,7 @@ test('native SDK runtime rejects a symlinked workflow journal file', async () =>
   const events: any[] = []
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowToolUseIds: new Set(['journal-symlink-launch']),
     workflowTranscriptRoots: [root],
@@ -1951,6 +1965,7 @@ test('native SDK runtime rejects workflow transcript symlinks that escape the tr
   const events: any[] = []
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowToolUseIds: new Set(['trusted-workflow-launch']),
     workflowTranscriptRoots: [trustedRoot],
@@ -2040,6 +2055,7 @@ test('native SDK runtime rejects a workflow directory replaced after canonical v
   const events: any[] = []
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowToolUseIds: new Set(['directory-swap-launch']),
     workflowTranscriptRoots: [root],
@@ -2099,6 +2115,7 @@ test('native SDK runtime falls back to one Agent lifecycle without workflow jour
   const events: any[] = []
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     handlers: { onEvent: async (event: unknown) => events.push(event) },
   }
@@ -2137,6 +2154,7 @@ test('native SDK runtime ignores non-workflow task notifications', async () => {
   const events: any[] = []
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowTasks: new Map(),
     handlers: { onEvent: async (event: unknown) => events.push(event) },
@@ -2161,6 +2179,7 @@ test('native SDK runtime closes lagged workflow agents using the terminal task s
   const agentToolUseId = `workflow-agent:${taskId}:${agentId}`
   const pending = {
     activeSubagents: new Set<string>([agentToolUseId]),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowTasks: new Map([
       [
@@ -2211,6 +2230,7 @@ test('native SDK runtime bounds terminal workflow monitor flushes', async () => 
   const taskId = 'blocked-flush-workflow-task'
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowTasks: new Map([
       [
@@ -2264,6 +2284,7 @@ test('native SDK runtime closes projected workflow agents when workflow monitori
   const agentToolUseId = `workflow-agent:${taskId}:${agentId}`
   const pending = {
     activeSubagents: new Set<string>([agentToolUseId]),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowTasks: new Map([
       [
