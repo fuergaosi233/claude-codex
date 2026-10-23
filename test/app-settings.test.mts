@@ -5,6 +5,7 @@ import { join, resolve } from 'node:path'
 import test from 'node:test'
 import { INVALID_REQUEST } from '../src/host-methods.mjs'
 import { CodexClaudeAppServer } from '../src/server.mjs'
+import { summarizeRpcParams } from '../src/server-helpers.mjs'
 import { SessionStore } from '../src/store.mjs'
 import type { ClaudeRuntime, RpcPeer, RuntimeTurnContext } from '../src/types.mjs'
 
@@ -601,11 +602,49 @@ test('config writes keep credentials out of the debug log', async () => {
       await app.send('thread/start', {
         cwd: root,
         model: 'sonnet',
-        config: { 'mcp_servers.local.env.FOURTH': 'env-value-10' },
+        config: {
+          'mcp_servers.local.env.FOURTH': 'env-value-10',
+          'mcp_servers.local.args': ['--api', 'arg-value-11'],
+          'mcp_servers.remote.url': 'https://example.com/u/url-path-12',
+          'model_providers.proxy.query_params': { sig: 'query-value-18' },
+          // Without a scheme it does not parse as a URL.
+          'mcp_servers.bare.url': 'mcp.example.com/s/url-path-19',
+        },
+      })
+      // A per-user server URL with its secret in the path, as the App saves it.
+      await app.request(
+        'config/batchWrite',
+        saveServer(root, 'hosted', {
+          url: 'https://mcp.example.com/api/mcp/s/url-path-13/mcp#url-fragment-14',
+        }),
+      )
+      // A server whose arguments carry a token, written whole or as its args.
+      await app.send('config/value/write', {
+        keyPath: 'mcp_servers.bridge',
+        value: {
+          command: 'npx',
+          args: ['-y', 'mcp-remote', '--header', 'Authorization: Bearer arg-value-15'],
+        },
+        mergeStrategy: 'replace',
+        filePath: null,
+      })
+      await app.send('config/value/write', {
+        keyPath: 'mcp_servers.bridge.args',
+        value: ['--header', 'Authorization: Bearer arg-value-16'],
+        mergeStrategy: 'replace',
+        filePath: null,
       })
     })
     const log = await readFile(debugLog, 'utf8')
-    for (const secret of [
+    // The App's own save nests args deeper than the log records; the summary
+    // drops them by itself.
+    const summary = JSON.stringify(
+      summarizeRpcParams(
+        'config/batchWrite',
+        saveServer(root, 'bridge', { command: 'npx', args: ['--token', 'arg-value-17'] }),
+      ),
+    )
+    const secrets = [
       'env-value-1',
       'url-password-2',
       'url-query-3',
@@ -616,8 +655,20 @@ test('config writes keep credentials out of the debug log', async () => {
       'env-value-8',
       'token-value-9',
       'env-value-10',
-    ])
-      assert.ok(!log.includes(secret), secret)
+      'arg-value-11',
+      'url-path-12',
+      'url-path-13',
+      'url-fragment-14',
+      'arg-value-15',
+      'arg-value-16',
+      'query-value-18',
+      'url-path-19',
+    ]
+    assert.deepEqual(
+      secrets.filter((secret) => log.includes(secret)),
+      [],
+    )
+    assert.ok(!summary.includes('arg-value-17'), summary)
     // Key names and the rest of each value stay, for debugging.
     for (const kept of [
       'GREETING',
@@ -629,8 +680,14 @@ test('config writes keep credentials out of the debug log', async () => {
       'access_token',
       'kept-name',
       '/bin/kept',
-      'example.com/mcp',
+      'https://redacted@example.com/',
+      'https://mcp.example.com/',
       'mcp_servers.local.env.FOURTH',
+      'mcp_servers.local.args',
+      'mcp_servers.bridge.args',
+      '"sig":"[redacted]"',
+      '"args":["[redacted]","[redacted]","[redacted]","[redacted]"]',
+      'npx',
       '[redacted]',
     ])
       assert.ok(log.includes(kept), kept)

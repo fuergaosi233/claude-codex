@@ -241,11 +241,14 @@ export function commandArray(value: unknown): string[] {
 }
 
 // A config value can hold credentials: an MCP server's environment and HTTP
-// headers, a bearer token, an API key, a password in a URL. The debug log
-// keeps every key name and the shape of the value, and none of those values.
-// Keys named like a map of credentials have every value under them replaced;
-// keys named like a credential have their own value replaced.
-const CREDENTIAL_MAP_KEY = /^(env|headers|http_headers|env_http_headers)$/i
+// headers, a bearer token, an API key, a token passed as a command argument
+// (`--header "Authorization: Bearer …"`), a password or secret path in a URL.
+// The debug log keeps every key name and the shape of the value, and none of
+// those values. Keys whose values can all be credentials (a server's `env`
+// and headers, a command's `args`, a provider's `query_params`) have every
+// value under them replaced; keys named like a credential have their own
+// value replaced; of a `url`, only the scheme and host are kept.
+const CREDENTIAL_HOLDER_KEY = /^(env|headers|http_headers|env_http_headers|args|query_params)$/i
 const CREDENTIAL_KEY = /token|secret|passw|api.?key|auth|cookie|credential|bearer|private.?key/i
 const REDACTED = '[redacted]'
 
@@ -253,7 +256,9 @@ const REDACTED = '[redacted]'
 // config, as the debug log may show it.
 function redactConfigValue(keyPath: string, value: unknown): unknown {
   const segments = keyPath.split('.')
-  if (segments.some((segment) => CREDENTIAL_MAP_KEY.test(segment) || CREDENTIAL_KEY.test(segment)))
+  if (
+    segments.some((segment) => CREDENTIAL_HOLDER_KEY.test(segment) || CREDENTIAL_KEY.test(segment))
+  )
     return redactLeaves(value)
   if (typeof value === 'string' && segments.at(-1) === 'url') return redactUrl(value)
   if (Array.isArray(value)) return value.map((entry) => redactConfigValue('', entry))
@@ -274,18 +279,19 @@ function redactLeaves(value: unknown): unknown {
   return REDACTED
 }
 
-// The user and password of a URL, and its query, can be credentials.
+// The user and password of a URL, its path (a per-user server URL often has
+// its secret there), its query and its fragment can each be a credential, so
+// only the scheme and host are kept. Text that does not parse as a URL is
+// replaced whole.
 function redactUrl(value: string): string {
   try {
     const url = new URL(value)
-    if (url.username || url.password) {
-      url.username = 'redacted'
-      url.password = ''
-    }
-    if (url.search) url.search = REDACTED
-    return url.toString()
+    const user = url.username || url.password ? 'redacted@' : ''
+    const rest =
+      (url.pathname !== '' && url.pathname !== '/') || url.search || url.hash ? `/${REDACTED}` : ''
+    return `${url.protocol}//${user}${url.host}${rest}`
   } catch {
-    return value
+    return REDACTED
   }
 }
 
