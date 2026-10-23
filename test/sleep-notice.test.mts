@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { NativeClaudeRuntime } from '../src/native-runtime.mjs'
 import {
   SLEEP_NOTICE_MIN_MS,
   type SleepClock,
@@ -205,8 +206,10 @@ test('only a sleep since the turn last made progress explains its failure', asyn
     result: 'API Error: Connection error.',
     failure: { terminalReason: 'api_error', category: null, status: null },
   } as const
-  // What a turn whose connection broke hears before it fails: retries, and
-  // the usage and figures of the result that ends it.
+  // What a turn whose connection broke hears before it fails: retries (its
+  // own, and a subagent's), notices, a compaction that failed, the message
+  // naming the error, a StopFailure hook, and the usage and figures of the
+  // result that ends it.
   const brokenOff = async (handlers: RuntimeHandlers): Promise<void> => {
     for (const attempt of [1, 2])
       await handlers.onEvent({
@@ -217,7 +220,39 @@ test('only a sleep since the turn last made progress explains its failure', asyn
         category: 'unknown',
         delayMs: 1000,
       })
+    await handlers.onEvent({ type: 'subagent_progress', toolUseId: 'agent', failedRequest: true })
     await handlers.onEvent({ type: 'notice', level: 'warning', message: 'Still reconnecting.' })
+    await handlers.onEvent({
+      type: 'compaction_failed',
+      message: 'Claude could not compact the conversation: Connection error.',
+    })
+    await handlers.onEvent({
+      type: 'model_rerouted',
+      fromModel: 'claude-a',
+      toModel: 'claude-b',
+      category: null,
+      message: 'Claude switched from claude-a to claude-b after a refusal.',
+    })
+    await handlers.onEvent({ type: 'message_boundary', failedRequest: true })
+    await handlers.onEvent({
+      type: 'usage_progress',
+      messageId: 'msg_error',
+      usage: { input_tokens: 0, output_tokens: 0 },
+      failedRequest: true,
+    })
+    await handlers.onEvent({
+      type: 'text_delta',
+      delta: 'API Error: Connection error.',
+      failedRequest: true,
+    })
+    for (const status of ['running', 'completed'] as const)
+      await handlers.onEvent({
+        type: 'hook_run',
+        hookId: 'hook-1',
+        hookEvent: 'StopFailure',
+        status,
+        entries: [],
+      })
     await handlers.onEvent({ type: 'usage', usage: { input_tokens: 0, output_tokens: 0 } })
     await handlers.onEvent({
       type: 'metrics',
@@ -276,4 +311,142 @@ test('only a sleep since the turn last made progress explains its failure', asyn
       },
     },
   )
+})
+
+// What Claude Code sends when a model request fails for good: its retries,
+// then a message of its own naming the error (a made-up id, model
+// <synthetic>, no usage), a StopFailure hook, and an error result.
+function failedRequestFrames(sessionId: string): Record<string, unknown>[] {
+  const noUsage = {
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0,
+  }
+  const retry = (attempt: number) => ({
+    type: 'system',
+    subtype: 'api_retry',
+    attempt,
+    max_retries: 10,
+    retry_delay_ms: 1000,
+    error_status: null,
+    error: 'unknown',
+    session_id: sessionId,
+  })
+  const hook = (subtype: string, extra: Record<string, unknown> = {}) => ({
+    type: 'system',
+    subtype,
+    hook_id: 'hook-1',
+    hook_name: 'StopFailure',
+    hook_event: 'StopFailure',
+    session_id: sessionId,
+    ...extra,
+  })
+  return [
+    retry(1),
+    retry(2),
+    {
+      type: 'assistant',
+      parent_tool_use_id: null,
+      session_id: sessionId,
+      uuid: `${sessionId}-error`,
+      error: 'unknown',
+      message: {
+        id: `${sessionId}-synthetic`,
+        model: '<synthetic>',
+        role: 'assistant',
+        content: [{ type: 'text', text: 'API Error: Connection error.' }],
+        usage: noUsage,
+      },
+    },
+    hook('hook_started'),
+    hook('hook_response', { outcome: 'success', exit_code: 0, stdout: '', stderr: '' }),
+    {
+      type: 'result',
+      subtype: 'success',
+      is_error: true,
+      result: 'API Error: Connection error.',
+      terminal_reason: 'api_error',
+      session_id: sessionId,
+      usage: noUsage,
+    },
+  ]
+}
+
+function reply(sessionId: string, id: string, text: string): Record<string, unknown> {
+  return {
+    type: 'assistant',
+    parent_tool_use_id: null,
+    session_id: sessionId,
+    uuid: `${sessionId}-${id}`,
+    message: {
+      id,
+      model: 'claude-test',
+      role: 'assistant',
+      content: [{ type: 'text', text }],
+      usage: { input_tokens: 10, output_tokens: 5 },
+    },
+  }
+}
+
+test('a native turn whose request failed for good says the computer slept, unless Claude went on after it', async () => {
+  let slept = 0
+  // Each turn's Claude Code session: what it sends, and when the computer
+  // sleeps (a number of minutes between two frames).
+  const sessions: Array<Array<Record<string, unknown> | number>> = []
+  const runtime = new NativeClaudeRuntime()
+  Reflect.set(runtime, 'sdk', {
+    query: async function* () {
+      for (const frame of sessions.shift() ?? []) {
+        if (typeof frame === 'number') slept += frame * MINUTE
+        else yield frame
+      }
+    },
+  })
+  const init = (sessionId: string) => ({ type: 'system', subtype: 'init', session_id: sessionId })
+  try {
+    await withInProcessApp(
+      scriptedRuntime((context, handlers) => runtime.runTurn(context, handlers)),
+      async (app) => {
+        const threadId = await app.startThread()
+        sessions.push([init('s-awake'), ...failedRequestFrames('s-awake')])
+        const awake = await app.turnCompleted(await app.startTurn(threadId, 'awake'))
+        assert.equal(awake.status, 'failed')
+        assert.equal(awake.error.message, 'API Error: Connection error.')
+
+        sessions.push([
+          init('s-late'),
+          reply('s-late', 'msg_working', 'Working.'),
+          25,
+          ...failedRequestFrames('s-late'),
+        ])
+        const late = await app.turnCompleted(await app.startTurn(threadId, 'went on, then slept'))
+        assert.equal(late.status, 'failed')
+        assert.equal(
+          late.error.message,
+          `API Error: Connection error. ${sleepNotice(25 * MINUTE, 'linux')}`,
+        )
+        assert.deepEqual(late.error.codexErrorInfo, awake.error.codexErrorInfo)
+
+        // Claude answered after waking: the sleep did not break the request.
+        sessions.push([
+          init('s-early'),
+          120,
+          reply('s-early', 'msg_back', 'Back at it.'),
+          ...failedRequestFrames('s-early'),
+        ])
+        const early = await app.turnCompleted(await app.startTurn(threadId, 'slept, then went on'))
+        assert.equal(early.status, 'failed')
+        assert.equal(early.error.message, awake.error.message)
+      },
+      {
+        server: {
+          sleepMonitor: { suspendedMs: () => slept, sleptSince: () => slept },
+          platform: 'linux',
+        },
+      },
+    )
+  } finally {
+    await runtime.stop()
+  }
 })

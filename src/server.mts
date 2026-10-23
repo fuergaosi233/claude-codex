@@ -440,18 +440,27 @@ const MAX_TRACKED_COMMAND_ITEMS = 512
 const MAX_QUEUED_ACTIVITY = 64
 
 // What a turn hears that does not show Claude getting on with it: a request
-// it will send again, a notice, an error, and the usage, figures and end of
-// the result that closes it. After a sleep broke its connection, a turn
-// hears only these until it fails. Usage also comes with each message, after
-// the message itself.
+// it will send again, a notice (a model fallback, a compaction that failed),
+// an error, a hook run (a StopFailure hook runs after a request failed), and
+// the usage, figures and end of the result that closes it. After a sleep
+// broke its connection, a turn hears only these, and the events of the
+// message naming the error (failedRequest), until it fails. Usage also comes
+// with each message, after the message itself.
 const NO_PROGRESS_EVENTS: ReadonlySet<RuntimeEvent['type']> = new Set([
   'retrying',
   'notice',
+  'model_rerouted',
+  'compaction_failed',
   'error',
+  'hook_run',
   'usage',
   'metrics',
   'completed',
 ])
+
+function showsProgress(event: RuntimeEvent): boolean {
+  return !NO_PROGRESS_EVENTS.has(event.type) && !('failedRequest' in event && event.failedRequest)
+}
 
 // A hidden goal continuation that does no tool work ends the run of
 // continuations until the user or the goal changes something.
@@ -4885,7 +4894,7 @@ export class CodexClaudeAppServer {
           // projected workflow agent) shows it is moving; the watchdog only
           // gives up after a whole window without any of it.
           noteProgress()
-          if (!NO_PROGRESS_EVENTS.has(event.type))
+          if (showsProgress(event))
             this.sleptAtTurnProgress.set(turn.id, this.sleepMonitor.suspendedMs())
           if (event.type === 'subagent_progress') return
           if (event.type === 'session') {
