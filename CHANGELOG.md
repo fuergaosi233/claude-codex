@@ -846,6 +846,32 @@ versioning or publishing metadata.
   subagent's thread while it runs, instead of not at all, and never in the
   parent. Claude Code reports them as the Agent call's `tool_progress` with
   `subagent_retry` (and none for a background agent).
+- A subagent's thread shows the subagent's own work, not just its prompt and
+  answer: its messages, thinking, and tool calls with their results, as the
+  same command, file change, MCP, web search and image items the parent's
+  calls make, with its todo list as the thread's plan. With the Agent SDK
+  backend the adapter asks Claude Code for the subagent's text and thinking
+  (`forwardSubagentText`) and routes each frame by its agent id, so a nested
+  agent's work lands in its own thread, and its cards land in the launching
+  agent's thread after what that agent said before the call. What an agent
+  says after launching one is a message of its own, also when the launched
+  agent hangs off the parent thread (a CLI without agent ids) or starts
+  between turns, so its answer shows once. The items are stored with the child
+  turn (`thread/read`, `thread/turns/list`, `thread/items/list`, resume,
+  followers), keep the parent's output caps (other long text of a call is
+  cut the same way, a diff at a line within 30,000 bytes), stop at 256 per
+  child turn or once a child turn's items come to 2 MiB (the answer is
+  always kept whole), and a call still open when the child turn ends shows
+  as failed, whichever way it ends: the subagent stops or fails, either
+  thread is interrupted (also when the agent's task cannot be stopped), or
+  the adapter stops or restarts. An image being read when the adapter dies is the exception: it
+  shows as the image, as it does in the parent's own turns. The parent
+  thread is unchanged.
+  `CLAUDE_CODEX_SUBAGENT_ITEMS=0` keeps the previous prompt-and-answer view.
+- Deleting a subagent's thread while the agent runs no longer fails the
+  parent's turn with "FOREIGN KEY constraint failed" when the agent ends, or
+  stops the adapter's shutdown halfway; the agent's end leaves nothing in
+  the deleted thread.
 
 ### Rust-first protocol groundwork
 

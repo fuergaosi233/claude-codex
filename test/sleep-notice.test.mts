@@ -416,9 +416,10 @@ function agentFrame(frame: Record<string, unknown>, call = 'agent-1'): Record<st
 }
 
 // What Claude Code sends once an agent's request failed for good: its
-// retries, the frame that comes after the last one, the failure of its task,
-// and the call's error result (to the main loop, or the agent it is nested
-// in).
+// retries, the frame that comes after the last one, the message naming the
+// error (forwarded with forwardSubagentText, for the agent's thread), the
+// failure of its task, and the call's error result (to the main loop, or the
+// agent it is nested in).
 function agentFailedFrames(
   sessionId: string,
   call = 'agent-1',
@@ -452,6 +453,20 @@ function agentFailedFrames(
     retry(1),
     retry(2),
     progress({}),
+    agentFrame(
+      {
+        type: 'assistant',
+        error: 'unknown',
+        session_id: sessionId,
+        message: {
+          id: `msg_${call}_error`,
+          model: '<synthetic>',
+          role: 'assistant',
+          content: [textBlock('API Error: Connection error.')],
+        },
+      },
+      call,
+    ),
     {
       type: 'system',
       subtype: 'task_updated',

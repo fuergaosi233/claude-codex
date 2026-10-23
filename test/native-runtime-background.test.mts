@@ -1981,6 +1981,188 @@ test("a subagent's own Agent call names the agent that made it, when the CLI doe
   )
 })
 
+// Runs `body` with CLAUDE_CODEX_SUBAGENT_ITEMS set to `value` (unset when
+// undefined).
+async function withSubagentItems<T>(value: string | undefined, body: () => Promise<T>): Promise<T> {
+  const previous = process.env.CLAUDE_CODEX_SUBAGENT_ITEMS
+  if (value === undefined) delete process.env.CLAUDE_CODEX_SUBAGENT_ITEMS
+  else process.env.CLAUDE_CODEX_SUBAGENT_ITEMS = value
+  try {
+    return await body()
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_CODEX_SUBAGENT_ITEMS
+    else process.env.CLAUDE_CODEX_SUBAGENT_ITEMS = previous
+  }
+}
+
+// A runtime whose sessions also record the options they were opened with.
+function optionsRecordingRuntime(): {
+  runtime: NativeClaudeRuntime
+  queries: FakeQuery[]
+  options: Record<string, unknown>[]
+} {
+  const { runtime, queries } = fakeRuntime()
+  const sdk = Reflect.get(runtime, 'sdk') as {
+    query(args: { prompt: AsyncIterable<Record<string, unknown>> }): FakeQuery
+  }
+  const options: Record<string, unknown>[] = []
+  Reflect.set(runtime, 'sdk', {
+    query: (args: {
+      prompt: AsyncIterable<Record<string, unknown>>
+      options: Record<string, unknown>
+    }) => {
+      options.push(args.options)
+      return sdk.query(args)
+    },
+  })
+  return { runtime, queries, options }
+}
+
+const subagentOutputs = (events: Array<RuntimeEvent | RuntimeTaskEvent>) =>
+  events.flatMap((event) =>
+    event.type === 'subagent_output'
+      ? [[event.toolUseId, event.agentId ?? null, event.output]]
+      : [],
+  )
+
+// A turn whose agent thinks, talks, greps, answers through StructuredOutput
+// and launches an agent of its own, which talks too.
+async function runNestedWork(): Promise<{
+  events: RuntimeEvent[]
+  options: Record<string, unknown>
+}> {
+  const { runtime, queries, options } = optionsRecordingRuntime()
+  const events: RuntimeEvent[] = []
+  const turn = runtime.runTurn(context, handlers(events))
+  const query = await waitFor(() => queries[0], 'session')
+  const nested = (block: Record<string, unknown>, agentId = 'task-1', parent = 'agent-1') => ({
+    type: 'assistant',
+    parent_tool_use_id: parent,
+    agent_id: agentId,
+    message: { id: `sub-${agentId}`, content: [block] },
+  })
+  const result = (id: string, content: string, parent: string | null) => ({
+    type: 'user',
+    parent_tool_use_id: parent,
+    ...(parent ? { agent_id: 'task-1' } : {}),
+    message: { content: [{ type: 'tool_result', tool_use_id: id, content }] },
+  })
+  query.push(
+    assistant('m1', [
+      { type: 'tool_use', id: 'agent-1', name: 'Agent', input: { prompt: 'look' } },
+    ]),
+    nested({ type: 'thinking', thinking: 'Plan it.' }),
+    nested(text('Looking.')),
+    nested({ type: 'tool_use', id: 'grep-1', name: 'Grep', input: { pattern: 'x' } }),
+    result('grep-1', 'hit', 'agent-1'),
+    nested({ type: 'tool_use', id: 'answer-1', name: 'StructuredOutput', input: { ok: true } }),
+    nested({ type: 'tool_use', id: 'agent-2', name: 'Agent', input: { prompt: 'deeper' } }),
+    // Claude Code sends the nested agent's frames under its own call.
+    nested(text('Deeper.'), 'task-2', 'agent-2'),
+    result('agent-2', 'deep report', 'agent-1'),
+    result('agent-1', 'report', null),
+    assistant('m2', [text('done')]),
+    { type: 'result', subtype: 'success', result: 'done' },
+  )
+  await turn
+  await runtime.stop()
+  assert.equal(options.length, 1)
+  return { events, options: options[0] ?? {} }
+}
+
+test("a subagent's own work reaches the turn as its output; its Agent calls stay with the tree, marking where its message ends", async () => {
+  const on = await withSubagentItems(undefined, runNestedWork)
+  assert.equal(on.options.forwardSubagentText, true, 'the CLI forwards its text and thinking')
+  assert.deepEqual(subagentOutputs(on.events), [
+    ['agent-1', 'task-1', { type: 'reasoning', text: 'Plan it.' }],
+    ['agent-1', 'task-1', { type: 'text', text: 'Looking.' }],
+    [
+      'agent-1',
+      'task-1',
+      { type: 'tool_use', toolUseId: 'grep-1', toolName: 'Grep', input: { pattern: 'x' } },
+    ],
+    [
+      'agent-1',
+      'task-1',
+      { type: 'tool_result', toolUseId: 'grep-1', content: 'hit', isError: false },
+    ],
+    // Its Agent call only ends what it was saying.
+    ['agent-1', 'task-1', { type: 'agent_call', toolUseId: 'agent-2' }],
+    ['agent-2', 'task-2', { type: 'text', text: 'Deeper.' }],
+  ])
+  const tree = (events: RuntimeEvent[]) =>
+    events.flatMap((event) =>
+      event.type === 'tool_use' || event.type === 'tool_result'
+        ? [[event.type, event.toolUseId]]
+        : event.type === 'text_delta'
+          ? [[event.type, event.delta]]
+          : [],
+    )
+  assert.deepEqual(tree(on.events), [
+    ['tool_use', 'agent-1'],
+    ['tool_use', 'agent-2'],
+    ['tool_result', 'agent-2'],
+    ['tool_result', 'agent-1'],
+    ['text_delta', 'done'],
+  ])
+
+  const off = await withSubagentItems('0', runNestedWork)
+  assert.equal('forwardSubagentText' in off.options, false)
+  assert.deepEqual(subagentOutputs(off.events), [], 'CLAUDE_CODEX_SUBAGENT_ITEMS=0 keeps it out')
+  assert.deepEqual(tree(off.events), tree(on.events))
+})
+
+test("a background subagent's work between turns goes to the listener, not to a turn", async () => {
+  for (const value of [undefined, '0']) {
+    await withSubagentItems(value, async () => {
+      await withSettleMs(40, async () => {
+        const { runtime, queries } = fakeRuntime()
+        const listener = recordingListener()
+        runtime.setBackgroundListener(listener)
+        const first = runtime.runTurn(context, handlers([]))
+        const query = await waitFor(() => queries[0], 'session')
+        query.push(...launchBackgroundAgent('a1'))
+        await first
+        const frame = (type: string, block: Record<string, unknown>) => ({
+          type,
+          parent_tool_use_id: 'agent-use',
+          agent_id: 'a1',
+          message: { id: 'sub', content: [block] },
+        })
+        query.push(
+          frame('assistant', text('Looking.')),
+          frame('assistant', { type: 'tool_use', id: 'grep-1', name: 'Grep', input: {} }),
+          frame('user', { type: 'tool_result', tool_use_id: 'grep-1', content: 'hit' }),
+          frame('assistant', { type: 'tool_use', id: 'agent-2', name: 'Agent', input: {} }),
+        )
+        const expected =
+          value === '0'
+            ? []
+            : [
+                ['agent-use', 'a1', { type: 'text', text: 'Looking.' }],
+                [
+                  'agent-use',
+                  'a1',
+                  { type: 'tool_use', toolUseId: 'grep-1', toolName: 'Grep', input: {} },
+                ],
+                [
+                  'agent-use',
+                  'a1',
+                  { type: 'tool_result', toolUseId: 'grep-1', content: 'hit', isError: false },
+                ],
+                ['agent-use', 'a1', { type: 'agent_call', toolUseId: 'agent-2' }],
+              ]
+        if (expected.length > 0)
+          await waitFor(() => subagentOutputs(listener.tasks).length >= expected.length, 'output')
+        else await sleep(30)
+        assert.deepEqual(subagentOutputs(listener.tasks), expected)
+        assert.deepEqual(listener.autonomous, [], 'its work starts no turn')
+        await runtime.stop()
+      })
+    })
+  }
+})
+
 test('the result reports the context window of the model behind the main loop', async () => {
   const { runtime, queries } = fakeRuntime()
   const events: RuntimeEvent[] = []

@@ -540,6 +540,32 @@ it, and the name stays the same in the thread's history and after the
 adapter restarts. A workflow agent's prompt is the task the workflow
 computed for it, not the user request the workflow relays to every agent.
 
+A subagent's thread shows its work as it goes: what it says and thinks, and
+each tool call with its result, drawn as the chat draws its own calls
+(commands and file reads, searches, edits, MCP tool calls, web searches,
+images), with its todo list as the thread's plan. An agent another agent
+launches shows its work in its own thread, and its agent cards show in the
+launching agent's thread after what that agent said before launching it; what
+the launching agent says next is a message of its own. The work is stored with
+the thread, so it is still there when the thread is reopened, after an adapter
+restart too, and every window following the chat sees it live. None of it
+shows in the parent chat, which keeps its agent cards and the subagent's
+answer. Claude Code hands a subagent's output over a block at a time, so its
+messages appear whole rather than word by word. Outputs are cut as the chat's
+own are, and so is any
+other long text of a call (a command, its arguments); an edit's diff keeps its
+first 30,000 bytes, cut at a line, with a last line saying how many changed
+lines are left out. One run of a subagent shows at most 256 pieces of work,
+and starts none once what it shows comes to 2 MiB; its answer always shows,
+whole and once. A call still running when the subagent's turn ends (stopped, interrupted from
+either thread, failed, or the adapter stopped or restarted) shows as failed,
+also after a reload; an image being read when the adapter died shows as the
+image, as it does in the chat's own turns. Deleting a subagent's thread while it runs drops its work
+and leaves the parent's turn alone. Workflow agents, and subagents on backends
+other than the Agent SDK, show their prompt and answer only. Set
+`CLAUDE_CODEX_SUBAGENT_ITEMS=0` for the adapter to keep every subagent's
+thread to its prompt and answer, as before.
+
 A subagent that fails says why. Its thread's turn fails with the reason Claude
 Code gave, such as an API error or the error its run ended with, without the
 CLI's tags and usage trailer, and the agent's state on the parent's agent
