@@ -179,12 +179,14 @@ export function sleepNotice(
   )
 }
 
-// Codex error codes sleep does not explain: the request was refused for what
-// it said or who sent it, not cut off.
+// Codex error codes sleep does not explain: the API answered the request,
+// refusing it for what it said or who sent it, or as too busy to take it; it
+// was not cut off.
 const NOT_FROM_SLEEP = new Set([
   'contextWindowExceeded',
   'usageLimitExceeded',
   'rateLimitExceeded',
+  'serverOverloaded',
   'badRequest',
   'unauthorized',
   'cyberPolicy',

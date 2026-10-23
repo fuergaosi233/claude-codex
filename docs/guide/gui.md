@@ -120,9 +120,12 @@ adapter's environment takes its place.
 
 Most failed connections on a laptop come from the computer going to sleep
 during a turn, which breaks Claude's connection to the model. When a turn
-fails after the computer slept for a minute or more during it, its error says
-so: roughly how long the computer slept, and that a message, or **Continue**,
-picks up where Claude left off. On macOS it also points to the App's
+fails after the computer slept for a minute or more since Claude last made
+progress in it, its error says so: roughly how long the computer slept, and
+that a message, or **Continue**, picks up where Claude left off. A sleep the
+turn went on from (Claude wrote or ran something after waking) is not blamed,
+and neither is an API that answered, for example as overloaded or over a
+limit. On macOS it also points to the App's
 **Settings > General > Prevent sleep while running**, which does not stop
 sleep with the lid closed (the App does not offer it on Windows). The error keeps its code and details.
 

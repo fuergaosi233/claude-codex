@@ -38,13 +38,14 @@ versioning or publishing metadata.
 
 ### Failures you can see and act on
 
-- A turn that fails after the computer slept for a minute or more during it
-  says so in its error: roughly how long the computer slept, that this broke
-  Claude's connection to the model, and that a message (or Continue) picks up
-  where it left off; on macOS it also points to the App's **Prevent sleep
-  while running** setting. The error code and details are
-  unchanged, and refusals such as usage limits or startup failures are left
-  alone.
+- A turn that fails after the computer slept for a minute or more since
+  Claude last made progress in it says so in its error: roughly how long the
+  computer slept, that this broke Claude's connection to the model, and that a
+  message (or Continue) picks up where it left off; on macOS it also points to
+  the App's **Prevent sleep while running** setting. A sleep the turn went on
+  from is not blamed (API retries, notices and the failing result do not
+  count as going on). The error code and details are unchanged, and refusals
+  such as usage limits, an overloaded API or startup failures are left alone.
 - The subagent watchdog (`CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS`) no longer fails a
   turn over quiet that is not a stall. The wait is paused while the turn waits
   on the user (an approval, a question, an MCP elicitation or a client dynamic

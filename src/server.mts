@@ -439,6 +439,20 @@ const MAX_TRACKED_TASK_IDS = 512
 const MAX_TRACKED_COMMAND_ITEMS = 512
 const MAX_QUEUED_ACTIVITY = 64
 
+// What a turn hears that does not show Claude getting on with it: a request
+// it will send again, a notice, an error, and the usage, figures and end of
+// the result that closes it. After a sleep broke its connection, a turn
+// hears only these until it fails. Usage also comes with each message, after
+// the message itself.
+const NO_PROGRESS_EVENTS: ReadonlySet<RuntimeEvent['type']> = new Set([
+  'retrying',
+  'notice',
+  'error',
+  'usage',
+  'metrics',
+  'completed',
+])
+
 // A hidden goal continuation that does no tool work ends the run of
 // continuations until the user or the goal changes something.
 const GOAL_IDLE_TURN_LIMIT = 1
@@ -685,6 +699,10 @@ export class CodexClaudeAppServer {
   private readonly runtime: ClaudeRuntime
   // Notices that the computer slept, for the turn watchdog and failed turns.
   private readonly sleepMonitor: SleepMonitor
+  // For each running turn, how long the computer had slept in all
+  // (sleepMonitor.suspendedMs()) when Claude last made progress in it: only
+  // a sleep since then can explain the turn's failure.
+  private readonly sleptAtTurnProgress = new Map<string, number>()
   private readonly platform: NodeJS.Platform
   // The CLI notices each recent turn has shown (see turn-notices.mts).
   private readonly turnNotices: TurnNoticeLog
@@ -3405,15 +3423,17 @@ export class CodexClaudeAppServer {
       void this.runRuntimeTurn(peer, thread, turn, prompt, {
         model: thread.model,
         effort: thread.reasoningEffort,
-      }).catch((error) => {
-        if (!this.failTurn(peer, threadId, turn, error)) return
-        recordRunEvent('turn.failed', {
-          threadId,
-          turnId,
-          runtimeBackend: thread.runtimeBackend,
-          error: { message: error.message },
-        })
       })
+        .catch((error) => {
+          if (!this.failTurn(peer, threadId, turn, error)) return
+          recordRunEvent('turn.failed', {
+            threadId,
+            turnId,
+            runtimeBackend: thread.runtimeBackend,
+            error: { message: error.message },
+          })
+        })
+        .finally(() => this.sleptAtTurnProgress.delete(turnId))
     })
     return { turn: responseTurn, reviewThreadId: threadId }
   }
@@ -4020,7 +4040,10 @@ export class CodexClaudeAppServer {
       .catch((error) => {
         this.failTurn(peer, thread.id, turn, error)
       })
-      .finally(() => this.runtimeRuns.delete(turn.id))
+      .finally(() => {
+        this.runtimeRuns.delete(turn.id)
+        this.sleptAtTurnProgress.delete(turn.id)
+      })
   }
 
   private completeWorkflowListTurn(peer: RpcPeer, thread: ThreadRecord, turn: TurnRecord): void {
@@ -4816,6 +4839,7 @@ export class CodexClaudeAppServer {
       : null
     const disarmWatchdog = (): void => watchdog.disarm()
     const noteProgress = (): void => watchdog.noteProgress()
+    this.sleptAtTurnProgress.set(turn.id, this.sleepMonitor.suspendedMs())
     const armWatchdog = (): void => {
       if (!acceptRuntimeEvents || (activeSubagents.size === 0 && !workflowInFlight)) return
       watchdog.arm()
@@ -4861,6 +4885,8 @@ export class CodexClaudeAppServer {
           // projected workflow agent) shows it is moving; the watchdog only
           // gives up after a whole window without any of it.
           noteProgress()
+          if (!NO_PROGRESS_EVENTS.has(event.type))
+            this.sleptAtTurnProgress.set(turn.id, this.sleepMonitor.suspendedMs())
           if (event.type === 'subagent_progress') return
           if (event.type === 'session') {
             this.store.updateClaudeSessionId(thread.id, event.claudeSessionId)
@@ -9871,11 +9897,20 @@ export class CodexClaudeAppServer {
     return true
   }
 
-  // What a failed turn's error leaves out: that the computer slept during
-  // the turn, which is the likely reason a model request broke off, and the
-  // notices Claude reported along the way, whose rows the App does not keep.
+  // What a failed turn's error leaves out: that the computer slept since
+  // Claude last made progress in the turn, which is the likely reason a model
+  // request broke off, and the notices Claude reported along the way, whose
+  // rows the App does not keep. A sleep the turn went on from (it streamed,
+  // ran a tool) did not break it. A turn with no run of its own counts the
+  // sleep since it started.
   private explainTurnError(turn: TurnRecord, error: CodexTurnError): CodexTurnError {
-    const sleptMs = turn.startedAt == null ? 0 : this.sleepMonitor.sleptSince(turn.startedAt * 1000)
+    const sleptAtProgress = this.sleptAtTurnProgress.get(turn.id)
+    const sleptMs =
+      sleptAtProgress !== undefined
+        ? this.sleepMonitor.suspendedMs() - sleptAtProgress
+        : turn.startedAt == null
+          ? 0
+          : this.sleepMonitor.sleptSince(turn.startedAt * 1000)
     const explained = withSleepNotice(error, sleptMs, this.platform)
     if (explained !== error) {
       debugLog('turn.slept', { threadId: turn.threadId, turnId: turn.id, sleptMs })
