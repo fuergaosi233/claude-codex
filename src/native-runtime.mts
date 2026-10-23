@@ -208,11 +208,12 @@ interface PendingTurn {
   // still working (see noteSubagentProgress), on the monotonic clock: a wall
   // clock set back must not hold the reports back for as long.
   progressReportedAtMs: number
-  // Whether that report told of no progress of the agent's work (a failed
-  // request or a heartbeat).
+  // Whether that report told of none of the agent's work (see
+  // subagentFrame).
   progressReportedIdle: boolean
-  // The calls whose agent last told of a request that failed (see
-  // noteSubagentProgress): such a call's result tells of the failure.
+  // The calls whose agent last told of a request that failed, with no work
+  // since (see noteSubagentProgress): such a call's error result tells of
+  // the failure.
   failedSubagentCalls: Set<string>
   // The API error behind the main loop's latest response or retry, null
   // once a response arrives without one.
@@ -2532,13 +2533,11 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   ): Promise<void> {
     const toolUseId = this.progressToolUseId(pending, type, message)
     if (!toolUseId) return
-    // The CLI's timer ticks every 30 s while a call runs, whatever its agent
-    // is doing: one may come while the agent's request keeps failing.
-    const heartbeat = type === 'tool_progress' && message.heartbeat === true
-    const failedRequest = tellsFailedRequest(type, message)
-    if (failedRequest) pending.failedSubagentCalls.add(toolUseId)
-    else if (!heartbeat) pending.failedSubagentCalls.delete(toolUseId)
-    const idle = failedRequest || heartbeat
+    // A failed request marks the call until the agent's work goes on.
+    const frame = this.subagentFrame(pending, type, message)
+    if (frame === 'failedRequest') pending.failedSubagentCalls.add(toolUseId)
+    else if (frame === 'work') pending.failedSubagentCalls.delete(toolUseId)
+    const idle = frame !== 'work'
     const now = performance.now()
     // Only a frame of the agent's work shows the turn went on after a sleep:
     // one is not held back behind a report that told of none.
@@ -2553,9 +2552,56 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     await pending.handlers.onEvent({
       type: 'subagent_progress',
       toolUseId,
-      ...(failedRequest ? { failedRequest } : {}),
-      ...(heartbeat ? { heartbeat } : {}),
+      ...(idle ? { idle } : {}),
     })
+  }
+
+  // What a frame of a call the turn waits on tells of its agent: a request
+  // that failed (a retry, or the message naming the error), nothing of its
+  // work, or its work. Claude Code sends some frames whatever the agent does:
+  // a heartbeat every 30 s while the call runs; after a retry, a frame
+  // without subagent_retry once the agent's next message comes, also when
+  // that message is the error its retries ended on (which it forwards only
+  // with forwardSubagentText); and the update and notification of a task
+  // that failed. A host agent's frame that only hands it the error results
+  // of nested agents whose requests failed tells of no work either.
+  private subagentFrame(
+    pending: PendingTurn,
+    type: string,
+    message: Record<string, unknown>,
+  ): 'failedRequest' | 'idle' | 'work' {
+    if (tellsFailedRequest(type, message)) return 'failedRequest'
+    if (type === 'tool_progress') {
+      // Beyond these, only a command's progress (Bash, PowerShell).
+      const agentCall =
+        message.subagent_type != null || isSubagentTool(String(message.tool_name ?? ''))
+      return message.heartbeat === true || agentCall ? 'idle' : 'work'
+    }
+    if (type === 'system') {
+      const status =
+        message.subtype === 'task_updated'
+          ? recordOrNull(message.patch)?.status
+          : message.subtype === 'task_notification'
+            ? message.status
+            : null
+      return status === 'failed' ? 'idle' : 'work'
+    }
+    if (type === 'user') {
+      const inner = recordOrNull(message.message)
+      const results = (inner ? contentBlocks(inner) : []).filter(
+        (block) => block.type === 'tool_result',
+      )
+      if (
+        results.length > 0 &&
+        results.every(
+          (block) =>
+            block.is_error === true &&
+            pending.failedSubagentCalls.has(String(block.tool_use_id ?? '')),
+        )
+      )
+        return 'idle'
+    }
+    return 'work'
   }
 
   private progressToolUseId(
@@ -3230,7 +3276,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       const isError = Boolean(block.is_error)
       const bodyContent = block.content
       // An agent whose request failed for good ends its call with the error.
-      const failedRequest = pending.failedSubagentCalls.delete(toolUseId)
+      const failedRequest = pending.failedSubagentCalls.delete(toolUseId) && isError
       await pending.handlers.onEvent({
         type: 'tool_result',
         toolUseId,
@@ -3685,9 +3731,10 @@ function tellsFailedRequest(type: string, message: Record<string, unknown>): boo
 // A foreground subagent's model request that failed and will be sent again.
 // The CLI tells it as the Agent call's tool_progress with subagent_retry:
 // parent_tool_use_id is the Agent call (tool_use_id is a made-up
-// `agent_<message id>`) and agent_id the subagent's task. The next such frame
-// without subagent_retry means the request went through. A subagent's retry
-// says nothing about why the main loop might fail.
+// `agent_<message id>`) and agent_id the subagent's task. The frame without
+// subagent_retry that comes after the last retry does not mean the request
+// went through (see subagentFrame). A subagent's retry says nothing about why
+// the main loop might fail.
 function subagentRetryEvent(
   message: Record<string, unknown>,
 ): Extract<RuntimeEvent, { type: 'retrying' }> | null {

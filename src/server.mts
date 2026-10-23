@@ -455,10 +455,11 @@ const MAX_QUEUED_ACTIVITY = 64
 // an error, a hook run (a StopFailure hook runs after a request failed), and
 // the usage, figures and end of the result that closes it. After a sleep
 // broke its connection, a turn hears only these, the events marked
-// failedRequest (the message naming the error; an agent's failed requests,
-// and the result of its call when it ended on one) and the heartbeats of the
-// agent call it waits on, until it fails. Usage also comes with each
-// message, after the message itself.
+// failedRequest (the message naming the error, and the error result of an
+// agent call whose agent's last request failed) and the idle progress of the
+// agent call it waits on (its failed requests, heartbeats and the like),
+// until it fails. Usage also comes with each message, after the message
+// itself.
 const NO_PROGRESS_EVENTS: ReadonlySet<RuntimeEvent['type']> = new Set([
   'retrying',
   'notice',
@@ -474,7 +475,7 @@ const NO_PROGRESS_EVENTS: ReadonlySet<RuntimeEvent['type']> = new Set([
 function showsProgress(event: RuntimeEvent): boolean {
   if (NO_PROGRESS_EVENTS.has(event.type)) return false
   if ('failedRequest' in event && event.failedRequest) return false
-  return !(event.type === 'subagent_progress' && event.heartbeat)
+  return !(event.type === 'subagent_progress' && event.idle)
 }
 
 // A hidden goal continuation that does no tool work ends the run of

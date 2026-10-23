@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { setTimeout as delay } from 'node:timers/promises'
 import { NativeClaudeRuntime } from '../src/native-runtime.mjs'
 import {
   SLEEP_NOTICE_MIN_MS,
@@ -220,7 +221,7 @@ test('only a sleep since the turn last made progress explains its failure', asyn
         category: 'unknown',
         delayMs: 1000,
       })
-    await handlers.onEvent({ type: 'subagent_progress', toolUseId: 'agent', failedRequest: true })
+    await handlers.onEvent({ type: 'subagent_progress', toolUseId: 'agent', idle: true })
     await handlers.onEvent({ type: 'notice', level: 'warning', message: 'Still reconnecting.' })
     await handlers.onEvent({
       type: 'compaction_failed',
@@ -375,27 +376,117 @@ function failedRequestFrames(sessionId: string): Record<string, unknown>[] {
 
 const textBlock = (text: string) => ({ type: 'text', text })
 
-// The main loop's call of an agent, and a frame of that agent's.
-function agentCall(sessionId: string): Record<string, unknown> {
-  return {
-    type: 'assistant',
-    parent_tool_use_id: null,
-    session_id: sessionId,
-    uuid: `${sessionId}-call`,
-    message: {
-      id: 'msg_call',
-      model: 'claude-test',
-      role: 'assistant',
-      content: [
-        { type: 'tool_use', id: 'agent-1', name: 'Agent', input: { prompt: 'check the build' } },
-      ],
-      usage: { input_tokens: 10, output_tokens: 5 },
+// The main loop's call of an agent (or an agent's call of one nested in it),
+// with the task Claude Code starts for it, and a frame of that agent's.
+function agentCall(
+  sessionId: string,
+  call = 'agent-1',
+  parent: string | null = null,
+): Record<string, unknown>[] {
+  return [
+    {
+      type: 'assistant',
+      parent_tool_use_id: parent,
+      session_id: sessionId,
+      uuid: `${sessionId}-${call}`,
+      message: {
+        id: `msg_${call}`,
+        model: 'claude-test',
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', id: call, name: 'Agent', input: { prompt: 'check the build' } },
+        ],
+        usage: { input_tokens: 10, output_tokens: 5 },
+      },
     },
-  }
+    {
+      type: 'system',
+      subtype: 'task_started',
+      task_id: `task-${call}`,
+      tool_use_id: call,
+      task_type: 'local_agent',
+      description: 'check the build',
+      session_id: sessionId,
+    },
+  ]
 }
 
-function agentFrame(frame: Record<string, unknown>): Record<string, unknown> {
-  return { parent_tool_use_id: 'agent-1', agent_id: 'task-1', ...frame }
+function agentFrame(frame: Record<string, unknown>, call = 'agent-1'): Record<string, unknown> {
+  return { parent_tool_use_id: call, agent_id: `task-${call}`, ...frame }
+}
+
+// What Claude Code sends once an agent's request failed for good: its
+// retries, the frame that comes after the last one, the failure of its task,
+// and the call's error result (to the main loop, or the agent it is nested
+// in).
+function agentFailedFrames(
+  sessionId: string,
+  call = 'agent-1',
+  parent: string | null = null,
+): Record<string, unknown>[] {
+  const progress = (extra: Record<string, unknown>) =>
+    agentFrame(
+      {
+        type: 'tool_progress',
+        tool_use_id: `agent_msg_${call}`,
+        tool_name: 'Agent',
+        elapsed_time_seconds: 0,
+        subagent_type: 'general-purpose',
+        session_id: sessionId,
+        ...extra,
+      },
+      call,
+    )
+  const retry = (attempt: number) =>
+    progress({
+      subagent_retry: {
+        agent_id: `task-${call}`,
+        attempt,
+        max_retries: 10,
+        retry_delay_ms: 1000,
+        error_status: null,
+        error_category: 'unknown',
+      },
+    })
+  return [
+    retry(1),
+    retry(2),
+    progress({}),
+    {
+      type: 'system',
+      subtype: 'task_updated',
+      task_id: `task-${call}`,
+      patch: { status: 'failed', end_time: 1, error: 'API Error: Connection error.' },
+      session_id: sessionId,
+    },
+    {
+      type: 'system',
+      subtype: 'task_notification',
+      task_id: `task-${call}`,
+      tool_use_id: call,
+      status: 'failed',
+      summary: 'check the build',
+      output_file: '',
+      session_id: sessionId,
+    },
+    {
+      type: 'user',
+      parent_tool_use_id: parent,
+      session_id: sessionId,
+      uuid: `${sessionId}-${call}-result`,
+      message: {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: call,
+            is_error: true,
+            content: [textBlock('API Error: Connection error.')],
+          },
+        ],
+      },
+    },
+  ]
 }
 
 function reply(sessionId: string, id: string, text: string): Record<string, unknown> {
@@ -417,14 +508,17 @@ function reply(sessionId: string, id: string, text: string): Record<string, unkn
 test('a native turn whose request failed for good says the computer slept, unless Claude went on after it', async () => {
   let slept = 0
   // Each turn's Claude Code session: what it sends, and when the computer
-  // sleeps (a number of minutes between two frames).
+  // sleeps (a number of minutes between two frames). Time goes on during a
+  // sleep, past the interval between two reports of an agent's progress.
   const sessions: Array<Array<Record<string, unknown> | number>> = []
   const runtime = new NativeClaudeRuntime()
   Reflect.set(runtime, 'sdk', {
     query: async function* () {
       for (const frame of sessions.shift() ?? []) {
-        if (typeof frame === 'number') slept += frame * MINUTE
-        else yield frame
+        if (typeof frame === 'number') {
+          slept += frame * MINUTE
+          await delay(300)
+        } else yield frame
       }
     },
   })
@@ -469,7 +563,7 @@ test('a native turn whose request failed for good says the computer slept, unles
         // ends on the error, and the main loop's next request fails too.
         sessions.push([
           init('s-agent'),
-          agentCall('s-agent'),
+          ...agentCall('s-agent'),
           25,
           {
             type: 'tool_progress',
@@ -479,46 +573,57 @@ test('a native turn whose request failed for good says the computer slept, unles
             elapsed_time_seconds: 1530,
             heartbeat: true,
           },
-          agentFrame({
-            type: 'tool_progress',
-            tool_use_id: 'agent_sub_2',
-            tool_name: 'Agent',
-            elapsed_time_seconds: 1530,
-            subagent_retry: { agent_id: 'task-1', attempt: 1, max_retries: 10 },
-          }),
-          agentFrame({
-            type: 'assistant',
-            error: 'unknown',
-            message: {
-              id: 'sub_synthetic',
-              model: '<synthetic>',
-              content: [textBlock('API Error: Connection error.')],
-            },
-          }),
-          {
-            type: 'user',
-            parent_tool_use_id: null,
-            session_id: 's-agent',
-            uuid: 's-agent-result',
-            message: {
-              role: 'user',
-              content: [
-                {
-                  type: 'tool_result',
-                  tool_use_id: 'agent-1',
-                  content: [textBlock('API Error: Connection error.')],
-                },
-              ],
-            },
-          },
+          ...agentFailedFrames('s-agent'),
           ...failedRequestFrames('s-agent'),
         ])
         const agent = await app.turnCompleted(await app.startTurn(threadId, 'an agent slept'))
         assert.equal(agent.status, 'failed')
         assert.equal(
           agent.error.message,
-          `API Error: Connection error. ${sleepNotice(25 * MINUTE, 'linux')}`,
+          `API Error: Connection error. A subagent failed. ${sleepNotice(25 * MINUTE, 'linux')}`,
         )
+
+        // The same, two agents deep: the nested agent's error result is
+        // handed to the agent it is nested in, whose request then fails too.
+        sessions.push([
+          init('s-nested'),
+          ...agentCall('s-nested'),
+          ...agentCall('s-nested', 'agent-2', 'agent-1'),
+          25,
+          ...agentFailedFrames('s-nested', 'agent-2', 'agent-1'),
+          ...agentFailedFrames('s-nested'),
+          ...failedRequestFrames('s-nested'),
+        ])
+        const nested = await app.turnCompleted(await app.startTurn(threadId, 'agents slept'))
+        assert.equal(nested.status, 'failed')
+        assert.equal(
+          nested.error.message,
+          `API Error: Connection error. 2 subagents failed. ${sleepNotice(25 * MINUTE, 'linux')}`,
+        )
+
+        // An agent that answered after waking went on: a later failure is
+        // not the sleep's.
+        sessions.push([
+          init('s-agent-on'),
+          ...agentCall('s-agent-on'),
+          25,
+          agentFrame({
+            type: 'assistant',
+            session_id: 's-agent-on',
+            message: {
+              id: 'sub_work',
+              model: 'claude-test',
+              content: [
+                { type: 'tool_use', id: 'bash-1', name: 'Bash', input: { command: 'make' } },
+              ],
+            },
+          }),
+          ...agentFailedFrames('s-agent-on'),
+          ...failedRequestFrames('s-agent-on'),
+        ])
+        const agentOn = await app.turnCompleted(await app.startTurn(threadId, 'an agent went on'))
+        assert.equal(agentOn.status, 'failed')
+        assert.equal(agentOn.error.message, 'API Error: Connection error. A subagent failed.')
       },
       {
         server: {
