@@ -1613,7 +1613,7 @@ export class CodexClaudeAppServer {
   private threadFork(peer: RpcPeer, params: Record<string, unknown>): unknown {
     const parentId = stringOr(params.threadId, '')
     const parent = this.store.getThread(parentId)
-    if (!parent) throw new Error(`unknown thread: ${parentId}`)
+    if (!parent) throw unknownThread(parentId)
     this.checkModelProfileBinding(parent)
     // A fork from one of the parent's turns keeps the history up to it, and
     // Claude's context with it. The parent's history includes the turns it
@@ -1645,7 +1645,7 @@ export class CodexClaudeAppServer {
     // in its model process profile. A Codex parent's lives in Codex, so its
     // fork may take any profile, as it takes any Claude model without them.
     if (parent.runtimeBackend === 'claude') {
-      assertModelProfileTransition(parent.model, forkModel)
+      invalidRequestIfThrows(() => assertModelProfileTransition(parent.model, forkModel))
     }
     const profileFingerprint = profileFingerprintForModel(forkModel, runtimeBackend)
     const requestedCwd = stringOr(params.cwd, parent.cwd)

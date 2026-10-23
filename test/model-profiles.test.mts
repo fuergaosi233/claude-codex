@@ -409,10 +409,13 @@ test('the App describes a profile thread in a fork on the same profile', async (
     assert.equal(summary?.modelProfileFingerprint, modelProfileFingerprint('main-model'))
 
     // The user's own fork still cannot leave the profile.
+    // The App shows why, as it does for the model menu.
     const userFork = await call('thread/fork', { threadId: parent, model: 'gpt-5.6-luna' })
     assert.match(userFork.error?.message ?? '', /unknown configured Claude model profile/)
+    assert.equal(userFork.error?.code, INVALID_REQUEST)
     const otherProfile = await call('thread/fork', { threadId: parent, model: 'second-model' })
     assert.match(otherProfile.error?.message ?? '', /cannot change model process profile/)
+    assert.equal(otherProfile.error?.code, INVALID_REQUEST)
     const sameProfile = await call('thread/fork', { threadId: parent })
     assert.equal(sameProfile.result.model, 'main-model')
   } finally {

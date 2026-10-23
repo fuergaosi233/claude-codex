@@ -77,7 +77,9 @@ versioning or publishing metadata.
 - Requests the user can correct fail with JSON-RPC `-32600` (invalid request),
   the code Codex uses, instead of `-32000`, with the same messages: an unknown
   thread, turn, section, queued message or process; a bad cursor or parameter;
-  a model the chat cannot take; a rewind or queued start while a turn runs.
+  a model the chat cannot take; a rewind or queued start while a turn runs; a
+  fork from an unknown thread, from a turn its thread does not have or that
+  still runs, or onto another model process profile.
   The model menu's "Couldn't update model settings" toast now gives the
   reason, after the App's own "Check your config.toml." line. Failures inside
   the adapter stay `-32000`.
