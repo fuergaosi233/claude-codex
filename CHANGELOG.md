@@ -74,6 +74,15 @@ versioning or publishing metadata.
   in the place it started, like Codex. A compaction an interrupt cuts short no
   longer reads as "Context compacted" after a reload, and one Claude Code could
   not do leaves no marker; its notice says what happened.
+- An image Claude, or a subagent, was still reading when the adapter died or
+  stopped shows as the failed Read once the adapter is back, instead of as an
+  image it never read: until the image is read, the item is stored as its
+  Read command, which restart recovery fails like any other open call (a
+  `thread/read` during the call shows the running Read). The App still shows
+  the image from the start of the call. An image Read the user declines, or a
+  deny rule refuses, now ends declined, as a declined command does, instead of
+  failed with Claude's refusal as its output; one auto mode's classifier denies
+  is a denied review of that declined Read, instead of a warning.
 - Requests the user can correct fail with JSON-RPC `-32600` (invalid request),
   the code Codex uses, instead of `-32000`, with the same messages: an unknown
   thread, turn, section, queued message or process; a bad cursor or parameter;

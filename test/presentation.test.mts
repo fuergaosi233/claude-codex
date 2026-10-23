@@ -27,6 +27,8 @@ type CapturedMessage = { method?: string; id?: unknown; params?: any; result?: a
 async function present(
   run: (handlers: RuntimeHandlers, turn: { interrupt: () => Promise<void> }) => Promise<void>,
   params: Record<string, unknown> = {},
+  // How the client answers an approval.
+  decision = 'accept',
 ) {
   const directory = await mkdtemp(join(tmpdir(), 'claude-presentation-'))
   const previousHome = process.env.CLAUDE_CODEX_HOME
@@ -63,7 +65,7 @@ async function present(
         const result =
           captured.method === 'item/tool/requestUserInput'
             ? { answers: { choice: { answers: ['Yes'] } } }
-            : { decision: 'accept' }
+            : { decision }
         setImmediate(() => {
           void server.handle(peer, { jsonrpc: '2.0', id: String(captured.id), result })
         })
@@ -796,6 +798,135 @@ test('an image Read asks about and falls back to its Read command', async () => 
   )
   assert.equal(turn.status, 'interrupted')
   assert.deepEqual(replay.items, turn.items)
+})
+
+test('an image Read the user declines ends as its declined Read, as a command does', async () => {
+  const input = { file_path: '/elsewhere/chart.png' }
+  let decision: string | null = null
+  const { messages, turn, replay } = await present(
+    async (handlers) => {
+      await handlers.onEvent({ type: 'tool_use', toolUseId: 'asked', toolName: 'Read', input })
+      decision = (
+        await handlers.onPermissionRequest({
+          type: 'permission_request',
+          requestId: 'perm-asked',
+          toolUseId: 'asked',
+          toolName: 'Read',
+          input,
+        })
+      ).decision
+      // Claude's refusal, which shows nowhere.
+      await handlers.onEvent({
+        type: 'tool_result',
+        toolUseId: 'asked',
+        content: "The user doesn't want to proceed with this tool use.",
+        isError: true,
+      })
+      await handlers.onEvent({ type: 'completed', success: true })
+    },
+    { sandbox: 'workspace-write' },
+    'decline',
+  )
+  assert.equal(decision, 'decline')
+  const started = messages.find(
+    (message) => message.method === 'item/started' && message.params.item.type === 'imageView',
+  )?.params.item
+  assert.deepEqual(started, { type: 'imageView', id: started?.id, path: '/elsewhere/chart.png' })
+  const completed = messages
+    .filter(
+      (message) => message.method === 'item/completed' && message.params.item.id === started.id,
+    )
+    .map((message) => message.params.item)
+  assert.deepEqual(
+    completed.map(({ type, command, status, aggregatedOutput, exitCode }) => ({
+      type,
+      command,
+      status,
+      aggregatedOutput,
+      exitCode,
+    })),
+    [
+      {
+        type: 'commandExecution',
+        command: 'Read /elsewhere/chart.png',
+        status: 'declined',
+        aggregatedOutput: null,
+        exitCode: null,
+      },
+    ],
+  )
+  assert.equal(turn.status, 'completed')
+  assert.deepEqual(replay.items, turn.items)
+  assert.deepEqual(
+    turn.items.find((item) => item.id === started.id),
+    completed[0],
+  )
+})
+
+test('an image Read the auto-mode classifier denies is a denied review of its declined Read', async () => {
+  const { messages, turn, replay } = await present(
+    emit([
+      {
+        type: 'tool_use',
+        toolUseId: 'denied',
+        toolName: 'Read',
+        input: { file_path: '/elsewhere/key.png' },
+      },
+      {
+        type: 'tool_denied',
+        toolUseId: 'denied',
+        toolName: 'Read',
+        autoReview: { rationale: 'The image is outside the project.' },
+      },
+      {
+        type: 'tool_result',
+        toolUseId: 'denied',
+        content: 'Permission to use Read has been denied.',
+        isError: true,
+      },
+      { type: 'completed', success: true },
+    ]),
+  )
+  const started = messages.find(
+    (message) => message.method === 'item/started' && message.params.item.type === 'imageView',
+  )?.params.item
+  assert.ok(started)
+  const ended = messages
+    .filter(
+      (message) => message.method === 'item/completed' && message.params.item.id === started.id,
+    )
+    .map((message) => message.params.item)
+  assert.equal(ended.length, 1)
+  const [read] = ended
+  assert.equal(read.type, 'commandExecution')
+  assert.equal(read.command, 'Read /elsewhere/key.png')
+  assert.equal(read.status, 'declined')
+  const reviewed = messages.find(
+    (message) => message.method === 'item/autoApprovalReview/completed',
+  )?.params
+  assert.ok(reviewed, 'the denial is a review of the Read')
+  assert.equal(reviewed.targetItemId, started.id)
+  assert.deepEqual(reviewed.review, {
+    status: 'denied',
+    riskLevel: null,
+    userAuthorization: null,
+    rationale: 'The image is outside the project.',
+  })
+  assert.deepEqual(reviewed.action, {
+    type: 'command',
+    source: 'shell',
+    command: 'Read /elsewhere/key.png',
+    cwd: read.cwd,
+  })
+  assert.equal(
+    messages.some((message) => message.method === 'warning'),
+    false,
+  )
+  assert.deepEqual(replay.items, turn.items)
+  assert.deepEqual(
+    turn.items.find((item) => item.id === started.id),
+    read,
+  )
 })
 
 test('subagent results keep only the report, in both CLI trailer formats', () => {

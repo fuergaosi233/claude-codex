@@ -1003,9 +1003,32 @@ test("deleting a subagent's thread mid-call lets go of its work; the agent's end
   }
 })
 
-test('an adapter that dies mid-call leaves no call of a subagent running once it is back', async () => {
+test('an adapter that dies mid-call leaves no call running once it is back, nor an image it never read', async () => {
+  const image = [
+    { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0K' } },
+  ]
+  // A Read call, of the parent's or a subagent's.
+  const read = (toolUseId: string, path: string) => ({
+    type: 'tool_use' as const,
+    toolUseId,
+    toolName: 'Read',
+    input: { file_path: path },
+  })
   const script: Script = async (context, handlers, tools) => {
+    // The parent reads two images too, one of them to the end.
+    await handlers.onEvent(read('parent-seen', 'parent-seen.png'))
+    await handlers.onEvent({ type: 'tool_result', toolUseId: 'parent-seen', content: image })
+    await handlers.onEvent(read('parent-shot', 'parent-shot.png'))
     await startAgent(context, handlers, tools, 'agent-fg', 'fg-task', 'look')
+    await handlers.onEvent(out('agent-fg', read('fg-seen', 'fg-seen.png')))
+    await handlers.onEvent(
+      out('agent-fg', {
+        type: 'tool_result',
+        toolUseId: 'fg-seen',
+        content: image,
+        isError: false,
+      }),
+    )
     await handlers.onEvent(
       out('agent-fg', {
         type: 'tool_use',
@@ -1014,6 +1037,7 @@ test('an adapter that dies mid-call leaves no call of a subagent running once it
         input: { command: 'sleep 600' },
       }),
     )
+    await handlers.onEvent(out('agent-fg', read('fg-shot', 'fg-shot.png')))
     await startAgent(context, handlers, tools, 'agent-bg', 'bg-task', 'watch', {
       background: true,
     })
@@ -1030,37 +1054,78 @@ test('an adapter that dies mid-call leaves no call of a subagent running once it
         'bg-task',
       ),
     )
+    await handlers.onEvent(out('agent-bg', read('bg-shot', 'bg-shot.png'), 'bg-task'))
     await new Promise(() => {})
   }
-  await withServer(script, async ({ startThread, startTurn, waitFor, request, crash }) => {
-    const threadId = await startThread()
-    await startTurn(threadId, 'die mid-call')
-    const looking = await waitFor(
-      (message) => message.method === 'item/started' && message.params.item.command === 'sleep 600',
-      'the foreground command',
-    )
-    const watching = await waitFor(
-      (message) => message.method === 'item/started' && message.params.item.type === 'mcpToolCall',
-      'the background call',
-    )
-    await crash()
-    for (const started of [looking, watching]) {
-      const { thread } = await request('thread/read', {
-        threadId: started.params.threadId,
-        includeTurns: true,
-      })
+  await withServer(
+    script,
+    async ({ startThread, startTurn, waitFor, request, crash, messages }) => {
+      const threadId = await startThread()
+      await startTurn(threadId, 'die mid-call')
+      const looking = await waitFor(
+        (message) =>
+          message.method === 'item/started' && message.params.item.command === 'sleep 600',
+        'the foreground command',
+      )
+      const watching = await waitFor(
+        (message) =>
+          message.method === 'item/started' && message.params.item.type === 'mcpToolCall',
+        'the background call',
+      )
+      const imageRead = (name: string) =>
+        waitFor(
+          (message) =>
+            message.method === 'item/started' &&
+            message.params.item.type === 'imageView' &&
+            message.params.item.path.endsWith(`/${name}`),
+          name,
+        )
+      // Every image Read shows as its image from the start.
+      const shots = await Promise.all(
+        ['parent-shot.png', 'fg-shot.png', 'bg-shot.png'].map(imageRead),
+      )
+      const seen = await Promise.all(['parent-seen.png', 'fg-seen.png'].map(imageRead))
       assert.deepEqual(
-        thread.turns.map((turn: any) => turn.status),
-        ['interrupted'],
+        seen.map((started) =>
+          completedIn(messages, started.params.threadId).find(
+            (item) => item.id === started.params.item.id,
+          ),
+        ),
+        seen.map((started) => started.params.item),
       )
-      const call = thread.turns[0].items.find((item: any) => item.id === started.params.item.id)
-      assert.equal(call?.status, 'failed')
-      assert.equal(
-        thread.turns[0].items.some((item: any) => item.status === 'inProgress'),
-        false,
-      )
-    }
-  })
+      await crash()
+      const readBack = async (started: any) => {
+        const { thread } = await request('thread/read', {
+          threadId: started.params.threadId,
+          includeTurns: true,
+        })
+        assert.deepEqual(
+          thread.turns.map((turn: any) => turn.status),
+          ['interrupted'],
+        )
+        assert.equal(
+          thread.turns[0].items.some((item: any) => item.status === 'inProgress'),
+          false,
+        )
+        return thread.turns[0].items.find((item: any) => item.id === started.params.item.id)
+      }
+      for (const started of [looking, watching]) {
+        const call = await readBack(started)
+        assert.equal(call?.status, 'failed')
+      }
+      // An image it never read is the Read that failed, not an image; one it
+      // read stays the image.
+      for (const started of shots) {
+        const call = await readBack(started)
+        const name = started.params.item.path.split('/').at(-1)
+        assert.deepEqual(
+          { type: call?.type, command: call?.command, status: call?.status },
+          { type: 'commandExecution', command: `Read ${name}`, status: 'failed' },
+        )
+      }
+      for (const started of seen) assert.deepEqual(await readBack(started), started.params.item)
+    },
+  )
 })
 
 test('child turns that end without finishing here leave no call open', () => {

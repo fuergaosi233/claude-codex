@@ -84,8 +84,10 @@ interface OpenTool {
   itemId: string
   startedAtMs: number
   explore: boolean
-  // A failed image Read shows as this Read command instead.
-  imageFallback: ThreadItem | null
+  // The image an image Read shows from its start. It is stored as its Read
+  // command until it reads the image, so it fails as that command however
+  // it ends without reading it, a crash of the adapter included.
+  image: ThreadItem | null
 }
 
 interface ChildTurnState {
@@ -234,7 +236,8 @@ export class SubagentItems {
   }
 
   // `stored` is the item as the deltas that follow leave it, so that a
-  // block that arrives whole is written once.
+  // block that arrives whole is written once, or, for an image Read, the
+  // Read command it is until the image shows.
   private startItem(
     peer: RpcPeer,
     state: ChildTurnState,
@@ -371,20 +374,24 @@ export class SubagentItems {
     if (!this.reserve(state)) return
     const options = { mcpServers: state.target.mcpServers ?? [] }
     const item = capToolItem(this.host.toolItem(event, state.target.cwd, options))
-    const imageFallback =
-      item.type === 'imageView'
-        ? capToolItem({
-            ...this.host.toolItem(event, state.target.cwd, { imageView: false }),
-            id: item.id,
-          })
-        : null
+    const image = item.type === 'imageView' ? item : null
     state.tools.set(output.toolUseId, {
       itemId: item.id,
       startedAtMs: nowMillis(),
       explore: isExploreTool(output.toolName),
-      imageFallback,
+      image,
     })
-    this.startItem(peer, state, item)
+    this.startItem(
+      peer,
+      state,
+      item,
+      image
+        ? capToolItem({
+            ...this.host.toolItem(event, state.target.cwd, { imageView: false }),
+            id: item.id,
+          })
+        : item,
+    )
     if (item.type === 'fileChange')
       this.emit(peer, state, 'item/fileChange/patchUpdated', {
         itemId: item.id,
@@ -413,6 +420,8 @@ export class SubagentItems {
         : ''
     const exitCode = parseExitCodeFromResult(content) ?? (isError ? 1 : 0)
     const item = this.updateItem(state, tool.itemId, (current) => {
+      // The image read shows, as it did from the start.
+      if (tool.image && !isError) return tool.image
       if (current.type === 'commandExecution')
         return {
           ...current,
@@ -421,8 +430,6 @@ export class SubagentItems {
           exitCode,
           durationMs,
         }
-      if (current.type === 'imageView' && isError)
-        return failedImageRead(tool, commandOutput, exitCode, durationMs) ?? current
       if (current.type === 'fileChange')
         return { ...current, status: isError ? 'failed' : 'completed' }
       if (current.type === 'mcpToolCall')
@@ -436,7 +443,7 @@ export class SubagentItems {
       return current
     })
     // A failed image Read's output arrives with its completed item.
-    if (item?.type === 'commandExecution' && commandOutput && !tool.imageFallback)
+    if (item?.type === 'commandExecution' && commandOutput && !tool.image)
       this.emit(peer, state, 'item/commandExecution/outputDelta', {
         itemId: tool.itemId,
         delta: commandOutput,
@@ -450,8 +457,6 @@ export class SubagentItems {
     const durationMs = Math.max(0, nowMillis() - tool.startedAtMs)
     const item = this.updateItem(state, tool.itemId, (current) => {
       if (current.type === 'commandExecution') return { ...current, status: 'failed', durationMs }
-      if (current.type === 'imageView')
-        return failedImageRead(tool, null, null, durationMs) ?? current
       if (current.type === 'fileChange') return { ...current, status: 'failed' }
       if (current.type === 'mcpToolCall')
         return { ...current, status: 'failed', error: { message: failure }, durationMs }
@@ -459,17 +464,6 @@ export class SubagentItems {
     })
     this.completeItem(peer, state, item)
   }
-}
-
-function failedImageRead(
-  tool: OpenTool,
-  output: string | null,
-  exitCode: number | null,
-  durationMs: number,
-): ThreadItem | null {
-  const fallback = tool.imageFallback
-  if (fallback?.type !== 'commandExecution') return null
-  return { ...fallback, status: 'failed', aggregatedOutput: output, exitCode, durationMs }
 }
 
 // An MCP result as the parent's items carry it, unless it is too big to keep
