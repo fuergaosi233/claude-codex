@@ -1679,14 +1679,15 @@ test('a fork from a turn keeps the turns up to it, and Claude resumes there', as
       `resumed mock-${parent} at ${turns[1]}-entry after 0 resets`,
     )
 
-    // A fork of a fork from before its own first turn branches where it did.
+    // A fork of a fork from before its own first turn branches where it did,
+    // with the turn it inherited.
     const [early] = forks
     const [own] = ids(await server.request('thread/turns/list', { threadId: early }))
     const { thread: inner } = await server.request('thread/fork', {
       threadId: early,
       beforeTurnId: own,
     })
-    assert.deepEqual(inner.turns, [])
+    assert.deepEqual(ids({ data: inner.turns }), turns.slice(0, 1))
     const innerCheck = await server.runTurn(inner.id, 'rewind check')
     assert.equal(
       await server.reply(inner.id, innerCheck),

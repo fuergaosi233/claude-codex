@@ -194,6 +194,29 @@ creates. Listing chats never runs git; switching branches by hand shows after
 the chat's next turn. Chats from before this version get their branch when
 they are next opened.
 
+## Forks and rewinds
+
+A forked chat shows the conversation it was forked with, then its own
+messages, as a Codex fork does: when it opens, after the adapter restarts,
+when the App pages its history and in Find. Like Codex, the adapter keeps a
+copy of those turns with the fork, under the same turn and item ids, so
+rewinding or deleting the original chat leaves the fork as it was. Forking a
+fork carries the whole conversation along, and forking from one of its
+earlier messages works on the inherited ones too. Claude's context follows
+the same cut: the fork remembers what it shows and nothing after it.
+
+Rewinding a fork (editing an earlier message, or **Fork from here** on a
+message before the fork point) can reach back into the inherited
+conversation: those turns go from the fork only, and Claude resumes after the
+newest one left, or in a new session when none is left.
+
+Forks made by an earlier adapter version showed only their own messages. Such
+a fork gets its inherited conversation the first time it is opened, when the
+adapter can tell exactly where it branched off; when it cannot (the original
+chat was rewound past that point or deleted, or its turns predate Claude
+checkpoints) the fork keeps showing only its own messages. Side chats and the
+other temporary forks the App makes are not kept, as in Codex.
+
 ## How tool calls show
 
 Claude's tool calls show as the items Codex uses for its own:
@@ -317,6 +340,20 @@ reads for that message, so Claude follows it without first looking for the
 file. That covers the skills in your Claude Code and project `.claude/skills`
 folders and the App's own skills Claude can run, up to 64 KiB per skill;
 Claude reads any other skill file itself. Your message shows only the chip.
+
+The `/` popup also lists the commands Claude Code finds for a folder beyond
+its own: your and the project's `.claude/commands`, the commands and skills of
+your Claude Code plugins (`plugin:name`) and the prompts of MCP servers. They
+show as "Local file" skills and run as slash commands, with the rest of your
+message as their arguments. Claude Code reports them when a chat's turn
+starts, so a folder no Claude chat has worked in yet lists them after its
+first turn, and a command added later appears once the next turn starts in
+that folder. A Claude CLI started with its setting sources turned off (see
+`CLAUDE_CODEX_CLAUDE_CONFIG_DIR` in
+[Configuration](/guide/configuration#reference-table)) finds no user,
+project or plugin commands, so none are listed. Commands named like one of
+the App's own (`/init`, `/compact`, …) are left out, and Claude Code's plain
+built-ins such as `/cost` are not listed.
 
 Context the App attaches to a message without showing it, such as the follow-up
 after you connect a suggested plugin, reaches Claude after the message, marked
@@ -543,6 +580,27 @@ setting decides there.
 
 With or without `CLAUDE_CODEX_MEMORIES`, the adapter refuses `memory/reset`
 rather than delete Claude Code's notes.
+
+## MCP servers and other settings
+
+**Settings > MCP servers** works for Claude chats. A server you add, edit or
+switch off there is saved by the adapter (in its own config, not in
+`config.toml`) and used by Claude chats from their next turn; Claude can call
+its tools, and the App lists the server with its tools. A server without a
+command or URL is refused with an error. The App's own desktop servers, which
+it writes there for its Codex chats each time it starts, are not kept.
+`CLAUDE_CODEX_APP_MCP_SERVERS=0` leaves these servers out, and the App then
+says its MCP settings are unavailable. Servers from the Codex and Claude Code
+configs and from `CLAUDE_CODEX_MCP_SERVERS` are listed apart from the ones you
+added; see [MCP, tools & directories](/guide/configuration#mcp-tools-directories).
+
+**Settings > Configuration** shows what Claude chats do. Network access shows
+on, as Claude chats have no network sandbox, and turning it off, or picking a
+verbosity, says "Couldn't update this setting", since Claude models have
+neither setting. Web search off takes Claude's WebSearch tool away; the other
+search modes keep it. The approval policy and sandbox mode are saved and apply
+to the chats you start. The full list is under
+[App settings](/guide/configuration#app-settings).
 
 ## App tools
 
