@@ -81,6 +81,7 @@ import { resolveClaudeModelProcess } from './model-profiles.mjs'
 import { echoedUuids, TurnInput, type TurnInputMessage } from './native-turn-input.mjs'
 import { appliedPermissionUpdates, permissionSuggestions } from './permission-suggestions.mjs'
 import { sdkHooks } from './sdk-hooks.mjs'
+import { subagentItemsEnabled } from './subagent-items.mjs'
 import { readTaskResult } from './task-output.mjs'
 import { ToolInputPreviews } from './tool-input-preview.mjs'
 import type {
@@ -103,6 +104,7 @@ import type {
   RuntimeTaskUsage,
   RuntimeTurnContext,
   RuntimeTurnSettings,
+  SubagentOutputEvent,
   UserInputAnswers,
   UserInputQuestion,
 } from './types.mjs'
@@ -850,6 +852,9 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       includeHookEvents: true,
       cwd: context.cwd,
     }
+    // A subagent's own text and thinking come through as well as its tool
+    // calls, for its child thread.
+    if (subagentItemsEnabled()) opts.forwardSubagentText = true
     // With model process profiles configured, every Claude turn runs in its
     // profile's process: its own executable, provider env and config dir.
     const modelProcess = resolveClaudeModelProcess(
@@ -1818,6 +1823,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (result) for (const uuid of echoedUuids(message)) this.acceptSteer(session, uuid)
     if (session.sink?.turn) {
       if (result) this.endSinkTurn(session, message)
+      else await this.forwardIdleSubagentOutput(session, type, message)
     } else if (session.current) {
       await this.deliver(session, session.current, message)
       if (session.current?.resolved) this.detach(session, session.current)
@@ -1836,6 +1842,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         session.autonomousRequested = true
         this.listener?.onAutonomousTurn(session.threadId)
       }
+    } else {
+      await this.forwardIdleSubagentOutput(session, type, message)
     }
     if (result) {
       session.cliRunning = false
@@ -1843,6 +1851,22 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         for (const uuid of echoedUuids(message)) session.openCommands.delete(uuid)
     }
     this.maybeRelease(session)
+  }
+
+  // A background subagent's own work while no turn of the thread runs goes
+  // to its child thread through the listener, as its task events do.
+  private async forwardIdleSubagentOutput(
+    session: LiveSession,
+    type: string,
+    message: Record<string, unknown>,
+  ): Promise<void> {
+    const listener = session.reusable ? this.listener : null
+    if (!listener || !message.parent_tool_use_id || !subagentItemsEnabled()) return
+    const events = subagentOutputEvents(type, message, {
+      skipTool: (name) => drawnElsewhere(name, null),
+      skipResult: () => false,
+    })
+    for (const event of events) await listener.onTaskEvent(session.threadId, event)
   }
 
   // Between turns, only Claude's own top-level output means it started a
@@ -2431,6 +2455,15 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         await pending.handlers.onEvent({ type: 'checkpoint', claudeSessionId, messageUuid })
     }
     await this.noteSubagentProgress(pending, type, message)
+    // A subagent's own work, for its child thread. Its Agent calls and their
+    // results go on below to the subagent tree.
+    if (message.parent_tool_use_id && subagentItemsEnabled()) {
+      const events = subagentOutputEvents(type, message, {
+        skipTool: (name) => drawnElsewhere(name, pending.context),
+        skipResult: (toolUseId) => pending.activeSubagents.has(toolUseId),
+      })
+      for (const event of events) await pending.handlers.onEvent(event)
+    }
     switch (type) {
       case 'system':
         await this.handleSystem(pending, message)
@@ -3687,6 +3720,64 @@ function workflowTaskToolUseId(taskId: string): string {
 
 function workflowAgentToolUseId(taskId: string, agentId: string): string {
   return `workflow-agent:${taskId}:${agentId}`
+}
+
+// What a subagent's own frame (an assistant or user message of its
+// transcript) shows in its child thread: its text, thinking, tool calls and
+// their results. Its Agent calls are not among them: those launch agents of
+// their own.
+function subagentOutputEvents(
+  type: string,
+  message: Record<string, unknown>,
+  filter: { skipTool(name: string): boolean; skipResult(toolUseId: string): boolean },
+): SubagentOutputEvent[] {
+  const toolUseId = stringOrNull(message.parent_tool_use_id)
+  if (!toolUseId || (type !== 'assistant' && type !== 'user')) return []
+  const agentId = stringOrNull(message.agent_id)
+  const inner = recordOrNull(message.message)
+  const content: unknown[] = Array.isArray(inner?.content) ? inner.content : []
+  const events: SubagentOutputEvent[] = []
+  const push = (output: SubagentOutputEvent['output']): void => {
+    events.push({ type: 'subagent_output', toolUseId, ...(agentId ? { agentId } : {}), output })
+  }
+  for (const entry of content) {
+    const block = recordOrNull(entry)
+    if (!block) continue
+    const blockType = String(block.type ?? '')
+    if (type === 'assistant' && blockType === 'text') {
+      push({ type: 'text', text: String(block.text ?? '') })
+    } else if (type === 'assistant' && blockType === 'thinking') {
+      push({ type: 'reasoning', text: String(block.thinking ?? '') })
+    } else if (type === 'assistant' && blockType === 'tool_use') {
+      const id = String(block.id ?? '')
+      const name = String(block.name ?? '')
+      if (!id || isSubagentTool(name) || filter.skipTool(name)) continue
+      push({
+        type: 'tool_use',
+        toolUseId: id,
+        toolName: name,
+        input: recordOrNull(block.input) ?? {},
+      })
+    } else if (type === 'user' && blockType === 'tool_result') {
+      const id = String(block.tool_use_id ?? '')
+      if (!id || filter.skipResult(id)) continue
+      push({
+        type: 'tool_result',
+        toolUseId: id,
+        content: block.content,
+        isError: Boolean(block.is_error),
+      })
+    }
+  }
+  return events
+}
+
+// Calls the server shows in a surface of their own (the question card, a
+// dynamic tool call), or that are no call at all (StructuredOutput carries a
+// turn's answer), as the main loop's are.
+function drawnElsewhere(name: string, context: RuntimeTurnContext | null): boolean {
+  if (name === 'StructuredOutput' || name === 'AskUserQuestion') return true
+  return context ? dynamicToolNames(context).has(name) : false
 }
 
 // Claude's own top-level response output (not a running task's).

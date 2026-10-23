@@ -1,5 +1,6 @@
 import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { subagentItemsEnabled } from './subagent-items.mjs'
 import type {
   ClaudePermissionUpdate,
   ClaudeRuntime,
@@ -11,6 +12,7 @@ import type {
   RuntimeSteerOptions,
   RuntimeTurnContext,
   RuntimeTurnSettings,
+  SubagentOutput,
 } from './types.mjs'
 import { sleep } from './util.mjs'
 
@@ -1591,6 +1593,72 @@ export class MockRuntime implements ClaudeRuntime {
       })
       await handlers.onEvent({ type: 'text_delta', delta: 'nested agents reported' })
       await handlers.onEvent({ type: 'completed', success: true, result: 'nested agents reported' })
+      return
+    }
+
+    if (/subagent items check/i.test(context.prompt)) {
+      // An agent thinks, says what it will do, reads a file and runs a
+      // command, then answers: its own work, which the native runtime
+      // forwards unless CLAUDE_CODEX_SUBAGENT_ITEMS=0.
+      const agentUseId = `task-items-${Date.now()}`
+      const taskId = 'mock-items-task'
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId: agentUseId,
+        toolName: 'Agent',
+        input: { description: 'mock working agent', prompt: 'look at the repo' },
+      })
+      await this.listener?.onTaskEvent(context.threadId, {
+        type: 'task_started',
+        taskId,
+        toolUseId: agentUseId,
+        taskType: 'local_agent',
+        description: 'mock working agent',
+        subagentType: null,
+        prompt: 'look at the repo',
+        backgrounded: false,
+      })
+      const answer = 'The repo has a README.'
+      const outputs: SubagentOutput[] = [
+        { type: 'reasoning', text: 'The README says what the repo is.' },
+        { type: 'text', text: 'I will read the README.' },
+        {
+          type: 'tool_use',
+          toolUseId: 'mock-items-read',
+          toolName: 'Read',
+          input: { file_path: 'README.md' },
+        },
+        {
+          type: 'tool_result',
+          toolUseId: 'mock-items-read',
+          content: '# Mock repo',
+          isError: false,
+        },
+        {
+          type: 'tool_use',
+          toolUseId: 'mock-items-bash',
+          toolName: 'Bash',
+          input: { command: 'git status --short' },
+        },
+        {
+          type: 'tool_result',
+          toolUseId: 'mock-items-bash',
+          content: ' M README.md',
+          isError: false,
+        },
+        { type: 'text', text: answer },
+      ]
+      if (subagentItemsEnabled())
+        for (const output of outputs)
+          await handlers.onEvent({
+            type: 'subagent_output',
+            toolUseId: agentUseId,
+            agentId: taskId,
+            output,
+          })
+      await handlers.onEvent({ type: 'tool_result', toolUseId: agentUseId, content: answer })
+      await handlers.onEvent({ type: 'text_delta', delta: 'the agent reported' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'the agent reported' })
       return
     }
 

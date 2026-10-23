@@ -666,6 +666,21 @@ export interface ClaudeCheckpoint {
 // checkpoint, or 'new' for a new session that remembers nothing.
 export type ClaudeResumePoint = ClaudeCheckpoint | 'new'
 
+// One piece of a subagent's work, as Claude Code forwards it from the
+// subagent's transcript: complete blocks, never streamed deltas.
+export type SubagentOutput =
+  | { type: 'text'; text: string }
+  | { type: 'reasoning'; text: string }
+  | { type: 'tool_use'; toolUseId: string; toolName: string; input: Record<string, unknown> }
+  | { type: 'tool_result'; toolUseId: string; content: unknown; isError: boolean }
+
+export interface SubagentOutputEvent {
+  type: 'subagent_output'
+  toolUseId: string
+  agentId?: string
+  output: SubagentOutput
+}
+
 export type RuntimeEvent =
   | { type: 'session'; claudeSessionId: string }
   // Claude wrote a top-level transcript entry; the newest one of a turn is
@@ -784,6 +799,12 @@ export type RuntimeEvent =
   // backend that filters nested events would otherwise keep to itself.
   // `toolUseId` is the call that started it.
   | { type: 'subagent_progress'; toolUseId: string }
+  // A subagent's own work: its text, thinking, tool calls and their results.
+  // `toolUseId` is the Agent call the frame came under and `agentId` the task
+  // id of the agent that wrote it, when the CLI reports it (a nested agent's
+  // frames may come under its host's call, naming the nested agent). The
+  // server shows it in that agent's own thread.
+  | SubagentOutputEvent
   | {
       type: 'metrics'
       durationMs: number | null
@@ -1016,6 +1037,9 @@ export type RuntimeTaskEvent =
       toolUseId: string
       delta: string
     }
+  // A background subagent's own work while no turn of its thread runs (the
+  // same event reaches a running turn's handlers instead).
+  | SubagentOutputEvent
 
 export interface RuntimeBackgroundListener {
   onTaskEvent(threadId: string, event: RuntimeTaskEvent): Promise<void> | void

@@ -193,6 +193,12 @@ import {
 } from './server-helpers.mjs'
 import { PINNED_SECTION_ID, type SessionStore, settledTurn } from './store.mjs'
 import {
+  SUBAGENT_CALL_UNFINISHED,
+  SubagentItems,
+  type SubagentItemsTarget,
+  subagentItemsEnabled,
+} from './subagent-items.mjs'
+import {
   clipText,
   collapseWhitespace,
   SUBAGENT_STOPPED_BY_USER,
@@ -254,6 +260,7 @@ import type {
   RuntimeTaskUsage,
   RuntimeTurnContext,
   RuntimeTurnSettings,
+  SubagentOutputEvent,
   ThreadAttachmentRecord,
   ThreadGoal,
   ThreadItem,
@@ -615,6 +622,8 @@ export class CodexClaudeAppServer {
   private goalToolHandlers = new Map<string, GoalToolHandlers>()
   // Chats a thread started with the leader tools, and the waits on them.
   private readonly leaderThreads: LeaderThreads
+  // Subagents' own work, shown in their child threads.
+  private readonly subagentItems: SubagentItems
   private elicitationCounts = new Map<string, number>()
   private tokenUsageByThread = new Map<string, TokenUsageBreakdown>()
   // Like Codex's last_token_usage, `last` is one API call: the main loop's
@@ -667,6 +676,12 @@ export class CodexClaudeAppServer {
       activeTurnId: (threadId) => this.activeTurnByThread.get(threadId) ?? null,
       startThread: (leader, options) => this.startLeaderThread(leader, options),
       sendInput: (threadId, text) => this.sendLeaderInput(threadId, text),
+    })
+    this.subagentItems = new SubagentItems({
+      store,
+      notify: (peer, notification) => this.notify(peer, notification),
+      toolItem: (event, cwd, options) => this.toolUseToItem(event, cwd, options),
+      reasoningVisible: () => reasoningSummariesVisible(this.configOverrides),
     })
     this.loadPersistedConfig()
     // A CLI reported a different set of built-in commands: the App refetches
@@ -4785,6 +4800,10 @@ export class CodexClaudeAppServer {
           // gives up after a whole window without any of it.
           noteProgress()
           if (event.type === 'subagent_progress') return
+          if (event.type === 'subagent_output') {
+            this.showSubagentOutput(peer, thread, subagentContexts, event, toolItemOptions)
+            return
+          }
           if (event.type === 'session') {
             this.store.updateClaudeSessionId(thread.id, event.claudeSessionId)
             if (resumeSessionAt) {
@@ -6097,6 +6116,57 @@ export class CodexClaudeAppServer {
     })
   }
 
+  // The child's last message: what the subagent answered, or why it ended.
+  private appendSubagentAnswer(
+    peer: RpcPeer,
+    context: SubagentContext,
+    childTurnId: string,
+    resultText: string,
+  ): void {
+    const agentItemId = newId()
+    const startedItem: ThreadItem = {
+      type: 'agentMessage',
+      id: agentItemId,
+      text: '',
+      phase: null,
+      memoryCitation: null,
+    }
+    this.store.appendItem(childTurnId, startedItem)
+    this.notify(peer, {
+      method: 'item/started',
+      params: {
+        threadId: context.childThreadId,
+        turnId: childTurnId,
+        item: startedItem,
+        startedAtMs: nowMillis(),
+      },
+    })
+
+    // App rule: visualize-line
+    const completedItem: ThreadItem = { ...startedItem, text: markVisualizeLines(resultText) }
+    this.store.updateItem(childTurnId, agentItemId, () => completedItem)
+    if (resultText) {
+      this.notify(peer, {
+        method: 'item/agentMessage/delta',
+        params: {
+          threadId: context.childThreadId,
+          turnId: childTurnId,
+          itemId: agentItemId,
+          delta: resultText,
+        },
+      })
+    }
+    this.notify(peer, {
+      method: 'item/completed',
+      params: {
+        threadId: context.childThreadId,
+        turnId: childTurnId,
+        item: completedItem,
+        completedAtMs: nowMillis(),
+      },
+    })
+  }
+
   private completeSubagentChildTurn(
     peer: RpcPeer,
     context: SubagentContext,
@@ -6127,48 +6197,23 @@ export class CodexClaudeAppServer {
       this.store.upsertTurn(childTurn)
     }
 
-    const agentItemId = newId()
-    const startedItem: ThreadItem = {
-      type: 'agentMessage',
-      id: agentItemId,
-      text: '',
-      phase: null,
-      memoryCitation: null,
-    }
-    this.store.appendItem(childTurn.id, startedItem)
-    this.notify(peer, {
-      method: 'item/started',
-      params: {
-        threadId: context.childThreadId,
-        turnId: childTurn.id,
-        item: startedItem,
-        startedAtMs: nowMillis(),
-      },
-    })
-
-    // App rule: visualize-line
-    const completedItem: ThreadItem = { ...startedItem, text: markVisualizeLines(resultText) }
-    this.store.updateItem(childTurn.id, agentItemId, () => completedItem)
-    if (resultText) {
-      this.notify(peer, {
-        method: 'item/agentMessage/delta',
-        params: {
-          threadId: context.childThreadId,
-          turnId: childTurn.id,
-          itemId: agentItemId,
-          delta: resultText,
-        },
-      })
-    }
-    this.notify(peer, {
-      method: 'item/completed',
-      params: {
-        threadId: context.childThreadId,
-        turnId: childTurn.id,
-        item: completedItem,
-        completedAtMs: nowMillis(),
-      },
-    })
+    // The child's work ends with it: calls still open fail and the message
+    // it was writing closes, as its answer when it is the answer.
+    const errorMessage =
+      error &&
+      typeof error === 'object' &&
+      typeof (error as { message?: unknown }).message === 'string'
+        ? (error as { message: string }).message
+        : null
+    const answered = this.subagentItems.finish(
+      peer,
+      childTurn.id,
+      resultText,
+      status === 'completed'
+        ? SUBAGENT_CALL_UNFINISHED
+        : errorMessage || resultText.trim() || SUBAGENT_CALL_UNFINISHED,
+    )
+    if (!answered) this.appendSubagentAnswer(peer, context, childTurn.id, resultText)
 
     const completed = this.store.completeTurn(childTurn.id, status, error) ?? childTurn
     if (durationMs != null) {
@@ -6544,6 +6589,71 @@ export class CodexClaudeAppServer {
     return null
   }
 
+  // A subagent's own work (its text, thinking and tool calls) shows in its
+  // child turn while that turn runs. CLAUDE_CODEX_SUBAGENT_ITEMS=0 leaves
+  // it out.
+  private showSubagentOutput(
+    peer: RpcPeer,
+    thread: ThreadRecord,
+    contexts: Map<string, SubagentContext>,
+    event: SubagentOutputEvent,
+    toolItemOptions: { mcpServers?: string[] },
+  ): void {
+    if (!subagentItemsEnabled()) return
+    const agent = this.subagentOutputAgent(thread.id, contexts, event)
+    if (!agent) return
+    const target: SubagentItemsTarget = {
+      threadId: agent.childThreadId,
+      turnId: agent.childTurnId,
+      cwd: this.store.getThread(agent.childThreadId)?.cwd ?? thread.cwd,
+      ...(toolItemOptions.mcpServers ? { mcpServers: toolItemOptions.mcpServers } : {}),
+    }
+    try {
+      this.subagentItems.add(peer, target, event.output)
+    } catch (error) {
+      // What the child shows of its work never fails the parent's turn.
+      debugLog('subagent.items.failed', {
+        threadId: thread.id,
+        childThreadId: agent.childThreadId,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
+
+  // The agent that wrote a subagent's frame: the one the frame names by task
+  // id (agent_id), else the one its Agent call (parent_tool_use_id) started.
+  // A frame naming an agent this thread does not know is not the call's
+  // agent's: a CLI that forwards a nested agent's frames under its host's
+  // call names the nested agent. Null too once the agent's child turn ended.
+  private subagentOutputAgent(
+    threadId: string,
+    contexts: Map<string, SubagentContext>,
+    event: SubagentOutputEvent,
+  ): SubagentContext | null {
+    let agent: SubagentContext | null = null
+    if (event.agentId) {
+      for (const [toolUseId, context] of contexts) {
+        if (this.taskIdByToolUse.get(toolUseId) !== event.agentId) continue
+        agent = context
+        break
+      }
+      agent ??= this.findBackgroundSubagent(threadId, { taskId: event.agentId })?.context ?? null
+    }
+    if (!agent) {
+      const foreground = contexts.get(event.toolUseId)
+      const entry = foreground
+        ? null
+        : this.findBackgroundSubagent(threadId, { toolUseId: event.toolUseId })
+      const callTaskKnown = foreground
+        ? this.taskIdByToolUse.has(event.toolUseId)
+        : Boolean(entry?.taskId || entry?.agentId)
+      if (event.agentId && callTaskKnown) return null
+      agent = foreground ?? entry?.context ?? null
+    }
+    if (!agent || this.store.getTurn(agent.childTurnId)?.status !== 'inProgress') return null
+    return agent
+  }
+
   // The agent whose own Agent call this is, when the frame names it by task
   // id (agent_id, newer CLIs) and it is still working in this turn or in the
   // background: the new child then hangs off that agent's child thread.
@@ -6693,6 +6803,17 @@ export class CodexClaudeAppServer {
   private handleTaskEvent(threadId: string, event: RuntimeTaskEvent): void {
     if (event.type === 'task_output') {
       this.appendBackgroundOutput(threadId, event)
+      return
+    }
+    if (event.type === 'subagent_output') {
+      const thread = this.store.getThread(threadId)
+      if (!thread) return
+      // Agents a running turn of the thread still waits on, if any.
+      const contexts = new Map<string, SubagentContext>()
+      for (const state of this.subagentStateByTurn.values())
+        if (state.thread.id === threadId)
+          for (const [toolUseId, context] of state.contexts) contexts.set(toolUseId, context)
+      this.showSubagentOutput(this.peerForThread(threadId), thread, contexts, event, {})
       return
     }
     // A foreground agent's progress keeps the turn waiting on it from giving
