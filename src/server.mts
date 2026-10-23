@@ -5594,17 +5594,36 @@ export class CodexClaudeAppServer {
             // with willRetry, which the App shows as a passing
             // "Reconnecting" row; like Codex, it is not kept in history.
             // Helper turns the App starts for structured output show nothing.
-            if (context.purpose === 'normal') {
+            if (context.purpose !== 'normal') return
+            // A subagent's retry shows in its own thread, while its turn
+            // runs; one whose agent is gone or unknown shows nowhere, never
+            // in this turn.
+            // App rule: reconnecting-errors
+            if (event.toolUseId) {
+              const agent =
+                subagentContexts.get(event.toolUseId) ??
+                this.findBackgroundSubagent(thread.id, { toolUseId: event.toolUseId })?.context
+              if (!agent || this.store.getTurn(agent.childTurnId)?.status !== 'inProgress') return
               this.notify(peer, {
                 method: 'error',
                 params: {
-                  threadId: thread.id,
-                  turnId: turn.id,
+                  threadId: agent.childThreadId,
+                  turnId: agent.childTurnId,
                   willRetry: true,
                   error: retryTurnError(event),
                 },
               })
+              return
             }
+            this.notify(peer, {
+              method: 'error',
+              params: {
+                threadId: thread.id,
+                turnId: turn.id,
+                willRetry: true,
+                error: retryTurnError(event),
+              },
+            })
             return
           }
           if (event.type === 'usage') {

@@ -806,9 +806,11 @@ export type RuntimeEvent =
     }
   // Claude's auto-memory recalled these memories for the prompt.
   | { type: 'memory_recall'; memories: RecalledMemory[] }
-  // A model request of the main loop failed and Claude will send it again
-  // after `delayMs`. `status` is the API's HTTP status (null when nothing
-  // answered) and `category` the SDK's error category ('overloaded', ...).
+  // A model request failed and Claude will send it again after `delayMs`.
+  // `status` is the API's HTTP status (null when nothing answered) and
+  // `category` the SDK's error category ('overloaded', ...). `toolUseId` is
+  // the Agent call of the subagent whose request it was; without it the
+  // request was the main loop's.
   | {
       type: 'retrying'
       attempt: number
@@ -816,6 +818,7 @@ export type RuntimeEvent =
       status: number | null
       category: string | null
       delayMs: number | null
+      toolUseId?: string
     }
   | {
       type: 'completed'

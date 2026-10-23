@@ -2572,11 +2572,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       return
     }
     if (subtype === 'api_retry') {
-      // A subagent's retries stay inside its own run.
-      if (message.parent_tool_use_id) return
       const status = numberOrNull(message.error_status)
       const category = stringOrNull(message.error)
-      pending.apiError = { category, status }
+      // A subagent's retry is told against its Agent call; it says nothing
+      // about why the main loop might fail.
+      const toolUseId = stringOrNull(message.parent_tool_use_id)
+      if (!toolUseId) pending.apiError = { category, status }
       await pending.handlers.onEvent({
         type: 'retrying',
         attempt: numberOrNull(message.attempt) ?? 1,
@@ -2584,6 +2585,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         status,
         category,
         delayMs: numberOrNull(message.retry_delay_ms),
+        ...(toolUseId ? { toolUseId } : {}),
       })
       return
     }

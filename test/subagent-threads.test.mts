@@ -626,3 +626,88 @@ for (const { summary, result, reason } of [
     )
   })
 }
+
+const retry = (attempt: number, toolUseId?: string) => ({
+  type: 'retrying' as const,
+  attempt,
+  maxRetries: 10,
+  status: 529,
+  category: 'overloaded',
+  delayMs: 2_000,
+  ...(toolUseId ? { toolUseId } : {}),
+})
+
+test("a subagent's API retries show in its own thread while it runs, never in the parent", async () => {
+  const script: Script = async (_context, handlers) => {
+    await handlers.onEvent({
+      type: 'tool_use',
+      toolUseId: 'agent-retrying',
+      toolName: 'Agent',
+      input: { description: 'Retrying', prompt: 'call the API' },
+    })
+    await handlers.onEvent(retry(1, 'agent-retrying'))
+    // An agent the turn does not know shows its retry nowhere.
+    await handlers.onEvent(retry(2, 'agent-unknown'))
+    // The main loop's own retry shows in the parent, as before.
+    await handlers.onEvent(retry(3))
+    await handlers.onEvent({ type: 'tool_result', toolUseId: 'agent-retrying', content: 'done' })
+    // A late retry of an agent that already finished shows nowhere.
+    await handlers.onEvent(retry(4, 'agent-retrying'))
+    await handlers.onEvent({ type: 'completed', success: true, result: 'done' })
+  }
+  await withScriptedServer(script, async ({ startThread, runTurn, request }) => {
+    const threadId = await startThread()
+    const live = await runTurn(threadId, 'retry inside an agent')
+    const child = spawnedChild(live, 'call the API')
+    const childTurnId = live.find(
+      (message) => message.method === 'turn/started' && message.params.threadId === child,
+    ).params.turn.id
+    const parentTurnId = live.find(
+      (message) => message.method === 'turn/started' && message.params.threadId === threadId,
+    ).params.turn.id
+    const errors = live.filter((message) => message.method === 'error')
+    assert.deepEqual(
+      errors.map((message) => [
+        message.params.threadId,
+        message.params.turnId,
+        message.params.willRetry,
+        message.params.error.message,
+      ]),
+      [
+        [child, childTurnId, true, 'Reconnecting... 1/10'],
+        [threadId, parentTurnId, true, 'Reconnecting... 3/10'],
+      ],
+    )
+    assert.deepEqual(errors[0].params.error.codexErrorInfo, errors[1].params.error.codexErrorInfo)
+    // Like Codex, a retry is not kept: both turns end without an error.
+    assert.equal(turnCompleted(live, child).params.turn.error, null)
+    assert.equal(turnCompleted(live, threadId).params.turn.error, null)
+    const read = (await request('thread/read', { threadId: child, includeTurns: true })).thread
+    assert.equal(read.turns.at(-1).error, null)
+  })
+})
+
+test("a background subagent's API retries show in its own thread", async () => {
+  await withScriptedServer(
+    backgroundAgent((handlers) => handlers.onEvent(retry(3, 'agent-bg'))),
+    async ({ startThread, runTurn }) => {
+      const threadId = await startThread()
+      const live = await runTurn(threadId, 'background agent')
+      const child = spawnedChild(live, 'survey')
+      const childTurnId = live.find(
+        (message) => message.method === 'turn/started' && message.params.threadId === child,
+      ).params.turn.id
+      assert.deepEqual(
+        live
+          .filter((message) => message.method === 'error')
+          .map((message) => [
+            message.params.threadId,
+            message.params.turnId,
+            message.params.willRetry,
+            message.params.error.message,
+          ]),
+        [[child, childTurnId, true, 'Reconnecting... 3/10']],
+      )
+    },
+  )
+})
