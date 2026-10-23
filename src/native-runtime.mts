@@ -3764,6 +3764,10 @@ function goalToolServer(sdk: ClaudeSdk, z: Zod, goal: GoalToolHandlers) {
   return sdk.createSdkMcpServer({
     name: GOAL_MCP_SERVER,
     version: '1.0.0',
+    // Loaded up front, never behind Claude Code's tool search: the goal
+    // tools are how Claude keeps the thread's goal, and Claude would not go
+    // looking for them.
+    alwaysLoad: true,
     tools: [
       sdk.tool('get_goal', GET_GOAL_DESCRIPTION, {}, () => run(() => goal.getGoal())),
       sdk.tool(
@@ -3846,6 +3850,9 @@ function leaderToolServer(sdk: ClaudeSdk, z: Zod, leader: LeaderToolHandlers) {
   return sdk.createSdkMcpServer({
     name: LEADER_MCP_SERVER,
     version: '1.0.0',
+    // Up front as well, like the goal tools: a user who turned these on
+    // expects Claude to see them.
+    alwaysLoad: true,
     tools: [
       sdk.tool(
         'thread_list',
