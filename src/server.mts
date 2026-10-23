@@ -665,7 +665,7 @@ export class CodexClaudeAppServer {
       sendInput: (threadId, text) => this.sendLeaderInput(threadId, text),
     })
     this.loadPersistedConfig()
-    // A CLI reported a different set of built-in commands: the App refetches
+    // A CLI reported a different set of commands: the App refetches
     // skills/list, which serves them as skills.
     // App rule: skills-popup
     this.stopCommandsListener = onClaudeCommandsChanged(() => {

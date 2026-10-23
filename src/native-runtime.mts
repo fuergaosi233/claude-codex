@@ -50,7 +50,7 @@ if (!process.env.ANTHROPIC_BETAS) {
 
 import type { Query } from '@anthropic-ai/claude-agent-sdk'
 import { autoCompactWindowEnv } from './auto-compact.mjs'
-import { noteClaudeCommands } from './claude-commands.mjs'
+import { noteClaudeCommands, noteFolderCommands, type ReportedCommand } from './claude-commands.mjs'
 import { noteClaudeModels } from './claude-models.mjs'
 import { removeCliMcpConfig, writeCliMcpConfig } from './cli-mcp-config.mjs'
 import { recordCliChildren } from './cli-orphans.mjs'
@@ -378,6 +378,9 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   private turns = new Map<string, PendingTurn>()
   private permissions = new Map<string, PendingPermission>()
   private sessions = new Map<string, LiveSession>()
+  // How many commands_changed messages each session has sent: a newer list
+  // than the one its supportedCommands() answer may still bring.
+  private commandPushes = new WeakMap<LiveSession, number>()
   // Session cron jobs per thread. They outlive a closed process: the next
   // resume of the same Claude session schedules them again.
   private cronJobs = new Map<string, CronJobs>()
@@ -2281,6 +2284,15 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       session.cliState = state || null
       return
     }
+    // The full command list again, after the CLI found more commands mid-
+    // session (skills in a subfolder Claude works in, a reloaded plugin).
+    // App rule: skills-popup
+    if (subtype === 'commands_changed') {
+      this.commandPushes.set(session, (this.commandPushes.get(session) ?? 0) + 1)
+      if (Array.isArray(message.commands) && this.isReusable(session.lastContext))
+        noteFolderCommands(session.lastContext.cwd, message.commands as ReportedCommand[])
+      return
+    }
     if (subtype === 'background_tasks_changed') {
       const next = new Set<string>()
       for (const entry of Array.isArray(message.tasks) ? message.tasks : []) {
@@ -2514,15 +2526,26 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     const subtype = String(message.subtype ?? '')
     if (subtype === 'init') {
       void recordCliChildren()
+      const query = pending.session.query
+      // The commands for the App's "/" popup. Helper turns run with settings
+      // of their own, so only a chat turn's session speaks for its folder.
+      // App rule: skills-popup
       const skills = Array.isArray(message.skills) ? message.skills.map(String) : null
-      if (skills)
-        void pending.session.query
-          ?.supportedCommands()
-          .then((commands) => noteClaudeCommands(commands, skills))
+      const folder = this.isReusable(pending.context) ? pending.context.cwd : null
+      const session = pending.session
+      const pushes = this.commandPushes.get(session) ?? 0
+      if (skills || folder)
+        void Promise.resolve()
+          .then(() => query?.supportedCommands())
+          .then((commands) => {
+            if (!Array.isArray(commands)) return
+            if (skills) noteClaudeCommands(commands, skills)
+            if (folder && (this.commandPushes.get(session) ?? 0) === pushes)
+              noteFolderCommands(folder, commands)
+          })
           .catch(() => {})
       // Which efforts each model takes, for model/list. An older SDK has no
       // supportedModels(), and model/list then keeps its static efforts.
-      const query = pending.session.query
       void Promise.resolve()
         .then(() => query?.supportedModels())
         .then(noteClaudeModels)

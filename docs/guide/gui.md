@@ -286,6 +286,20 @@ file. That covers the skills in your Claude Code and project `.claude/skills`
 folders and the App's own skills Claude can run, up to 64 KiB per skill;
 Claude reads any other skill file itself. Your message shows only the chip.
 
+The `/` popup also lists the commands Claude Code finds for a folder beyond
+its own: your and the project's `.claude/commands`, the commands and skills of
+your Claude Code plugins (`plugin:name`) and the prompts of MCP servers. They
+show as "Local file" skills and run as slash commands, with the rest of your
+message as their arguments. Claude Code reports them when a chat's turn
+starts, so a folder no Claude chat has worked in yet lists them after its
+first turn, and a command added later appears once the next turn starts in
+that folder. A Claude CLI started with its setting sources turned off (see
+`CLAUDE_CODEX_CLAUDE_CONFIG_DIR` in
+[Configuration](/guide/configuration#reference-table)) finds no user,
+project or plugin commands, so none are listed. Commands named like one of
+the App's own (`/init`, `/compact`, …) are left out, and Claude Code's plain
+built-ins such as `/cost` are not listed.
+
 Context the App attaches to a message without showing it, such as the follow-up
 after you connect a suggested plugin, reaches Claude after the message, marked
 as data rather than instructions when the App does not vouch for it.

@@ -533,6 +533,16 @@ versioning or publishing metadata.
 - A `config/batchWrite` is all or nothing: one refused edit leaves the
   settings as they were. Keys earlier versions saved but never honored are
   dropped from the adapter's settings when it starts.
+- The App's `/` popup lists every command Claude Code reports for a folder,
+  not only its built-in skills: the user's and the project's
+  `.claude/commands`, plugin commands and skills (`plugin:name`) and MCP
+  prompts. Picking one runs it as `/name args`. The list is kept per folder
+  from the last chat session there (`supportedCommands()` when a turn starts,
+  then each `commands_changed`), so a folder shows them after its first
+  Claude turn; `skills/changed` makes the App refetch it. Names the App uses
+  itself, names that are not one slash-command word and rows that share a
+  name with one of Claude Code's own commands are left out, and a skill read
+  from `.claude/skills` keeps its own entry.
 
 ### Provider and multi-agent boundaries
 
