@@ -417,6 +417,14 @@ export const APP_RULES: readonly AppRule[] = [
       'With approvals on, have Claude run `cat README.md && touch x`: the card shows the whole command.',
   },
   {
+    id: 'turn-notices',
+    app: 'Shows an `error` notification with willRetry as a dim row of its own under the turn it names, with its message as written, whether that turn still runs or has ended, without failing or ending the turn; only a "Reconnecting... n/m" message replaces the row before it. It does not keep the row when the chat is reopened, and it ignores `warning` notifications.',
+    adapter:
+      "Sends what Claude Code reports beside a turn (a compaction it could not do, a model it switched to, an urgent CLI notification, a tool call it denied) as a `warning`, as Codex does, and as such an `error` with no code: each message once per turn, the first 5 as rows. A turn that then fails repeats its notices in the error's additionalDetails, which the App keeps. A structured-output helper turn sends warnings only, and CLAUDE_CODEX_NOTICE_ROWS=0 turns the rows off.",
+    verify:
+      'Run /compact in a chat whose conversation Claude Code refuses to compact: a row under the turn says why, and the turn completes.',
+  },
+  {
     id: 'item-completed-replaces',
     app: 'Replaces the item with the same id on item/completed, whatever type it started as.',
     adapter:

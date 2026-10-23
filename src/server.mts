@@ -219,6 +219,12 @@ import {
   skillInstructions,
   withTurnContext,
 } from './turn-context.mjs'
+import {
+  noticeRowsEnabled,
+  noticeTurnError,
+  TurnNoticeLog,
+  withTurnNotices,
+} from './turn-notices.mjs'
 import type {
   ClaudeResumePoint,
   ClaudeRuntime,
@@ -655,6 +661,8 @@ export class CodexClaudeAppServer {
   // Notices that the computer slept, for failed turns.
   private readonly sleepMonitor: SleepMonitor
   private readonly platform: NodeJS.Platform
+  // The CLI notices each recent turn has shown (see turn-notices.mts).
+  private readonly turnNotices: TurnNoticeLog
 
   constructor(store: SessionStore, runtime: ClaudeRuntime, options: ServerOptions = {}) {
     this.store = store
@@ -662,6 +670,7 @@ export class CodexClaudeAppServer {
     this.sleepMonitor = options.sleepMonitor ?? new SleepTracker()
     this.sleepMonitor.start?.()
     this.platform = options.platform ?? process.platform
+    this.turnNotices = new TurnNoticeLog()
     this.leaderThreads = new LeaderThreads({
       store,
       activeTurnId: (threadId) => this.activeTurnByThread.get(threadId) ?? null,
@@ -3551,7 +3560,6 @@ export class CodexClaudeAppServer {
     // thread/compact/start carries no instructions: a bare /compact, which
     // no side-conversation note may precede either.
     const context: RuntimeTurnContext = { ...built.context, prompt: '/compact', imageInputs: [] }
-    const noticesSeen = new Set<string>()
     let compacted = false
     let failure: string | null = null
     await this.runtime.runTurn(context, {
@@ -3577,14 +3585,13 @@ export class CodexClaudeAppServer {
           this.recordCompactedContext(peer, thread.id, turnId, event.postTokens, false)
           return
         }
+        if (event.type === 'compaction_failed') {
+          failure = event.message
+          this.publishNotice(peer, thread.id, turnId, event.message)
+          return
+        }
         if (event.type === 'notice') {
-          if (event.level !== 'info' && !noticesSeen.has(event.message)) {
-            noticesSeen.add(event.message)
-            this.notify(peer, {
-              method: 'warning',
-              params: { threadId: thread.id, message: event.message },
-            })
-          }
+          if (event.level !== 'info') this.publishNotice(peer, thread.id, turnId, event.message)
           return
         }
         if (event.type === 'completed') {
@@ -4310,7 +4317,11 @@ export class CodexClaudeAppServer {
     let agentItemId: string | null = null
     let reasoningItemId: string | null = null
     let hasTextOutput = false
-    const noticesSeen = new Set<string>()
+    // What Claude Code reports beside the turn, once each: a warning, and a
+    // row under the turn unless the turn is one the user does not watch.
+    const noticesVisible = params.outputSchema == null
+    const publishNotice = (message: string): void =>
+      this.publishNotice(peer, thread.id, turn.id, message, noticesVisible)
     const commandOutputSeen = new Set<string>()
     // Hook runs by Claude's hook id, and the settings file each hook event
     // was traced to (read once per turn).
@@ -4642,12 +4653,11 @@ export class CodexClaudeAppServer {
         : undefined
       const action = item ? autoReviewAction(item, stringOr(params.cwd, thread.cwd)) : null
       if (!itemId || !action) {
-        const message = rationale
-          ? `Permission denied for ${toolName}: ${rationale}`
-          : `Permission denied for ${toolName}`
-        if (noticesSeen.has(message)) return
-        noticesSeen.add(message)
-        this.notify(peer, { method: 'warning', params: { threadId: thread.id, message } })
+        publishNotice(
+          rationale
+            ? `Permission denied for ${toolName}: ${rationale}`
+            : `Permission denied for ${toolName}`,
+        )
         return
       }
       const completedAtMs = nowMillis()
@@ -5517,6 +5527,15 @@ export class CodexClaudeAppServer {
             this.recordCompactedContext(peer, thread.id, turn.id, event.postTokens, true)
             return
           }
+          if (event.type === 'compaction_failed') {
+            debugLog('turn.runtime.compaction_failed', {
+              threadId: thread.id,
+              turnId: turn.id,
+              message: event.message,
+            })
+            publishNotice(event.message)
+            return
+          }
           if (event.type === 'memory_recall') {
             recalledMemories.push(...event.memories)
             return
@@ -5542,15 +5561,10 @@ export class CodexClaudeAppServer {
           }
           if (event.type === 'notice') {
             debugLog('turn.runtime.notice', { threadId: thread.id, turnId: turn.id, ...event })
-            // Runtime status is not assistant prose. Keep genuine warnings
-            // visible in the native warning surface without breaking Markdown.
-            if (event.level !== 'info' && !noticesSeen.has(event.message)) {
-              noticesSeen.add(event.message)
-              this.notify(peer, {
-                method: 'warning',
-                params: { threadId: thread.id, message: event.message },
-              })
-            }
+            // Runtime status is not assistant prose: genuine warnings go out
+            // as notices, beside the transcript and without breaking its
+            // Markdown.
+            if (event.level !== 'info') publishNotice(event.message)
             return
           }
           if (event.type === 'retrying') {
@@ -5638,7 +5652,7 @@ export class CodexClaudeAppServer {
               ...event,
             })
             // The App only draws Codex's one reroute reason, a cyber-safety
-            // reroute; any other fallback is a plain warning.
+            // reroute; any other fallback is a notice.
             if (event.category === 'cyber') {
               this.notify(peer, {
                 method: 'model/rerouted',
@@ -5651,10 +5665,7 @@ export class CodexClaudeAppServer {
                 },
               })
             } else {
-              this.notify(peer, {
-                method: 'warning',
-                params: { threadId: thread.id, message: event.message },
-              })
+              publishNotice(event.message)
             }
             return
           }
@@ -9308,6 +9319,29 @@ export class CodexClaudeAppServer {
     if (peer) this.notify(peer, notification)
   }
 
+  // A notice from Claude Code (turn-notices.mts): the `warning` Codex would
+  // send, and for the first few of a turn also a row under it that the App
+  // renders. Each message goes out once per turn. turnId null: the thread has
+  // no turn to show it under, so only the warning goes out; visible false: a
+  // turn the user does not watch, such as a title or a compaction's summary.
+  // App rule: turn-notices
+  private publishNotice(
+    peer: RpcPeer,
+    threadId: string,
+    turnId: string | null,
+    message: string,
+    visible = true,
+  ): void {
+    const decision = this.turnNotices.record(turnId ?? `thread:${threadId}`, message)
+    if (!decision.warn) return
+    this.notify(peer, { method: 'warning', params: { threadId, message } })
+    if (!decision.show || !visible || !turnId || !noticeRowsEnabled()) return
+    this.notify(peer, {
+      method: 'error',
+      params: { threadId, turnId, willRetry: true, error: noticeTurnError(message) },
+    })
+  }
+
   private setThreadStatus(
     peer: RpcPeer | null,
     threadId: string,
@@ -9637,14 +9671,15 @@ export class CodexClaudeAppServer {
   }
 
   // What a failed turn's error leaves out: that the computer slept during
-  // the turn, which is the likely reason a model request broke off.
+  // the turn, which is the likely reason a model request broke off, and the
+  // notices Claude reported along the way, whose rows the App does not keep.
   private explainTurnError(turn: TurnRecord, error: CodexTurnError): CodexTurnError {
     const sleptMs = turn.startedAt == null ? 0 : this.sleepMonitor.sleptSince(turn.startedAt * 1000)
     const explained = withSleepNotice(error, sleptMs, this.platform)
     if (explained !== error) {
       debugLog('turn.slept', { threadId: turn.threadId, turnId: turn.id, sleptMs })
     }
-    return explained
+    return withTurnNotices(explained, this.turnNotices.messages(turn.id))
   }
 
   // Writes a turn's terminal state. Returns null when the turn already ended,

@@ -2551,8 +2551,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       if (message.compact_result === 'failed') {
         const reason = stringOrNull(message.compact_error)
         await pending.handlers.onEvent({
-          type: 'notice',
-          level: 'warning',
+          type: 'compaction_failed',
           message: reason
             ? `Claude could not compact the conversation: ${reason}`
             : 'Claude could not compact the conversation.',

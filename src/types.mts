@@ -760,6 +760,9 @@ export type RuntimeEvent =
       preTokens: number | null
       postTokens: number | null
     }
+  // Claude could not compact the conversation; `message` says so and why.
+  // The history stays as it was.
+  | { type: 'compaction_failed'; message: string }
   // A plan-mode turn's finished plan: the text Claude handed to ExitPlanMode.
   // The App shows it as the turn's plan card and offers to implement it.
   | { type: 'proposed_plan'; toolUseId: string; text: string }
@@ -1101,7 +1104,8 @@ export interface ClaudeRuntime {
   // turn starts a new one: the thread's history was rewound or deleted.
   resetSession?(threadId: string): void
   // True when a turn whose prompt is `/compact` compacts the Claude session
-  // it resumes, reporting it with compaction_started / compaction_completed.
+  // it resumes, reporting it with compaction_started / compaction_completed
+  // (compaction_failed when Claude could not).
   compactsSessions?(): boolean
   // The MCP config was reloaded. Sessions still open retry their MCP servers
   // that failed or wait for a sign-in; a session opened later reads the
