@@ -4501,12 +4501,20 @@ export class CodexClaudeAppServer {
     const openToolItems = new Set<string>()
     // Read, Grep, Glob and LS items, whose output the App keeps capped.
     const exploreItemIds = new Set<string>()
-    // An image Read shows as an imageView, kept here by item, from its start.
-    // Until it reads the image it is stored as its Read command, so it fails
-    // as one when Claude cannot read the image, the call is stopped or the
-    // adapter dies (restart recovery fails what is in progress).
+    // An image Read shows as an imageView. If Claude cannot read the image,
+    // the item becomes this failed Read command instead.
     // App rule: item-completed-replaces
-    const imageReads = new Map<string, ThreadItem>()
+    const imageReadFallbacks = new Map<string, ThreadItem>()
+    const failedImageRead = (
+      itemId: string,
+      output: string | null,
+      exitCode: number | null,
+      durationMs: number | null,
+    ): ThreadItem | null => {
+      const fallback = imageReadFallbacks.get(itemId)
+      if (fallback?.type !== 'commandExecution') return null
+      return { ...fallback, status: 'failed', aggregatedOutput: output, exitCode, durationMs }
+    }
     // What Claude's auto-memory recalled for the turn's prompts.
     const recalledMemories: RecalledMemory[] = []
     // The item/tool/call requests of dynamic tool items still open, by item.
@@ -4663,6 +4671,8 @@ export class CodexClaudeAppServer {
       const durationMs = started == null ? null : Math.max(0, nowMillis() - started)
       const updated = this.store.updateItem(turn.id, itemId, (item) => {
         if (item.type === 'commandExecution') return { ...item, status: 'failed', durationMs }
+        if (item.type === 'imageView')
+          return failedImageRead(itemId, null, null, durationMs) ?? item
         if (item.type === 'fileChange') return { ...item, status: 'failed' }
         if (item.type === 'mcpToolCall')
           return { ...item, status: 'failed', error: { message }, durationMs }
@@ -5569,13 +5579,12 @@ export class CodexClaudeAppServer {
             if (isExploreTool(event.toolName)) exploreItemIds.add(item.id)
             else if (item.type === 'commandExecution')
               this.rememberCommandItem(event.toolUseId, thread.id, turn.id, item.id)
-            if (item.type === 'imageView') imageReads.set(item.id, item)
-            this.store.appendItem(
-              turn.id,
-              item.type === 'imageView'
-                ? { ...this.toolUseToItem(event, thread.cwd, { imageView: false }), id: item.id }
-                : item,
-            )
+            if (item.type === 'imageView')
+              imageReadFallbacks.set(item.id, {
+                ...this.toolUseToItem(event, thread.cwd, { imageView: false }),
+                id: item.id,
+              })
+            this.store.appendItem(turn.id, item)
             this.notify(peer, {
               method: 'item/started',
               params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: nowMillis() },
@@ -5628,10 +5637,7 @@ export class CodexClaudeAppServer {
             })()
             const parsedExitCode = parseExitCodeFromResult(event.content) ?? (event.isError ? 1 : 0)
             const output = exploreItemIds.has(itemId) ? capOutput(resultText) : resultText
-            const image = imageReads.get(itemId)
             const updated = this.store.updateItem(turn.id, itemId, (item) => {
-              // The image read shows, as it did from the start.
-              if (image && !event.isError) return image
               if (item.type === 'commandExecution') {
                 return {
                   ...item,
@@ -5646,6 +5652,8 @@ export class CodexClaudeAppServer {
                   durationMs,
                 }
               }
+              if (item.type === 'imageView' && event.isError)
+                return failedImageRead(itemId, output, parsedExitCode, durationMs) ?? item
               if (item.type === 'fileChange')
                 return { ...item, status: event.isError ? 'failed' : 'completed' }
               if (item.type === 'mcpToolCall') {
@@ -5672,7 +5680,7 @@ export class CodexClaudeAppServer {
               item?.type === 'commandExecution' &&
               output &&
               !commandOutputSeen.has(itemId) &&
-              !image
+              !imageReadFallbacks.has(itemId)
             ) {
               this.notify(peer, {
                 method: 'item/commandExecution/outputDelta',
@@ -5950,7 +5958,14 @@ export class CodexClaudeAppServer {
             }
           }
           const decision = await watchdog.whilePaused(
-            this.requestApproval(peer, thread.id, turn.id, itemId, event),
+            this.requestApproval(
+              peer,
+              thread.id,
+              turn.id,
+              itemId,
+              event,
+              imageReadFallbacks.get(itemId),
+            ),
           )
           if (!turnIsActive()) return { decision: 'cancel' }
           if (decision.decision === 'decline' || decision.decision === 'cancel')
@@ -7571,6 +7586,9 @@ export class CodexClaudeAppServer {
     turnId: string,
     itemId: string,
     event: Extract<RuntimeEvent, { type: 'permission_request' }>,
+    // The command an item that is not one asks about, such as the Read
+    // behind an image the App shows.
+    commandFallback?: ThreadItem,
   ): Promise<PermissionDecision> {
     // Defensive: if Codex App selected approvalPolicy=never (or "Full access"
     // sandbox), auto-accept without bouncing the request to the user. The
@@ -7613,10 +7631,11 @@ export class CodexClaudeAppServer {
     // The App draws a patch approval from the fileChange item it belongs to,
     // so only an edit asks as one. Any other tool asks as a command: Bash and
     // the file exploration tools as the command their item shows (an image
-    // Read as its Read, which it is stored as until the image shows), any
-    // other with the tool's name and what it touches in place of a shell
-    // command.
-    const item = this.store.getTurn(turnId)?.items.find((candidate) => candidate.id === itemId)
+    // Read as its Read), any other with the tool's name and what it touches
+    // in place of a shell command.
+    const item =
+      commandFallback ??
+      this.store.getTurn(turnId)?.items.find((candidate) => candidate.id === itemId)
     const isFileChange = item?.type === 'fileChange'
     const commandItem = item?.type === 'commandExecution' ? item : null
     const command =

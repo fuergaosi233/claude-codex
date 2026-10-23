@@ -478,7 +478,7 @@ export const APP_RULES: readonly AppRule[] = [
     id: 'item-completed-replaces',
     app: 'Replaces the item with the same id on item/completed, whatever type it started as.',
     adapter:
-      'Completes an image Read that fails or is stopped as its failed Read command (one the user declines or Claude Code refuses as its declined Read command) in place of the imageView it started as, which is stored as that Read command until the image is read, and a compaction Claude could not do while the turn went on as an empty reasoning item, which the App does not draw, in place of the contextCompaction it started as.',
+      'Completes an image Read that fails or is stopped as its failed Read command in place of the imageView it started as, and a compaction Claude could not do while the turn went on as an empty reasoning item, which the App does not draw, in place of the contextCompaction it started as.',
     verify:
       'Ask Claude to read an image file that does not exist: the turn shows the failed Read, not an empty image.',
   },

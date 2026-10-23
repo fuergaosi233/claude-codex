@@ -234,10 +234,7 @@ Claude's tool calls show as the items Codex uses for its own:
   keeps the first 30,000 characters of a file or search result; Claude gets
   all of it.
 - **Images.** A Read of an image file shows the image. If the Read fails, or
-  the turn stops before it ends (the adapter stopping or dying included), it
-  shows as the failed Read instead, also after a reload; one you decline, or
-  a rule or auto mode refuses, shows as the declined Read, as a declined
-  command does.
+  the turn stops before it ends, it shows as the failed Read instead.
 - **The web.** WebSearch shows as a web search, and WebFetch as opening the
   page it fetches.
 - **MCP tools** show under their server's name. A server whose name contains
