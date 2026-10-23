@@ -413,6 +413,23 @@ it, and the name stays the same in the thread's history and after the
 adapter restarts. A workflow agent's prompt is the task the workflow
 computed for it, not the user request the workflow relays to every agent.
 
+A subagent's thread shows its work as it goes: what it says and thinks, and
+each tool call with its result, drawn as the chat draws its own calls
+(commands and file reads, searches, edits, MCP tool calls, web searches,
+images), with its todo list as the thread's plan. An agent another agent
+launches shows its work in its own thread. The work is stored with the thread,
+so it is still there when the thread is reopened, after an adapter restart
+too, and every window following the chat sees it live. None of it shows in the
+parent chat, which keeps its agent cards and the subagent's answer. Claude Code
+hands a subagent's output over a block at a time, so its messages appear whole
+rather than word by word. Outputs are cut as the chat's own are, and one run of
+a subagent shows at most 256 pieces of work; its answer always shows, once. A
+call still running when the subagent ends (stopped, interrupted, failed, or the
+adapter stopped) shows as failed. Workflow agents, and subagents on backends
+other than the Agent SDK, show their prompt and answer only. Set
+`CLAUDE_CODEX_SUBAGENT_ITEMS=0` for the adapter to keep every subagent's
+thread to its prompt and answer, as before.
+
 A subagent that fails says why. Its thread's turn fails with the reason Claude
 Code gave, such as an API error or the error its run ended with, without the
 CLI's tags and usage trailer, and the agent's state on the parent's agent

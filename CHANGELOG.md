@@ -639,6 +639,18 @@ versioning or publishing metadata.
   before Claude Code confirmed the stop no longer ends its thread twice.
 - A subagent's API retries show as **Reconnecting n/m** in the subagent's
   thread while it runs, instead of not at all, and never in the parent.
+- A subagent's thread shows the subagent's own work, not just its prompt and
+  answer: its messages, thinking, and tool calls with their results, as the
+  same command, file change, MCP, web search and image items the parent's
+  calls make, with its todo list as the thread's plan. With the Agent SDK
+  backend the adapter asks Claude Code for the subagent's text and thinking
+  (`forwardSubagentText`) and routes each frame by its agent id, so a nested
+  agent's work lands in its own thread. The items are stored with the child
+  turn (`thread/read`, `thread/turns/list`, `thread/items/list`, resume,
+  followers), keep the parent's output caps, stop at 256 per child turn, and
+  a call still open when the subagent ends shows as failed. The parent
+  thread is unchanged. `CLAUDE_CODEX_SUBAGENT_ITEMS=0` keeps the previous
+  prompt-and-answer view.
 
 ### Rust-first protocol groundwork
 

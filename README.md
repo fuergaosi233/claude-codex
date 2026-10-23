@@ -394,6 +394,10 @@ starts that wait over, so a long but healthy workflow runs to the end. When it d
 turn fails and its stuck agents stop; background agents it handed off keep running. See the
 [configuration reference](https://fuergaosi233.github.io/claude-codex/guide/configuration#reference-table).
 
+A subagent's thread shows the subagent's own work as it goes (its messages, thinking, and tool
+calls with their results) and keeps it with the thread; the parent chat shows none of it.
+`CLAUDE_CODEX_SUBAGENT_ITEMS=0` keeps a subagent's thread to its prompt and answer.
+
 This compatibility layer is specific to the native Claude Agent SDK backend. Alternate HTTP,
 agentapi, and `claude -p` backends receive no workflow event bridge. Interactive workflow
 management actions such as pause, resume, stop, and save are not implemented.

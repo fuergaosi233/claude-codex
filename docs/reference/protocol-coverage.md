@@ -39,7 +39,8 @@ Implemented as real remote/runtime behavior:
   command actions, image views, web searches and page opens, MCP tool calls by
   server and tool, hook runs, model reroutes, aggregated git diff updates, and
   `error` notifications for API retries (`willRetry`; a subagent's in its own
-  thread) and failed turns, with Codex error codes.
+  thread) and failed turns, with Codex error codes. A subagent's own messages,
+  reasoning and tool calls stream as these items in its own thread's turn.
 - **Remote utilities** — file read/write/list/metadata/copy/remove/watch,
   command exec with stdin/terminate, process spawn/stdin/kill, fuzzy file
   search, direct MCP stdio/HTTP tool and resource calls.
