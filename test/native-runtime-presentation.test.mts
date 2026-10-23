@@ -546,6 +546,32 @@ test('Claude compacting the conversation becomes compaction events; a subagent c
   }
 })
 
+test('/compact streams its summary and output as plain-text user messages, which end nothing', async () => {
+  const plain = (text: string, fields: Record<string, unknown> = {}) => ({
+    type: 'user',
+    message: { role: 'user', content: text },
+    ...fields,
+  })
+  const events = await collect(
+    [
+      system('status', { status: 'compacting' }),
+      system('compact_boundary', {
+        compact_metadata: { trigger: 'manual', pre_tokens: 34_000, post_tokens: 1_200 },
+      }),
+      plain('This session is being continued from a previous conversation.', {
+        isCompactSummary: true,
+      }),
+      plain('<local-command-stdout>Compacted </local-command-stdout>'),
+      system('status', { status: null, compact_result: 'success' }),
+    ],
+    { prompt: '/compact' },
+  )
+  assert.deepEqual(events, [
+    { type: 'compaction_started' },
+    { type: 'compaction_completed', trigger: 'manual', preTokens: 34_000, postTokens: 1_200 },
+  ])
+})
+
 test("native API retries become retrying events, a subagent's told by its Agent call, and urgent CLI notifications warnings", async () => {
   const notification = (key: string, fields: Record<string, unknown>) =>
     system('notification', { key, text: `${key} text`, priority: 'high', ...fields })

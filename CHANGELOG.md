@@ -43,9 +43,11 @@ versioning or publishing metadata.
   computer slept, that this broke Claude's connection to the model, and that a
   message (or Continue) picks up where it left off; on macOS it also points to
   the App's **Prevent sleep while running** setting. A sleep the turn went on
-  from is not blamed (API retries, a subagent's included, notices, hooks, the
-  message Claude Code writes to name the failed request and the failing result
-  do not count as going on). The error code and details are unchanged, and
+  from is not blamed (API retries, a subagent's included, notices, hooks,
+  Claude Code's heartbeats for a running tool call, the message Claude Code
+  writes to name the failed request, the result of a subagent that ended on
+  one and the failing result do not count as going on). The error code and
+  details are unchanged, and
   refusals such as usage limits, an overloaded API or a Claude Code start that
   a retry cannot fix are left alone.
 - The subagent watchdog (`CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS`) no longer fails a
@@ -88,6 +90,12 @@ versioning or publishing metadata.
   not do leaves no marker; its notice says what happened. That includes a
   `/compact` (`thread/compact/start`) Claude Code could not do: its turn keeps
   only the summary written instead, and no `thread/compacted` is sent.
+- A `/compact` Claude Code did now ends as compacted, with
+  `thread/compacted`. The adapter failed on the plain-text messages the
+  command streams once it has compacted (its summary and output), so the
+  turn also got a summary written in a session of its own, which cost a
+  second model call, and sent no `thread/compacted`. A run that goes wrong
+  after Claude compacted the session no longer undoes that either.
 - Requests the user can correct fail with JSON-RPC `-32600` (invalid request),
   as Codex answers an unknown thread or turn and a bad cursor, instead of
   `-32000`, with the same messages: an unknown thread, turn, section, queued
@@ -98,8 +106,10 @@ versioning or publishing metadata.
   with `-32602`, invalid params.)
   The model menu's "Couldn't update model settings" toast now gives the
   reason, after the App's own "Check your config.toml." line. Failures inside
-  the adapter stay `-32000`, and so do project errors, whose text the App
-  matches.
+  the adapter stay `-32000`, and so do the project store's errors (a project
+  not found, a name, roots or metadata it refuses), whose text the App
+  matches; a bad project cursor or an empty `idempotencyKey` is an invalid
+  request.
 - Model process profiles that fail to load fail with one line of at most 300
   characters that names the file (or `CLAUDE_CODEX_MODEL_PROFILES`) and says
   what is wrong. The message used to carry the JSON parser's excerpt of the
@@ -635,7 +645,8 @@ versioning or publishing metadata.
   unset (or has network access off), and would otherwise preselect Custom
   (config.toml) in new chats.
 - `web_search = "disabled"` saved in the App's settings takes WebSearch from
-  Claude threads; `cached`, `indexed` and `live` keep it.
+  Claude threads, including the summary `/compact` writes in a session of its
+  own; `cached`, `indexed` and `live` keep it.
 - **Behavior change:** `CLAUDE_CODEX_WEBSEARCH=0` now takes Claude Code's
   WebSearch tool away from Claude threads too, while the App's settings saved
   no web search mode. Before, it only made `config/read` report

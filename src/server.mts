@@ -465,9 +465,11 @@ const MAX_QUEUED_ACTIVITY = 64
 // it will send again, a notice (a model fallback, a compaction that failed),
 // an error, a hook run (a StopFailure hook runs after a request failed), and
 // the usage, figures and end of the result that closes it. After a sleep
-// broke its connection, a turn hears only these, and the events of the
-// message naming the error (failedRequest), until it fails. Usage also comes
-// with each message, after the message itself.
+// broke its connection, a turn hears only these, the events marked
+// failedRequest (the message naming the error; an agent's failed requests,
+// and the result of its call when it ended on one) and the heartbeats of the
+// agent call it waits on, until it fails. Usage also comes with each
+// message, after the message itself.
 const NO_PROGRESS_EVENTS: ReadonlySet<RuntimeEvent['type']> = new Set([
   'retrying',
   'notice',
@@ -481,7 +483,9 @@ const NO_PROGRESS_EVENTS: ReadonlySet<RuntimeEvent['type']> = new Set([
 ])
 
 function showsProgress(event: RuntimeEvent): boolean {
-  return !NO_PROGRESS_EVENTS.has(event.type) && !('failedRequest' in event && event.failedRequest)
+  if (NO_PROGRESS_EVENTS.has(event.type)) return false
+  if ('failedRequest' in event && event.failedRequest) return false
+  return !(event.type === 'subagent_progress' && event.heartbeat)
 }
 
 // A hidden goal continuation that does no tool work ends the run of
@@ -3810,6 +3814,16 @@ export class CodexClaudeAppServer {
       onUserInputRequest: async (event) => ({
         answers: Object.fromEntries(event.questions.map((q) => [q.id, { answers: [] }])),
       }),
+    }).catch((error: unknown) => {
+      // Once Claude has compacted the session, a run that goes wrong after
+      // it does not undo that: the thread has compacted, and no summary is
+      // written in its place.
+      if (!compacted) throw error
+      debugLog('thread.compact.failed_after_compaction', {
+        threadId: thread.id,
+        turnId,
+        error: error instanceof Error ? error.message : String(error),
+      })
     })
     if (!compacted)
       debugLog('thread.compact.session_incomplete', {
@@ -3865,6 +3879,8 @@ export class CodexClaudeAppServer {
         forkSession: false,
         mcpServers: null,
         allowedTools: ['Read', 'Glob', 'Grep'],
+        // With web search off, the summary cannot search either.
+        disallowedTools: this.effectiveWebSearch() === 'disabled' ? ['WebSearch'] : [],
         addDirs: [],
         enableFileCheckpointing: false,
         outputFormat: null,

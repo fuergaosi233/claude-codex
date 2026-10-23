@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { MockRuntime } from '../src/mock-runtime.mjs'
-import { type InProcessApp, withInProcessApp } from './fixtures/in-process-app.mjs'
+import { type InProcessApp, scriptedRuntime, withInProcessApp } from './fixtures/in-process-app.mjs'
 
 // The App draws a stored contextCompaction, or one item/completed closed, as
 // "Context compacted", and an open one as compacting while its turn runs and
@@ -186,5 +186,39 @@ test('a /compact Claude refuses shows the refusal as a row and the summary, not 
     await app.turnCompleted(nextTurn)
     assert.deepEqual(storedTypes(app, nextTurn), ['contextCompaction'])
     assert.deepEqual(app.notified('thread/compacted'), [{ threadId, turnId: nextTurn }])
+  })
+})
+
+test('a /compact that compacted the session stands when its run goes wrong afterwards', async () => {
+  const runtime = scriptedRuntime(
+    async (context, handlers) => {
+      if (context.prompt === '/compact') {
+        await handlers.onEvent({
+          type: 'compaction_completed',
+          trigger: 'manual',
+          preTokens: 90_000,
+          postTokens: 9_000,
+        })
+        throw new Error('the stream broke after the compaction')
+      }
+      await handlers.onEvent({ type: 'session', claudeSessionId: 'claude-session' })
+      await handlers.onEvent({ type: 'text_delta', delta: 'done' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'done' })
+    },
+    { compactsSessions: () => true },
+  )
+  await withInProcessApp(runtime, async (app) => {
+    const threadId = await app.startThread()
+    const first = await app.startTurn(threadId, 'hello')
+    await app.turnCompleted(first)
+    await app.request('thread/compact/start', { threadId })
+    const compactTurn = await app.waitFor(
+      () => app.notified('turn/started').find((params) => params.turn.id !== first)?.turn.id,
+    )
+    assert.equal((await app.turnCompleted(compactTurn)).status, 'completed')
+    // Compacted, and said so: no summary written in its place.
+    assert.deepEqual(storedTypes(app, compactTurn), ['contextCompaction'])
+    assert.deepEqual(app.notified('thread/compacted'), [{ threadId, turnId: compactTurn }])
+    assert.deepEqual(app.notified('error'), [])
   })
 })

@@ -120,9 +120,9 @@ and so do three requests of the 26.1013 protocol that the App never sends. A
 request the user can put right (an unknown thread, turn, section, queued
 message or process, a bad cursor or parameter, a model the thread cannot
 take) fails with `-32600` (invalid request), as Codex answers an unknown
-thread or turn and a bad cursor, and a failure inside
-the adapter with `-32000`. Project errors stay `-32000`, with the texts the
-App matches.
+thread or turn and a bad cursor, and a failure inside the adapter with
+`-32000`. The project store's errors (a project not found, a name, roots or
+metadata it refuses) stay `-32000`, with the texts the App matches.
 Regenerate the reference schema under `generated/` with
 `npm run generate:schema` (needs a matching `codex` on PATH).
 

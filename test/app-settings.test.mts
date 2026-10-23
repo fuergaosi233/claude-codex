@@ -54,6 +54,8 @@ interface TestApp {
   send: (method: string, params: Record<string, unknown>) => Promise<Response>
   // Runs a turn and returns the context the runtime got.
   turn: (threadId: string, params?: Record<string, unknown>) => Promise<RuntimeTurnContext>
+  // Compacts a thread and returns the context of the turn that summarized it.
+  compact: (threadId: string) => Promise<RuntimeTurnContext>
   notifications: Array<{ method: string; params: any }>
 }
 
@@ -121,8 +123,19 @@ async function withServer(
       assert.ok(context)
       return context
     }
+    const compact = async (threadId: string) => {
+      const completed = new Promise<void>((done) => {
+        finish = done
+      })
+      await request('thread/compact/start', { threadId })
+      await completed
+      const context = contexts.at(-1)
+      assert.ok(context)
+      assert.equal(context.purpose, 'compact')
+      return context
+    }
     try {
-      await run({ request, send, turn, notifications })
+      await run({ request, send, turn, compact, notifications })
     } finally {
       await server.stop()
     }
@@ -782,12 +795,15 @@ test('settings Claude threads have no counterpart for are refused, and read back
 test('web search turned off in the App settings takes WebSearch from Claude', async () => {
   const root = await mkdtemp(join(tmpdir(), 'app-settings-web-search-'))
   try {
-    await withServer(root, {}, async ({ request, turn }) => {
+    await withServer(root, {}, async ({ request, turn, compact }) => {
       const started = await request('thread/start', { cwd: root, model: 'sonnet' })
       const threadId = started.thread.id
       assert.ok(!(await turn(threadId)).disallowedTools?.includes('WebSearch'))
+      assert.ok(!(await compact(threadId)).disallowedTools?.includes('WebSearch'))
       await request('config/value/write', { keyPath: 'web_search', value: 'disabled' })
       assert.deepEqual((await turn(threadId)).disallowedTools, ['WebSearch'])
+      // Nor can the summary /compact writes in a session of its own search.
+      assert.deepEqual((await compact(threadId)).disallowedTools, ['WebSearch'])
       // Claude has the one kind of search: the others keep it.
       for (const mode of ['cached', 'indexed', 'live']) {
         await request('config/value/write', { keyPath: 'web_search', value: mode })
