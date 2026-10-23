@@ -103,8 +103,10 @@ versioning or publishing metadata.
   section parameter errors with `-32602`, invalid params.)
   The model menu's "Couldn't update model settings" toast now gives the
   reason, after the App's own "Check your config.toml." line. Failures inside
-  the adapter stay `-32000`, and so do project errors, whose text the App
-  matches.
+  the adapter stay `-32000`, and so do the project store's errors (a project
+  not found, a name, roots or metadata it refuses), whose text the App
+  matches; a bad project cursor or an empty `idempotencyKey` is an invalid
+  request.
 - Model process profiles that fail to load fail with one line of at most 300
   characters that names the file (or `CLAUDE_CODEX_MODEL_PROFILES`) and says
   what is wrong. The message used to carry the JSON parser's excerpt of the

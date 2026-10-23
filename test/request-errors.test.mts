@@ -92,13 +92,21 @@ test('an unknown turn, cursor or id, and a bad parameter, are invalid requests',
       { sectionId: section.id, name: ' ' },
       /^section name must not be empty$/,
     )
-    // Project errors keep the server error code; the App matches their text.
+    // The project store's errors keep the server error code; the App matches
+    // their text. A bad project cursor or key is the caller's to put right.
     await refused(
       app,
       'project/read',
       { projectId: 'gone' },
       /^project not found: gone$/,
       SERVER_ERROR,
+    )
+    await refused(app, 'project/list', { cursor: '-1' }, /^invalid project cursor$/)
+    await refused(
+      app,
+      'project/create',
+      { name: 'Work', idempotencyKey: '' },
+      /^idempotencyKey must not be empty$/,
     )
     await refused(app, 'thread/goal/set', { threadId, status: 'bogus' }, /invalid goal status/)
     await refused(app, 'thread/goal/set', { threadId, objective: ' ' }, /must not be empty/)
