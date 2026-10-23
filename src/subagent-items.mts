@@ -105,6 +105,9 @@ export class SubagentItems {
         omitted: 0,
       }
       this.turns.set(target.turnId, state)
+    } else {
+      // The latest frame says best which servers its calls may name.
+      state.target = target
     }
     if (output.type === 'text') this.addText(peer, state, output.text)
     else if (output.type === 'reasoning') this.addReasoning(peer, state, output.text)

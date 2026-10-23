@@ -407,6 +407,10 @@ interface SubagentContext {
   // go to the parent turn.
   hostThreadId?: string
   hostTurnId?: string
+  // The MCP servers configured for the turn that started the agent, or took
+  // it over with SendMessage. Its tool items name the server by these, as the
+  // parent's do, also for the work it does between the parent's turns.
+  mcpServers?: string[]
 }
 
 interface ActiveSubagentState {
@@ -5003,7 +5007,14 @@ export class CodexClaudeAppServer {
           if (
             event.type === 'tool_use' &&
             ((event.toolName === 'SendMessage' &&
-              this.beginSubagentSendInput(peer, thread, turn, event.toolUseId, event.input)) ||
+              this.beginSubagentSendInput(
+                peer,
+                thread,
+                turn,
+                event.toolUseId,
+                event.input,
+                toolItemOptions.mcpServers,
+              )) ||
               (event.toolName === 'TaskStop' &&
                 this.beginSubagentClose(peer, thread, turn, event.toolUseId, event.input)))
           )
@@ -5231,6 +5242,7 @@ export class CodexClaudeAppServer {
               prompt: promptText,
               subType,
               ...(host ? { hostThreadId, hostTurnId } : {}),
+              mcpServers: toolItemOptions.mcpServers,
             }
             this.emitSubagentActivity(peer, hostThreadId, hostTurnId, subagentContext, 'started')
 
@@ -6737,11 +6749,13 @@ export class CodexClaudeAppServer {
     if (!subagentItemsEnabled()) return
     const agent = this.subagentOutputAgent(thread.id, contexts, event)
     if (!agent) return
+    // The agent's own servers: a frame between turns has no turn to ask.
+    const mcpServers = agent.mcpServers ?? toolItemOptions.mcpServers
     const target: SubagentItemsTarget = {
       threadId: agent.childThreadId,
       turnId: agent.childTurnId,
       cwd: this.store.getThread(agent.childThreadId)?.cwd ?? thread.cwd,
-      ...(toolItemOptions.mcpServers ? { mcpServers: toolItemOptions.mcpServers } : {}),
+      ...(mcpServers ? { mcpServers } : {}),
     }
     try {
       this.subagentItems.add(peer, target, event.output)
@@ -6840,6 +6854,7 @@ export class CodexClaudeAppServer {
     thread: ThreadRecord,
     turnId: string,
     agentId: string,
+    mcpServers: string[],
   ): BackgroundSubagent | null {
     // A direct child first; then one nested below another agent.
     const child =
@@ -6883,6 +6898,7 @@ export class CodexClaudeAppServer {
         prompt: '',
         subType: child.agentRole,
         ...(hostThreadId !== thread.id && hostTurnId ? { hostThreadId, hostTurnId } : {}),
+        mcpServers,
       },
       running: false,
     }
@@ -7153,11 +7169,12 @@ export class CodexClaudeAppServer {
     turn: TurnRecord,
     toolUseId: string,
     input: Record<string, unknown>,
+    mcpServers: string[],
   ): boolean {
     const to = typeof input.to === 'string' ? input.to : ''
     const entry = to
       ? (this.findBackgroundSubagent(thread.id, { agentId: to }) ??
-        this.adoptChildAgent(thread, turn.id, to))
+        this.adoptChildAgent(thread, turn.id, to, mcpServers))
       : null
     if (!entry) return false
     const message =

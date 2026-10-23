@@ -68,6 +68,8 @@ interface ServerOptions {
   runtime?: ClaudeRuntime
   // CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS for the run; unset when absent.
   watchdogMs?: string
+  // CLAUDE_CODEX_MCP_SERVERS for the run; unset when absent.
+  mcpServers?: string
 }
 
 async function withServer(
@@ -81,6 +83,7 @@ async function withServer(
     CODEX_HOME: process.env.CODEX_HOME,
     CLAUDE_CODEX_SUBAGENT_ITEMS: process.env.CLAUDE_CODEX_SUBAGENT_ITEMS,
     CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS: process.env.CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS,
+    CLAUDE_CODEX_MCP_SERVERS: process.env.CLAUDE_CODEX_MCP_SERVERS,
   }
   const setEnv = (values: Record<string, string | undefined>) => {
     for (const [name, value] of Object.entries(values)) {
@@ -93,6 +96,7 @@ async function withServer(
     CODEX_HOME: join(directory, 'codex-home'),
     CLAUDE_CODEX_SUBAGENT_ITEMS: options.items,
     CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS: options.watchdogMs,
+    CLAUDE_CODEX_MCP_SERVERS: options.mcpServers,
   })
   let listener: RuntimeBackgroundListener | undefined
   const stops = new Map<string, () => void>()
@@ -834,6 +838,109 @@ test('a message sent to a running agent goes after what it said so far, and its 
       ])
       assert.deepEqual(leftOpen(messages, child), [])
     },
+  )
+})
+
+test("a subagent's MCP calls name the configured server, `__` and all, between turns too", async () => {
+  // `my` and `my__server` both run: the longer name wins, as for the parent.
+  const servers = JSON.stringify({ my: { command: 'true' }, my__server: { command: 'true' } })
+  const call = (toolUseId: string, tool: string, text: string): SubagentOutput[] => [
+    { type: 'tool_use', toolUseId, toolName: `mcp__my__server__${tool}`, input: { q: tool } },
+    { type: 'tool_result', toolUseId, content: [{ type: 'text', text }], isError: false },
+  ]
+  const script: Script = async (context, handlers, tools) => {
+    if (context.prompt.includes('ask again')) {
+      // SendMessage takes over the foreground agent, which then works on in
+      // the background.
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId: 'send-1',
+        toolName: 'SendMessage',
+        input: { to: 'f00dcafe', message: 'Look once more.' },
+      })
+      await handlers.onEvent({ type: 'tool_result', toolUseId: 'send-1', content: 'Message sent.' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'asked' })
+      return
+    }
+    await startAgent(context, handlers, tools, 'agent-fg', 'fg-task', 'look it up')
+    for (const output of call('fg-search', 'search', 'hit'))
+      await handlers.onEvent(out('agent-fg', output, 'fg-task'))
+    await handlers.onEvent({
+      type: 'tool_result',
+      toolUseId: 'agent-fg',
+      content: `Found it.\nagentId: f00dcafe\n<usage>subagent_tokens: 5\ntool_uses: 1\nduration_ms: 9</usage>`,
+    })
+    await startAgent(context, handlers, tools, 'agent-bg', 'bg-task', 'watch it', {
+      background: true,
+    })
+    await handlers.onEvent({
+      type: 'tool_result',
+      toolUseId: 'agent-bg',
+      content: 'Async agent launched successfully.\nagentId: bg-task',
+      structured: {
+        isAsync: true,
+        status: 'async_launched',
+        agentId: 'bg-task',
+        prompt: 'watch it',
+      },
+    })
+    await handlers.onEvent({ type: 'completed', success: true, result: 'launched' })
+  }
+  await withServer(
+    script,
+    async ({ startThread, runTurn, listener, waitFor, request, messages }) => {
+      const threadId = await startThread()
+      const live = await runTurn(threadId, 'look it up, then watch it')
+      const foreground = spawnedChild(live, 'look it up')
+      const background = spawnedChild(live, 'watch it')
+      const settle = async (taskId: string, child: string, result: string) => {
+        const from = messages.length
+        await listener().onTaskEvent(threadId, {
+          type: 'task_notification',
+          taskId,
+          toolUseId: taskId === 'bg-task' ? 'agent-bg' : null,
+          status: 'completed',
+          summary: 'Agent completed',
+          result,
+          usage: null,
+        })
+        await waitFor(
+          (message) => message.method === 'turn/completed' && message.params.threadId === child,
+          `${taskId} to end`,
+          from,
+        )
+      }
+      // Between the parent's turns.
+      for (const output of call('bg-fetch', 'fetch', 'page'))
+        await listener().onTaskEvent(threadId, out('agent-bg', output, 'bg-task'))
+      await settle('bg-task', background, 'Watched.')
+      await runTurn(threadId, 'ask again')
+      for (const output of call('fg-lookup', 'lookup', 'same'))
+        await listener().onTaskEvent(threadId, out('', output, 'f00dcafe'))
+      await settle('f00dcafe', foreground, 'Same.')
+
+      const mcp = (tool: string, text: string) => [
+        'mcp',
+        `my__server/${tool}`,
+        'completed',
+        [{ type: 'text', text }],
+        null,
+      ]
+      assert.deepEqual((await threadItems(request, background)).map(shape), [
+        ['user', 'watch it'],
+        mcp('fetch', 'page'),
+        ['message', null, 'Watched.'],
+      ])
+      assert.deepEqual((await threadItems(request, foreground)).map(shape), [
+        ['user', 'look it up'],
+        mcp('search', 'hit'),
+        ['message', null, 'Found it.'],
+        ['user', 'Look once more.'],
+        mcp('lookup', 'same'),
+        ['message', null, 'Same.'],
+      ])
+    },
+    { mcpServers: servers },
   )
 })
 
