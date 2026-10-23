@@ -72,16 +72,24 @@ export interface IdleSleepGuardOptions {
   pollMs?: number
   setInterval?: (callback: () => void, ms: number) => unknown
   clearInterval?: (handle: unknown) => void
+  now?: () => number
   log?: (event: string, data: Record<string, unknown>) => void
 }
 
-// After this many keep-awake processes failed or ended on their own, the
-// guard stops trying until the adapter restarts.
+// After this many keep-awake processes in a row failed or ended on their own,
+// the guard stops trying until the adapter restarts, rather than start one
+// after another.
 export const MAX_KEEP_AWAKE_FAILURES = 3
+
+// A keep-awake process that ran this long, or until the guard let it go,
+// worked: the failures before it no longer count, so ones hours apart never
+// add up to the limit.
+export const KEEP_AWAKE_STEADY_MS = 60_000
 
 interface Hold {
   handle: KeepAwakeHandle | null
   live: boolean
+  since: number
 }
 
 export class IdleSleepGuard {
@@ -92,6 +100,7 @@ export class IdleSleepGuard {
   private readonly pollMs: number
   private readonly setTimer: (callback: () => void, ms: number) => unknown
   private readonly clearTimer: (handle: unknown) => void
+  private readonly now: () => number
   private readonly log: (event: string, data: Record<string, unknown>) => void
   private hold: Hold | null = null
   private poll: unknown = null
@@ -113,6 +122,7 @@ export class IdleSleepGuard {
       })
     this.clearTimer =
       options.clearInterval ?? ((handle) => clearInterval(handle as ReturnType<typeof setInterval>))
+    this.now = options.now ?? Date.now
     this.log = options.log ?? debugLog
   }
 
@@ -135,7 +145,7 @@ export class IdleSleepGuard {
 
   private acquire(): void {
     if (this.hold || this.failures >= MAX_KEEP_AWAKE_FAILURES) return
-    const hold: Hold = { handle: null, live: true }
+    const hold: Hold = { handle: null, live: true, since: this.now() }
     this.hold = hold
     try {
       hold.handle = this.spawn(CAFFEINATE, ['-i', '-w', String(this.pid)], (error) =>
@@ -156,6 +166,7 @@ export class IdleSleepGuard {
     if (!hold.live) return
     hold.live = false
     if (this.hold === hold) this.hold = null
+    if (this.now() - hold.since >= KEEP_AWAKE_STEADY_MS) this.failures = 0
     this.failures += 1
     const gaveUp = this.failures >= MAX_KEEP_AWAKE_FAILURES
     this.log('idleSleep.lost', {
@@ -174,6 +185,8 @@ export class IdleSleepGuard {
     this.hold = null
     hold.live = false
     hold.handle?.stop()
+    // It ran until nothing needed it.
+    this.failures = 0
     this.log('idleSleep.release', {})
   }
 

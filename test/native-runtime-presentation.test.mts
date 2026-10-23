@@ -534,6 +534,17 @@ test('Claude compacting the conversation becomes compaction events; a subagent c
 test("native API retries become retrying events, a subagent's told by its Agent call, and urgent CLI notifications warnings", async () => {
   const notification = (key: string, fields: Record<string, unknown>) =>
     system('notification', { key, text: `${key} text`, priority: 'high', ...fields })
+  // The CLI tells a subagent's retry as its Agent call's tool_progress: the
+  // call is parent_tool_use_id, tool_use_id one the CLI makes up.
+  const agentProgress = (fields: Record<string, unknown>) => ({
+    type: 'tool_progress',
+    tool_use_id: 'agent_msg_01',
+    tool_name: 'Agent',
+    parent_tool_use_id: 'agent',
+    elapsed_time_seconds: 0,
+    subagent_type: 'general-purpose',
+    ...fields,
+  })
   const events = await collect([
     system('api_retry', {
       attempt: 1,
@@ -542,13 +553,27 @@ test("native API retries become retrying events, a subagent's told by its Agent 
       error_status: 529,
       error: 'overloaded',
     }),
-    // A subagent's retry is told against the Agent call that runs it.
+    agentProgress({
+      subagent_retry: {
+        agent_id: 'a0f1e2d3c4b5a697',
+        attempt: 1,
+        max_retries: 10,
+        retry_delay_ms: 600,
+        error_status: 500,
+        error_category: 'server_error',
+      },
+    }),
+    // The request went through; a heartbeat says so.
+    agentProgress({}),
+    { type: 'tool_progress', tool_use_id: 'bash', tool_name: 'Bash', parent_tool_use_id: null },
+    // An api_retry naming an Agent call, which the CLI does not send, is
+    // that subagent's all the same.
     system('api_retry', {
-      attempt: 1,
+      attempt: 2,
       max_retries: 10,
-      retry_delay_ms: 600,
-      error_status: 500,
-      error: 'server_error',
+      retry_delay_ms: 1200,
+      error_status: 529,
+      error: 'overloaded',
       parent_tool_use_id: 'agent',
     }),
     system('api_retry', {
@@ -581,6 +606,16 @@ test("native API retries become retrying events, a subagent's told by its Agent 
       status: 500,
       category: 'server_error',
       delayMs: 600,
+      toolUseId: 'agent',
+      agentId: 'a0f1e2d3c4b5a697',
+    },
+    {
+      type: 'retrying',
+      attempt: 2,
+      maxRetries: 10,
+      status: 529,
+      category: 'overloaded',
+      delayMs: 1200,
       toolUseId: 'agent',
     },
     {
@@ -678,6 +713,21 @@ test('a failed native turn says why it failed, and a successful one carries no f
 
   // A subagent's retry says nothing about why the main loop failed.
   const afterSubagentRetry = await completedEvent([
+    {
+      type: 'tool_progress',
+      tool_use_id: 'agent_msg_01',
+      tool_name: 'Agent',
+      parent_tool_use_id: 'agent',
+      elapsed_time_seconds: 0,
+      subagent_retry: {
+        agent_id: 'a0f1e2d3c4b5a697',
+        attempt: 10,
+        max_retries: 10,
+        retry_delay_ms: 30_000,
+        error_status: 529,
+        error_category: 'overloaded',
+      },
+    },
     system('api_retry', {
       attempt: 10,
       max_retries: 10,

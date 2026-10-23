@@ -91,8 +91,9 @@ request on its own. With the default native backend, each retry shows in the
 turn as Codex shows a stream retry: a passing **Reconnecting 1/10** row that
 counts up and leaves once Claude answers, with the HTTP status and the wait
 under it. Like Codex, the adapter does not store these rows, so they are gone
-when the chat is reopened. A subagent's retries show the same way in the
-subagent's own thread while it runs, never in the parent chat.
+when the chat is reopened. A foreground subagent's retries show the same way
+in the subagent's own thread while it runs, never in the parent chat; Claude
+Code does not report a background agent's retries.
 
 A turn that fails tells the App why, with the error code Codex would send:
 the context window is full, the server is busy (HTTP 529), a rate limit, a bad
@@ -119,17 +120,23 @@ adapter's environment takes its place.
 
 Most failed connections on a laptop come from the computer going to sleep
 during a turn, which breaks Claude's connection to the model. When a turn
-fails after the computer slept for a minute or more during it, its error says
-so: roughly how long the computer slept, and that a message, or **Continue**,
-picks up where Claude left off. On macOS it also points to the App's
+fails after the computer slept for a minute or more since Claude last made
+progress in it, its error says so: roughly how long the computer slept, and
+that a message, or **Continue**, picks up where Claude left off. A sleep the
+turn went on from (Claude wrote or ran something after waking) is not blamed,
+and neither is an API that answered, for example as overloaded or over a
+limit. On macOS it also points to the App's
 **Settings > General > Prevent sleep while running**, which does not stop
 sleep with the lid closed (the App does not offer it on Windows). The error keeps its code and details.
 
 To have the adapter keep a Mac awake itself while Claude works, start it with
 `CLAUDE_CODEX_PREVENT_IDLE_SLEEP=1`: it then holds `caffeinate -i` while any
 turn, background agent or other background work runs, and lets go once nothing
-does. Closing the lid still sleeps. It is off by default and does nothing on
-other platforms.
+does. A command Claude runs in the background with Bash counts as background
+work, so a dev server or file watcher keeps the Mac awake until its Claude
+session closes, `CLAUDE_CODEX_BACKGROUND_IDLE_MS` (default 2 hours) after the
+session's last message. Closing the lid still sleeps. It is off by default and
+does nothing on other platforms.
 
 A turn waiting on a subagent or workflow does not fail because the computer
 slept, or while it waits on you for an approval, an answer, an MCP form or an
@@ -539,7 +546,17 @@ stops says it was stopped by the user, one an interrupt of the parent ends
 says it was interrupted, and one still running when the parent turn fails says
 it ended because the parent turn failed, and why; none of these count as
 failed subagents. Each of these endings is also the subagent thread's last
-message. The App draws a turn's error only when the turn failed, and does not
+message.
+
+A workflow agent that fails, such as one that stalled on every attempt or hit
+an API error, fails the same way as soon as the workflow records it, with the
+reason the workflow reported for it, and counts as a failed subagent. If the
+workflow gives no reason within two seconds, or none by the time it ends, the
+agent's turn says only that it failed. An attempt the workflow ran again after
+a stall ends as failed too, as soon as the next attempt starts, saying the
+workflow ran the agent again. Claude Code's progress report replaces that
+attempt's error with the next attempt's start, so its own reason does not come
+through. The App draws a turn's error only when the turn failed, and does not
 draw the agent's state on the parent's wait card; both are there for clients
 that read them.
 

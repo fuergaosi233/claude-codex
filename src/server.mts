@@ -450,6 +450,20 @@ const MAX_TRACKED_TASK_IDS = 512
 const MAX_TRACKED_COMMAND_ITEMS = 512
 const MAX_QUEUED_ACTIVITY = 64
 
+// What a turn hears that does not show Claude getting on with it: a request
+// it will send again, a notice, an error, and the usage, figures and end of
+// the result that closes it. After a sleep broke its connection, a turn
+// hears only these until it fails. Usage also comes with each message, after
+// the message itself.
+const NO_PROGRESS_EVENTS: ReadonlySet<RuntimeEvent['type']> = new Set([
+  'retrying',
+  'notice',
+  'error',
+  'usage',
+  'metrics',
+  'completed',
+])
+
 // A hidden goal continuation that does no tool work ends the run of
 // continuations until the user or the goal changes something.
 const GOAL_IDLE_TURN_LIMIT = 1
@@ -696,6 +710,10 @@ export class CodexClaudeAppServer {
   private readonly runtime: ClaudeRuntime
   // Notices that the computer slept, for the turn watchdog and failed turns.
   private readonly sleepMonitor: SleepMonitor
+  // For each running turn, how long the computer had slept in all
+  // (sleepMonitor.suspendedMs()) when Claude last made progress in it: only
+  // a sleep since then can explain the turn's failure.
+  private readonly sleptAtTurnProgress = new Map<string, number>()
   private readonly platform: NodeJS.Platform
   // The CLI notices each recent turn has shown (see turn-notices.mts).
   private readonly turnNotices: TurnNoticeLog
@@ -3328,7 +3346,7 @@ export class CodexClaudeAppServer {
     if (params.model != null) {
       // Unlike turn/start, an unknown model fails instead of falling back.
       const requested = stringOr(params.model, '')
-      const model = allSelectableModelOptions().find(
+      const model = invalidRequestIfThrows(allSelectableModelOptions).find(
         (option) => option.id.toLowerCase() === requested.toLowerCase(),
       )?.id
       if (!model) throw invalidRequest(`unknown model: ${requested}`)
@@ -3468,15 +3486,17 @@ export class CodexClaudeAppServer {
       void this.runRuntimeTurn(peer, thread, turn, prompt, {
         model: thread.model,
         effort: thread.reasoningEffort,
-      }).catch((error) => {
-        if (!this.failTurn(peer, threadId, turn, error)) return
-        recordRunEvent('turn.failed', {
-          threadId,
-          turnId,
-          runtimeBackend: thread.runtimeBackend,
-          error: { message: error.message },
-        })
       })
+        .catch((error) => {
+          if (!this.failTurn(peer, threadId, turn, error)) return
+          recordRunEvent('turn.failed', {
+            threadId,
+            turnId,
+            runtimeBackend: thread.runtimeBackend,
+            error: { message: error.message },
+          })
+        })
+        .finally(() => this.sleptAtTurnProgress.delete(turnId))
     })
     return { turn: responseTurn, reviewThreadId: threadId }
   }
@@ -3538,7 +3558,12 @@ export class CodexClaudeAppServer {
   // Compacts the thread like Codex's /compact: Claude compacts the thread's
   // own session, so the next turn goes on from its summary. A thread with no
   // Claude session yet, or whose compaction fails, gets a summary written in
-  // a session of its own instead, and keeps its session as it was.
+  // a session of its own instead, and keeps its session as it was. When
+  // Claude could not compact the session, nothing claims it did: the item
+  // ends as an empty reasoning item, which the App does not draw and the
+  // turn does not keep, and no thread/compacted follows; the notice row says
+  // why and the summary still lands.
+  // App rule: item-completed-replaces
   private async compactThread(
     peer: RpcPeer,
     thread: ThreadRecord,
@@ -3561,6 +3586,17 @@ export class CodexClaudeAppServer {
         params: { threadId, turnId, item: compactItem, completedAtMs: nowMillis() },
       })
     }
+    const dropCompactItem = (): void => {
+      if (!compactOpen) return
+      compactOpen = false
+      const item: ThreadItem = { type: 'reasoning', id: compactItem.id, summary: [], content: [] }
+      this.notify(peer, {
+        method: 'item/completed',
+        params: { threadId, turnId, item, completedAtMs: nowMillis() },
+      })
+    }
+    // Set once Claude was asked to compact the session and did not.
+    let sessionFailed = false
     let agentItem: ThreadItem | null = null
     const completeAgentItem = (): void => {
       if (!agentItem) return
@@ -3605,7 +3641,10 @@ export class CodexClaudeAppServer {
           })
           return false
         })
+        sessionFailed = !compacted
       }
+      // The summary written next is not the session's compaction.
+      if (sessionFailed && active()) dropCompactItem()
       if (compacted || !active()) return
       const item: ThreadItem = {
         type: 'agentMessage',
@@ -3651,7 +3690,8 @@ export class CodexClaudeAppServer {
             method: 'turn/completed',
             params: { threadId, turn: this.toLifecycleTurn(completed) },
           })
-          this.notify(peer, { method: 'thread/compacted', params: { threadId, turnId } })
+          if (!sessionFailed)
+            this.notify(peer, { method: 'thread/compacted', params: { threadId, turnId } })
         }
       }
     }
@@ -4071,7 +4111,10 @@ export class CodexClaudeAppServer {
       .catch((error) => {
         this.failTurn(peer, thread.id, turn, error)
       })
-      .finally(() => this.runtimeRuns.delete(turn.id))
+      .finally(() => {
+        this.runtimeRuns.delete(turn.id)
+        this.sleptAtTurnProgress.delete(turn.id)
+      })
   }
 
   private completeWorkflowListTurn(peer: RpcPeer, thread: ThreadRecord, turn: TurnRecord): void {
@@ -4887,6 +4930,7 @@ export class CodexClaudeAppServer {
       : null
     const disarmWatchdog = (): void => watchdog.disarm()
     const noteProgress = (): void => watchdog.noteProgress()
+    this.sleptAtTurnProgress.set(turn.id, this.sleepMonitor.suspendedMs())
     const armWatchdog = (): void => {
       if (!acceptRuntimeEvents || (activeSubagents.size === 0 && !workflowInFlight)) return
       watchdog.arm()
@@ -4932,6 +4976,8 @@ export class CodexClaudeAppServer {
           // projected workflow agent) shows it is moving; the watchdog only
           // gives up after a whole window without any of it.
           noteProgress()
+          if (!NO_PROGRESS_EVENTS.has(event.type))
+            this.sleptAtTurnProgress.set(turn.id, this.sleepMonitor.suspendedMs())
           if (event.type === 'subagent_progress') return
           if (event.type === 'session') {
             this.store.updateClaudeSessionId(thread.id, event.claudeSessionId)
@@ -5755,12 +5801,14 @@ export class CodexClaudeAppServer {
             if (context.purpose !== 'normal') return
             // A subagent's retry shows in its own thread, while its turn
             // runs; one whose agent is gone or unknown shows nowhere, never
-            // in this turn.
+            // in this turn. Its Agent call names it, else its task id.
             // App rule: reconnecting-errors
-            if (event.toolUseId) {
+            if (event.toolUseId || event.agentId) {
               const agent =
-                subagentContexts.get(event.toolUseId) ??
-                this.findBackgroundSubagent(thread.id, { toolUseId: event.toolUseId })?.context
+                (event.toolUseId
+                  ? (subagentContexts.get(event.toolUseId) ??
+                    this.findBackgroundSubagent(thread.id, { toolUseId: event.toolUseId })?.context)
+                  : undefined) ?? this.nestingHost(thread.id, subagentContexts, event.agentId)
               if (!agent || this.store.getTurn(agent.childTurnId)?.status !== 'inProgress') return
               this.notify(peer, {
                 method: 'error',
@@ -6698,9 +6746,10 @@ export class CodexClaudeAppServer {
 
   // The agent whose own Agent call this is, when the frame names it by task
   // id (agent_id, newer CLIs) and it is still working in this turn or in the
-  // background: the new child then hangs off that agent's child thread.
-  // Null for the main loop's calls, for an older CLI and for a host whose
-  // child turn is over, which leaves the child under the parent thread.
+  // background: the new child then hangs off that agent's child thread (and
+  // a retry the agent reports shows there). Null for the main loop's calls,
+  // for an older CLI and for a host whose child turn is over, which leaves
+  // the child under the parent thread.
   private nestingHost(
     threadId: string,
     contexts: Map<string, SubagentContext>,
@@ -8067,14 +8116,16 @@ export class CodexClaudeAppServer {
   // The model a settings or metadata update moves the thread to, or null. The
   // App sends the chat's current model along with other settings; that is no
   // change, even when the picker no longer lists it and repairing it would
-  // pick a model on the other backend.
+  // pick a model on the other backend. Model process profiles that fail to
+  // load are the user's to fix, like a model the thread cannot take.
+  // App rule: model-menu-settings
   private requestedModelChange(
     thread: ThreadRecord,
     params: Record<string, unknown>,
   ): string | null {
     const rawModel = modelFromParams(params, null)
     if (!rawModel || rawModel === thread.model) return null
-    const model = normalizeSelectableModelId(rawModel, thread.model)
+    const model = invalidRequestIfThrows(() => normalizeSelectableModelId(rawModel, thread.model))
     return model === thread.model ? null : model
   }
 
@@ -9978,11 +10029,20 @@ export class CodexClaudeAppServer {
     return true
   }
 
-  // What a failed turn's error leaves out: that the computer slept during
-  // the turn, which is the likely reason a model request broke off, and the
-  // notices Claude reported along the way, whose rows the App does not keep.
+  // What a failed turn's error leaves out: that the computer slept since
+  // Claude last made progress in the turn, which is the likely reason a model
+  // request broke off, and the notices Claude reported along the way, whose
+  // rows the App does not keep. A sleep the turn went on from (it streamed,
+  // ran a tool) did not break it. A turn with no run of its own counts the
+  // sleep since it started.
   private explainTurnError(turn: TurnRecord, error: CodexTurnError): CodexTurnError {
-    const sleptMs = turn.startedAt == null ? 0 : this.sleepMonitor.sleptSince(turn.startedAt * 1000)
+    const sleptAtProgress = this.sleptAtTurnProgress.get(turn.id)
+    const sleptMs =
+      sleptAtProgress !== undefined
+        ? this.sleepMonitor.suspendedMs() - sleptAtProgress
+        : turn.startedAt == null
+          ? 0
+          : this.sleepMonitor.sleptSince(turn.startedAt * 1000)
     const explained = withSleepNotice(error, sleptMs, this.platform)
     if (explained !== error) {
       debugLog('turn.slept', { threadId: turn.threadId, turnId: turn.id, sleptMs })

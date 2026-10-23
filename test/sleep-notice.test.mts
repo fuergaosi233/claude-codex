@@ -8,6 +8,7 @@ import {
   sleepNotice,
   withSleepNotice,
 } from '../src/sleep-notice.mjs'
+import type { RuntimeHandlers } from '../src/types.mjs'
 import { scriptedRuntime, withInProcessApp } from './fixtures/in-process-app.mjs'
 
 const MINUTE = 60_000
@@ -127,8 +128,14 @@ test('a failed turn that slept says so, keeping its error code', () => {
   })
   // Too short to matter.
   assert.equal(withSleepNotice(error, 30_000, 'linux'), error)
-  // Sleep does not explain a refusal of the request itself.
-  for (const code of ['usageLimitExceeded', 'contextWindowExceeded', 'unauthorized'] as const) {
+  // Sleep does not explain a refusal of the request itself, or an API too
+  // busy to take it.
+  for (const code of [
+    'usageLimitExceeded',
+    'contextWindowExceeded',
+    'unauthorized',
+    'serverOverloaded',
+  ] as const) {
     const refused = { ...error, codexErrorInfo: code }
     assert.equal(withSleepNotice(refused, 14 * MINUTE, 'linux'), refused)
   }
@@ -147,7 +154,9 @@ test('a failed turn that slept says so, keeping its error code', () => {
 
 test('a turn that fails after the computer slept says so in the turn and the error', async () => {
   let slept = 0
+  let sleepInTurn = 0
   const runtime = scriptedRuntime(async (_context, handlers) => {
+    slept += sleepInTurn
     await handlers.onEvent({
       type: 'completed',
       success: false,
@@ -162,7 +171,7 @@ test('a turn that fails after the computer slept says so in the turn and the err
       const awake = await app.turnCompleted(await app.startTurn(threadId, 'first'))
       assert.equal(awake.status, 'failed')
 
-      slept = 25 * MINUTE
+      sleepInTurn = 25 * MINUTE
       const turnId = await app.startTurn(threadId, 'second')
       const failed = await app.turnCompleted(turnId)
       assert.match(failed.error.message, /Prevent sleep while running/)
@@ -183,6 +192,87 @@ test('a turn that fails after the computer slept says so in the turn and the err
       server: {
         sleepMonitor: { suspendedMs: () => slept, sleptSince: () => slept },
         platform: 'darwin',
+      },
+    },
+  )
+})
+
+test('only a sleep since the turn last made progress explains its failure', async () => {
+  let slept = 0
+  const failed = {
+    type: 'completed',
+    success: false,
+    result: 'API Error: Connection error.',
+    failure: { terminalReason: 'api_error', category: null, status: null },
+  } as const
+  // What a turn whose connection broke hears before it fails: retries, and
+  // the usage and figures of the result that ends it.
+  const brokenOff = async (handlers: RuntimeHandlers): Promise<void> => {
+    for (const attempt of [1, 2])
+      await handlers.onEvent({
+        type: 'retrying',
+        attempt,
+        maxRetries: 10,
+        status: null,
+        category: 'unknown',
+        delayMs: 1000,
+      })
+    await handlers.onEvent({ type: 'notice', level: 'warning', message: 'Still reconnecting.' })
+    await handlers.onEvent({ type: 'usage', usage: { input_tokens: 0, output_tokens: 0 } })
+    await handlers.onEvent({
+      type: 'metrics',
+      durationMs: 1,
+      apiDurationMs: 0,
+      numTurns: 1,
+      costUsd: 0,
+    })
+    await handlers.onEvent(failed)
+  }
+  const runtime = scriptedRuntime(async (context, handlers) => {
+    const prompt = context.prompt ?? ''
+    if (/slept, then went on/.test(prompt)) {
+      // Asleep long before the failure; Claude went on after waking.
+      slept += 2 * 60 * MINUTE
+      await handlers.onEvent({ type: 'text_delta', delta: 'Back at it.' })
+      await handlers.onEvent({ type: 'message_boundary' })
+      await brokenOff(handlers)
+    } else if (/went on, then slept/.test(prompt)) {
+      await handlers.onEvent({ type: 'text_delta', delta: 'Working.' })
+      await handlers.onEvent({ type: 'message_boundary' })
+      slept += 25 * MINUTE
+      await brokenOff(handlers)
+    } else if (/slept twice/.test(prompt)) {
+      slept += 2 * 60 * MINUTE
+      await handlers.onEvent({ type: 'text_delta', delta: 'Back at it.' })
+      slept += 14 * MINUTE
+      await brokenOff(handlers)
+    } else {
+      await handlers.onEvent(failed)
+    }
+  })
+  await withInProcessApp(
+    runtime,
+    async (app) => {
+      const threadId = await app.startThread()
+      const awake = await app.turnCompleted(await app.startTurn(threadId, 'awake'))
+      assert.equal(awake.status, 'failed')
+      assert.doesNotMatch(awake.error.message, /slept/)
+
+      const earlier = await app.turnCompleted(await app.startTurn(threadId, 'slept, then went on'))
+      assert.equal(earlier.status, 'failed')
+      assert.equal(earlier.error.message, awake.error.message)
+
+      const late = await app.turnCompleted(await app.startTurn(threadId, 'went on, then slept'))
+      assert.equal(late.error.message, withSleepNotice(awake.error, 25 * MINUTE, 'linux').message)
+
+      // Only the sleep since Claude last went on counts.
+      const twice = await app.turnCompleted(await app.startTurn(threadId, 'slept twice'))
+      assert.equal(twice.error.message, withSleepNotice(awake.error, 14 * MINUTE, 'linux').message)
+    },
+    {
+      server: {
+        sleepMonitor: { suspendedMs: () => slept, sleptSince: () => slept },
+        platform: 'linux',
       },
     },
   )

@@ -38,13 +38,14 @@ versioning or publishing metadata.
 
 ### Failures you can see and act on
 
-- A turn that fails after the computer slept for a minute or more during it
-  says so in its error: roughly how long the computer slept, that this broke
-  Claude's connection to the model, and that a message (or Continue) picks up
-  where it left off; on macOS it also points to the App's **Prevent sleep
-  while running** setting. The error code and details are
-  unchanged, and refusals such as usage limits or startup failures are left
-  alone.
+- A turn that fails after the computer slept for a minute or more since
+  Claude last made progress in it says so in its error: roughly how long the
+  computer slept, that this broke Claude's connection to the model, and that a
+  message (or Continue) picks up where it left off; on macOS it also points to
+  the App's **Prevent sleep while running** setting. A sleep the turn went on
+  from is not blamed (API retries, notices and the failing result do not
+  count as going on). The error code and details are unchanged, and refusals
+  such as usage limits, an overloaded API or startup failures are left alone.
 - The subagent watchdog (`CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS`) no longer fails a
   turn over quiet that is not a stall. The wait is paused while the turn waits
   on the user (an approval, a question, an MCP elicitation or a client dynamic
@@ -53,8 +54,14 @@ versioning or publishing metadata.
 - Opt-in `CLAUDE_CODEX_PREVENT_IDLE_SLEEP=1` keeps a Mac from idle-sleeping
   while Claude works: the adapter holds `caffeinate -i -w <adapter pid>` while
   any turn, background agent or other background work runs, and stops it once
-  nothing does. Closing the lid still sleeps. Off by default, and it does
-  nothing on other platforms.
+  nothing does. A command Claude runs in the background with Bash, such as a
+  dev server or file watcher, counts as background work and keeps the Mac
+  awake until its Claude session closes, `CLAUDE_CODEX_BACKGROUND_IDLE_MS`
+  (default 2 hours) after the session's last message. Closing the lid still
+  sleeps. A `caffeinate` that fails or ends on its own is started again while
+  work runs; the adapter stops trying until it restarts only after three in a
+  row end within a minute of starting.
+  Off by default, and it does nothing on other platforms.
 - What Claude Code reports beside a turn (a compaction it could not do, a
   switch to a fallback model, an urgent CLI notification, a call it refused)
   now shows in the Codex App as a dim row under the turn, which goes on. Each
@@ -73,7 +80,9 @@ versioning or publishing metadata.
 - A turn keeps a `contextCompaction` item only once the compaction completes,
   in the place it started, like Codex. A compaction an interrupt cuts short no
   longer reads as "Context compacted" after a reload, and one Claude Code could
-  not do leaves no marker; its notice says what happened.
+  not do leaves no marker; its notice says what happened. That includes a
+  `/compact` (`thread/compact/start`) Claude Code could not do: its turn keeps
+  only the summary written instead, and no `thread/compacted` is sent.
 - Requests the user can correct fail with JSON-RPC `-32600` (invalid request),
   the code Codex uses, instead of `-32000`, with the same messages: an unknown
   thread, turn, section, queued message or process; a bad cursor or parameter;
@@ -83,6 +92,20 @@ versioning or publishing metadata.
   The model menu's "Couldn't update model settings" toast now gives the
   reason, after the App's own "Check your config.toml." line. Failures inside
   the adapter stay `-32000`.
+- Model process profiles that fail to load fail with one line of at most 300
+  characters that names the file (or `CLAUDE_CODEX_MODEL_PROFILES`) and says
+  what is wrong. The message used to carry the JSON parser's excerpt of the
+  file's text, which could include a credential, and the id or
+  `defaultModel` value that was not valid. A model change from the menu or
+  `turn/settings/update` that fails on them is now an invalid request
+  (`-32600`) like one from `turn/start`, so the toast shows the reason.
+- A workflow agent that fails (one that stalled on every attempt, or hit an
+  API error) ends its thread's turn as failed, with the reason the workflow
+  reported, and counts as a failed subagent of its parent. It used to show as
+  running until the workflow ended and then as completed. An attempt the
+  workflow ran again after a stall ends as failed too, as soon as the next
+  attempt starts, saying the workflow ran the agent again, instead of staying
+  open. Claude Code's progress report does not keep that attempt's own error.
 - The goal tools (`codex_goal`) and leader tools (`codex_leader`) load with the
   session instead of behind Claude Code's tool search, so Claude knows they are
   there in a session with many tools.
@@ -791,8 +814,10 @@ versioning or publishing metadata.
   Stopped, interrupted and orphaned subagents say how they ended and do not
   count as failed. Stopping a foreground subagent whose Agent call returned
   before Claude Code confirmed the stop no longer ends its thread twice.
-- A subagent's API retries show as **Reconnecting n/m** in the subagent's
-  thread while it runs, instead of not at all, and never in the parent.
+- A foreground subagent's API retries show as **Reconnecting n/m** in the
+  subagent's thread while it runs, instead of not at all, and never in the
+  parent. Claude Code reports them as the Agent call's `tool_progress` with
+  `subagent_retry` (and none for a background agent).
 
 ### Rust-first protocol groundwork
 

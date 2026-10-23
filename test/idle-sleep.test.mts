@@ -5,6 +5,7 @@ import {
   IdleSleepGuard,
   type IdleSleepGuardOptions,
   idleSleepPreventionEnabled,
+  KEEP_AWAKE_STEADY_MS,
   type KeepAwakeSpawner,
   MAX_KEEP_AWAKE_FAILURES,
   spawnKeepAwake,
@@ -131,6 +132,47 @@ test('a keep-awake process that fails is taken up again, up to a limit', () => {
   assert.equal(fake.spawned.length, MAX_KEEP_AWAKE_FAILURES)
   assert.equal(guard.holding, false)
   assert.equal(fake.polling, false)
+})
+
+test('only failures in a row count toward the limit', () => {
+  const fake = fakeKeepAwake()
+  let clock = 0
+  let busy = true
+  const guard = new IdleSleepGuard({ ...fake.options, now: () => clock, busy: () => busy })
+  const failLast = () => fake.spawned.at(-1)?.exit(new Error('caffeinate exited with code 1'))
+  guard.check()
+
+  // Each one ran a while before it ended: the poll always takes hold again.
+  for (let i = 0; i <= MAX_KEEP_AWAKE_FAILURES; i += 1) {
+    clock += KEEP_AWAKE_STEADY_MS
+    failLast()
+    fake.poll()
+    assert.ok(guard.holding)
+  }
+  assert.equal(fake.spawned.length, MAX_KEEP_AWAKE_FAILURES + 2)
+
+  // One let go of while it ran worked too.
+  failLast()
+  fake.poll()
+  busy = false
+  guard.check()
+  busy = true
+  guard.check()
+  for (let i = 1; i < MAX_KEEP_AWAKE_FAILURES; i += 1) {
+    failLast()
+    fake.poll()
+    assert.ok(guard.holding)
+  }
+
+  // Ones that end right away, one after another, still give up.
+  clock += 1_000
+  failLast()
+  assert.equal(guard.holding, false)
+  assert.equal(fake.polling, false)
+  const tried = fake.spawned.length
+  guard.check()
+  fake.poll()
+  assert.equal(fake.spawned.length, tried)
 })
 
 test('a spawn that throws, or fails before it returns, does not hold or throw', () => {
