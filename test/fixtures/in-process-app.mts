@@ -68,6 +68,7 @@ const SAVED_ENV = [
   'CLAUDE_CODEX_MOCK',
   'CLAUDE_CODEX_NOTICE_ROWS',
   'CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS',
+  'CLAUDE_CODEX_PREVENT_IDLE_SLEEP',
 ] as const
 
 export interface InProcessOptions {

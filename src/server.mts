@@ -59,6 +59,7 @@ import {
   RpcError,
   SERVER_ERROR,
 } from './host-methods.mjs'
+import { IdleSleepGuard, type IdleSleepGuardOptions } from './idle-sleep.mjs'
 import { inheritedAgents, inheritedHooks, inheritedPermissionRules } from './inherited-config.mjs'
 import { LEADER_APP_THREAD_TOOLS, LeaderThreads } from './leader-tools.mjs'
 import {
@@ -553,6 +554,8 @@ export interface ServerOptions {
   sleepMonitor?: SleepMonitor
   // Where the adapter runs, for advice that names an App setting.
   platform?: NodeJS.Platform
+  // The keep-awake guard's settings; the server says when it is busy.
+  idleSleep?: Omit<IdleSleepGuardOptions, 'busy'>
 }
 
 export class CodexClaudeAppServer {
@@ -664,6 +667,8 @@ export class CodexClaudeAppServer {
   private readonly platform: NodeJS.Platform
   // The CLI notices each recent turn has shown (see turn-notices.mts).
   private readonly turnNotices: TurnNoticeLog
+  // Keeps the Mac from idle-sleeping while anything runs, when turned on.
+  private readonly idleSleep: IdleSleepGuard
 
   constructor(store: SessionStore, runtime: ClaudeRuntime, options: ServerOptions = {}) {
     this.store = store
@@ -672,6 +677,10 @@ export class CodexClaudeAppServer {
     this.sleepMonitor.start?.()
     this.platform = options.platform ?? process.platform
     this.turnNotices = new TurnNoticeLog()
+    this.idleSleep = new IdleSleepGuard({
+      ...options.idleSleep,
+      busy: () => this.hasActiveTurns(),
+    })
     this.leaderThreads = new LeaderThreads({
       store,
       activeTurnId: (threadId) => this.activeTurnByThread.get(threadId) ?? null,
@@ -735,6 +744,7 @@ export class CodexClaudeAppServer {
     this.stopped = true
     this.stopCommandsListener()
     this.sleepMonitor.stop?.()
+    this.idleSleep.stop()
     this.leaderThreads.stop()
     try {
       // Child turns are created directly from Task/Workflow events and are not
@@ -767,6 +777,13 @@ export class CodexClaudeAppServer {
 
   setIdleCheckHandler(handler: () => void): void {
     this.idleCheckHandler = handler
+  }
+
+  // Something that kept the adapter busy may have ended: the keep-awake
+  // guard and the daemon's idle exit look again.
+  private checkIdle(): void {
+    this.idleSleep.check()
+    this.idleCheckHandler?.()
   }
 
   private async handleNotification(_peer: RpcPeer, _message: WireMessage): Promise<void> {
@@ -6778,7 +6795,7 @@ export class CodexClaudeAppServer {
       context,
       status === 'completed' ? 'completed' : 'interrupted',
     )
-    this.idleCheckHandler?.()
+    this.checkIdle()
   }
 
   // Subagent activity belongs to a parent turn. A background agent usually
@@ -7033,7 +7050,7 @@ export class CodexClaudeAppServer {
       this.activeTurnByThread.has(threadId) ||
       this.runtime.hasPendingContinuation?.(threadId) !== true
     ) {
-      this.idleCheckHandler?.()
+      this.checkIdle()
       return
     }
     const peer = this.peerForThread(threadId)
@@ -7080,7 +7097,7 @@ export class CodexClaudeAppServer {
       threadId,
       'Claude session ended before this agent reported back.',
     )
-    this.idleCheckHandler?.()
+    this.checkIdle()
   }
 
   private hasRunningBackgroundSubagent(parentThreadId: string): boolean {
@@ -9381,6 +9398,8 @@ export class CodexClaudeAppServer {
     if (target)
       this.notify(target, { method: 'thread/status/changed', params: { threadId, status } })
     this.leaderThreads.threadChanged()
+    // A turn starting is when the keep-awake guard takes hold.
+    this.idleSleep.check()
   }
 
   // An aborted `signal` drops the request and rejects; the caller's
@@ -9553,7 +9572,7 @@ export class CodexClaudeAppServer {
       this.refreshGitInfoAfterTurn(threadId)
       setImmediate(() => {
         if (!this.startFollowUp(threadId, settled?.status) && this.activeTurnByThread.size === 0)
-          this.idleCheckHandler?.()
+          this.checkIdle()
       })
     }
   }
