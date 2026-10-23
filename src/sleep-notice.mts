@@ -160,8 +160,9 @@ export function sleepDuration(ms: number): string {
 
 // The sentence a failed turn gets when the computer slept during it, or null
 // for a sleep too short to matter. The Codex App's "Prevent sleep while
-// running" setting (Settings > General, desktop App on macOS and Windows)
-// keeps the computer awake while a turn runs, but not with the lid closed.
+// running" setting (Settings > General) keeps the computer awake while a turn
+// runs, but not with the lid closed. The App hides it on Windows, so only
+// macOS gets pointed to it.
 export function sleepNotice(
   sleptMs: number,
   platform: NodeJS.Platform = process.platform,
@@ -171,7 +172,7 @@ export function sleepNotice(
     `The computer running Claude slept for ${sleepDuration(sleptMs)} during this turn, ` +
     "which interrupted Claude's connection to the model; send a message (or Continue) to " +
     'pick up where it left off'
-  if (platform !== 'darwin' && platform !== 'win32') return `${lead}.`
+  if (platform !== 'darwin') return `${lead}.`
   return (
     `${lead}, and turn on Settings > General > Prevent sleep while running to keep the ` +
     'computer awake during tasks (it does not stop sleep when the lid is closed).'

@@ -105,10 +105,13 @@ test('the sleep sentence names the time asleep, and the App setting where it has
     sleepNotice(14 * MINUTE, 'darwin'),
     "The computer running Claude slept for about 14 minutes during this turn, which interrupted Claude's connection to the model; send a message (or Continue) to pick up where it left off, and turn on Settings > General > Prevent sleep while running to keep the computer awake during tasks (it does not stop sleep when the lid is closed).",
   )
-  assert.equal(
-    sleepNotice(14 * MINUTE, 'linux'),
-    "The computer running Claude slept for about 14 minutes during this turn, which interrupted Claude's connection to the model; send a message (or Continue) to pick up where it left off.",
-  )
+  for (const platform of ['linux', 'win32'] as const) {
+    assert.equal(
+      sleepNotice(14 * MINUTE, platform),
+      "The computer running Claude slept for about 14 minutes during this turn, which interrupted Claude's connection to the model; send a message (or Continue) to pick up where it left off.",
+      platform,
+    )
+  }
 })
 
 test('a failed turn that slept says so, keeping its error code', () => {
