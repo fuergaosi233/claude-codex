@@ -28,6 +28,32 @@ export class RpcError extends Error {
   }
 }
 
+// The answer to a request the user can put right: an unknown thread, turn or
+// id, a parameter out of range, an option the thread cannot take. Codex
+// answers these with INVALID_REQUEST, and the App shows the reason for this
+// code where it shows none for others (the model menu's toast). A failure
+// inside the server stays a SERVER_ERROR.
+export function invalidRequest(message: string, data?: unknown): RpcError {
+  return new RpcError(message, data, INVALID_REQUEST)
+}
+
+// A refusal the user can put right, thrown as a plain error by code that
+// answers no requests itself, as an invalid request. An RpcError keeps its
+// own code.
+export function asInvalidRequest(error: unknown): RpcError {
+  if (error instanceof RpcError) return error
+  return invalidRequest(error instanceof Error ? error.message : String(error))
+}
+
+// The result of such code, failing as an invalid request.
+export function invalidRequestIfThrows<T>(check: () => T): T {
+  try {
+    return check()
+  } catch (error) {
+    throw asInvalidRequest(error)
+  }
+}
+
 // The answer to a method this server does not have, in the JSON-RPC form the
 // App takes as "not supported here" and falls back from without an error.
 export function methodNotFound(method: string): RpcError {

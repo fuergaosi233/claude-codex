@@ -53,8 +53,11 @@ import {
 } from './goal-prompts.mjs'
 import {
   accountUsage,
+  asInvalidRequest,
   hostMethod,
   INVALID_REQUEST,
+  invalidRequest,
+  invalidRequestIfThrows,
   methodNotFound,
   RpcError,
   SERVER_ERROR,
@@ -448,7 +451,7 @@ function goalTurnMadeProgress(turn: TurnRecord): boolean {
 function goalBudget(value: unknown): number | null {
   if (value == null) return null
   if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0)
-    throw new Error('goal budgets must be positive integers when provided')
+    throw invalidRequest('goal budgets must be positive integers when provided')
   return value
 }
 
@@ -459,7 +462,7 @@ function isUsageLimitError(error: unknown): boolean {
 
 function queuedInput(value: unknown): UserInput[] {
   const input = Array.isArray(value) ? (value as UserInput[]) : []
-  if (isEmptyInput(input)) throw new Error('queued message input must not be empty')
+  if (isEmptyInput(input)) throw invalidRequest('queued message input must not be empty')
   return input
 }
 
@@ -544,10 +547,14 @@ function threadModelProfileBindingError(thread: ThreadRecord): Error | null {
 }
 
 // A Codex model with Codex routing off has nowhere to run.
-function codexRoutingDisabledError(model: string): Error {
-  return new Error(
+function codexRoutingDisabledError(model: string): RpcError {
+  return invalidRequest(
     `Codex model routing is disabled, so ${model} cannot run here; pick a Claude model`,
   )
+}
+
+function unknownThread(threadId: string): RpcError {
+  return invalidRequest(`unknown thread: ${threadId}`)
 }
 
 export interface ServerOptions {
@@ -1485,7 +1492,7 @@ export class CodexClaudeAppServer {
   private threadResume(peer: RpcPeer, params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
-    if (!thread) throw new Error('unknown thread: ' + threadId)
+    if (!thread) throw unknownThread(threadId)
     // A chat its model process profile can no longer run still opens, so it
     // can be read; a turn, review, compaction or fork of it is refused.
     const unbound = this.modelProfileUnbound(thread)
@@ -1893,9 +1900,9 @@ export class CodexClaudeAppServer {
   private threadSectionMove(params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     if (params.sectionId !== null && typeof params.sectionId !== 'string')
-      throw new Error('sectionId must be a string or null')
+      throw invalidRequest('sectionId must be a string or null')
     const sectionId = params.sectionId === null ? null : params.sectionId
-    if (sectionId === '') throw new Error('sectionId must not be empty')
+    if (sectionId === '') throw invalidRequest('sectionId must not be empty')
     const beforeThreadId =
       typeof params.beforeThreadId === 'string' && params.beforeThreadId.length > 0
         ? params.beforeThreadId
@@ -1916,7 +1923,7 @@ export class CodexClaudeAppServer {
       ? Math.max(1, Math.min(Math.floor(requestedLimit), 200))
       : 100
     const offset = typeof params.cursor === 'string' ? Number(params.cursor) : 0
-    if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('invalid section cursor')
+    if (!Number.isSafeInteger(offset) || offset < 0) throw invalidRequest('invalid section cursor')
     const sections = this.store.listSections(limit, String(offset))
     const nextOffset = offset + sections.length
     const hasMore = this.store.listSections(1, String(nextOffset)).length > 0
@@ -1936,7 +1943,7 @@ export class CodexClaudeAppServer {
   private threadSectionUpdate(params: Record<string, unknown>): unknown {
     const sectionId = stringOr(params.sectionId, '')
     const existing = this.store.getSection(sectionId)
-    if (!existing) throw new Error(`unknown section: ${sectionId}`)
+    if (!existing) throw invalidRequest(`unknown section: ${sectionId}`)
     const name = typeof params.name === 'string' ? params.name : existing.name
     const appearance =
       params.appearance === undefined
@@ -1976,7 +1983,7 @@ export class CodexClaudeAppServer {
       ? Math.max(1, Math.min(Math.floor(requestedLimit), 200))
       : 100
     const offset = typeof params.cursor === 'string' ? Number(params.cursor) : 0
-    if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('invalid project cursor')
+    if (!Number.isSafeInteger(offset) || offset < 0) throw invalidRequest('invalid project cursor')
     const projects = this.store.listProjects(sortKey, sortDirection, limit + 1, offset)
     return {
       data: projects.slice(0, limit),
@@ -1992,7 +1999,7 @@ export class CodexClaudeAppServer {
 
   private projectCreate(params: Record<string, unknown>, importing: boolean): unknown {
     const idempotencyKey = stringOr(params.idempotencyKey, '')
-    if (!idempotencyKey) throw new Error('idempotencyKey must not be empty')
+    if (!idempotencyKey) throw invalidRequest('idempotencyKey must not be empty')
     const { project, created } = this.store.createProject(newId(), idempotencyKey, {
       name: projectName(params.name),
       roots: projectRoots(params.roots),
@@ -2046,7 +2053,7 @@ export class CodexClaudeAppServer {
   private threadRead(params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
-    if (!thread) throw new Error('unknown thread: ' + threadId)
+    if (!thread) throw unknownThread(threadId)
     // The Codex App hydrates the Subagent panel with includeTurns:false. A
     // parent-linked child with no renderable turns is treated by that client
     // as still loading, and it does not reliably follow up with turns/list.
@@ -2091,7 +2098,7 @@ export class CodexClaudeAppServer {
   // thread/turns/list cursor that loads the match's turn.
   private threadSearchOccurrences(params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
-    if (!this.store.getThread(threadId)) throw new Error(`unknown thread: ${threadId}`)
+    if (!this.store.getThread(threadId)) throw unknownThread(threadId)
     const searchTerm = typeof params.searchTerm === 'string' ? params.searchTerm : ''
     const occurrences = findOccurrences(this.store.listTurns(threadId), searchTerm)
     const start = offsetCursor(params.cursor, 'occurrence')
@@ -2106,11 +2113,11 @@ export class CodexClaudeAppServer {
   // archived with the thread, the pull requests opened from it.
   private threadAttachmentAdd(params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
-    if (!this.store.getThread(threadId)) throw new Error(`unknown thread: ${threadId}`)
+    if (!this.store.getThread(threadId)) throw unknownThread(threadId)
     const attachmentType = stringOr(params.attachmentType, '')
     const identityKey = stringOr(params.identityKey, '')
     if (!attachmentType || !identityKey)
-      throw new Error('attachmentType and identityKey must not be empty')
+      throw invalidRequest('attachmentType and identityKey must not be empty')
     const { attachment, created } = this.store.addThreadAttachment(threadId, {
       id: newId(),
       attachmentType,
@@ -2123,7 +2130,7 @@ export class CodexClaudeAppServer {
 
   private threadAttachmentList(params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
-    if (!this.store.getThread(threadId)) throw new Error(`unknown thread: ${threadId}`)
+    if (!this.store.getThread(threadId)) throw unknownThread(threadId)
     const offset = offsetCursor(params.cursor, 'attachment')
     const limit = pageLimit(params.limit, 200) ?? 100
     const attachments = this.store.listThreadAttachments(threadId, limit + 1, offset)
@@ -2139,8 +2146,8 @@ export class CodexClaudeAppServer {
   private threadAttachmentOwnerList(params: Record<string, unknown>): unknown {
     const attachmentType = stringOr(params.attachmentType, '')
     const identityKey = stringOr(params.identityKey, '')
-    if (!attachmentType.trim()) throw new Error('attachmentType must not be empty')
-    if (!identityKey.trim()) throw new Error('identityKey must not be empty')
+    if (!attachmentType.trim()) throw invalidRequest('attachmentType must not be empty')
+    if (!identityKey.trim()) throw invalidRequest('identityKey must not be empty')
     const archived = typeof params.archived === 'boolean' ? params.archived : null
     const offset = offsetCursor(params.cursor, 'attachment owner')
     const limit = pageLimit(params.limit, 200) ?? 25
@@ -2214,7 +2221,7 @@ export class CodexClaudeAppServer {
     })
     if (!archived) {
       const thread = this.store.getThread(threadId)
-      if (!thread) throw new Error(`unknown thread: ${threadId}`)
+      if (!thread) throw unknownThread(threadId)
       return { thread: this.toThread(thread, this.store.listTurns(threadId)) }
     }
     this.clearThreadState(threadId)
@@ -2273,7 +2280,7 @@ export class CodexClaudeAppServer {
   private threadInjectItems(params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
-    if (!thread) throw new Error(`unknown thread: ${threadId}`)
+    if (!thread) throw unknownThread(threadId)
     const items = Array.isArray(params.items) ? params.items : []
     this.store.addInjectedItems(threadId, items)
     debugLog('thread.inject_items', { threadId, count: items.length })
@@ -2288,10 +2295,10 @@ export class CodexClaudeAppServer {
     this.goalThread(threadId)
     this.subscribe(threadId, peer)
     if (params.status != null && !isGoalStatus(params.status))
-      throw new Error(`invalid goal status: ${String(params.status)}`)
+      throw invalidRequest(`invalid goal status: ${String(params.status)}`)
     const status = isGoalStatus(params.status) ? params.status : null
     const objective = typeof params.objective === 'string' ? params.objective.trim() : null
-    if (objective === '') throw new Error('goal objective must not be empty')
+    if (objective === '') throw invalidRequest('goal objective must not be empty')
     // An explicit null clears the budget; an absent field leaves it alone.
     const budget = 'tokenBudget' in params ? goalBudget(params.tokenBudget) : undefined
     const existing = this.store.getGoal(threadId)
@@ -2302,7 +2309,7 @@ export class CodexClaudeAppServer {
       !existing ||
       (existing.status === 'complete' && objective && objective !== existing.objective)
     ) {
-      if (!objective) throw new Error(`no goal exists for thread ${threadId}`)
+      if (!objective) throw invalidRequest(`no goal exists for thread ${threadId}`)
       goal = {
         threadId,
         objective,
@@ -2356,8 +2363,8 @@ export class CodexClaudeAppServer {
 
   private goalThread(threadId: string): ThreadRecord {
     const thread = this.store.getThread(threadId)
-    if (!thread) throw new Error(`unknown thread: ${threadId}`)
-    if (thread.ephemeral) throw new Error('Goal tools require a persistent thread.')
+    if (!thread) throw unknownThread(threadId)
+    if (thread.ephemeral) throw invalidRequest('Goal tools require a persistent thread.')
     return thread
   }
 
@@ -2588,8 +2595,8 @@ export class CodexClaudeAppServer {
   // thread/queue/start.
   private queueThread(threadId: string): ThreadRecord {
     const thread = this.store.getThread(threadId)
-    if (!thread) throw new Error(`unknown thread: ${threadId}`)
-    if (thread.ephemeral) throw new Error('queued messages require a persistent thread')
+    if (!thread) throw unknownThread(threadId)
+    if (thread.ephemeral) throw invalidRequest('queued messages require a persistent thread')
     return thread
   }
 
@@ -2600,7 +2607,7 @@ export class CodexClaudeAppServer {
 
   private queuedSubmission(threadId: string, id: string): QueuedSubmission {
     const item = this.store.listQueue(threadId).find((entry) => entry.id === id)
-    if (!item) throw new Error(`unknown queued submission: ${id}`)
+    if (!item) throw invalidRequest(`unknown queued submission: ${id}`)
     return item
   }
 
@@ -2676,7 +2683,9 @@ export class CodexClaudeAppServer {
     const threadId = stringOr(params.threadId, '')
     this.queueThread(threadId)
     if (this.activeTurnByThread.has(threadId))
-      throw new Error(`cannot start a queued message while thread ${threadId} has an active turn`)
+      throw invalidRequest(
+        `cannot start a queued message while thread ${threadId} has an active turn`,
+      )
     const id = stringOr(params.queuedSubmissionId, '')
     const submission = this.queuedSubmission(threadId, id)
     return this.dispatchQueued(peer, threadId, submission)
@@ -2789,13 +2798,15 @@ export class CodexClaudeAppServer {
   private threadMetadataUpdate(params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
-    if (!thread) throw new Error(`unknown thread: ${threadId}`)
+    if (!thread) throw unknownThread(threadId)
     // projectId: omitted or null leaves it, '' clears it, an id assigns it.
     const projectId = typeof params.projectId === 'string' ? params.projectId || null : undefined
     if (projectId) this.requireProject(projectId)
     // The App sets the branch after it creates one for the thread.
     const gitInfo =
-      params.gitInfo == null ? undefined : patchGitInfo(thread.gitInfo ?? null, params.gitInfo)
+      params.gitInfo == null
+        ? undefined
+        : invalidRequestIfThrows(() => patchGitInfo(thread.gitInfo ?? null, params.gitInfo))
 
     // Support dynamic model, reasoning effort, approval policy and sandbox updates
     const model = this.requestedModelChange(thread, params)
@@ -2845,7 +2856,7 @@ export class CodexClaudeAppServer {
   private threadSettingsUpdate(peer: RpcPeer, params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
-    if (!thread) throw new Error(`unknown thread: ${threadId}`)
+    if (!thread) throw unknownThread(threadId)
 
     // Codex App sends model and effort changes through this RPC. Keep these
     // legacy settings fields in the compatibility handler so removing the
@@ -2952,7 +2963,7 @@ export class CodexClaudeAppServer {
   private threadRollback(params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
-    if (!thread) throw new Error(`unknown thread: ${threadId}`)
+    if (!thread) throw unknownThread(threadId)
     // Honor the protocol's `numTurns: u32, must be >= 1` — drop that many
     // turns from the end of the thread. Without this, App's rewind UI sends
     // the request and we silently return the unchanged thread, leaving the
@@ -2975,9 +2986,9 @@ export class CodexClaudeAppServer {
     const threadId = stringOr(params.threadId, '')
     const beforeTurnId = stringOr(params.beforeTurnId, '')
     const thread = this.store.getThread(threadId)
-    if (!thread) throw new Error(`unknown thread: ${threadId}`)
+    if (!thread) throw unknownThread(threadId)
     if (!this.store.listTurns(threadId).some((turn) => turn.id === beforeTurnId))
-      throw new Error(`unknown turn: ${beforeTurnId}`)
+      throw invalidRequest(`unknown turn: ${beforeTurnId}`)
     const dropped = this.rewindThread(thread, () =>
       this.store.deleteTurnsFrom(threadId, beforeTurnId),
     )
@@ -2999,7 +3010,7 @@ export class CodexClaudeAppServer {
   // rewinds. Returns the number of turns dropped.
   private rewindThread(thread: ThreadRecord, drop: () => number): number {
     if (this.activeTurnByThread.has(thread.id))
-      throw new Error(`cannot rewind thread ${thread.id} while a turn is running`)
+      throw invalidRequest(`cannot rewind thread ${thread.id} while a turn is running`)
     const dropped = drop()
     if (dropped === 0) return 0
     const remaining = this.store.listTurns(thread.id)
@@ -3232,7 +3243,7 @@ export class CodexClaudeAppServer {
       return { status: 'targetUnavailable' }
     const unsupported = ['summary', 'serviceTier'].filter((key) => params[key] != null)
     if (unsupported.length > 0)
-      throw new Error(`a running Claude turn cannot change ${unsupported.join(', ')}`)
+      throw invalidRequest(`a running Claude turn cannot change ${unsupported.join(', ')}`)
     const settings: RuntimeTurnSettings = {}
     // App rule: auto-review
     const reviewer = approvalsReviewerFromParams(params)
@@ -3243,12 +3254,13 @@ export class CodexClaudeAppServer {
       const model = allSelectableModelOptions().find(
         (option) => option.id.toLowerCase() === requested.toLowerCase(),
       )?.id
-      if (!model) throw new Error(`unknown model: ${requested}`)
+      if (!model) throw invalidRequest(`unknown model: ${requested}`)
       const backend = isCodexOpenAiModel(model) ? 'codex' : 'claude'
       if (backend !== thread.runtimeBackend)
-        throw new Error(`a running ${thread.runtimeBackend} turn cannot switch to ${model}`)
+        throw invalidRequest(`a running ${thread.runtimeBackend} turn cannot switch to ${model}`)
       // The running turn's process belongs to its model process profile.
-      if (backend === 'claude') assertModelProfileTransition(thread.model, model)
+      if (backend === 'claude')
+        invalidRequestIfThrows(() => assertModelProfileTransition(thread.model, model))
       const resolved = backend === 'codex' ? model : resolveClaudeModel(model)
       if (resolved) settings.model = resolved
     }
@@ -3256,7 +3268,7 @@ export class CodexClaudeAppServer {
     // Haiku), so it leaves the effort as it is.
     if (params.effort != null && params.effort !== 'none') {
       const effort = resolveClaudeEffort(stringOr(params.effort, ''))
-      if (!effort) throw new Error(`unsupported effort: ${String(params.effort)}`)
+      if (!effort) throw invalidRequest(`unsupported effort: ${String(params.effort)}`)
       settings.effort = effort
     }
     if (reviewer && reviewer !== (thread.approvalsReviewer ?? 'user')) {
@@ -3319,7 +3331,7 @@ export class CodexClaudeAppServer {
   private reviewStart(peer: RpcPeer, params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
-    if (!thread) throw new Error(`unknown thread: ${threadId}`)
+    if (!thread) throw unknownThread(threadId)
     this.checkModelProfileBinding(thread)
     this.subscribe(threadId, peer)
     const turnId = newId()
@@ -3395,7 +3407,7 @@ export class CodexClaudeAppServer {
   private threadCompactStart(peer: RpcPeer, params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
-    if (!thread) throw new Error(`unknown thread: ${threadId}`)
+    if (!thread) throw unknownThread(threadId)
     this.checkModelProfileBinding(thread)
     this.subscribe(threadId, peer)
     const turnId = newId()
@@ -3733,7 +3745,7 @@ export class CodexClaudeAppServer {
   private async turnStart(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
-    if (!thread) throw new Error(`unknown thread: ${threadId}`)
+    if (!thread) throw unknownThread(threadId)
     this.checkModelProfileBinding(thread)
     // Follow-up turns the adapter starts itself have no requesting peer.
     if (peer !== DETACHED_PEER) this.subscribe(threadId, peer)
@@ -7869,23 +7881,32 @@ export class CodexClaudeAppServer {
   // and config dir; a thread with no conversation yet can take any profile.
   // A conversation no profile can run any more keeps its model, so a model
   // change cannot pin it to a profile, or to none, and resume it there.
+  // Every refusal here is the user's to put right, by picking another model
+  // or starting a new chat: an invalid request, whose reason the App's model
+  // menu shows.
+  // App rule: model-menu-settings
   private setThreadModel(thread: ThreadRecord, model: string): void {
     let runtimeBackend = thread.runtimeBackend
-    if (this.crossesRuntimeBackend(thread, model)) {
-      const codexModel = isCodexOpenAiModel(model)
-      if (this.threadHasConversation(thread)) {
-        throw new Error(
-          `cannot change runtime backend from ${thread.runtimeBackend} to ${codexModel ? 'codex' : 'claude'} for ${model}; start a new thread`,
-        )
+    let profileFingerprint: string | null
+    try {
+      if (this.crossesRuntimeBackend(thread, model)) {
+        const codexModel = isCodexOpenAiModel(model)
+        if (this.threadHasConversation(thread)) {
+          throw new Error(
+            `cannot change runtime backend from ${thread.runtimeBackend} to ${codexModel ? 'codex' : 'claude'} for ${model}; start a new thread`,
+          )
+        }
+        if (codexModel && this.codexRoutingDisabled()) throw codexRoutingDisabledError(model)
+        runtimeBackend = codexModel ? 'codex' : 'claude'
+      } else if (runtimeBackend === 'claude' && this.threadHasConversation(thread)) {
+        const unbound = threadModelProfileBindingError(thread)
+        if (unbound) throw unbound
+        assertModelProfileTransition(thread.model, model)
       }
-      if (codexModel && this.codexRoutingDisabled()) throw codexRoutingDisabledError(model)
-      runtimeBackend = codexModel ? 'codex' : 'claude'
-    } else if (runtimeBackend === 'claude' && this.threadHasConversation(thread)) {
-      const unbound = threadModelProfileBindingError(thread)
-      if (unbound) throw unbound
-      assertModelProfileTransition(thread.model, model)
+      profileFingerprint = profileFingerprintForModel(model, runtimeBackend)
+    } catch (error) {
+      throw asInvalidRequest(error)
     }
-    const profileFingerprint = profileFingerprintForModel(model, runtimeBackend)
     thread.runtimeBackend = runtimeBackend
     thread.model = model
     thread.modelProfileFingerprint = profileFingerprint
@@ -7897,7 +7918,7 @@ export class CodexClaudeAppServer {
   // checks this first: turns, reviews, compaction and forks.
   private checkModelProfileBinding(thread: ThreadRecord): void {
     const unbound = this.modelProfileUnbound(thread)
-    if (unbound) throw unbound
+    if (unbound) throw asInvalidRequest(unbound)
   }
 
   // Why the thread's conversation cannot go on in a Claude Code process, or
@@ -7956,7 +7977,7 @@ export class CodexClaudeAppServer {
     // the global ones.
     const threadId = stringOr(params.threadId, '')
     if (threadId && !this.store.getThread(threadId))
-      throw new Error(`thread not found: ${threadId}`)
+      throw invalidRequest(`thread not found: ${threadId}`)
     return experimentalFeatureList(this.memoriesOn(), params)
   }
 
@@ -7975,8 +7996,8 @@ export class CodexClaudeAppServer {
     if (!memoriesMappingEnabled()) return {}
     const threadId = stringOr(params.threadId, '')
     const mode = parseMemoryMode(params.mode)
-    if (!mode) throw new Error(`invalid memory mode: ${String(params.mode)}`)
-    if (!this.store.getThread(threadId)) throw new Error(`unknown thread: ${threadId}`)
+    if (!mode) throw invalidRequest(`invalid memory mode: ${String(params.mode)}`)
+    if (!this.store.getThread(threadId)) throw unknownThread(threadId)
     this.store.setThreadMemoryMode(threadId, mode)
     debugLog('thread.memoryMode', { threadId, mode })
     return {}
@@ -8317,12 +8338,12 @@ export class CodexClaudeAppServer {
   private async commandExec(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
     const processId = typeof params.processId === 'string' ? params.processId : newId()
     const command = commandArray(params.command)
-    if (command.length === 0) throw new Error('command/exec requires command')
+    if (command.length === 0) throw invalidRequest('command/exec requires command')
     if (
       (params.streamStdoutStderr === true || params.streamStdin === true || params.tty === true) &&
       typeof params.processId !== 'string'
     ) {
-      throw new Error('command/exec streaming requires processId')
+      throw invalidRequest('command/exec streaming requires processId')
     }
 
     const executable = command[0] as string
@@ -8425,7 +8446,7 @@ export class CodexClaudeAppServer {
   private commandExecWrite(params: Record<string, unknown>): unknown {
     const processId = stringOr(params.processId, '')
     const child = this.commandProcesses.get(processId)
-    if (!child) throw new Error(`unknown command process: ${processId}`)
+    if (!child) throw invalidRequest(`unknown command process: ${processId}`)
     if (typeof params.deltaBase64 === 'string' && params.deltaBase64.length > 0) {
       child.stdin?.write(Buffer.from(params.deltaBase64, 'base64'))
     }
@@ -8438,18 +8459,18 @@ export class CodexClaudeAppServer {
   private commandExecTerminate(params: Record<string, unknown>): unknown {
     const processId = stringOr(params.processId, '')
     const child = this.commandProcesses.get(processId)
-    if (!child) throw new Error(`unknown command process: ${processId}`)
+    if (!child) throw invalidRequest(`unknown command process: ${processId}`)
     child.kill('SIGTERM')
     return {}
   }
 
   private processSpawn(peer: RpcPeer, params: Record<string, unknown>): unknown {
     const processHandle = stringOr(params.processHandle, '')
-    if (!processHandle) throw new Error('process/spawn requires processHandle')
+    if (!processHandle) throw invalidRequest('process/spawn requires processHandle')
     if (this.processHandles.has(processHandle))
-      throw new Error(`process handle already active: ${processHandle}`)
+      throw invalidRequest(`process handle already active: ${processHandle}`)
     const command = commandArray(params.command)
-    if (command.length === 0) throw new Error('process/spawn requires command')
+    if (command.length === 0) throw invalidRequest('process/spawn requires command')
     const cwd = stringOr(params.cwd, process.cwd())
     const isTty = params.tty === true
     const streamOutput = params.streamStdoutStderr === true || isTty
@@ -8628,7 +8649,7 @@ export class CodexClaudeAppServer {
   private processWriteStdin(params: Record<string, unknown>): unknown {
     const processHandle = stringOr(params.processHandle, '')
     const child = this.processHandles.get(processHandle)
-    if (!child) throw new Error(`unknown process handle: ${processHandle}`)
+    if (!child) throw invalidRequest(`unknown process handle: ${processHandle}`)
     if (typeof params.deltaBase64 === 'string' && params.deltaBase64.length > 0) {
       if ((child as any).__isPtyBridge) {
         child.stdin?.write(JSON.stringify({ action: 'input', data: params.deltaBase64 }) + '\n')
@@ -8655,7 +8676,7 @@ export class CodexClaudeAppServer {
   private processKill(params: Record<string, unknown>): unknown {
     const processHandle = stringOr(params.processHandle, '')
     const child = this.processHandles.get(processHandle)
-    if (!child) throw new Error(`unknown process handle: ${processHandle}`)
+    if (!child) throw invalidRequest(`unknown process handle: ${processHandle}`)
     if ((child as any).__isPtyBridge) {
       child.stdin?.write(JSON.stringify({ action: 'kill' }) + '\n')
     }

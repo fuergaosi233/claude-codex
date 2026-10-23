@@ -1,8 +1,10 @@
 // Codex's paged views of a thread's history: thread/turns/list,
 // thread/items/list, thread/timeline/list, the two searches and the turns a
 // fork keeps. A thread's turns come from the store whole, so cursors are
-// positions in them.
+// positions in them. A page asking for a cursor, turn or item the thread does
+// not have is an invalid request.
 
+import { invalidRequest } from './host-methods.mjs'
 import { stripQuietTurnHeartbeat } from './quiet-turns.mjs'
 import type { ThreadItem, TurnRecord } from './types.mjs'
 import { toolOutputInput } from './util.mjs'
@@ -23,7 +25,7 @@ export function pageLimit(value: unknown, max = Number.MAX_SAFE_INTEGER): number
 export function offsetCursor(value: unknown, what: string): number {
   if (value == null) return 0
   const offset = typeof value === 'string' ? Number(value) : Number.NaN
-  if (!Number.isSafeInteger(offset) || offset < 0) throw new Error(`invalid ${what} cursor`)
+  if (!Number.isSafeInteger(offset) || offset < 0) throw invalidRequest(`invalid ${what} cursor`)
   return offset
 }
 
@@ -39,7 +41,7 @@ export function pageTurns(
   let start = 0
   if (params.cursor != null) {
     start = ordered.findIndex((turn) => turn.id === params.cursor)
-    if (start < 0) throw new Error(`invalid turn cursor: ${String(params.cursor)}`)
+    if (start < 0) throw invalidRequest(`invalid turn cursor: ${String(params.cursor)}`)
   }
   const end = params.limit == null ? ordered.length : start + params.limit
   const data = ordered.slice(start, end)
@@ -100,7 +102,7 @@ export function pageItems(
 ): { data: ThreadItemEntry[]; nextCursor: string | null; backwardsCursor: string | null } {
   const scope = params.turnId == null ? turns : turns.filter((turn) => turn.id === params.turnId)
   if (params.turnId != null && scope.length === 0)
-    throw new Error(`turn not found: ${params.turnId}`)
+    throw invalidRequest(`turn not found: ${params.turnId}`)
   const entries = scope.flatMap((turn) =>
     turn.items.map(
       (item): ThreadItemEntry => ({
@@ -116,9 +118,10 @@ export function pageItems(
   const cursor = params.cursor
   if (cursor != null && typeof cursor === 'object') {
     const itemId = (cursor as { itemId?: unknown }).itemId
-    if (params.turnId == null) throw new Error('an item cursor needs a turnId')
+    if (params.turnId == null) throw invalidRequest('an item cursor needs a turnId')
     const anchor = entries.findIndex((entry) => entry.item.id === itemId)
-    if (anchor < 0) throw new Error(`item not found in turn ${params.turnId}: ${String(itemId)}`)
+    if (anchor < 0)
+      throw invalidRequest(`item not found in turn ${params.turnId}: ${String(itemId)}`)
     start = anchor + step
   } else if (cursor != null) {
     start = offsetCursor(cursor, 'item')
