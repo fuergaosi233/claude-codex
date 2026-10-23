@@ -207,6 +207,9 @@ interface PendingTurn {
   // still working (see noteSubagentProgress), on the monotonic clock: a wall
   // clock set back must not hold the reports back for as long.
   progressReportedAtMs: number
+  // Whether that report told of no progress of the agent's work (a failed
+  // request or a heartbeat).
+  progressReportedIdle: boolean
   // The calls whose agent last told of a request that failed (see
   // noteSubagentProgress): such a call's result tells of the failure.
   failedSubagentCalls: Set<string>
@@ -1647,6 +1650,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       workflowFailure: null,
       model: null,
       progressReportedAtMs: Number.NEGATIVE_INFINITY,
+      progressReportedIdle: false,
       failedSubagentCalls: new Set(),
       apiError: null,
       notificationKeys: new Set(),
@@ -2504,16 +2508,29 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   ): Promise<void> {
     const toolUseId = this.progressToolUseId(pending, type, message)
     if (!toolUseId) return
+    // The CLI's timer ticks every 30 s while a call runs, whatever its agent
+    // is doing: one may come while the agent's request keeps failing.
+    const heartbeat = type === 'tool_progress' && message.heartbeat === true
     const failedRequest = tellsFailedRequest(type, message)
     if (failedRequest) pending.failedSubagentCalls.add(toolUseId)
-    else pending.failedSubagentCalls.delete(toolUseId)
+    else if (!heartbeat) pending.failedSubagentCalls.delete(toolUseId)
+    const idle = failedRequest || heartbeat
     const now = performance.now()
-    if (now - pending.progressReportedAtMs < SUBAGENT_PROGRESS_INTERVAL_MS) return
+    // Only a frame of the agent's work shows the turn went on after a sleep:
+    // one is not held back behind a report that told of none.
+    if (
+      now - pending.progressReportedAtMs < SUBAGENT_PROGRESS_INTERVAL_MS &&
+      (idle || !pending.progressReportedIdle)
+    ) {
+      return
+    }
     pending.progressReportedAtMs = now
+    pending.progressReportedIdle = idle
     await pending.handlers.onEvent({
       type: 'subagent_progress',
       toolUseId,
       ...(failedRequest ? { failedRequest } : {}),
+      ...(heartbeat ? { heartbeat } : {}),
     })
   }
 
@@ -3634,9 +3651,8 @@ function tellsFailedRequest(type: string, message: Record<string, unknown>): boo
 // The CLI tells it as the Agent call's tool_progress with subagent_retry:
 // parent_tool_use_id is the Agent call (tool_use_id is a made-up
 // `agent_<message id>`) and agent_id the subagent's task. The next such frame
-// without subagent_retry means the request went through, and is only a
-// heartbeat. A subagent's retry says nothing about why the main loop might
-// fail.
+// without subagent_retry means the request went through. A subagent's retry
+// says nothing about why the main loop might fail.
 function subagentRetryEvent(
   message: Record<string, unknown>,
 ): Extract<RuntimeEvent, { type: 'retrying' }> | null {

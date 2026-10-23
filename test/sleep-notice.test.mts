@@ -464,22 +464,26 @@ test('a native turn whose request failed for good says the computer slept, unles
         assert.equal(early.status, 'failed')
         assert.equal(early.error.message, awake.error.message)
 
-        // The sleep broke a request of an agent the turn waited on: the
-        // agent retries and fails, its call ends on the error, and the main
-        // loop's next request fails too.
+        // The sleep broke a request of an agent the turn waited on: Claude
+        // Code's timer ticks on waking, the agent retries and fails, its call
+        // ends on the error, and the main loop's next request fails too.
         sessions.push([
           init('s-agent'),
           agentCall('s-agent'),
-          agentFrame({
-            type: 'assistant',
-            message: { id: 'sub_1', content: [textBlock('Looking.')] },
-          }),
           25,
+          {
+            type: 'tool_progress',
+            tool_use_id: 'agent-1-heartbeat-50',
+            tool_name: 'Agent',
+            parent_tool_use_id: 'agent-1',
+            elapsed_time_seconds: 1530,
+            heartbeat: true,
+          },
           agentFrame({
             type: 'tool_progress',
             tool_use_id: 'agent_sub_2',
             tool_name: 'Agent',
-            elapsed_time_seconds: 1500,
+            elapsed_time_seconds: 1530,
             subagent_retry: { agent_id: 'task-1', attempt: 1, max_retries: 10 },
           }),
           agentFrame({

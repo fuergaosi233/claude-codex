@@ -1362,14 +1362,20 @@ test('native turn reports progress of the agents it waits on, not of those it ha
   await runtime.stop()
 })
 
-test("an agent's failed requests keep the turn alive, marked as no progress of its work", async () => {
+test("an agent's failed requests and the CLI's heartbeats keep the turn alive, marked as no progress of its work", async () => {
   const { runtime, queries } = fakeRuntime()
   const events: RuntimeEvent[] = []
   const turn = runtime.runTurn(context, handlers(events))
   const query = await waitFor(() => queries[0], 'session')
   const progress = () =>
     events.flatMap((event) =>
-      event.type === 'subagent_progress' ? [event.failedRequest === true] : [],
+      event.type !== 'subagent_progress'
+        ? []
+        : event.failedRequest
+          ? ['failed']
+          : event.heartbeat
+            ? ['heartbeat']
+            : ['progress'],
     )
   // One frame at a time, past the interval between two reports.
   const send = async (frame: Record<string, unknown>, reports: number) => {
@@ -1426,14 +1432,16 @@ test("an agent's failed requests keep the turn alive, marked as no progress of i
     },
     3,
   )
-  // A heartbeat without a retry, or the agent's own output, is progress.
+  // The frame saying a retried request went through (no subagent_retry), or
+  // the agent's own output, is progress.
   await send(
     {
       type: 'tool_progress',
       tool_use_id: 'agent_msg_child',
       tool_name: 'Agent',
       parent_tool_use_id: 'agent-1',
-      elapsed_time_seconds: 9,
+      elapsed_time_seconds: 0,
+      subagent_type: 'general-purpose',
     },
     4,
   )
@@ -1447,8 +1455,27 @@ test("an agent's failed requests keep the turn alive, marked as no progress of i
       { type: 'tool_use', id: 'agent-2', name: 'Agent', input: { prompt: 'run the tests' } },
     ]),
   )
+  // The CLI's timer ticks every 30 s whatever the agent does: no progress of
+  // its work. The agent's output goes out at once even right after one.
+  query.push(
+    {
+      type: 'tool_progress',
+      tool_use_id: 'agent-2-heartbeat-0',
+      tool_name: 'Agent',
+      parent_tool_use_id: 'agent-2',
+      elapsed_time_seconds: 30,
+      heartbeat: true,
+    },
+    {
+      type: 'assistant',
+      parent_tool_use_id: 'agent-2',
+      message: { id: 'sub-2', content: [text('Running the tests.')] },
+    },
+  )
+  await waitFor(() => progress().length === 6, 'progress report 6')
+  await sleep(300)
   // An agent that ended on a request that failed for good: its call's
-  // result tells of the failure, and is no progress either.
+  // result tells of the failure, and is no progress either...
   await send(
     {
       type: 'assistant',
@@ -1456,7 +1483,19 @@ test("an agent's failed requests keep the turn alive, marked as no progress of i
       error: 'unknown',
       message: { id: 'sub-error-2', model: '<synthetic>', content: [text('API Error')] },
     },
-    5,
+    7,
+  )
+  // ...even with a heartbeat after the failure.
+  await send(
+    {
+      type: 'tool_progress',
+      tool_use_id: 'agent-2-heartbeat-1',
+      tool_name: 'Agent',
+      parent_tool_use_id: 'agent-2',
+      elapsed_time_seconds: 60,
+      heartbeat: true,
+    },
+    8,
   )
   query.push(
     {
@@ -1469,7 +1508,16 @@ test("an agent's failed requests keep the turn alive, marked as no progress of i
     { type: 'result', subtype: 'success', result: 'Built.' },
   )
   await turn
-  assert.deepEqual(progress(), [true, true, true, false, true])
+  assert.deepEqual(progress(), [
+    'failed',
+    'failed',
+    'failed',
+    'progress',
+    'heartbeat',
+    'progress',
+    'failed',
+    'heartbeat',
+  ])
   assert.deepEqual(
     events.flatMap((event) =>
       event.type === 'tool_result' ? [[event.toolUseId, event.failedRequest === true]] : [],
