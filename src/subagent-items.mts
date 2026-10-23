@@ -112,6 +112,13 @@ export class SubagentItems {
     else this.completeTool(peer, state, output)
   }
 
+  // A message reaches the running subagent: what it was saying ends there,
+  // so what it says next goes after the message.
+  interject(peer: RpcPeer, turnId: string): void {
+    const state = this.turns.get(turnId)
+    if (state) this.closeMessage(peer, state, 'commentary', null)
+  }
+
   // The child turn ends: its open tool calls fail with `failure` and its open
   // message closes. True when that message is the subagent's `answer`, which
   // then needs no copy.

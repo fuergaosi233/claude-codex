@@ -7162,6 +7162,7 @@ export class CodexClaudeAppServer {
     const childTurn = this.store.getTurn(context.childTurnId)
     if (childTurn?.status === 'inProgress') {
       // Still running: Claude queues the message for its next step.
+      this.subagentItems.interject(peer, childTurn.id)
       this.store.appendItem(childTurn.id, userItem)
       this.emitItemLifecycle(peer, context.childThreadId, childTurn.id, userItem)
     } else {
