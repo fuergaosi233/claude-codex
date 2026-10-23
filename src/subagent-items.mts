@@ -53,7 +53,7 @@ export interface SubagentItemsTarget {
 type ToolUseEvent = Extract<RuntimeEvent, { type: 'tool_use' }>
 
 export interface SubagentItemsHost {
-  store: Pick<SessionStore, 'appendItem' | 'updateItem'>
+  store: Pick<SessionStore, 'appendItem' | 'updateItem' | 'turnStatus'>
   notify(peer: RpcPeer, notification: { method: string; params: unknown }): void
   // The item a tool call shows as, as the parent's calls show.
   toolItem(
@@ -93,9 +93,15 @@ export class SubagentItems {
     this.host = host
   }
 
+  // The child turns whose work is being shown.
+  get openTurns(): number {
+    return this.turns.size
+  }
+
   add(peer: RpcPeer, target: SubagentItemsTarget, output: SubagentOutput): void {
     let state = this.turns.get(target.turnId)
     if (!state) {
+      this.prune(peer)
       state = {
         target,
         message: null,
@@ -146,6 +152,26 @@ export class SubagentItems {
     // carries the answer's own text and no phase.
     this.closeMessage(peer, state, answered ? null : 'commentary', answered ? answer : null)
     return answered
+  }
+
+  // Every child turn still shown ends without an answer: the adapter stops.
+  finishAll(peer: RpcPeer, failure: string): void {
+    for (const turnId of [...this.turns.keys()]) this.finish(peer, turnId, '', failure)
+  }
+
+  // A deleted thread's child turns are gone with it: nothing is left to close.
+  forget(threadId: string): void {
+    for (const [turnId, state] of this.turns)
+      if (state.target.threadId === threadId) this.turns.delete(turnId)
+  }
+
+  // A child turn that ended some way that did not finish its work here (or
+  // went with its thread) cannot show more of it: its open calls fail now,
+  // so no item of an ended turn stays in progress.
+  private prune(peer: RpcPeer): void {
+    for (const turnId of [...this.turns.keys()])
+      if (this.host.store.turnStatus(turnId) !== 'inProgress')
+        this.finish(peer, turnId, '', SUBAGENT_CALL_UNFINISHED)
   }
 
   // Counts an item against the turn's limit; false when it is left out.

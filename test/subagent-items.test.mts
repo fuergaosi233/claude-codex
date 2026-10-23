@@ -6,7 +6,7 @@ import test from 'node:test'
 import { MockRuntime } from '../src/mock-runtime.mjs'
 import { CodexClaudeAppServer } from '../src/server.mjs'
 import { SessionStore } from '../src/store.mjs'
-import { MAX_SUBAGENT_ITEMS } from '../src/subagent-items.mjs'
+import { MAX_SUBAGENT_ITEMS, SubagentItems } from '../src/subagent-items.mjs'
 import type {
   ClaudeRuntime,
   RpcPeer,
@@ -15,6 +15,8 @@ import type {
   RuntimeTurnContext,
   SubagentOutput,
   SubagentOutputEvent,
+  ThreadItem,
+  TurnRecord,
 } from '../src/types.mjs'
 
 // A subagent's own work (what it says and thinks, its tool calls and their
@@ -59,6 +61,11 @@ interface Harness {
   listener(): RuntimeBackgroundListener
   // The adapter stops and starts again on the same state.
   restart(): Promise<void>
+  // The adapter dies without stopping; the next one recovers the state the
+  // way it does at startup.
+  crash(): Promise<void>
+  // The child turns whose work the adapter is still showing.
+  openChildTurns(): number
 }
 
 interface ServerOptions {
@@ -128,6 +135,7 @@ async function withServer(
     },
   }
   let server = new CodexClaudeAppServer(new SessionStore(join(directory, 'state.sqlite')), runtime)
+  const crashed: CodexClaudeAppServer[] = []
   let nextId = 0
   const connect = (id: string): Client => {
     const messages: any[] = []
@@ -201,10 +209,19 @@ async function withServer(
       await server.stop()
       server = new CodexClaudeAppServer(new SessionStore(join(directory, 'state.sqlite')), runtime)
     },
+    crash: async () => {
+      crashed.push(server)
+      const store = new SessionStore(join(directory, 'state.sqlite'))
+      store.recoverStaleInProgressTurns()
+      server = new CodexClaudeAppServer(store, runtime)
+    },
+    openChildTurns: () =>
+      (server as unknown as { subagentItems: { openTurns: number } }).subagentItems.openTurns,
   }
   try {
     await body(harness)
   } finally {
+    for (const dead of crashed) await dead.stop()
     await server.stop()
     setEnv(saved)
     await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
@@ -707,6 +724,261 @@ test('an adapter that stops mid-call leaves no call of a subagent running', asyn
       false,
     )
   })
+})
+
+test("a subagent's own turn interrupted when its task cannot be stopped leaves no call running", async () => {
+  let release = () => {}
+  const released = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const script: Script = async (_context, handlers) => {
+    // The CLI names no task for this agent, so nothing stops it: only its
+    // thread's turn ends.
+    await handlers.onEvent({
+      type: 'tool_use',
+      toolUseId: 'agent-scan',
+      toolName: 'Agent',
+      input: { description: 'scan', prompt: 'scan' },
+    })
+    await handlers.onEvent(
+      out('agent-scan', {
+        type: 'tool_use',
+        toolUseId: 'find',
+        toolName: 'Bash',
+        input: { command: 'find .' },
+      }),
+    )
+    await released
+    await handlers.onEvent(
+      out('agent-scan', { type: 'tool_result', toolUseId: 'find', content: 'a', isError: false }),
+    )
+    await handlers.onEvent({
+      type: 'tool_result',
+      toolUseId: 'agent-scan',
+      content: 'Scanned.',
+      isError: false,
+    })
+    await handlers.onEvent({ type: 'completed', success: true, result: 'done' })
+  }
+  await withServer(
+    script,
+    async ({ startThread, startTurn, waitFor, request, messages, openChildTurns }) => {
+      const threadId = await startThread()
+      await startTurn(threadId, 'scan the repo')
+      const finding = await waitFor(
+        (message) => message.method === 'item/started' && message.params.item.command === 'find .',
+        'the subagent command',
+      )
+      const child = finding.params.threadId
+      await request('turn/interrupt', { threadId: child, turnId: finding.params.turnId })
+      assert.equal(turnCompleted(messages, child).params.turn.status, 'interrupted')
+      const stopped = [
+        ['user', 'scan'],
+        ['command', 'find .', 'failed', null, null],
+      ]
+      assert.deepEqual(completedIn(messages, child).map(shape), stopped)
+      assert.deepEqual(leftOpen(messages, child), [])
+      assert.deepEqual((await threadItems(request, child)).map(shape), stopped)
+      assert.equal(openChildTurns(), 0)
+      // What the agent does after that shows nowhere; its answer still does.
+      release()
+      await waitFor(
+        (message) => message.method === 'turn/completed' && message.params.threadId === threadId,
+        'the parent turn',
+      )
+      assert.deepEqual((await threadItems(request, child)).map(shape), [
+        ...stopped,
+        ['message', null, 'Scanned.'],
+      ])
+      assert.equal(openChildTurns(), 0)
+    },
+  )
+})
+
+test("deleting a subagent's thread mid-call lets go of its work; the agent's end fails nothing", async () => {
+  // The agent ends after its thread is gone, or the adapter stops first.
+  for (const end of ['agent', 'adapter'] as const) {
+    let release = () => {}
+    const released = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const script: Script = async (context, handlers, tools) => {
+      await startAgent(context, handlers, tools, 'agent-gone', 'gone-task', 'wander')
+      await handlers.onEvent(
+        out('agent-gone', {
+          type: 'tool_use',
+          toolUseId: 'walk',
+          toolName: 'Bash',
+          input: { command: 'sleep 1' },
+        }),
+      )
+      await released
+      await handlers.onEvent(
+        out('agent-gone', { type: 'tool_use', toolUseId: 'more', toolName: 'Bash', input: {} }),
+      )
+      await handlers.onEvent({
+        type: 'tool_result',
+        toolUseId: 'agent-gone',
+        content: 'Wandered.',
+        isError: false,
+      })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'done' })
+    }
+    await withServer(
+      script,
+      async ({ startThread, startTurn, waitFor, request, restart, openChildTurns }) => {
+        const threadId = await startThread()
+        await startTurn(threadId, 'delete the child')
+        const walking = await waitFor(
+          (message) =>
+            message.method === 'item/started' && message.params.item.command === 'sleep 1',
+          'the subagent command',
+        )
+        const child = walking.params.threadId
+        assert.equal(openChildTurns(), 1)
+        await request('thread/delete', { threadId: child })
+        assert.equal(openChildTurns(), 0, end)
+        if (end === 'adapter') {
+          await restart()
+          const { thread } = await request('thread/read', { threadId, includeTurns: true })
+          assert.equal(thread.turns[0].status, 'interrupted')
+        } else {
+          release()
+          const completed = await waitFor(
+            (message) =>
+              message.method === 'turn/completed' && message.params.threadId === threadId,
+            'the parent turn',
+          )
+          assert.equal(completed.params.turn.status, 'completed')
+          assert.equal(openChildTurns(), 0)
+        }
+        await assert.rejects(request('thread/read', { threadId: child }))
+      },
+    )
+  }
+})
+
+test('an adapter that dies mid-call leaves no call of a subagent running once it is back', async () => {
+  const script: Script = async (context, handlers, tools) => {
+    await startAgent(context, handlers, tools, 'agent-fg', 'fg-task', 'look')
+    await handlers.onEvent(
+      out('agent-fg', {
+        type: 'tool_use',
+        toolUseId: 'look',
+        toolName: 'Bash',
+        input: { command: 'sleep 600' },
+      }),
+    )
+    await startAgent(context, handlers, tools, 'agent-bg', 'bg-task', 'watch', {
+      background: true,
+    })
+    await handlers.onEvent({
+      type: 'tool_result',
+      toolUseId: 'agent-bg',
+      content: 'Async agent launched successfully.\nagentId: bg-task',
+      structured: { isAsync: true, status: 'async_launched', agentId: 'bg-task', prompt: 'watch' },
+    })
+    await handlers.onEvent(
+      out(
+        'agent-bg',
+        { type: 'tool_use', toolUseId: 'watch', toolName: 'mcp__docs__fetch', input: {} },
+        'bg-task',
+      ),
+    )
+    await new Promise(() => {})
+  }
+  await withServer(script, async ({ startThread, startTurn, waitFor, request, crash }) => {
+    const threadId = await startThread()
+    await startTurn(threadId, 'die mid-call')
+    const looking = await waitFor(
+      (message) => message.method === 'item/started' && message.params.item.command === 'sleep 600',
+      'the foreground command',
+    )
+    const watching = await waitFor(
+      (message) => message.method === 'item/started' && message.params.item.type === 'mcpToolCall',
+      'the background call',
+    )
+    await crash()
+    for (const started of [looking, watching]) {
+      const { thread } = await request('thread/read', {
+        threadId: started.params.threadId,
+        includeTurns: true,
+      })
+      assert.deepEqual(
+        thread.turns.map((turn: any) => turn.status),
+        ['interrupted'],
+      )
+      const call = thread.turns[0].items.find((item: any) => item.id === started.params.item.id)
+      assert.equal(call?.status, 'failed')
+      assert.equal(
+        thread.turns[0].items.some((item: any) => item.status === 'inProgress'),
+        false,
+      )
+    }
+  })
+})
+
+test('child turns that end without finishing here leave no call open', () => {
+  const statuses = new Map<string, TurnRecord['status']>()
+  const stored = new Map<string, ThreadItem[]>()
+  const projector = new SubagentItems({
+    store: {
+      appendItem: (turnId, item) => {
+        stored.set(turnId, [...(stored.get(turnId) ?? []), item])
+        return null
+      },
+      updateItem: (turnId, itemId, updater) => {
+        const items = (stored.get(turnId) ?? []).map((item) =>
+          item.id === itemId ? updater(item) : item,
+        )
+        stored.set(turnId, items)
+        return { items } as unknown as TurnRecord
+      },
+      turnStatus: (turnId) => statuses.get(turnId) ?? null,
+    },
+    notify: () => {},
+    toolItem: (event, cwd) =>
+      ({
+        type: 'commandExecution',
+        id: event.toolUseId,
+        command: String(event.input.command),
+        cwd,
+        processId: null,
+        source: 'agent',
+        status: 'inProgress',
+        commandActions: [],
+        aggregatedOutput: null,
+        exitCode: null,
+        durationMs: null,
+      }) as unknown as ThreadItem,
+    reasoningVisible: () => true,
+  })
+  const peer: RpcPeer = { id: 'projector-test', send: () => {}, close: () => {} }
+  const call = (threadId: string, turnId: string, command: string) => {
+    statuses.set(turnId, 'inProgress')
+    projector.add(
+      peer,
+      { threadId, turnId, cwd: '/' },
+      { type: 'tool_use', toolUseId: command, toolName: 'Bash', input: { command } },
+    )
+  }
+  const statusOf = (turnId: string) =>
+    stored.get(turnId)?.map((item) => (item as { status?: string }).status)
+  call('a', 'turn-a', 'one')
+  call('b', 'turn-b', 'two')
+  assert.equal(projector.openTurns, 2)
+  // A child turn that ended some other way: the next child turn closes it.
+  statuses.set('turn-a', 'interrupted')
+  call('c', 'turn-c', 'three')
+  assert.deepEqual(statusOf('turn-a'), ['failed'])
+  assert.equal(projector.openTurns, 2)
+  // A deleted thread's turn is let go.
+  projector.forget('b')
+  assert.equal(projector.openTurns, 1)
+  // The adapter stops: whatever is still open fails.
+  projector.finishAll(peer, 'server stopped')
+  assert.deepEqual(statusOf('turn-c'), ['failed'])
+  assert.equal(projector.openTurns, 0)
 })
 
 test("a background subagent's work between turns shows in its thread until it ends", async () => {

@@ -744,9 +744,15 @@ versioning or publishing metadata.
   agent's work lands in its own thread. The items are stored with the child
   turn (`thread/read`, `thread/turns/list`, `thread/items/list`, resume,
   followers), keep the parent's output caps, stop at 256 per child turn, and
-  a call still open when the subagent ends shows as failed. The parent
-  thread is unchanged. `CLAUDE_CODEX_SUBAGENT_ITEMS=0` keeps the previous
-  prompt-and-answer view.
+  a call still open when the child turn ends shows as failed, whichever way
+  it ends: the subagent stops or fails, either thread is interrupted (also
+  when the agent's task cannot be stopped), or the adapter stops or
+  restarts. The parent thread is unchanged.
+  `CLAUDE_CODEX_SUBAGENT_ITEMS=0` keeps the previous prompt-and-answer view.
+- Deleting a subagent's thread while the agent runs no longer fails the
+  parent's turn with "FOREIGN KEY constraint failed" when the agent ends, or
+  stops the adapter's shutdown halfway; the agent's end leaves nothing in
+  the deleted thread.
 
 ### Rust-first protocol groundwork
 

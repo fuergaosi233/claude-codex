@@ -803,6 +803,9 @@ export class CodexClaudeAppServer {
       // persisted as inProgress until a later restart recovery pass.
       this.finalizeActiveSubagentsForShutdown('server stopped')
       this.finalizeBackgroundSubagents(null, 'server stopped')
+      // Whatever child turn is still shown, however it got left behind,
+      // leaves no call in progress in the store.
+      this.subagentItems.finishAll(DETACHED_PEER, 'server stopped')
       this.completeActiveTurns('interrupted', { message: 'server stopped' })
     } finally {
       // The App plugin servers go with the adapter.
@@ -3184,6 +3187,7 @@ export class CodexClaudeAppServer {
       this.lastTurnParamsByThread.delete(id)
       this.goalProgressByThread.delete(id)
       this.backgroundSubagents.delete(id)
+      this.subagentItems.forget(id)
       // Whoever deleted the thread hears it, and so does every follower.
       const targets = new Map([[peer.id, peer]])
       for (const follower of this.subscribersOf(id)) targets.set(follower.id, follower)
@@ -6341,6 +6345,12 @@ export class CodexClaudeAppServer {
         diff: '',
         error: null,
       }
+      // A child thread deleted while its agent ran keeps nothing of it: the
+      // agent's end is no reason to fail the parent's turn, or the stop.
+      if (!this.store.getThread(context.childThreadId)) {
+        this.subagentItems.forget(context.childThreadId)
+        return settledTurn(childTurn, status, error)
+      }
       this.store.upsertTurn(childTurn)
     }
 
@@ -7973,6 +7983,10 @@ export class CodexClaudeAppServer {
           )
           this.subagentStateByTurn.delete(turnId)
         }
+        // A subagent's turn ended from its own thread, when its task could
+        // not be stopped: what it was doing ends here, though the agent may
+        // still report back.
+        this.subagentItems.finish(peer, turnId, '', 'Interrupted by the user.')
         this.exitReviewMode(peer, threadId, turnId)
         const completed =
           this.store.completeTurn(turnId, 'interrupted', { message: 'interrupted' }) ?? turn

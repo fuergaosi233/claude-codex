@@ -515,8 +515,10 @@ parent chat, which keeps its agent cards and the subagent's answer. Claude Code
 hands a subagent's output over a block at a time, so its messages appear whole
 rather than word by word. Outputs are cut as the chat's own are, and one run of
 a subagent shows at most 256 pieces of work; its answer always shows, once. A
-call still running when the subagent ends (stopped, interrupted, failed, or the
-adapter stopped) shows as failed. Workflow agents, and subagents on backends
+call still running when the subagent's turn ends (stopped, interrupted from
+either thread, failed, or the adapter stopped or restarted) shows as failed,
+also after a reload. Deleting a subagent's thread while it runs drops its work
+and leaves the parent's turn alone. Workflow agents, and subagents on backends
 other than the Agent SDK, show their prompt and answer only. Set
 `CLAUDE_CODEX_SUBAGENT_ITEMS=0` for the adapter to keep every subagent's
 thread to its prompt and answer, as before.
