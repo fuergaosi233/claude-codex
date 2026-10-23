@@ -801,37 +801,40 @@ test('a message sent to a running agent goes after what it said so far, and its 
     }
     await handlers.onEvent({ type: 'completed', success: true, result: 'done' })
   }
-  await withServer(script, async ({ startThread, runTurn, listener, waitFor, request, messages }) => {
-    const threadId = await startThread()
-    const child = spawnedChild(await runTurn(threadId, 'launch in the background'), 'survey')
-    const send = (text: string) =>
-      listener().onTaskEvent(threadId, out('agent-bg', { type: 'text', text }, 'bg-task'))
-    await send('Looking around.')
-    await runTurn(threadId, 'ask for more')
-    await send('The docs are fine.')
-    const from = messages.length
-    await listener().onTaskEvent(threadId, {
-      type: 'task_notification',
-      taskId: 'bg-task',
-      toolUseId: 'agent-bg',
-      status: 'completed',
-      summary: 'Agent "survey" completed',
-      result: 'The docs are fine.',
-      usage: null,
-    })
-    await waitFor(
-      (message) => message.method === 'turn/completed' && message.params.threadId === child,
-      'the background child',
-      from,
-    )
-    assert.deepEqual((await threadItems(request, child)).map(shape), [
-      ['user', 'survey'],
-      ['message', 'commentary', 'Looking around.'],
-      ['user', 'Check the docs too.'],
-      ['message', null, 'The docs are fine.'],
-    ])
-    assert.deepEqual(leftOpen(messages, child), [])
-  })
+  await withServer(
+    script,
+    async ({ startThread, runTurn, listener, waitFor, request, messages }) => {
+      const threadId = await startThread()
+      const child = spawnedChild(await runTurn(threadId, 'launch in the background'), 'survey')
+      const send = (text: string) =>
+        listener().onTaskEvent(threadId, out('agent-bg', { type: 'text', text }, 'bg-task'))
+      await send('Looking around.')
+      await runTurn(threadId, 'ask for more')
+      await send('The docs are fine.')
+      const from = messages.length
+      await listener().onTaskEvent(threadId, {
+        type: 'task_notification',
+        taskId: 'bg-task',
+        toolUseId: 'agent-bg',
+        status: 'completed',
+        summary: 'Agent "survey" completed',
+        result: 'The docs are fine.',
+        usage: null,
+      })
+      await waitFor(
+        (message) => message.method === 'turn/completed' && message.params.threadId === child,
+        'the background child',
+        from,
+      )
+      assert.deepEqual((await threadItems(request, child)).map(shape), [
+        ['user', 'survey'],
+        ['message', 'commentary', 'Looking around.'],
+        ['user', 'Check the docs too.'],
+        ['message', null, 'The docs are fine.'],
+      ])
+      assert.deepEqual(leftOpen(messages, child), [])
+    },
+  )
 })
 
 test('the work of an agent the turn handed off is no sign of life from a stuck one', async () => {
