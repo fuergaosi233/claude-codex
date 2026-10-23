@@ -315,7 +315,7 @@ no counterpart for: a write that sets one of those fails, and the App shows
 | `approval_policy`, `sandbox_mode` | Settings > Configuration | kept and read back; the App sends them with each new thread, where they set how Claude asks for permission |
 | `web_search` | Settings > Configuration | `disabled` takes Claude's WebSearch tool away; `cached`, `indexed` and `live` keep it, as Claude has the one kind of search |
 | `model_reasoning_summary` | Settings > Configuration | `none` hides Claude's thinking |
-| `sandbox_workspace_write.network_access` | Settings > Configuration | always on: Claude threads have no network sandbox, so turning it off fails |
+| `sandbox_workspace_write.network_access` | Settings > Configuration | always on: Claude threads have no network sandbox, so turning it off fails. `config/read` still reports `sandbox_workspace_write` unset, as Codex does without the table, so Settings shows network access off: with it on, the App would take the default permissions for Custom (config.toml) instead of its Default permissions preset |
 | other `sandbox_workspace_write` fields | none | fixed: Claude threads have no filesystem sandbox, so other values fail |
 | `model_verbosity` | Settings > Configuration | fails: Claude models have no verbosity setting; read back as unset |
 | `service_tier`, `profiles.<name>.service_tier` | the speed menu | `default` succeeds and is not kept; any other tier fails, as Claude models list none |

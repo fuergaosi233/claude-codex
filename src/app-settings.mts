@@ -13,7 +13,8 @@ import { codexHome } from './util.mjs'
 //   a message saying so, and the servers already saved stay saved, unused.
 // - A setting Claude has no counterpart for fails when it sets a value, so the
 //   App shows the setting as not saved; clearing it succeeds. config/read
-//   reports what Claude threads actually do for it.
+//   reports what Claude threads actually do for it, but for the network
+//   access the App's permission presets need unset (see server.mts).
 // - Everything else is kept as written and reported back by config/read:
 //   settings the adapter applies itself (model, effort, approval policy,
 //   sandbox mode, web search, reasoning summaries, memories) and the App's own
@@ -291,8 +292,9 @@ export function pruneLegacySettings(settings: Table): boolean {
   return pruned
 }
 
-// Codex's sandbox_workspace_write table as it holds for Claude threads.
-export function claudeSandboxWorkspaceWrite(): Table {
+// Codex's sandbox_workspace_write table as it holds for Claude threads: what
+// a write of it may set without failing. config/read reports none.
+function claudeSandboxWorkspaceWrite(): Table {
   return {
     writable_roots: [],
     network_access: true,

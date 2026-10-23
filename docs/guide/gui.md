@@ -615,10 +615,14 @@ it starts, are never kept, with or without the switch. Servers from the Codex an
 configs and from `CLAUDE_CODEX_MCP_SERVERS` are listed apart from the ones you
 added; see [MCP, tools & directories](/guide/configuration#mcp-tools-directories).
 
-**Settings > Configuration** shows what Claude chats do. Network access shows
-on, as Claude chats have no network sandbox, and turning it off, or picking a
-verbosity, says "Couldn't update this setting", since Claude models have
-neither setting. Web search off takes Claude's WebSearch tool away; the other
+**Settings > Configuration** shows what Claude chats do, but for one row:
+Network access shows off, although Claude chats always have network access, as
+they have no network sandbox. The adapter leaves that setting unset, as Codex
+does without a `[sandbox_workspace_write]` table, because the App takes the
+default permissions for its Default permissions preset only then; reported on,
+new chats would preselect Custom (config.toml). Turning it on changes nothing.
+Turning it off, or picking a verbosity, says "Couldn't update this setting",
+since Claude chats have neither setting. Web search off takes Claude's WebSearch tool away; the other
 search modes keep it. The approval policy and sandbox mode are saved and apply
 to the chats you start. The full list is under
 [App settings](/guide/configuration#app-settings).

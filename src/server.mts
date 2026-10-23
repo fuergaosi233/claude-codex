@@ -11,7 +11,6 @@ import {
   appMcpServers,
   appMcpServersEnabled,
   appMcpServerTable,
-  claudeSandboxWorkspaceWrite,
   editMcpServers,
   pruneLegacySettings,
   unsupportedSettingWrite,
@@ -7990,9 +7989,14 @@ export class CodexClaudeAppServer {
         approval_policy: this.configOverrides.approval_policy ?? 'on-request',
         approvals_reviewer: this.configOverrides.approvals_reviewer ?? 'user',
         sandbox_mode: this.configOverrides.sandbox_mode ?? 'workspace-write',
-        // Claude threads have no network or filesystem sandbox; see
-        // app-settings.mts for the settings Claude has no counterpart for.
-        sandbox_workspace_write: claudeSandboxWorkspaceWrite(),
+        // Claude threads have no network or filesystem sandbox (see
+        // app-settings.mts), but the App takes on-request with workspace-write
+        // for its Default permissions preset only while this is unset, as
+        // Codex reports it without a [sandbox_workspace_write] table. Any
+        // table with network access on would make new chats preselect
+        // Custom (config.toml); Settings shows network access off instead.
+        // App rule: permission-presets
+        sandbox_workspace_write: null,
         forced_chatgpt_workspace_id: null,
         forced_login_method: null,
         // Claude searches the web live with its WebSearch tool, which

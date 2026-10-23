@@ -421,9 +421,16 @@ export const APP_RULES: readonly AppRule[] = [
     id: 'settings-write-errors',
     app: 'Writes Settings > Configuration (approval policy, sandbox mode, network access, web search, verbosity, reasoning summaries) with config/value/write, reads the values back from config/read, and shows "Couldn\'t update this setting" next to a setting whose write fails.',
     adapter:
-      'Refuses a write of a setting Claude threads have no counterpart for, such as model verbosity, a service tier or network access off, and reports in config/read what Claude threads do for it.',
+      'Refuses a write of a setting Claude threads have no counterpart for, such as model verbosity, a service tier or network access off, and reports in config/read what Claude threads do for it, except the network access the permission-presets rule keeps unset.',
+    verify: 'Picking a verbosity, or turning network access off, shows the error next to it.',
+  },
+  {
+    id: 'permission-presets',
+    app: "Takes config/read's approval_policy on-request with sandbox_mode workspace-write for its Default permissions preset only while sandbox_workspace_write is null, or a table with no writable_roots and network_access, exclude_tmpdir_env_var and exclude_slash_tmp all false (app-shared y4e/v4e; $_t/Q_t in 26.930). Otherwise it lists Custom (config.toml) in the composer's permissions menu and preselects it for a new chat with no stored choice. Settings > Configuration shows network access as that table's network_access, off when it is null.",
+    adapter:
+      'Reports sandbox_workspace_write as null, as Codex does without a [sandbox_workspace_write] table, although Claude threads always have network access; Settings shows network access off for them, and turning it off is refused under settings-write-errors.',
     verify:
-      'Settings > Configuration shows network access on, and picking a verbosity shows the error next to it.',
+      'With no permissions picked before, start a new chat: the composer shows Default permissions and the menu lists no Custom (config.toml).',
   },
   {
     id: 'dynamic-tools',

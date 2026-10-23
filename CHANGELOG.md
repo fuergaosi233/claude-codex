@@ -591,9 +591,13 @@ versioning or publishing metadata.
   instead of being saved and ignored, so the App shows "Couldn't update this
   setting": `model_verbosity`, a service tier other than the default, network
   access off and the other workspace sandbox fields, `instructions`,
-  `developer_instructions` and `compact_prompt`. `config/read` reports network
-  access on, as Claude threads have it. Writing the value Claude already has,
-  or clearing a key, still succeeds.
+  `developer_instructions` and `compact_prompt`. Writing the value Claude
+  already has, or clearing a key, still succeeds. `config/read` keeps
+  reporting `sandbox_workspace_write` unset, so Settings shows network access
+  off although Claude threads always have it: the App takes the default
+  permissions for its Default permissions preset only while that table is
+  unset (or has network access off), and would otherwise preselect Custom
+  (config.toml) in new chats.
 - `web_search = "disabled"` saved in the App's settings takes WebSearch from
   Claude threads; `cached`, `indexed` and `live` keep it.
 - A `config/batchWrite` is all or nothing: one refused edit leaves the

@@ -156,6 +156,34 @@ const servers = (context: RuntimeTurnContext) =>
 // The servers added in the App's MCP settings apply only with this.
 const appServersOn = { CLAUDE_CODEX_APP_MCP_SERVERS: '1' }
 
+// The permissions preset the App's composer takes config/read's settings
+// for: on-request with workspace-write is its Default permissions ('auto')
+// only while sandbox_workspace_write is unset, or an empty table with network
+// access and both exclude flags off. Otherwise it lists and preselects
+// Custom (config.toml) for new chats.
+// App rule: permission-presets
+function appPermissionPreset(config: {
+  approval_policy?: unknown
+  sandbox_mode?: unknown
+  sandbox_workspace_write?: {
+    writable_roots?: unknown[]
+    network_access?: unknown
+    exclude_tmpdir_env_var?: unknown
+    exclude_slash_tmp?: unknown
+  } | null
+}): string | null {
+  const table = config.sandbox_workspace_write
+  const plain =
+    table == null ||
+    ((table.writable_roots ?? []).length === 0 &&
+      table.network_access === false &&
+      table.exclude_tmpdir_env_var === false &&
+      table.exclude_slash_tmp === false)
+  if (config.sandbox_mode === 'workspace-write' && config.approval_policy === 'on-request')
+    return plain ? 'auto' : null
+  return null
+}
+
 test('servers added in the App MCP settings run in Claude threads and survive a restart', async () => {
   const root = await mkdtemp(join(tmpdir(), 'app-mcp-settings-'))
   const userFile = join(root, 'codex', 'config.toml')
@@ -569,12 +597,9 @@ test('settings Claude threads have no counterpart for are refused, and read back
   try {
     await withServer(root, {}, async ({ request, send }) => {
       const before = await request('config/read', {})
-      assert.deepEqual(before.config.sandbox_workspace_write, {
-        writable_roots: [],
-        network_access: true,
-        exclude_tmpdir_env_var: false,
-        exclude_slash_tmp: false,
-      })
+      // New chats keep the App's Default permissions preset.
+      assert.equal(appPermissionPreset(before.config), 'auto')
+      assert.equal(before.config.sandbox_workspace_write, null)
       for (const key of [
         'model_verbosity',
         'service_tier',
@@ -697,7 +722,7 @@ test('settings saved before the App settings were checked are cleaned up on star
       assert.deepEqual(config.mcp_servers, { kept: { command: '/bin/kept' } })
       assert.equal(config['mcp_servers.node_repl'], undefined)
       assert.equal(config.model_verbosity, null)
-      assert.equal(config.sandbox_workspace_write.network_access, true)
+      assert.equal(config.sandbox_workspace_write, null)
       assert.equal(config['desktop.flag'], true)
       assert.equal(config.approval_policy, 'never')
     })
