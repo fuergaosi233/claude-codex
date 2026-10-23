@@ -217,7 +217,9 @@ export function turnPrompt(
   return { prompt, context: blocks }
 }
 
-// The prompt as one text, for a runtime that sends no content blocks.
+// The prompt as one text, for a runtime that sends no content blocks. With
+// any context, a command message no longer starts with `/name` there, so it
+// does not run: the context cannot follow it without becoming its arguments.
 export function flatPrompt(prompt: string, context: readonly string[] | undefined): string {
   return context && context.length > 0 ? [...context, prompt].join('\n\n') : prompt
 }

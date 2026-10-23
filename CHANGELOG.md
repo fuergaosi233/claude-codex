@@ -637,6 +637,13 @@ versioning or publishing metadata.
   mentioned with the command stays in its arguments as `@path`. A command
   sent while a turn runs is not folded into it: Claude Code runs it once the
   current answer ends, and the turn stays open until it is done.
+  This is on the default Agent SDK backend. The `claude-p`, `agent-http` and
+  `agentapi` backends get a message as one flat text, now with that context
+  ahead of the command, so there a command sent with context does not run:
+  Claude reads the text as a plain message. Before, context other than
+  injected items followed the command into its arguments. A message with no
+  context still goes as typed. Codex chats on the `codex-proxy` route get the
+  same flat text and have no Claude Code commands.
 
 ### Provider and multi-agent boundaries
 

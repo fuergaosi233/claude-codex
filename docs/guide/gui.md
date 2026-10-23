@@ -368,6 +368,15 @@ its arguments. A command you send while Claude is still working is not
 folded into the running answer the way other messages are: Claude Code runs
 it once that answer ends, and the turn ends after it.
 
+That is on the default Agent SDK backend. The `claude-p`, `agent-http` and
+`agentapi` backends (see [Backends](/guide/backends)) get a message as one
+flat text, with that context ahead of the command, so a command sent with any
+of it does not run there: Claude reads the whole text as a plain message.
+Only a message with no such context goes as typed. The context cannot follow
+the command instead, as it would become the command's arguments. Codex chats
+on the `codex-proxy` route get the same flat text, and have no Claude Code
+commands to run.
+
 Context the App attaches to a message without showing it, such as the follow-up
 after you connect a suggested plugin, reaches Claude after the message (before
 it for a command), marked as data rather than instructions when the App does
