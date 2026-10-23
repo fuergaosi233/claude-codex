@@ -622,9 +622,11 @@ does without a `[sandbox_workspace_write]` table, because the App takes the
 default permissions for its Default permissions preset only then; reported on,
 new chats would preselect Custom (config.toml). Turning it on changes nothing.
 Turning it off, or picking a verbosity, says "Couldn't update this setting",
-since Claude chats have neither setting. Web search off takes Claude's WebSearch tool away; the other
-search modes keep it. The approval policy and sandbox mode are saved and apply
-to the chats you start. The full list is under
+since Claude chats have neither setting. Web search off takes Claude's
+WebSearch tool away; the other search modes keep it. It shows off, and Claude
+has no WebSearch, also when the adapter runs with `CLAUDE_CODEX_WEBSEARCH=0`
+and no mode was picked there. The approval policy and sandbox mode are saved
+and apply to the chats you start. The full list is under
 [App settings](/guide/configuration#app-settings).
 
 ## App tools

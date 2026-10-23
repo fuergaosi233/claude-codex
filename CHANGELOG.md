@@ -600,6 +600,12 @@ versioning or publishing metadata.
   (config.toml) in new chats.
 - `web_search = "disabled"` saved in the App's settings takes WebSearch from
   Claude threads; `cached`, `indexed` and `live` keep it.
+- **Behavior change:** `CLAUDE_CODEX_WEBSEARCH=0` now takes Claude Code's
+  WebSearch tool away from Claude threads too, while the App's settings saved
+  no web search mode. Before, it only made `config/read` report
+  `web_search = "disabled"` (and capabilities no web search), so Settings
+  showed web search off while Claude could still search. A mode saved in
+  Settings wins, and `modelProvider/capabilities/read` now follows it.
 - A `config/batchWrite` is all or nothing: one refused edit leaves the
   settings as they were. Keys earlier versions saved but never honored are
   dropped from the adapter's settings when it starts.

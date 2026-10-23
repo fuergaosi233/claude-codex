@@ -158,9 +158,10 @@ codex.
   adapter also skips the whole-tree `git diff` after each tool call; the turn's
   end still records one.
 - `config/read` reports `web_search = "live"`, the way Claude's WebSearch tool
-  searches, unless `CLAUDE_CODEX_WEBSEARCH=0` turns the App's search affordance
-  off or the App saved another value; a saved `disabled` also takes WebSearch
-  from Claude threads. `model_context_window` stays null, as
+  searches, unless the App saved another value or, with none saved,
+  `CLAUDE_CODEX_WEBSEARCH=0` turns it off; `disabled` either way takes
+  WebSearch from Claude threads, and `modelProvider/capabilities/read` reports
+  web search only while they have it. `model_context_window` stays null, as
   Codex reports it only when `config.toml` sets it.
 - `turn/plan/updated` is reserved for the `update_plan`/TodoWrite checklist tool
   and ships the spec shape `{ explanation, plan: [{ step, status }] }` (status

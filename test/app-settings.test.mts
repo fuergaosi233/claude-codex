@@ -694,6 +694,30 @@ test('web search turned off in the App settings takes WebSearch from Claude', as
   }
 })
 
+test('web search off by CLAUDE_CODEX_WEBSEARCH=0 takes WebSearch from Claude until Settings saves a mode', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'app-settings-web-search-env-'))
+  try {
+    await withServer(root, { CLAUDE_CODEX_WEBSEARCH: '0' }, async ({ request, turn }) => {
+      // Settings shows web search off, and Claude has no WebSearch.
+      assert.equal((await request('config/read', {})).config.web_search, 'disabled')
+      assert.equal((await request('modelProvider/capabilities/read', {})).webSearch, false)
+      const started = await request('thread/start', { cwd: root, model: 'sonnet' })
+      const threadId = started.thread.id
+      assert.deepEqual((await turn(threadId)).disallowedTools, ['WebSearch'])
+      // A mode saved in Settings wins over the switch.
+      await request('config/value/write', { keyPath: 'web_search', value: 'live' })
+      assert.equal((await request('config/read', {})).config.web_search, 'live')
+      assert.equal((await request('modelProvider/capabilities/read', {})).webSearch, true)
+      assert.ok(!(await turn(threadId)).disallowedTools?.includes('WebSearch'))
+      // Clearing it falls back to the switch.
+      await request('config/value/write', { keyPath: 'web_search', value: null })
+      assert.deepEqual((await turn(threadId)).disallowedTools, ['WebSearch'])
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('settings saved before the App settings were checked are cleaned up on start', async () => {
   const root = await mkdtemp(join(tmpdir(), 'app-settings-legacy-'))
   const configPath = join(root, 'adapter', 'config.json')

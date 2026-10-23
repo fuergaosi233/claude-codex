@@ -1080,10 +1080,9 @@ export class CodexClaudeAppServer {
         return {
           namespaceTools: true,
           imageGeneration: false,
-          // Claude Code SDK ships a WebSearch tool. Default to advertising it
-          // so Codex App shows the search affordance; CLAUDE_CODEX_WEBSEARCH=0
-          // turns it off for environments where the tool is rate-limited.
-          webSearch: process.env.CLAUDE_CODEX_WEBSEARCH !== '0',
+          // Whether Claude threads have their WebSearch tool: the same web
+          // search mode config/read reports and turns apply.
+          webSearch: this.effectiveWebSearch() !== 'disabled',
         }
       case 'experimentalFeature/list':
         return this.experimentalFeatureList(asRecord(params))
@@ -4352,9 +4351,9 @@ export class CodexClaudeAppServer {
     // the MCP servers added in the App's settings.
     const inheritConfig = desktopPresentation && !isCodexThread
     const mcp = readMcpConfig({ ...this.appMcpScope(), cwd: turnCwd, inherit: inheritConfig })
-    // The App's Settings > Configuration > Web search. Claude has the one
-    // kind of search, so only turning it off changes what Claude may do.
-    const webSearchOff = !isCodexThread && this.configOverrides.web_search === 'disabled'
+    // The App's Settings > Configuration > Web search, as config/read reports
+    // it: also off with CLAUDE_CODEX_WEBSEARCH=0 while nothing is saved.
+    const webSearchOff = !isCodexThread && this.effectiveWebSearch() === 'disabled'
     const permissionRules = inheritConfig ? inheritedPermissionRules(turnCwd) : null
     // The tools the client registered when it started the thread.
     const dynamicTools =
@@ -7964,6 +7963,19 @@ export class CodexClaudeAppServer {
     this.failTurn(this.peerForThread(threadId), threadId, turn, error)
   }
 
+  // The web search mode of Claude threads, as config/read reports it and
+  // turns apply it: the mode saved in the App's Settings > Configuration, or
+  // else disabled with CLAUDE_CODEX_WEBSEARCH=0 (for a host where the tool is
+  // rate-limited or unwanted) and live, the way Claude's WebSearch tool
+  // searches, otherwise. Claude has the one kind of search, so only disabled
+  // changes what Claude may do: it takes the WebSearch tool away.
+  private effectiveWebSearch(): unknown {
+    return (
+      this.configOverrides.web_search ??
+      (process.env.CLAUDE_CODEX_WEBSEARCH === '0' ? 'disabled' : 'live')
+    )
+  }
+
   private configRead(params: Record<string, unknown>): unknown {
     // Base config = our typed defaults; overrides (whatever the App's
     // settings sheet has written previously via config/value/write) are
@@ -7999,12 +8011,9 @@ export class CodexClaudeAppServer {
         sandbox_workspace_write: null,
         forced_chatgpt_workspace_id: null,
         forced_login_method: null,
-        // Claude searches the web live with its WebSearch tool, which
-        // modelProvider/capabilities/read advertises unless
-        // CLAUDE_CODEX_WEBSEARCH=0.
-        web_search:
-          this.configOverrides.web_search ??
-          (process.env.CLAUDE_CODEX_WEBSEARCH === '0' ? 'disabled' : 'live'),
+        // What turns apply, so Settings shows web search off only while
+        // Claude has no WebSearch tool.
+        web_search: this.effectiveWebSearch(),
         tools: this.configOverrides.tools ?? null,
         profile: this.configOverrides.profile ?? null,
         profiles: {},
