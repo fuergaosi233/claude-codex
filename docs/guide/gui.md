@@ -352,7 +352,9 @@ that folder. A Claude CLI started with its setting sources turned off (see
 `CLAUDE_CODEX_CLAUDE_CONFIG_DIR` in
 [Configuration](/guide/configuration#reference-table)) finds no user,
 project or plugin commands, so none are listed. Commands named like one of
-the App's own (`/init`, `/compact`, …) are left out, and Claude Code's plain
+the App's own are left out: `/init`, `/compact`, `/review-mode` and the rest,
+including the ones the App offers only in some windows or chats (`/pin`,
+`/archive`, `/read-aloud`, `/hotkey-window-new`, …). Claude Code's plain
 built-ins such as `/cost` are not listed.
 
 Context the App attaches to a message without showing it, such as the follow-up

@@ -55,32 +55,53 @@ const SEED: readonly ClaudeCommand[] = [
   },
 ]
 
-// The App's own "/" commands. A same-named Claude command would sit next to
-// them in the popup and do something else.
+// The App's own "/" commands, by the id it registers each under, including
+// the ones it shows only in some windows or chats (hotkey window, ChatGPT
+// chats, projects) and the archive or delete command a thread's menu adds.
+// A same-named Claude command would sit next to them in the popup and do
+// something else. Ids the App makes up per item (skill:<path>,
+// custom-prompt:<id>, service-tier:<tier>, ...) are not names a user types.
 const APP_COMMANDS = new Set([
+  'archive',
   'autoreview',
   'chat',
+  'chatgpt-lockdown',
+  'chatgpt-model',
   'cloud',
+  'cloud-environment',
   'compact',
+  'custom-gpt',
+  'delete',
+  'dictate',
   'feedback',
   'fork',
   'goal',
+  'hotkey-window-new',
+  'hotkey-window-resume',
+  'ide-context',
   'init',
   'local',
+  'local-project-to-chat',
   'mcp',
   'memories',
   'model',
   'new',
+  'pet',
+  'pin',
   'plan-mode',
   'project',
+  'projectless',
+  'read-aloud',
   'reasoning',
   'rename',
   'review-mode',
   'share',
   'side',
+  'sketch',
   'status',
   'usage',
   'worktree',
+  'worktree-prompt',
 ])
 
 // Plugin commands and skills are namespaced as `plugin:name`; MCP prompts are

@@ -9,6 +9,7 @@ import {
   claudeCommandManifest,
   listClaudeCommands,
   listFolderCommands,
+  noteClaudeCommands,
   noteFolderCommands,
   onClaudeCommandsChanged,
   type ReportedCommand,
@@ -142,6 +143,78 @@ test('noteFolderCommands keeps the commands a folder reports beyond Claude Code 
     } finally {
       off()
     }
+  })
+})
+
+test('commands named like one of the App\'s own "/" commands are left out', async () => {
+  await withEnv({}, async (home) => {
+    const folder = join(home, 'project')
+    // Every command the App registers in its "/" popup, by id.
+    const app = [
+      'archive',
+      'autoreview',
+      'chat',
+      'chatgpt-lockdown',
+      'chatgpt-model',
+      'cloud',
+      'cloud-environment',
+      'compact',
+      'custom-gpt',
+      'delete',
+      'dictate',
+      'feedback',
+      'fork',
+      'goal',
+      'hotkey-window-new',
+      'hotkey-window-resume',
+      'ide-context',
+      'init',
+      'local',
+      'local-project-to-chat',
+      'mcp',
+      'memories',
+      'model',
+      'new',
+      'pet',
+      'pin',
+      'plan-mode',
+      'project',
+      'projectless',
+      'read-aloud',
+      'reasoning',
+      'rename',
+      'review-mode',
+      'share',
+      'side',
+      'sketch',
+      'status',
+      'usage',
+      'worktree',
+      'worktree-prompt',
+    ]
+    noteFolderCommands(folder, [
+      { name: 'simplify', description: '', argumentHint: '', builtin: true },
+      ...app.map((name) => ({ name, description: 'Mine.', argumentHint: '' })),
+      { name: 'deploy', description: 'Deploy.', argumentHint: '' },
+      // A plugin's command only shares the part after its namespace.
+      { name: 'acme:pin', description: 'Pin with Acme.', argumentHint: '' },
+    ])
+    assert.deepEqual(
+      listFolderCommands(folder).map((command) => command.name),
+      ['acme:pin', 'deploy'],
+    )
+    // Claude Code's own skills are filtered the same way.
+    noteClaudeCommands(
+      [
+        { name: 'pet', description: '', argumentHint: '', builtin: true },
+        { name: 'review', description: 'Review.', argumentHint: '', builtin: true },
+      ],
+      ['pet', 'review'],
+    )
+    assert.deepEqual(
+      listClaudeCommands().map((command) => command.name),
+      ['review'],
+    )
   })
 })
 

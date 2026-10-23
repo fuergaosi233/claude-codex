@@ -604,7 +604,9 @@ versioning or publishing metadata.
   from the last chat session there (`supportedCommands()` when a turn starts,
   then each `commands_changed`), so a folder shows them after its first
   Claude turn; `skills/changed` makes the App refetch it. Names the App uses
-  itself, names that are not one slash-command word and rows that share a
+  itself (every command id it registers, including `/pin`, `/archive`,
+  `/read-aloud` and the hotkey-window and ChatGPT-chat ones), names that are
+  not one slash-command word and rows that share a
   name with one of Claude Code's own commands are left out, and a skill read
   from `.claude/skills` keeps its own entry.
 
