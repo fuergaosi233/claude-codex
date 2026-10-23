@@ -161,31 +161,35 @@ test('workflow journal monitor stops waiting for failure reasons once the workfl
   }
 })
 
-test('workflow journal monitor ends an attempt the workflow ran again as failed', async () => {
+test('workflow journal monitor ends an attempt the workflow ran again as failed, without waiting for a reason', async () => {
   const first = 'ad00000000000001'
   const second = 'ad00000000000002'
   const third = 'ad00000000000003'
   const run = await workflowRun('wf_retried_run', [first, second, third])
+  const failures = new WorkflowAgentFailures()
   const { monitor, results } = monitorFor(run, 'wf_retried_run', {
-    failureReason: (agentId) =>
-      agentId === first ? 'stalled — no progress for 600000ms' : undefined,
-    failureReasonWaitMs: 0,
+    failureReason: (agentId) => failures.reason(agentId),
+    failureReasonWaitMs: 60_000,
   })
+  const progress = (agentId: string) => [
+    { type: 'workflow_agent', index: 1, label: 'review', agentId, state: 'start' },
+  ]
   try {
     await run.journal({ type: 'started', key: key(1), agentId: first })
+    failures.note(progress(first))
     await monitor.flush()
     assert.deepEqual(results, [], 'the only attempt so far is still running')
+    // The first two attempts stall. Claude Code reports each stall's error
+    // together with the next attempt's start, keeping only the start.
     await run.journal(
       { type: 'started', key: key(1), agentId: second },
       { type: 'started', key: key(1), agentId: third },
     )
+    failures.note(progress(second))
+    failures.note(progress(third))
     await monitor.flush()
     assert.deepEqual(results, [
-      {
-        agentId: first,
-        content: `stalled — no progress for 600000ms\nagentId: ${first}`,
-        isError: true,
-      },
+      { agentId: first, content: `${WORKFLOW_AGENT_RETRIED}\nagentId: ${first}`, isError: true },
       { agentId: second, content: `${WORKFLOW_AGENT_RETRIED}\nagentId: ${second}`, isError: true },
     ])
     assert.deepEqual(monitor.activeAgentIds(), [third])
@@ -234,22 +238,24 @@ test('workflow agent failures take the reason of each attempt from the progress 
   })
   failures.note([
     { type: 'workflow_phase', index: 1, title: 'Review' },
-    agent(1, 'af01', 'error', 'stalled \x1b[31m—\x1b[0m no progress\nfor 600000ms'),
+    agent(1, 'af01', 'start'),
     agent(2, 'af02', 'start'),
   ])
-  assert.equal(failures.reason('af01'), 'stalled — no progress for 600000ms')
+  assert.equal(failures.reason('af01'), null)
   assert.equal(failures.reason('af02'), null)
 
-  // The call runs its agent again; the next report has the new attempt.
+  // Call 1's agent stalls and the call runs it again. Claude Code reports the
+  // stall's error and the new attempt's start together, keeping only the
+  // latest state of each call: the stall never shows.
   failures.note([agent(1, 'af03', 'start'), agent(2, 'af02', 'progress')])
-  assert.equal(failures.reason('af01'), 'stalled — no progress for 600000ms', 'kept')
-  assert.equal(failures.reason('af03'), null, 'the earlier error is not the new attempt’s')
+  assert.equal(failures.reason('af01'), null)
+  assert.equal(failures.reason('af03'), null)
 
   // The call throws once its attempts are over: that error has no agentId
   // and belongs to the last attempt only.
-  failures.note([agent(1, undefined, 'error', 'agent stalled on all 2 attempts')])
+  failures.note([agent(1, undefined, 'error', 'agent stalled \x1b[31mon all\x1b[0m 2\nattempts')])
   assert.equal(failures.reason('af03'), 'agent stalled on all 2 attempts')
-  assert.equal(failures.reason('af01'), 'stalled — no progress for 600000ms')
+  assert.equal(failures.reason('af01'), null)
   assert.equal(failures.reason('af02'), null)
 
   // A withheld script still says that its agent failed.

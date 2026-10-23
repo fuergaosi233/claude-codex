@@ -101,8 +101,9 @@ versioning or publishing metadata.
   API error) ends its thread's turn as failed, with the reason the workflow
   reported, and counts as a failed subagent of its parent. It used to show as
   running until the workflow ended and then as completed. An attempt the
-  workflow ran again after a stall ends the same way, with its own reason,
-  instead of staying open.
+  workflow ran again after a stall ends as failed too, as soon as the next
+  attempt starts, saying the workflow ran the agent again, instead of staying
+  open. Claude Code's progress report does not keep that attempt's own error.
 - The goal tools (`codex_goal`) and leader tools (`codex_leader`) load with the
   session instead of behind Claude Code's tool search, so Claude knows they are
   there in a session with many tools.

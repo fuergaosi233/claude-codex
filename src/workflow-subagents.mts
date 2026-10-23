@@ -273,8 +273,11 @@ export class WorkflowJournalMonitor {
         !ended.has(entry.agentId)
       ) {
         // A later attempt at the same call started: this one is over, and
-        // nothing else will say so.
-        result = this.failedResult(entry.agentId, WORKFLOW_AGENT_RETRIED)
+        // nothing else will say so. Its reason does not come either: Claude
+        // Code reports the stalled attempt's error and the next attempt's
+        // start together and keeps only the latest state of each call, so
+        // there is nothing to wait for.
+        result = this.failedResult(entry.agentId, WORKFLOW_AGENT_RETRIED, false)
       } else {
         continue
       }
@@ -286,10 +289,15 @@ export class WorkflowJournalMonitor {
   }
 
   // The failed result of an agent that ended without one, with the reason the
-  // workflow gave. Null while that reason may still come.
-  private failedResult(agentId: string, fallback: string): WorkflowJournalAgentResult | null {
+  // workflow gave. Null while that reason may still come, unless `wait` is
+  // false.
+  private failedResult(
+    agentId: string,
+    fallback: string,
+    wait = true,
+  ): WorkflowJournalAgentResult | null {
     const reason = collapseWhitespace(this.failureReason?.(agentId) ?? '')
-    if (!reason && !this.settling) {
+    if (!reason && wait && !this.settling) {
       const now = Date.now()
       const since = this.endedWithoutResult.get(agentId) ?? now
       this.endedWithoutResult.set(agentId, since)
@@ -359,7 +367,9 @@ export class WorkflowJournalMonitor {
 // script call (its index), and an error state says why the attempt failed.
 // The attempt's agentId comes with it, except for an error the call threw
 // once its attempts were over (stalled on every one, say); that error is the
-// call's own, and so its last attempt's.
+// call's own, and so its last attempt's. The error of an attempt the call
+// runs again never shows: the next attempt's start comes in the same report
+// and replaces it.
 export class WorkflowAgentFailures {
   private readonly agentErrors = new Map<string, string>()
   private readonly callErrors = new Map<number, string>()

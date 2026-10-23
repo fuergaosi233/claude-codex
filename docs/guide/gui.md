@@ -489,10 +489,13 @@ message.
 
 A workflow agent that fails, such as one that stalled on every attempt or hit
 an API error, fails the same way as soon as the workflow records it, with the
-reason the workflow reported for it, and counts as a failed subagent. An
-attempt the workflow ran again after a stall ends as failed too, with its own
-reason. If the workflow gives no reason within two seconds, or none by the
-time it ends, the agent's turn says only that it failed. The App draws a turn's error only when the turn failed, and does not
+reason the workflow reported for it, and counts as a failed subagent. If the
+workflow gives no reason within two seconds, or none by the time it ends, the
+agent's turn says only that it failed. An attempt the workflow ran again after
+a stall ends as failed too, as soon as the next attempt starts, saying the
+workflow ran the agent again. Claude Code's progress report replaces that
+attempt's error with the next attempt's start, so its own reason does not come
+through. The App draws a turn's error only when the turn failed, and does not
 draw the agent's state on the parent's wait card; both are there for clients
 that read them.
 
