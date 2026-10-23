@@ -43,9 +43,11 @@ versioning or publishing metadata.
   computer slept, that this broke Claude's connection to the model, and that a
   message (or Continue) picks up where it left off; on macOS it also points to
   the App's **Prevent sleep while running** setting. A sleep the turn went on
-  from is not blamed (API retries, notices and the failing result do not
-  count as going on). The error code and details are unchanged, and refusals
-  such as usage limits, an overloaded API or startup failures are left alone.
+  from is not blamed (API retries, a subagent's included, notices, hooks, the
+  message Claude Code writes to name the failed request and the failing result
+  do not count as going on). The error code and details are unchanged, and
+  refusals such as usage limits, an overloaded API or a Claude Code start that
+  a retry cannot fix are left alone.
 - The subagent watchdog (`CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS`) no longer fails a
   turn over quiet that is not a stall. The wait is paused while the turn waits
   on the user (an approval, a question, an MCP elicitation or a client dynamic
@@ -74,9 +76,12 @@ versioning or publishing metadata.
   `CLAUDE_CODEX_NOTICE_ROWS=0` sends the warnings alone.
 - A tool call, MCP elicitation or client dynamic tool call that background work
   (a background agent, a workflow, a cron job) makes while no turn runs is
-  still refused, but no longer silently: Claude is told no user turn was active
-  and that the user can run it again in a turn, and the user sees a notice row
-  under the thread's running or last turn. Nothing is queued.
+  still turned down, but no longer silently. For a tool call or client dynamic
+  tool call, Claude is told no user turn was active and that the user can run
+  it again in a turn. An MCP elicitation is declined, and the server gets only
+  a plain decline, so what Claude sees of it is up to that server. In every
+  case the user sees a notice row under the thread's running or last turn.
+  Nothing is queued.
 - A turn keeps a `contextCompaction` item only once the compaction completes,
   in the place it started, like Codex. A compaction an interrupt cuts short no
   longer reads as "Context compacted" after a reload, and one Claude Code could
@@ -84,14 +89,17 @@ versioning or publishing metadata.
   `/compact` (`thread/compact/start`) Claude Code could not do: its turn keeps
   only the summary written instead, and no `thread/compacted` is sent.
 - Requests the user can correct fail with JSON-RPC `-32600` (invalid request),
-  the code Codex uses, instead of `-32000`, with the same messages: an unknown
-  thread, turn, section, queued message or process; a bad cursor or parameter;
-  a model the chat cannot take; a rewind or queued start while a turn runs; a
-  fork from an unknown thread, from a turn its thread does not have or that
-  still runs, or onto another model process profile.
+  as Codex answers an unknown thread or turn and a bad cursor, instead of
+  `-32000`, with the same messages: an unknown thread, turn, section, queued
+  message or process; a bad cursor or parameter; a model the chat cannot
+  take; a rewind or queued start while a turn runs; a fork from an unknown
+  thread, from a turn its thread does not have or that still runs, or onto
+  another model process profile. (Codex answers some section parameter errors
+  with `-32602`, invalid params.)
   The model menu's "Couldn't update model settings" toast now gives the
   reason, after the App's own "Check your config.toml." line. Failures inside
-  the adapter stay `-32000`.
+  the adapter stay `-32000`, and so do project errors, whose text the App
+  matches.
 - Model process profiles that fail to load fail with one line of at most 300
   characters that names the file (or `CLAUDE_CODEX_MODEL_PROFILES`) and says
   what is wrong. The message used to carry the JSON parser's excerpt of the
@@ -597,8 +605,7 @@ versioning or publishing metadata.
   Codex or Claude Code config brings, and `CLAUDE_CODEX_MCP_SERVERS` wins
   over it; the App's own desktop servers (`node_repl`, `cua_repl`) are
   accepted and not kept. A server or field named `__proto__` is refused
-  with `INVALID_REQUEST`, where it would have reported success and been
-  dropped unchecked.
+  with `INVALID_REQUEST`.
   The switch is off by default, since such a server runs a program or reaches
   a URL from every Claude thread. Without it the page lists no server, and a
   save, switch or delete there fails with a message the App shows under the
@@ -635,6 +642,15 @@ versioning or publishing metadata.
   `web_search = "disabled"` (and capabilities no web search), so Settings
   showed web search off while Claude could still search. A mode saved in
   Settings wins, and `modelProvider/capabilities/read` now follows it.
+- Web search off holds on the `claude-p` backend too. It now passes the tools
+  a thread must not have to `claude-p` as `--disallowedTools`, the way the
+  SDK route does, and no longer pre-approves one of them: a read-only thread
+  used to get `--allowedTools` with WebSearch in it whatever the setting
+  said. The same flag carries the Claude Code deny rules the adapter bridges
+  and the MCP tools the config disables, which `claude-p` turns did not get
+  before.
+  The `agent-http` and `agentapi` backends run Claude outside the adapter, so
+  Claude keeps WebSearch there whatever the setting says.
 - A `config/batchWrite` is all or nothing: one refused edit leaves the
   settings as they were. Keys earlier versions saved but never honored are
   dropped from the adapter's settings when it starts.

@@ -1250,6 +1250,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
           `${server} asked for your input while no turn was running, so the request was declined. Ask Claude to try again in a new message.`,
         )
       }
+      // A decline carries no reason: what Claude hears is up to the server,
+      // so only the notice tells the user why.
       return { action: 'decline' }
     }
     const url = stringOrNull(request.url)
@@ -2558,7 +2560,11 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     const now = performance.now()
     if (now - pending.progressReportedAtMs < SUBAGENT_PROGRESS_INTERVAL_MS) return
     pending.progressReportedAtMs = now
-    await pending.handlers.onEvent({ type: 'subagent_progress', toolUseId })
+    await pending.handlers.onEvent({
+      type: 'subagent_progress',
+      toolUseId,
+      ...(tellsFailedRequest(type, message) ? { failedRequest: true } : {}),
+    })
   }
 
   private progressToolUseId(
@@ -3059,13 +3065,17 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     pending: PendingTurn,
     messageId: string | null,
     streamStart = false,
+    failedRequest = false,
   ): Promise<void> {
     if (messageId ? messageId === pending.assistantMessageId : !streamStart) return
     pending.assistantMessageId = messageId
     pending.streamedBlocks = new Map()
     pending.toolInputPreviews?.clear()
     if (!pending.context?.outputFormat) {
-      await pending.handlers.onEvent({ type: 'message_boundary' })
+      await pending.handlers.onEvent({
+        type: 'message_boundary',
+        ...(failedRequest ? { failedRequest } : {}),
+      })
     }
   }
 
@@ -3100,19 +3110,21 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     // The subagent that wrote a nested frame, by its task id (newer CLIs;
     // the same id after a resume). Its Agent calls launch agents of its own.
     const agentId = nestedMessage ? stringOrNull(message.agent_id) : null
+    // The CLI answers a request that failed for good with an assistant
+    // message naming the error; the result then carries its HTTP status. The
+    // message shows, but is no sign Claude got on with the turn.
+    const apiError = stringOrNull(message.error)
+    const failed = !nestedMessage && apiError != null ? { failedRequest: true } : {}
     if (!nestedMessage) {
-      await this.beginAssistantMessage(pending, stringOrNull(inner.id))
+      await this.beginAssistantMessage(pending, stringOrNull(inner.id), false, apiError != null)
       pending.model = stringOrNull(inner.model) ?? pending.model
-      // The CLI answers a request that failed for good with an assistant
-      // message naming the error; the result then carries its HTTP status.
-      const apiError = stringOrNull(message.error)
       pending.apiError = apiError ? { category: apiError, status: null } : null
       const usage = recordOrNull(inner.usage)
       const messageId = stringOrNull(inner.id)
       // Not final until the result, but enough to see a goal budget run out
       // inside a long turn.
       if (usage && messageId)
-        await pending.handlers.onEvent({ type: 'usage_progress', messageId, usage })
+        await pending.handlers.onEvent({ type: 'usage_progress', messageId, usage, ...failed })
     }
     const content = (inner.content as Array<Record<string, unknown>>) || []
     for (const block of content) {
@@ -3123,7 +3135,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         if (pending.context?.outputFormat) {
           pending.structuredBuffer += text
         } else if (text) {
-          await pending.handlers.onEvent({ type: 'text_delta', delta: text })
+          await pending.handlers.onEvent({ type: 'text_delta', delta: text, ...failed })
         }
       } else if (blockType === 'thinking') {
         if (nestedMessage) continue
@@ -3653,6 +3665,15 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       return
     }
   }
+}
+
+// The frame tells of a model request that failed: a retry (the main loop's
+// api_retry, a subagent's subagent_retry) or the message the CLI writes for a
+// request that failed for good, which names the error.
+function tellsFailedRequest(type: string, message: Record<string, unknown>): boolean {
+  if (type === 'tool_progress') return recordOrNull(message.subagent_retry) != null
+  if (type === 'system') return message.subtype === 'api_retry'
+  return type === 'assistant' && stringOrNull(message.error) != null
 }
 
 // A foreground subagent's model request that failed and will be sent again.

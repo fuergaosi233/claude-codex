@@ -1362,6 +1362,94 @@ test('native turn reports progress of the agents it waits on, not of those it ha
   await runtime.stop()
 })
 
+test("an agent's failed requests keep the turn alive, marked as no progress of its work", async () => {
+  const { runtime, queries } = fakeRuntime()
+  const events: RuntimeEvent[] = []
+  const turn = runtime.runTurn(context, handlers(events))
+  const query = await waitFor(() => queries[0], 'session')
+  const progress = () =>
+    events.flatMap((event) =>
+      event.type === 'subagent_progress' ? [event.failedRequest === true] : [],
+    )
+  // One frame at a time, past the interval between two reports.
+  const send = async (frame: Record<string, unknown>, reports: number) => {
+    query.push(frame)
+    await waitFor(() => progress().length === reports, `progress report ${reports}`)
+    await sleep(300)
+  }
+  query.push(
+    init,
+    assistant('m1', [
+      { type: 'tool_use', id: 'agent-1', name: 'Agent', input: { prompt: 'check the build' } },
+    ]),
+  )
+  // The CLI tells the agent's retry as its Agent call's tool_progress...
+  await send(
+    {
+      type: 'tool_progress',
+      tool_use_id: 'agent_msg_child',
+      tool_name: 'Agent',
+      parent_tool_use_id: 'agent-1',
+      elapsed_time_seconds: 3,
+      subagent_retry: {
+        agent_id: 'a1b2c3d4e5f60718',
+        attempt: 1,
+        max_retries: 10,
+        retry_delay_ms: 1000,
+        error_status: null,
+        error_category: 'unknown',
+      },
+    },
+    1,
+  )
+  // ...an api_retry naming the call is the agent's too...
+  await send(
+    {
+      type: 'system',
+      subtype: 'api_retry',
+      attempt: 2,
+      max_retries: 10,
+      retry_delay_ms: 2000,
+      error_status: null,
+      error: 'unknown',
+      parent_tool_use_id: 'agent-1',
+    },
+    2,
+  )
+  // ...and so is the message naming the error once the request failed for good.
+  await send(
+    {
+      type: 'assistant',
+      parent_tool_use_id: 'agent-1',
+      error: 'unknown',
+      message: { id: 'sub-error', model: '<synthetic>', content: [text('API Error')] },
+    },
+    3,
+  )
+  // A heartbeat without a retry, or the agent's own output, is progress.
+  await send(
+    {
+      type: 'tool_progress',
+      tool_use_id: 'agent_msg_child',
+      tool_name: 'Agent',
+      parent_tool_use_id: 'agent-1',
+      elapsed_time_seconds: 9,
+    },
+    4,
+  )
+  query.push(
+    {
+      type: 'user',
+      parent_tool_use_id: null,
+      message: { content: [{ type: 'tool_result', tool_use_id: 'agent-1', content: 'built' }] },
+    },
+    { type: 'result', subtype: 'success', result: 'Built.' },
+  )
+  await turn
+  assert.deepEqual(progress(), [true, true, true, false])
+  await runtime.stop()
+})
+
 test('native turn keeps reporting agent progress after the wall clock is set back', async () => {
   const wallClock = Date.now
   try {

@@ -18,6 +18,13 @@ Only the SDK route gets a message's context (injected items, a picked skill's
 message, so a Claude Code command (`/name args`) sent with any context does not
 run there; see [Skills and the App's tools](/guide/gui#skills-and-the-app-s-tools).
 
+Web search off (Settings > Configuration, or `CLAUDE_CODEX_WEBSEARCH=0` with no
+mode saved there) takes Claude Code's WebSearch tool away on the SDK route and
+`claude-p`, which gets the tools a thread must not have as `--disallowedTools`.
+`agent-http` and `agentapi` run Claude outside the adapter, so Claude keeps
+WebSearch there whatever the web search setting says, as Claude Code's own
+setting decides [memories](/guide/gui#memories) there.
+
 ## Switching routes
 
 Install the host helper next to the shim:

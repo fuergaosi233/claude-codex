@@ -462,18 +462,27 @@ const MAX_TRACKED_COMMAND_ITEMS = 512
 const MAX_QUEUED_ACTIVITY = 64
 
 // What a turn hears that does not show Claude getting on with it: a request
-// it will send again, a notice, an error, and the usage, figures and end of
-// the result that closes it. After a sleep broke its connection, a turn
-// hears only these until it fails. Usage also comes with each message, after
-// the message itself.
+// it will send again, a notice (a model fallback, a compaction that failed),
+// an error, a hook run (a StopFailure hook runs after a request failed), and
+// the usage, figures and end of the result that closes it. After a sleep
+// broke its connection, a turn hears only these, and the events of the
+// message naming the error (failedRequest), until it fails. Usage also comes
+// with each message, after the message itself.
 const NO_PROGRESS_EVENTS: ReadonlySet<RuntimeEvent['type']> = new Set([
   'retrying',
   'notice',
+  'model_rerouted',
+  'compaction_failed',
   'error',
+  'hook_run',
   'usage',
   'metrics',
   'completed',
 ])
+
+function showsProgress(event: RuntimeEvent): boolean {
+  return !NO_PROGRESS_EVENTS.has(event.type) && !('failedRequest' in event && event.failedRequest)
+}
 
 // A hidden goal continuation that does no tool work ends the run of
 // continuations until the user or the goal changes something.
@@ -1985,6 +1994,10 @@ export class CodexClaudeAppServer {
       typeof params.beforeThreadId === 'string' && params.beforeThreadId.length > 0
         ? params.beforeThreadId
         : null
+    // Checked here, not left to the store, so an unknown id is the caller's error.
+    if (!this.store.getThread(threadId)) throw unknownThread(threadId)
+    if (sectionId != null && !this.store.getSection(sectionId))
+      throw invalidRequest(`unknown section: ${sectionId}`)
     const moved = this.store.moveThreadToSection(threadId, sectionId, beforeThreadId)
     debugLog('thread.section.moved', {
       threadId,
@@ -2010,6 +2023,7 @@ export class CodexClaudeAppServer {
 
   private threadSectionCreate(params: Record<string, unknown>): unknown {
     const name = stringOr(params.name, '')
+    if (!name.trim()) throw invalidRequest('section name must not be empty')
     const section = this.store.createSection(
       newId(),
       name,
@@ -2023,6 +2037,8 @@ export class CodexClaudeAppServer {
     const existing = this.store.getSection(sectionId)
     if (!existing) throw invalidRequest(`unknown section: ${sectionId}`)
     const name = typeof params.name === 'string' ? params.name : existing.name
+    if (sectionId !== PINNED_SECTION_ID && !name.trim())
+      throw invalidRequest('section name must not be empty')
     const appearance =
       params.appearance === undefined
         ? existing.appearance
@@ -2031,7 +2047,10 @@ export class CodexClaudeAppServer {
   }
 
   private threadSectionDelete(params: Record<string, unknown>): unknown {
-    this.store.deleteSection(stringOr(params.sectionId, ''))
+    const sectionId = stringOr(params.sectionId, '')
+    if (sectionId === PINNED_SECTION_ID) throw invalidRequest('the pinned section is reserved')
+    if (!this.store.getSection(sectionId)) throw invalidRequest(`unknown section: ${sectionId}`)
+    this.store.deleteSection(sectionId)
     return {}
   }
 
@@ -5006,7 +5025,7 @@ export class CodexClaudeAppServer {
           // progress, a projected workflow agent) shows it is moving; the
           // watchdog only gives up after a whole window without any of it.
           noteProgress()
-          if (!NO_PROGRESS_EVENTS.has(event.type))
+          if (showsProgress(event))
             this.sleptAtTurnProgress.set(turn.id, this.sleepMonitor.suspendedMs())
           if (event.type === 'subagent_progress') return
           if (event.type === 'session') {

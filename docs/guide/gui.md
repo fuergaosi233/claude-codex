@@ -165,20 +165,23 @@ the warning alone. Title and other helper turns send warnings only.
 A background agent, a workflow or a cron job can call a tool that needs your
 approval, ask for your input through an MCP server, or call an App tool after
 your turn has ended. With no turn running there is nowhere to ask, so the
-call is refused, as before, but not silently: Claude is told no user turn was
-active and that you can run it again in a turn, and a notice row under the
-chat's running or last turn says what was refused. Nothing is queued; ask
-Claude to run it again in a new message.
+request is turned down, as before, but not silently. A tool call or an App
+tool call is refused, and Claude is told no user turn was active and that you
+can run it again in a turn. An MCP server's request for your input is
+declined: the server gets only a plain decline, so what Claude hears of it is
+up to that server. In every case a notice row under the chat's running or
+last turn says what was turned down. Nothing is queued; ask Claude to run it
+again in a new message.
 
 ### Request errors
 
 A request you can put right, such as a model the chat cannot take, an unknown
-chat or a bad parameter, fails with the JSON-RPC code Codex uses for it,
-`-32600` (invalid request), and its message says why. Picking a Codex model in
-a Claude chat that has a reply, for example, shows the **Couldn't update model
-settings** toast with the reason (below the App's own "Check your config.toml."
-line, which the App adds to every such error), and the menu goes back to the
-Claude model.
+chat or a bad parameter, fails with the JSON-RPC code `-32600` (invalid
+request), as Codex answers an unknown chat, and its message says why. Picking
+a Codex model in a Claude chat that has a reply, for example, shows the
+**Couldn't update model settings** toast with the reason (below the App's own
+"Check your config.toml." line, which the App adds to every such error), and
+the menu goes back to the Claude model.
 A failure inside the adapter stays a server error (`-32000`).
 
 ## The context gauge
@@ -678,7 +681,10 @@ Turning it off, or picking a verbosity, says "Couldn't update this setting",
 since Claude chats have neither setting. Web search off takes Claude's
 WebSearch tool away; the other search modes keep it. It shows off, and Claude
 has no WebSearch, also when the adapter runs with `CLAUDE_CODEX_WEBSEARCH=0`
-and no mode was picked there. The approval policy and sandbox mode are saved
+and no mode was picked there. That is on the default backend and `claude-p`:
+the `agent-http` and `agentapi` backends run Claude outside the adapter, so
+Claude keeps WebSearch there whatever this shows (see
+[Backends](/guide/backends)). The approval policy and sandbox mode are saved
 and apply to the chats you start. The full list is under
 [App settings](/guide/configuration#app-settings).
 

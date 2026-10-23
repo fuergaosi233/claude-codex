@@ -646,6 +646,70 @@ test("native API retries become retrying events, a subagent's told by its Agent 
   ])
 })
 
+test('the message naming a failed request shows, marked as no progress of the turn', async () => {
+  const usage = { input_tokens: 0, output_tokens: 0 }
+  const runtime = new NativeClaudeRuntime()
+  const frames = [
+    assistant('msg_working', [text('Working.')]),
+    system('api_retry', {
+      attempt: 1,
+      max_retries: 10,
+      retry_delay_ms: 1000,
+      error_status: null,
+      error: 'unknown',
+    }),
+    {
+      type: 'assistant',
+      parent_tool_use_id: null,
+      error: 'unknown',
+      message: {
+        id: 'msg_synthetic',
+        model: '<synthetic>',
+        content: [text('API Error: Connection error.')],
+        usage,
+      },
+    },
+    {
+      type: 'result',
+      subtype: 'success',
+      is_error: true,
+      result: 'API Error: Connection error.',
+      terminal_reason: 'api_error',
+    },
+  ]
+  Reflect.set(runtime, 'sdk', {
+    query: async function* () {
+      yield* frames
+    },
+  })
+  const events: RuntimeEvent[] = []
+  await assert.rejects(
+    runtime.runTurn(context, {
+      onEvent: async (event) => {
+        events.push(event)
+      },
+      onPermissionRequest: async () => ({ decision: 'accept' }),
+    }),
+    /API Error: Connection error/,
+  )
+  const shown = events.filter((event) => event.type !== 'metrics' && event.type !== 'completed')
+  assert.deepEqual(shown, [
+    { type: 'message_boundary' },
+    { type: 'text_delta', delta: 'Working.' },
+    {
+      type: 'retrying',
+      attempt: 1,
+      maxRetries: 10,
+      status: null,
+      category: 'unknown',
+      delayMs: 1000,
+    },
+    { type: 'message_boundary', failedRequest: true },
+    { type: 'usage_progress', messageId: 'msg_synthetic', usage, failedRequest: true },
+    { type: 'text_delta', delta: 'API Error: Connection error.', failedRequest: true },
+  ])
+})
+
 async function completedEvent(messages: Record<string, unknown>[]) {
   const runtime = new NativeClaudeRuntime()
   Reflect.set(runtime, 'sdk', {

@@ -46,8 +46,8 @@ Implemented as real remote/runtime behavior:
   A subagent's own messages, reasoning and tool calls stream as these items in
   its own thread's turn.
 - **Request errors** — `-32600` (invalid request) for requests the user can
-  put right, `-32000` for failures inside the adapter, `-32601` for unknown
-  methods.
+  put right, `-32000` for failures inside the adapter and for project errors
+  (the App matches their text), `-32601` for unknown methods.
 - **Remote utilities** — file read/write/list/metadata/copy/remove/watch,
   command exec with stdin/terminate, process spawn/stdin/kill, fuzzy file
   search, direct MCP stdio/HTTP tool and resource calls.
