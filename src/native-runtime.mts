@@ -1074,7 +1074,15 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         ) {
           return { behavior: 'allow' }
         }
-        return { behavior: 'deny', message: 'no active turn to ask the user for approval' }
+        // Claude learns why, and the user hears of it under the thread's
+        // last turn: nothing would show it otherwise.
+        if (session) {
+          this.listener?.onNotice?.(
+            session.threadId,
+            `${toolName} was denied: background work asked for it while no turn was running, so there was nowhere to ask you for approval. Ask Claude to run it again in a new message to approve it.`,
+          )
+        }
+        return { behavior: 'deny', message: betweenTurnsMessage(toolName, 'denied') }
       }
       const context = pending.context
       const autoAllow = autoAllowsTools(context)
@@ -1207,10 +1215,19 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     request: Record<string, unknown>,
     signal: AbortSignal,
   ): Promise<ElicitationResponse> {
-    const pending = sessionRef()?.current
+    const session = sessionRef()
+    const pending = session?.current
     // Between turns (a background task's MCP call) there is nowhere to ask.
-    if (!pending || pending.resolved || !pending.handlers.onElicitationRequest)
+    if (!pending || pending.resolved || !pending.handlers.onElicitationRequest) {
+      if (session && (!pending || pending.resolved)) {
+        const server = String(request.serverName ?? '') || 'An MCP server'
+        this.listener?.onNotice?.(
+          session.threadId,
+          `${server} asked for your input while no turn was running, so the request was declined. Ask Claude to try again in a new message.`,
+        )
+      }
       return { action: 'decline' }
+    }
     const url = stringOrNull(request.url)
     const mode = request.mode === 'url' && url ? 'url' : 'form'
     const schema = request.requestedSchema
@@ -1273,15 +1290,21 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     const meta = recordOrNull(recordOrNull(extra)?._meta)
     const callId = stringOrNull(meta?.['claudecode/toolUseId']) ?? `call-${newId()}`
     const signal = (recordOrNull(extra)?.signal as AbortSignal | undefined) ?? null
-    const pending = sessionRef()?.current
+    const session = sessionRef()
+    const pending = session?.current
     // Between turns (a background task's call) no client turn can answer.
-    if (!pending || pending.resolved || !pending.handlers.onDynamicToolCall)
+    if (!pending || pending.resolved || !pending.handlers.onDynamicToolCall) {
+      if (session && (!pending || pending.resolved)) {
+        this.listener?.onNotice?.(
+          session.threadId,
+          `${tool} was not run: background work called it while no turn was running, and only a running turn can answer it. Ask Claude to run it again in a new message.`,
+        )
+      }
       return dynamicToolCallResult({
-        contentItems: [
-          { type: 'inputText', text: 'dynamic tools are only available during a turn' },
-        ],
+        contentItems: [{ type: 'inputText', text: betweenTurnsMessage(tool, 'not run') }],
         success: false,
       })
+    }
     try {
       const response = await pending.handlers.onDynamicToolCall(
         { callId, namespace, tool, arguments: args },
@@ -2551,8 +2574,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       if (message.compact_result === 'failed') {
         const reason = stringOrNull(message.compact_error)
         await pending.handlers.onEvent({
-          type: 'notice',
-          level: 'warning',
+          type: 'compaction_failed',
           message: reason
             ? `Claude could not compact the conversation: ${reason}`
             : 'Claude could not compact the conversation.',
@@ -3752,6 +3774,17 @@ function workflowTaskUsage(value: unknown): RuntimeTaskUsage | null {
 
 const taskUsage = workflowTaskUsage
 
+// What Claude is told about a call that came between turns (from a
+// background agent, a workflow or a cron job): no user turn was running to
+// ask, and the user can run it again in one. Nothing is queued.
+function betweenTurnsMessage(tool: string, outcome: 'denied' | 'not run'): string {
+  const why =
+    outcome === 'denied'
+      ? 'no user turn was active to ask the user for approval'
+      : 'no user turn was active to answer it'
+  return `${tool} was ${outcome} because ${why}; the user can re-run it in a turn.`
+}
+
 function goalToolServer(sdk: ClaudeSdk, z: Zod, goal: GoalToolHandlers) {
   const run = async (call: () => Promise<string>) => {
     try {
@@ -3764,6 +3797,10 @@ function goalToolServer(sdk: ClaudeSdk, z: Zod, goal: GoalToolHandlers) {
   return sdk.createSdkMcpServer({
     name: GOAL_MCP_SERVER,
     version: '1.0.0',
+    // Loaded up front, never behind Claude Code's tool search: the goal
+    // tools are how Claude keeps the thread's goal, and Claude would not go
+    // looking for them.
+    alwaysLoad: true,
     tools: [
       sdk.tool('get_goal', GET_GOAL_DESCRIPTION, {}, () => run(() => goal.getGoal())),
       sdk.tool(
@@ -3846,6 +3883,9 @@ function leaderToolServer(sdk: ClaudeSdk, z: Zod, leader: LeaderToolHandlers) {
   return sdk.createSdkMcpServer({
     name: LEADER_MCP_SERVER,
     version: '1.0.0',
+    // Up front as well, like the goal tools: a user who turned these on
+    // expects Claude to see them.
+    alwaysLoad: true,
     tools: [
       sdk.tool(
         'thread_list',

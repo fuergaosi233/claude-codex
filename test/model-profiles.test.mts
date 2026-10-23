@@ -4,6 +4,7 @@ import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
+import { INVALID_REQUEST } from '../src/host-methods.mjs'
 import {
   assertModelProfileTransition,
   loadClaudeModelProfiles,
@@ -512,6 +513,7 @@ test('a running profile turn switches model only within its profile', async () =
     // Another profile is another process: launcher, provider and config dir.
     const across = await update({ model: 'second-model' })
     assert.match(across.error?.message ?? '', /cannot change model process profile/)
+    assert.equal(across.error?.code, INVALID_REQUEST)
     const same = await update({ model: 'main-model', effort: 'high' })
     assert.deepEqual(same.result, { status: 'applied' })
     assert.deepEqual(updates, [{ model: 'vendor/main-1', effort: 'high' }])
@@ -552,14 +554,18 @@ test('a chat keeps its profile once it has a conversation; a new chat takes any'
     // App rule: model-menu-settings
     const menu = await call('thread/settings/update', { threadId, model: 'main-model' })
     assert.match(menu.error?.message ?? '', /cannot change model process profile/)
+    // The code the App's model menu shows the reason for.
+    assert.equal(menu.error?.code, INVALID_REQUEST)
     const metadata = await call('thread/metadata/update', { threadId, model: 'main-model' })
     assert.match(metadata.error?.message ?? '', /cannot change model process profile/)
+    assert.equal(metadata.error?.code, INVALID_REQUEST)
     const turn = await call('turn/start', {
       threadId,
       model: 'main-model',
       input: [{ type: 'text', text: 'Switch.' }],
     })
     assert.match(turn.error?.message ?? '', /cannot change model process profile/)
+    assert.equal(turn.error?.code, INVALID_REQUEST)
     assert.equal(harness.store.getThread(threadId)?.model, 'second-model')
 
     // A resume ignores the picker rather than failing.
@@ -629,6 +635,7 @@ test('a chat whose profile changed or went away still opens, but nothing starts 
       model: 'claude-sonnet-4-5',
     })
     assert.match(picked.error?.message ?? '', /model process profiles are no longer configured/)
+    assert.equal(picked.error?.code, INVALID_REQUEST)
     assert.equal(harness.store.getThread(unsent.thread.id)?.model, 'main-model')
   } finally {
     await harness.close()
@@ -1244,6 +1251,9 @@ async function assertOpensButStartsNothing(
   assert.match(fork.error?.message ?? '', refusal)
   const moved = await call('thread/metadata/update', { threadId, model: 'second-model' })
   assert.match(moved.error?.message ?? '', refusal)
+  // The user puts it right by starting a new chat: an invalid request.
+  for (const refused of [turn, review, compact, fork, moved])
+    assert.equal(refused.error?.code, INVALID_REQUEST)
 
   // Turns the adapter starts by itself say why they did not, in words the App
   // shows as they are.

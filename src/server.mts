@@ -53,12 +53,16 @@ import {
 } from './goal-prompts.mjs'
 import {
   accountUsage,
+  asInvalidRequest,
   hostMethod,
   INVALID_REQUEST,
+  invalidRequest,
+  invalidRequestIfThrows,
   methodNotFound,
   RpcError,
   SERVER_ERROR,
 } from './host-methods.mjs'
+import { IdleSleepGuard, type IdleSleepGuardOptions } from './idle-sleep.mjs'
 import { inheritedAgents, inheritedHooks, inheritedPermissionRules } from './inherited-config.mjs'
 import { LEADER_APP_THREAD_TOOLS, LeaderThreads } from './leader-tools.mjs'
 import {
@@ -123,6 +127,7 @@ import {
   asRecord,
   autoReviewAction,
   buildSystemPromptAddendum,
+  type CodexTurnError,
   coerceStructuredValue,
   collaborationModeEnvelope,
   collaborationModeFromParams,
@@ -191,6 +196,7 @@ import {
   wrapMcpToolError,
   wrapMcpToolResult,
 } from './server-helpers.mjs'
+import { type SleepMonitor, SleepTracker, withSleepNotice } from './sleep-notice.mjs'
 import { PINNED_SECTION_ID, type SessionStore, settledTurn } from './store.mjs'
 import {
   findOccurrences,
@@ -217,6 +223,13 @@ import {
   skillInstructions,
   withTurnContext,
 } from './turn-context.mjs'
+import {
+  noticeRowsEnabled,
+  noticeTurnError,
+  TurnNoticeLog,
+  withTurnNotices,
+} from './turn-notices.mjs'
+import { TurnWatchdog } from './turn-watchdog.mjs'
 import type {
   ClaudeResumePoint,
   ClaudeRuntime,
@@ -438,7 +451,7 @@ function goalTurnMadeProgress(turn: TurnRecord): boolean {
 function goalBudget(value: unknown): number | null {
   if (value == null) return null
   if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0)
-    throw new Error('goal budgets must be positive integers when provided')
+    throw invalidRequest('goal budgets must be positive integers when provided')
   return value
 }
 
@@ -449,7 +462,7 @@ function isUsageLimitError(error: unknown): boolean {
 
 function queuedInput(value: unknown): UserInput[] {
   const input = Array.isArray(value) ? (value as UserInput[]) : []
-  if (isEmptyInput(input)) throw new Error('queued message input must not be empty')
+  if (isEmptyInput(input)) throw invalidRequest('queued message input must not be empty')
   return input
 }
 
@@ -534,10 +547,22 @@ function threadModelProfileBindingError(thread: ThreadRecord): Error | null {
 }
 
 // A Codex model with Codex routing off has nowhere to run.
-function codexRoutingDisabledError(model: string): Error {
-  return new Error(
+function codexRoutingDisabledError(model: string): RpcError {
+  return invalidRequest(
     `Codex model routing is disabled, so ${model} cannot run here; pick a Claude model`,
   )
+}
+
+function unknownThread(threadId: string): RpcError {
+  return invalidRequest(`unknown thread: ${threadId}`)
+}
+
+export interface ServerOptions {
+  sleepMonitor?: SleepMonitor
+  // Where the adapter runs, for advice that names an App setting.
+  platform?: NodeJS.Platform
+  // The keep-awake guard's settings; the server says when it is busy.
+  idleSleep?: Omit<IdleSleepGuardOptions, 'busy'>
 }
 
 export class CodexClaudeAppServer {
@@ -644,10 +669,25 @@ export class CodexClaudeAppServer {
   private readonly stopCommandsListener: () => void
   private readonly store: SessionStore
   private readonly runtime: ClaudeRuntime
+  // Notices that the computer slept, for the turn watchdog and failed turns.
+  private readonly sleepMonitor: SleepMonitor
+  private readonly platform: NodeJS.Platform
+  // The CLI notices each recent turn has shown (see turn-notices.mts).
+  private readonly turnNotices: TurnNoticeLog
+  // Keeps the Mac from idle-sleeping while anything runs, when turned on.
+  private readonly idleSleep: IdleSleepGuard
 
-  constructor(store: SessionStore, runtime: ClaudeRuntime) {
+  constructor(store: SessionStore, runtime: ClaudeRuntime, options: ServerOptions = {}) {
     this.store = store
     this.runtime = runtime
+    this.sleepMonitor = options.sleepMonitor ?? new SleepTracker()
+    this.sleepMonitor.start?.()
+    this.platform = options.platform ?? process.platform
+    this.turnNotices = new TurnNoticeLog()
+    this.idleSleep = new IdleSleepGuard({
+      ...options.idleSleep,
+      busy: () => this.hasActiveTurns(),
+    })
     this.leaderThreads = new LeaderThreads({
       store,
       activeTurnId: (threadId) => this.activeTurnByThread.get(threadId) ?? null,
@@ -666,6 +706,7 @@ export class CodexClaudeAppServer {
       onAutonomousTurn: (threadId) => this.handleAutonomousTurn(threadId),
       onSessionReleased: (threadId, liveTaskIds) =>
         this.handleSessionReleased(threadId, liveTaskIds),
+      onNotice: (threadId, message) => this.handleRuntimeNotice(threadId, message),
     })
   }
 
@@ -709,6 +750,8 @@ export class CodexClaudeAppServer {
     if (this.stopped) return
     this.stopped = true
     this.stopCommandsListener()
+    this.sleepMonitor.stop?.()
+    this.idleSleep.stop()
     this.leaderThreads.stop()
     try {
       // Child turns are created directly from Task/Workflow events and are not
@@ -741,6 +784,13 @@ export class CodexClaudeAppServer {
 
   setIdleCheckHandler(handler: () => void): void {
     this.idleCheckHandler = handler
+  }
+
+  // Something that kept the adapter busy may have ended: the keep-awake
+  // guard and the daemon's idle exit look again.
+  private checkIdle(): void {
+    this.idleSleep.check()
+    this.idleCheckHandler?.()
   }
 
   private async handleNotification(_peer: RpcPeer, _message: WireMessage): Promise<void> {
@@ -1442,7 +1492,7 @@ export class CodexClaudeAppServer {
   private threadResume(peer: RpcPeer, params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
-    if (!thread) throw new Error('unknown thread: ' + threadId)
+    if (!thread) throw unknownThread(threadId)
     // A chat its model process profile can no longer run still opens, so it
     // can be read; a turn, review, compaction or fork of it is refused.
     const unbound = this.modelProfileUnbound(thread)
@@ -1850,9 +1900,9 @@ export class CodexClaudeAppServer {
   private threadSectionMove(params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     if (params.sectionId !== null && typeof params.sectionId !== 'string')
-      throw new Error('sectionId must be a string or null')
+      throw invalidRequest('sectionId must be a string or null')
     const sectionId = params.sectionId === null ? null : params.sectionId
-    if (sectionId === '') throw new Error('sectionId must not be empty')
+    if (sectionId === '') throw invalidRequest('sectionId must not be empty')
     const beforeThreadId =
       typeof params.beforeThreadId === 'string' && params.beforeThreadId.length > 0
         ? params.beforeThreadId
@@ -1873,7 +1923,7 @@ export class CodexClaudeAppServer {
       ? Math.max(1, Math.min(Math.floor(requestedLimit), 200))
       : 100
     const offset = typeof params.cursor === 'string' ? Number(params.cursor) : 0
-    if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('invalid section cursor')
+    if (!Number.isSafeInteger(offset) || offset < 0) throw invalidRequest('invalid section cursor')
     const sections = this.store.listSections(limit, String(offset))
     const nextOffset = offset + sections.length
     const hasMore = this.store.listSections(1, String(nextOffset)).length > 0
@@ -1893,7 +1943,7 @@ export class CodexClaudeAppServer {
   private threadSectionUpdate(params: Record<string, unknown>): unknown {
     const sectionId = stringOr(params.sectionId, '')
     const existing = this.store.getSection(sectionId)
-    if (!existing) throw new Error(`unknown section: ${sectionId}`)
+    if (!existing) throw invalidRequest(`unknown section: ${sectionId}`)
     const name = typeof params.name === 'string' ? params.name : existing.name
     const appearance =
       params.appearance === undefined
@@ -1933,7 +1983,7 @@ export class CodexClaudeAppServer {
       ? Math.max(1, Math.min(Math.floor(requestedLimit), 200))
       : 100
     const offset = typeof params.cursor === 'string' ? Number(params.cursor) : 0
-    if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('invalid project cursor')
+    if (!Number.isSafeInteger(offset) || offset < 0) throw invalidRequest('invalid project cursor')
     const projects = this.store.listProjects(sortKey, sortDirection, limit + 1, offset)
     return {
       data: projects.slice(0, limit),
@@ -1949,7 +1999,7 @@ export class CodexClaudeAppServer {
 
   private projectCreate(params: Record<string, unknown>, importing: boolean): unknown {
     const idempotencyKey = stringOr(params.idempotencyKey, '')
-    if (!idempotencyKey) throw new Error('idempotencyKey must not be empty')
+    if (!idempotencyKey) throw invalidRequest('idempotencyKey must not be empty')
     const { project, created } = this.store.createProject(newId(), idempotencyKey, {
       name: projectName(params.name),
       roots: projectRoots(params.roots),
@@ -2003,7 +2053,7 @@ export class CodexClaudeAppServer {
   private threadRead(params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
-    if (!thread) throw new Error('unknown thread: ' + threadId)
+    if (!thread) throw unknownThread(threadId)
     // The Codex App hydrates the Subagent panel with includeTurns:false. A
     // parent-linked child with no renderable turns is treated by that client
     // as still loading, and it does not reliably follow up with turns/list.
@@ -2048,7 +2098,7 @@ export class CodexClaudeAppServer {
   // thread/turns/list cursor that loads the match's turn.
   private threadSearchOccurrences(params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
-    if (!this.store.getThread(threadId)) throw new Error(`unknown thread: ${threadId}`)
+    if (!this.store.getThread(threadId)) throw unknownThread(threadId)
     const searchTerm = typeof params.searchTerm === 'string' ? params.searchTerm : ''
     const occurrences = findOccurrences(this.store.listTurns(threadId), searchTerm)
     const start = offsetCursor(params.cursor, 'occurrence')
@@ -2063,11 +2113,11 @@ export class CodexClaudeAppServer {
   // archived with the thread, the pull requests opened from it.
   private threadAttachmentAdd(params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
-    if (!this.store.getThread(threadId)) throw new Error(`unknown thread: ${threadId}`)
+    if (!this.store.getThread(threadId)) throw unknownThread(threadId)
     const attachmentType = stringOr(params.attachmentType, '')
     const identityKey = stringOr(params.identityKey, '')
     if (!attachmentType || !identityKey)
-      throw new Error('attachmentType and identityKey must not be empty')
+      throw invalidRequest('attachmentType and identityKey must not be empty')
     const { attachment, created } = this.store.addThreadAttachment(threadId, {
       id: newId(),
       attachmentType,
@@ -2080,7 +2130,7 @@ export class CodexClaudeAppServer {
 
   private threadAttachmentList(params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
-    if (!this.store.getThread(threadId)) throw new Error(`unknown thread: ${threadId}`)
+    if (!this.store.getThread(threadId)) throw unknownThread(threadId)
     const offset = offsetCursor(params.cursor, 'attachment')
     const limit = pageLimit(params.limit, 200) ?? 100
     const attachments = this.store.listThreadAttachments(threadId, limit + 1, offset)
@@ -2096,8 +2146,8 @@ export class CodexClaudeAppServer {
   private threadAttachmentOwnerList(params: Record<string, unknown>): unknown {
     const attachmentType = stringOr(params.attachmentType, '')
     const identityKey = stringOr(params.identityKey, '')
-    if (!attachmentType.trim()) throw new Error('attachmentType must not be empty')
-    if (!identityKey.trim()) throw new Error('identityKey must not be empty')
+    if (!attachmentType.trim()) throw invalidRequest('attachmentType must not be empty')
+    if (!identityKey.trim()) throw invalidRequest('identityKey must not be empty')
     const archived = typeof params.archived === 'boolean' ? params.archived : null
     const offset = offsetCursor(params.cursor, 'attachment owner')
     const limit = pageLimit(params.limit, 200) ?? 25
@@ -2171,7 +2221,7 @@ export class CodexClaudeAppServer {
     })
     if (!archived) {
       const thread = this.store.getThread(threadId)
-      if (!thread) throw new Error(`unknown thread: ${threadId}`)
+      if (!thread) throw unknownThread(threadId)
       return { thread: this.toThread(thread, this.store.listTurns(threadId)) }
     }
     this.clearThreadState(threadId)
@@ -2230,7 +2280,7 @@ export class CodexClaudeAppServer {
   private threadInjectItems(params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
-    if (!thread) throw new Error(`unknown thread: ${threadId}`)
+    if (!thread) throw unknownThread(threadId)
     const items = Array.isArray(params.items) ? params.items : []
     this.store.addInjectedItems(threadId, items)
     debugLog('thread.inject_items', { threadId, count: items.length })
@@ -2245,10 +2295,10 @@ export class CodexClaudeAppServer {
     this.goalThread(threadId)
     this.subscribe(threadId, peer)
     if (params.status != null && !isGoalStatus(params.status))
-      throw new Error(`invalid goal status: ${String(params.status)}`)
+      throw invalidRequest(`invalid goal status: ${String(params.status)}`)
     const status = isGoalStatus(params.status) ? params.status : null
     const objective = typeof params.objective === 'string' ? params.objective.trim() : null
-    if (objective === '') throw new Error('goal objective must not be empty')
+    if (objective === '') throw invalidRequest('goal objective must not be empty')
     // An explicit null clears the budget; an absent field leaves it alone.
     const budget = 'tokenBudget' in params ? goalBudget(params.tokenBudget) : undefined
     const existing = this.store.getGoal(threadId)
@@ -2259,7 +2309,7 @@ export class CodexClaudeAppServer {
       !existing ||
       (existing.status === 'complete' && objective && objective !== existing.objective)
     ) {
-      if (!objective) throw new Error(`no goal exists for thread ${threadId}`)
+      if (!objective) throw invalidRequest(`no goal exists for thread ${threadId}`)
       goal = {
         threadId,
         objective,
@@ -2313,8 +2363,8 @@ export class CodexClaudeAppServer {
 
   private goalThread(threadId: string): ThreadRecord {
     const thread = this.store.getThread(threadId)
-    if (!thread) throw new Error(`unknown thread: ${threadId}`)
-    if (thread.ephemeral) throw new Error('Goal tools require a persistent thread.')
+    if (!thread) throw unknownThread(threadId)
+    if (thread.ephemeral) throw invalidRequest('Goal tools require a persistent thread.')
     return thread
   }
 
@@ -2545,8 +2595,8 @@ export class CodexClaudeAppServer {
   // thread/queue/start.
   private queueThread(threadId: string): ThreadRecord {
     const thread = this.store.getThread(threadId)
-    if (!thread) throw new Error(`unknown thread: ${threadId}`)
-    if (thread.ephemeral) throw new Error('queued messages require a persistent thread')
+    if (!thread) throw unknownThread(threadId)
+    if (thread.ephemeral) throw invalidRequest('queued messages require a persistent thread')
     return thread
   }
 
@@ -2557,7 +2607,7 @@ export class CodexClaudeAppServer {
 
   private queuedSubmission(threadId: string, id: string): QueuedSubmission {
     const item = this.store.listQueue(threadId).find((entry) => entry.id === id)
-    if (!item) throw new Error(`unknown queued submission: ${id}`)
+    if (!item) throw invalidRequest(`unknown queued submission: ${id}`)
     return item
   }
 
@@ -2633,7 +2683,9 @@ export class CodexClaudeAppServer {
     const threadId = stringOr(params.threadId, '')
     this.queueThread(threadId)
     if (this.activeTurnByThread.has(threadId))
-      throw new Error(`cannot start a queued message while thread ${threadId} has an active turn`)
+      throw invalidRequest(
+        `cannot start a queued message while thread ${threadId} has an active turn`,
+      )
     const id = stringOr(params.queuedSubmissionId, '')
     const submission = this.queuedSubmission(threadId, id)
     return this.dispatchQueued(peer, threadId, submission)
@@ -2746,13 +2798,15 @@ export class CodexClaudeAppServer {
   private threadMetadataUpdate(params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
-    if (!thread) throw new Error(`unknown thread: ${threadId}`)
+    if (!thread) throw unknownThread(threadId)
     // projectId: omitted or null leaves it, '' clears it, an id assigns it.
     const projectId = typeof params.projectId === 'string' ? params.projectId || null : undefined
     if (projectId) this.requireProject(projectId)
     // The App sets the branch after it creates one for the thread.
     const gitInfo =
-      params.gitInfo == null ? undefined : patchGitInfo(thread.gitInfo ?? null, params.gitInfo)
+      params.gitInfo == null
+        ? undefined
+        : invalidRequestIfThrows(() => patchGitInfo(thread.gitInfo ?? null, params.gitInfo))
 
     // Support dynamic model, reasoning effort, approval policy and sandbox updates
     const model = this.requestedModelChange(thread, params)
@@ -2802,7 +2856,7 @@ export class CodexClaudeAppServer {
   private threadSettingsUpdate(peer: RpcPeer, params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
-    if (!thread) throw new Error(`unknown thread: ${threadId}`)
+    if (!thread) throw unknownThread(threadId)
 
     // Codex App sends model and effort changes through this RPC. Keep these
     // legacy settings fields in the compatibility handler so removing the
@@ -2909,7 +2963,7 @@ export class CodexClaudeAppServer {
   private threadRollback(params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
-    if (!thread) throw new Error(`unknown thread: ${threadId}`)
+    if (!thread) throw unknownThread(threadId)
     // Honor the protocol's `numTurns: u32, must be >= 1` — drop that many
     // turns from the end of the thread. Without this, App's rewind UI sends
     // the request and we silently return the unchanged thread, leaving the
@@ -2932,9 +2986,9 @@ export class CodexClaudeAppServer {
     const threadId = stringOr(params.threadId, '')
     const beforeTurnId = stringOr(params.beforeTurnId, '')
     const thread = this.store.getThread(threadId)
-    if (!thread) throw new Error(`unknown thread: ${threadId}`)
+    if (!thread) throw unknownThread(threadId)
     if (!this.store.listTurns(threadId).some((turn) => turn.id === beforeTurnId))
-      throw new Error(`unknown turn: ${beforeTurnId}`)
+      throw invalidRequest(`unknown turn: ${beforeTurnId}`)
     const dropped = this.rewindThread(thread, () =>
       this.store.deleteTurnsFrom(threadId, beforeTurnId),
     )
@@ -2956,7 +3010,7 @@ export class CodexClaudeAppServer {
   // rewinds. Returns the number of turns dropped.
   private rewindThread(thread: ThreadRecord, drop: () => number): number {
     if (this.activeTurnByThread.has(thread.id))
-      throw new Error(`cannot rewind thread ${thread.id} while a turn is running`)
+      throw invalidRequest(`cannot rewind thread ${thread.id} while a turn is running`)
     const dropped = drop()
     if (dropped === 0) return 0
     const remaining = this.store.listTurns(thread.id)
@@ -3189,7 +3243,7 @@ export class CodexClaudeAppServer {
       return { status: 'targetUnavailable' }
     const unsupported = ['summary', 'serviceTier'].filter((key) => params[key] != null)
     if (unsupported.length > 0)
-      throw new Error(`a running Claude turn cannot change ${unsupported.join(', ')}`)
+      throw invalidRequest(`a running Claude turn cannot change ${unsupported.join(', ')}`)
     const settings: RuntimeTurnSettings = {}
     // App rule: auto-review
     const reviewer = approvalsReviewerFromParams(params)
@@ -3200,12 +3254,13 @@ export class CodexClaudeAppServer {
       const model = allSelectableModelOptions().find(
         (option) => option.id.toLowerCase() === requested.toLowerCase(),
       )?.id
-      if (!model) throw new Error(`unknown model: ${requested}`)
+      if (!model) throw invalidRequest(`unknown model: ${requested}`)
       const backend = isCodexOpenAiModel(model) ? 'codex' : 'claude'
       if (backend !== thread.runtimeBackend)
-        throw new Error(`a running ${thread.runtimeBackend} turn cannot switch to ${model}`)
+        throw invalidRequest(`a running ${thread.runtimeBackend} turn cannot switch to ${model}`)
       // The running turn's process belongs to its model process profile.
-      if (backend === 'claude') assertModelProfileTransition(thread.model, model)
+      if (backend === 'claude')
+        invalidRequestIfThrows(() => assertModelProfileTransition(thread.model, model))
       const resolved = backend === 'codex' ? model : resolveClaudeModel(model)
       if (resolved) settings.model = resolved
     }
@@ -3213,7 +3268,7 @@ export class CodexClaudeAppServer {
     // Haiku), so it leaves the effort as it is.
     if (params.effort != null && params.effort !== 'none') {
       const effort = resolveClaudeEffort(stringOr(params.effort, ''))
-      if (!effort) throw new Error(`unsupported effort: ${String(params.effort)}`)
+      if (!effort) throw invalidRequest(`unsupported effort: ${String(params.effort)}`)
       settings.effort = effort
     }
     if (reviewer && reviewer !== (thread.approvalsReviewer ?? 'user')) {
@@ -3276,7 +3331,7 @@ export class CodexClaudeAppServer {
   private reviewStart(peer: RpcPeer, params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
-    if (!thread) throw new Error(`unknown thread: ${threadId}`)
+    if (!thread) throw unknownThread(threadId)
     this.checkModelProfileBinding(thread)
     this.subscribe(threadId, peer)
     const turnId = newId()
@@ -3352,7 +3407,7 @@ export class CodexClaudeAppServer {
   private threadCompactStart(peer: RpcPeer, params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
-    if (!thread) throw new Error(`unknown thread: ${threadId}`)
+    if (!thread) throw unknownThread(threadId)
     this.checkModelProfileBinding(thread)
     this.subscribe(threadId, peer)
     const turnId = newId()
@@ -3364,7 +3419,8 @@ export class CodexClaudeAppServer {
       startedAt: nowSeconds(),
       completedAt: null,
       durationMs: null,
-      items: [compactItem],
+      // The compaction item joins the turn once it completes (compactThread).
+      items: [],
       diff: '',
       error: null,
     }
@@ -3415,9 +3471,14 @@ export class CodexClaudeAppServer {
     const threadId = thread.id
     const turnId = turn.id
     let compactOpen = true
+    // The turn keeps the item, first in it, only once it completes: the App
+    // draws a stored contextCompaction as compacted, and Codex keeps only
+    // the compactions that finished.
+    // App rule: compaction-marker
     const completeCompactItem = (): void => {
       if (!compactOpen) return
       compactOpen = false
+      this.store.insertItemAfter(turnId, null, compactItem)
       this.notify(peer, {
         method: 'item/completed',
         params: { threadId, turnId, item: compactItem, completedAtMs: nowMillis() },
@@ -3536,7 +3597,6 @@ export class CodexClaudeAppServer {
     // thread/compact/start carries no instructions: a bare /compact, which
     // no side-conversation note may precede either.
     const context: RuntimeTurnContext = { ...built.context, prompt: '/compact', imageInputs: [] }
-    const noticesSeen = new Set<string>()
     let compacted = false
     let failure: string | null = null
     await this.runtime.runTurn(context, {
@@ -3562,14 +3622,13 @@ export class CodexClaudeAppServer {
           this.recordCompactedContext(peer, thread.id, turnId, event.postTokens, false)
           return
         }
+        if (event.type === 'compaction_failed') {
+          failure = event.message
+          this.publishNotice(peer, thread.id, turnId, event.message)
+          return
+        }
         if (event.type === 'notice') {
-          if (event.level !== 'info' && !noticesSeen.has(event.message)) {
-            noticesSeen.add(event.message)
-            this.notify(peer, {
-              method: 'warning',
-              params: { threadId: thread.id, message: event.message },
-            })
-          }
+          if (event.level !== 'info') this.publishNotice(peer, thread.id, turnId, event.message)
           return
         }
         if (event.type === 'completed') {
@@ -3686,7 +3745,7 @@ export class CodexClaudeAppServer {
   private async turnStart(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
-    if (!thread) throw new Error(`unknown thread: ${threadId}`)
+    if (!thread) throw unknownThread(threadId)
     this.checkModelProfileBinding(thread)
     // Follow-up turns the adapter starts itself have no requesting peer.
     if (peer !== DETACHED_PEER) this.subscribe(threadId, peer)
@@ -4295,7 +4354,11 @@ export class CodexClaudeAppServer {
     let agentItemId: string | null = null
     let reasoningItemId: string | null = null
     let hasTextOutput = false
-    const noticesSeen = new Set<string>()
+    // What Claude Code reports beside the turn, once each: a warning, and a
+    // row under the turn unless the turn is one the user does not watch.
+    const noticesVisible = params.outputSchema == null
+    const publishNotice = (message: string): void =>
+      this.publishNotice(peer, thread.id, turn.id, message, noticesVisible)
     const commandOutputSeen = new Set<string>()
     // Hook runs by Claude's hook id, and the settings file each hook event
     // was traced to (read once per turn).
@@ -4516,24 +4579,41 @@ export class CodexClaudeAppServer {
       openToolItems.clear()
     }
     // Claude compacting the conversation within the turn, on its own when
-    // the context fills up, shows as Codex's contextCompaction item. Like
-    // Codex's, a compaction an interrupt or a failed turn cuts short stays
-    // open, which the App shows as interrupted.
-    let compactionItemId: string | null = null
+    // the context fills up, shows as Codex's contextCompaction item. The turn
+    // keeps the item only once the compaction is done, in the place it
+    // started: the App draws a stored contextCompaction as compacted
+    // whatever became of it. Like Codex's, a compaction an interrupt or a
+    // failed turn cuts short stays open, which the App shows as interrupted.
+    // One that failed while the turn went on becomes an empty reasoning item,
+    // which the App does not draw, so nothing claims the context was
+    // compacted; the notice that it failed says what happened.
+    // App rule: compaction-marker
+    // App rule: item-completed-replaces
+    let compaction: { id: string; afterItemId: string | null } | null = null
     const startCompactionItem = (): void => {
-      if (compactionItemId) return
-      compactionItemId = newId()
-      const item: ThreadItem = { type: 'contextCompaction', id: compactionItemId }
-      this.store.appendItem(turn.id, item)
+      if (compaction) return
+      const items = this.store.getTurn(turn.id)?.items ?? []
+      compaction = { id: newId(), afterItemId: items.at(-1)?.id ?? null }
+      const item: ThreadItem = { type: 'contextCompaction', id: compaction.id }
       this.notify(peer, {
         method: 'item/started',
         params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: nowMillis() },
       })
     }
     const completeCompactionItem = (): void => {
-      if (!compactionItemId) return
-      const item: ThreadItem = { type: 'contextCompaction', id: compactionItemId }
-      compactionItemId = null
+      if (!compaction) return
+      const item: ThreadItem = { type: 'contextCompaction', id: compaction.id }
+      this.store.insertItemAfter(turn.id, compaction.afterItemId, item)
+      compaction = null
+      this.notify(peer, {
+        method: 'item/completed',
+        params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
+      })
+    }
+    const dropCompactionItem = (): void => {
+      if (!compaction) return
+      const item: ThreadItem = { type: 'reasoning', id: compaction.id, summary: [], content: [] }
+      compaction = null
       this.notify(peer, {
         method: 'item/completed',
         params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
@@ -4627,12 +4707,11 @@ export class CodexClaudeAppServer {
         : undefined
       const action = item ? autoReviewAction(item, stringOr(params.cwd, thread.cwd)) : null
       if (!itemId || !action) {
-        const message = rationale
-          ? `Permission denied for ${toolName}: ${rationale}`
-          : `Permission denied for ${toolName}`
-        if (noticesSeen.has(message)) return
-        noticesSeen.add(message)
-        this.notify(peer, { method: 'warning', params: { threadId: thread.id, message } })
+        publishNotice(
+          rationale
+            ? `Permission denied for ${toolName}: ${rationale}`
+            : `Permission denied for ${toolName}`,
+        )
         return
       }
       const completedAtMs = nowMillis()
@@ -4674,53 +4753,31 @@ export class CodexClaudeAppServer {
       mcpServers: Object.keys((context.mcpServers ?? {}) as Record<string, unknown>),
     }
     let acceptRuntimeEvents = true
-    let watchdogTimer: NodeJS.Timeout | null = null
     let resolveWatchdog: (() => void) | null = null
-    // When the turn last heard from the subagents or workflow it waits on.
-    // A busy child reports many times a second, so progress only moves this
-    // mark; a timer that comes due early waits out the rest of the window.
-    // It is read off the monotonic clock the timer runs on, so a jump of the
-    // wall clock (a laptop waking from sleep) neither fails nor stretches it.
-    let lastProgressAtMs = 0
+    // Fails the turn after a whole window without a sign of life from the
+    // subagents or workflow it waits on. Waiting on the user pauses it, and
+    // a sleep of the computer starts the window over (turn-watchdog.mts).
     const watchdogTimeoutMs = subagentWatchdogTimeoutMs()
-    const watchdogPromise =
-      watchdogTimeoutMs > 0
-        ? new Promise<void>((resolve) => {
-            resolveWatchdog = resolve
-          })
-        : null
-    const disarmWatchdog = (): void => {
-      if (watchdogTimer) clearTimeout(watchdogTimer)
-      watchdogTimer = null
-    }
-    const noteProgress = (): void => {
-      lastProgressAtMs = performance.now()
-    }
-    const scheduleWatchdog = (delayMs: number): void => {
-      watchdogTimer = setTimeout(() => {
-        watchdogTimer = null
-        const idleMs = performance.now() - lastProgressAtMs
-        if (idleMs < watchdogTimeoutMs) {
-          scheduleWatchdog(watchdogTimeoutMs - idleMs)
-          return
-        }
+    const watchdog = new TurnWatchdog({
+      timeoutMs: watchdogTimeoutMs,
+      suspendedMs: () => this.sleepMonitor.suspendedMs(),
+      onExpire: () => {
         // Flip this before resolving the race so an already-buffered SDK event
         // cannot create a fresh child after the watchdog has decided to fail.
         acceptRuntimeEvents = false
         resolveWatchdog?.()
-      }, delayMs)
-      watchdogTimer.unref()
-    }
+      },
+    })
+    const watchdogPromise = watchdog.enabled
+      ? new Promise<void>((resolve) => {
+          resolveWatchdog = resolve
+        })
+      : null
+    const disarmWatchdog = (): void => watchdog.disarm()
+    const noteProgress = (): void => watchdog.noteProgress()
     const armWatchdog = (): void => {
-      if (
-        !watchdogPromise ||
-        watchdogTimer ||
-        !acceptRuntimeEvents ||
-        (activeSubagents.size === 0 && !workflowInFlight)
-      )
-        return
-      noteProgress()
-      scheduleWatchdog(watchdogTimeoutMs)
+      if (!acceptRuntimeEvents || (activeSubagents.size === 0 && !workflowInFlight)) return
+      watchdog.arm()
     }
     this.subagentStateByTurn.set(turn.id, {
       thread,
@@ -5502,6 +5559,16 @@ export class CodexClaudeAppServer {
             this.recordCompactedContext(peer, thread.id, turn.id, event.postTokens, true)
             return
           }
+          if (event.type === 'compaction_failed') {
+            debugLog('turn.runtime.compaction_failed', {
+              threadId: thread.id,
+              turnId: turn.id,
+              message: event.message,
+            })
+            dropCompactionItem()
+            publishNotice(event.message)
+            return
+          }
           if (event.type === 'memory_recall') {
             recalledMemories.push(...event.memories)
             return
@@ -5527,15 +5594,10 @@ export class CodexClaudeAppServer {
           }
           if (event.type === 'notice') {
             debugLog('turn.runtime.notice', { threadId: thread.id, turnId: turn.id, ...event })
-            // Runtime status is not assistant prose. Keep genuine warnings
-            // visible in the native warning surface without breaking Markdown.
-            if (event.level !== 'info' && !noticesSeen.has(event.message)) {
-              noticesSeen.add(event.message)
-              this.notify(peer, {
-                method: 'warning',
-                params: { threadId: thread.id, message: event.message },
-              })
-            }
+            // Runtime status is not assistant prose: genuine warnings go out
+            // as notices, beside the transcript and without breaking its
+            // Markdown.
+            if (event.level !== 'info') publishNotice(event.message)
             return
           }
           if (event.type === 'retrying') {
@@ -5623,7 +5685,7 @@ export class CodexClaudeAppServer {
               ...event,
             })
             // The App only draws Codex's one reroute reason, a cyber-safety
-            // reroute; any other fallback is a plain warning.
+            // reroute; any other fallback is a notice.
             if (event.category === 'cyber') {
               this.notify(peer, {
                 method: 'model/rerouted',
@@ -5636,10 +5698,7 @@ export class CodexClaudeAppServer {
                 },
               })
             } else {
-              this.notify(peer, {
-                method: 'warning',
-                params: { threadId: thread.id, message: event.message },
-              })
+              publishNotice(event.message)
             }
             return
           }
@@ -5712,13 +5771,15 @@ export class CodexClaudeAppServer {
               })
             }
           }
-          const decision = await this.requestApproval(
-            peer,
-            thread.id,
-            turn.id,
-            itemId,
-            event,
-            imageReadFallbacks.get(itemId),
+          const decision = await watchdog.whilePaused(
+            this.requestApproval(
+              peer,
+              thread.id,
+              turn.id,
+              itemId,
+              event,
+              imageReadFallbacks.get(itemId),
+            ),
           )
           if (!turnIsActive()) return { decision: 'cancel' }
           if (decision.decision === 'decline' || decision.decision === 'cancel')
@@ -5761,12 +5822,8 @@ export class CodexClaudeAppServer {
             type: 'active',
             activeFlags: ['waitingOnUserInput'],
           })
-          const answers = await this.requestUserInput(
-            peer,
-            thread.id,
-            turn.id,
-            item.id,
-            event.questions,
+          const answers = await watchdog.whilePaused(
+            this.requestUserInput(peer, thread.id, turn.id, item.id, event.questions),
           )
           if (!turnIsActive()) return { answers: {} }
           const contentItems = userInputAnswersAsContent(event.questions, answers)
@@ -5793,7 +5850,9 @@ export class CodexClaudeAppServer {
         onElicitationRequest: async (request, signal) => {
           if (!turnIsActive()) return { action: 'cancel' }
           completeMessage()
-          return this.requestElicitation(peer, thread.id, turn.id, request, signal)
+          return watchdog.whilePaused(
+            this.requestElicitation(peer, thread.id, turn.id, request, signal),
+          )
         },
         // Claude called one of the client's dynamic tools: a dynamicToolCall
         // item around the item/tool/call request, as Codex records it.
@@ -5821,12 +5880,14 @@ export class CodexClaudeAppServer {
           })
           const abort = new AbortController()
           dynamicToolCalls.set(item.id, abort)
-          const response = await this.requestDynamicTool(
-            peer,
-            thread.id,
-            turn.id,
-            request,
-            AbortSignal.any([signal, abort.signal]),
+          const response = await watchdog.whilePaused(
+            this.requestDynamicTool(
+              peer,
+              thread.id,
+              turn.id,
+              request,
+              AbortSignal.any([signal, abort.signal]),
+            ),
           )
           dynamicToolCalls.delete(item.id)
           // An interrupt or the end of the turn closed the item already.
@@ -5925,9 +5986,9 @@ export class CodexClaudeAppServer {
     }
     if (this.store.getTurn(turn.id)?.status === 'inProgress') {
       completeOpenToolItems('Claude finished the turn without a result for this tool.')
-      // A compaction that failed never reached its boundary; the turn
-      // went on without it and completes.
-      completeCompactionItem()
+      // A compaction that never reached its boundary failed; the turn went
+      // on without it, and the context was not compacted.
+      dropCompactionItem()
       this.finalizeOrphanedSubagents(peer, thread, turn, subagentContexts, activeSubagents)
     }
     this.subagentStateByTurn.delete(turn.id)
@@ -6746,7 +6807,7 @@ export class CodexClaudeAppServer {
       context,
       status === 'completed' ? 'completed' : 'interrupted',
     )
-    this.idleCheckHandler?.()
+    this.checkIdle()
   }
 
   // Subagent activity belongs to a parent turn. A background agent usually
@@ -6976,6 +7037,19 @@ export class CodexClaudeAppServer {
     this.startAutonomousTurn(threadId)
   }
 
+  // A notice the runtime raises outside any turn's stream, such as a call a
+  // background agent made between turns that had to be refused. It shows
+  // under the thread's running turn, else under its last one; a thread
+  // without turns only gets the warning.
+  // App rule: turn-notices
+  private handleRuntimeNotice(threadId: string, message: string): void {
+    if (this.stopped || !this.store.getThread(threadId)) return
+    const turnId =
+      this.activeTurnByThread.get(threadId) ?? this.store.lastTurnRef(threadId)?.id ?? null
+    debugLog('thread.notice', { threadId, turnId })
+    this.publishNotice(this.peerForThread(threadId), threadId, turnId, message)
+  }
+
   // Claude answers a background agent's report without a user prompt. Open
   // a parent turn for it the way Codex does for its own agent wakeups.
   private startAutonomousTurn(threadId: string): void {
@@ -6988,7 +7062,7 @@ export class CodexClaudeAppServer {
       this.activeTurnByThread.has(threadId) ||
       this.runtime.hasPendingContinuation?.(threadId) !== true
     ) {
-      this.idleCheckHandler?.()
+      this.checkIdle()
       return
     }
     const peer = this.peerForThread(threadId)
@@ -7035,7 +7109,7 @@ export class CodexClaudeAppServer {
       threadId,
       'Claude session ended before this agent reported back.',
     )
-    this.idleCheckHandler?.()
+    this.checkIdle()
   }
 
   private hasRunningBackgroundSubagent(parentThreadId: string): boolean {
@@ -7807,23 +7881,32 @@ export class CodexClaudeAppServer {
   // and config dir; a thread with no conversation yet can take any profile.
   // A conversation no profile can run any more keeps its model, so a model
   // change cannot pin it to a profile, or to none, and resume it there.
+  // Every refusal here is the user's to put right, by picking another model
+  // or starting a new chat: an invalid request, whose reason the App's model
+  // menu shows.
+  // App rule: model-menu-settings
   private setThreadModel(thread: ThreadRecord, model: string): void {
     let runtimeBackend = thread.runtimeBackend
-    if (this.crossesRuntimeBackend(thread, model)) {
-      const codexModel = isCodexOpenAiModel(model)
-      if (this.threadHasConversation(thread)) {
-        throw new Error(
-          `cannot change runtime backend from ${thread.runtimeBackend} to ${codexModel ? 'codex' : 'claude'} for ${model}; start a new thread`,
-        )
+    let profileFingerprint: string | null
+    try {
+      if (this.crossesRuntimeBackend(thread, model)) {
+        const codexModel = isCodexOpenAiModel(model)
+        if (this.threadHasConversation(thread)) {
+          throw new Error(
+            `cannot change runtime backend from ${thread.runtimeBackend} to ${codexModel ? 'codex' : 'claude'} for ${model}; start a new thread`,
+          )
+        }
+        if (codexModel && this.codexRoutingDisabled()) throw codexRoutingDisabledError(model)
+        runtimeBackend = codexModel ? 'codex' : 'claude'
+      } else if (runtimeBackend === 'claude' && this.threadHasConversation(thread)) {
+        const unbound = threadModelProfileBindingError(thread)
+        if (unbound) throw unbound
+        assertModelProfileTransition(thread.model, model)
       }
-      if (codexModel && this.codexRoutingDisabled()) throw codexRoutingDisabledError(model)
-      runtimeBackend = codexModel ? 'codex' : 'claude'
-    } else if (runtimeBackend === 'claude' && this.threadHasConversation(thread)) {
-      const unbound = threadModelProfileBindingError(thread)
-      if (unbound) throw unbound
-      assertModelProfileTransition(thread.model, model)
+      profileFingerprint = profileFingerprintForModel(model, runtimeBackend)
+    } catch (error) {
+      throw asInvalidRequest(error)
     }
-    const profileFingerprint = profileFingerprintForModel(model, runtimeBackend)
     thread.runtimeBackend = runtimeBackend
     thread.model = model
     thread.modelProfileFingerprint = profileFingerprint
@@ -7835,7 +7918,7 @@ export class CodexClaudeAppServer {
   // checks this first: turns, reviews, compaction and forks.
   private checkModelProfileBinding(thread: ThreadRecord): void {
     const unbound = this.modelProfileUnbound(thread)
-    if (unbound) throw unbound
+    if (unbound) throw asInvalidRequest(unbound)
   }
 
   // Why the thread's conversation cannot go on in a Claude Code process, or
@@ -7894,7 +7977,7 @@ export class CodexClaudeAppServer {
     // the global ones.
     const threadId = stringOr(params.threadId, '')
     if (threadId && !this.store.getThread(threadId))
-      throw new Error(`thread not found: ${threadId}`)
+      throw invalidRequest(`thread not found: ${threadId}`)
     return experimentalFeatureList(this.memoriesOn(), params)
   }
 
@@ -7913,8 +7996,8 @@ export class CodexClaudeAppServer {
     if (!memoriesMappingEnabled()) return {}
     const threadId = stringOr(params.threadId, '')
     const mode = parseMemoryMode(params.mode)
-    if (!mode) throw new Error(`invalid memory mode: ${String(params.mode)}`)
-    if (!this.store.getThread(threadId)) throw new Error(`unknown thread: ${threadId}`)
+    if (!mode) throw invalidRequest(`invalid memory mode: ${String(params.mode)}`)
+    if (!this.store.getThread(threadId)) throw unknownThread(threadId)
     this.store.setThreadMemoryMode(threadId, mode)
     debugLog('thread.memoryMode', { threadId, mode })
     return {}
@@ -8255,12 +8338,12 @@ export class CodexClaudeAppServer {
   private async commandExec(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
     const processId = typeof params.processId === 'string' ? params.processId : newId()
     const command = commandArray(params.command)
-    if (command.length === 0) throw new Error('command/exec requires command')
+    if (command.length === 0) throw invalidRequest('command/exec requires command')
     if (
       (params.streamStdoutStderr === true || params.streamStdin === true || params.tty === true) &&
       typeof params.processId !== 'string'
     ) {
-      throw new Error('command/exec streaming requires processId')
+      throw invalidRequest('command/exec streaming requires processId')
     }
 
     const executable = command[0] as string
@@ -8363,7 +8446,7 @@ export class CodexClaudeAppServer {
   private commandExecWrite(params: Record<string, unknown>): unknown {
     const processId = stringOr(params.processId, '')
     const child = this.commandProcesses.get(processId)
-    if (!child) throw new Error(`unknown command process: ${processId}`)
+    if (!child) throw invalidRequest(`unknown command process: ${processId}`)
     if (typeof params.deltaBase64 === 'string' && params.deltaBase64.length > 0) {
       child.stdin?.write(Buffer.from(params.deltaBase64, 'base64'))
     }
@@ -8376,18 +8459,18 @@ export class CodexClaudeAppServer {
   private commandExecTerminate(params: Record<string, unknown>): unknown {
     const processId = stringOr(params.processId, '')
     const child = this.commandProcesses.get(processId)
-    if (!child) throw new Error(`unknown command process: ${processId}`)
+    if (!child) throw invalidRequest(`unknown command process: ${processId}`)
     child.kill('SIGTERM')
     return {}
   }
 
   private processSpawn(peer: RpcPeer, params: Record<string, unknown>): unknown {
     const processHandle = stringOr(params.processHandle, '')
-    if (!processHandle) throw new Error('process/spawn requires processHandle')
+    if (!processHandle) throw invalidRequest('process/spawn requires processHandle')
     if (this.processHandles.has(processHandle))
-      throw new Error(`process handle already active: ${processHandle}`)
+      throw invalidRequest(`process handle already active: ${processHandle}`)
     const command = commandArray(params.command)
-    if (command.length === 0) throw new Error('process/spawn requires command')
+    if (command.length === 0) throw invalidRequest('process/spawn requires command')
     const cwd = stringOr(params.cwd, process.cwd())
     const isTty = params.tty === true
     const streamOutput = params.streamStdoutStderr === true || isTty
@@ -8566,7 +8649,7 @@ export class CodexClaudeAppServer {
   private processWriteStdin(params: Record<string, unknown>): unknown {
     const processHandle = stringOr(params.processHandle, '')
     const child = this.processHandles.get(processHandle)
-    if (!child) throw new Error(`unknown process handle: ${processHandle}`)
+    if (!child) throw invalidRequest(`unknown process handle: ${processHandle}`)
     if (typeof params.deltaBase64 === 'string' && params.deltaBase64.length > 0) {
       if ((child as any).__isPtyBridge) {
         child.stdin?.write(JSON.stringify({ action: 'input', data: params.deltaBase64 }) + '\n')
@@ -8593,7 +8676,7 @@ export class CodexClaudeAppServer {
   private processKill(params: Record<string, unknown>): unknown {
     const processHandle = stringOr(params.processHandle, '')
     const child = this.processHandles.get(processHandle)
-    if (!child) throw new Error(`unknown process handle: ${processHandle}`)
+    if (!child) throw invalidRequest(`unknown process handle: ${processHandle}`)
     if ((child as any).__isPtyBridge) {
       child.stdin?.write(JSON.stringify({ action: 'kill' }) + '\n')
     }
@@ -9293,6 +9376,29 @@ export class CodexClaudeAppServer {
     if (peer) this.notify(peer, notification)
   }
 
+  // A notice from Claude Code (turn-notices.mts): the `warning` Codex would
+  // send, and for the first few of a turn also a row under it that the App
+  // renders. Each message goes out once per turn. turnId null: the thread has
+  // no turn to show it under, so only the warning goes out; visible false: a
+  // turn the user does not watch, such as a title or a compaction's summary.
+  // App rule: turn-notices
+  private publishNotice(
+    peer: RpcPeer,
+    threadId: string,
+    turnId: string | null,
+    message: string,
+    visible = true,
+  ): void {
+    const decision = this.turnNotices.record(turnId ?? `thread:${threadId}`, message)
+    if (!decision.warn) return
+    this.notify(peer, { method: 'warning', params: { threadId, message } })
+    if (!decision.show || !visible || !turnId || !noticeRowsEnabled()) return
+    this.notify(peer, {
+      method: 'error',
+      params: { threadId, turnId, willRetry: true, error: noticeTurnError(message) },
+    })
+  }
+
   private setThreadStatus(
     peer: RpcPeer | null,
     threadId: string,
@@ -9313,6 +9419,8 @@ export class CodexClaudeAppServer {
     if (target)
       this.notify(target, { method: 'thread/status/changed', params: { threadId, status } })
     this.leaderThreads.threadChanged()
+    // A turn starting is when the keep-awake guard takes hold.
+    this.idleSleep.check()
   }
 
   // An aborted `signal` drops the request and rejects; the caller's
@@ -9485,7 +9593,7 @@ export class CodexClaudeAppServer {
       this.refreshGitInfoAfterTurn(threadId)
       setImmediate(() => {
         if (!this.startFollowUp(threadId, settled?.status) && this.activeTurnByThread.size === 0)
-          this.idleCheckHandler?.()
+          this.checkIdle()
       })
     }
   }
@@ -9597,7 +9705,7 @@ export class CodexClaudeAppServer {
   // ended, e.g. through turn/interrupt.
   private failTurn(peer: RpcPeer, threadId: string, turn: TurnRecord, error: Error): boolean {
     this.exitReviewMode(peer, threadId, turn.id)
-    const turnError = turnErrorOf(error)
+    const turnError = this.explainTurnError(turn, turnErrorOf(error))
     const completed = this.endTurn(turn, 'failed', turnError)
     if (!completed) {
       // Its end was recorded, but whatever ended it never let go of the
@@ -9619,6 +9727,18 @@ export class CodexClaudeAppServer {
     this.clearActiveTurn(threadId)
     this.setThreadStatus(peer, threadId, { type: 'idle' })
     return true
+  }
+
+  // What a failed turn's error leaves out: that the computer slept during
+  // the turn, which is the likely reason a model request broke off, and the
+  // notices Claude reported along the way, whose rows the App does not keep.
+  private explainTurnError(turn: TurnRecord, error: CodexTurnError): CodexTurnError {
+    const sleptMs = turn.startedAt == null ? 0 : this.sleepMonitor.sleptSince(turn.startedAt * 1000)
+    const explained = withSleepNotice(error, sleptMs, this.platform)
+    if (explained !== error) {
+      debugLog('turn.slept', { threadId: turn.threadId, turnId: turn.id, sleptMs })
+    }
+    return withTurnNotices(explained, this.turnNotices.messages(turn.id))
   }
 
   // Writes a turn's terminal state. Returns null when the turn already ended,

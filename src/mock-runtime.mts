@@ -104,8 +104,7 @@ export class MockRuntime implements ClaudeRuntime {
       }
       if (this.failingCompactions.delete(context.threadId)) {
         await handlers.onEvent({
-          type: 'notice',
-          level: 'warning',
+          type: 'compaction_failed',
           message: 'Claude could not compact the conversation: mock compaction failure',
         })
         await handlers.onEvent({ type: 'completed', success: true, result: '' })
@@ -142,7 +141,10 @@ export class MockRuntime implements ClaudeRuntime {
     // Claude compacting on its own partway through a turn. "boundary only"
     // leaves out the status message before the boundary; "stalls" never
     // reaches it, until an interrupt; "then hold" keeps the turn running
-    // afterwards until a steer says "release".
+    // afterwards until a steer says "release". "fails" reports that Claude
+    // could not compact ("fails 3 times" tries twice more, each try starting
+    // again and failing the same way), and "never ends" reports nothing more,
+    // as an older CLI does; either way the turn goes on without it.
     if (/auto compaction check/i.test(context.prompt)) {
       await handlers.onEvent({ type: 'text_delta', delta: 'Reading the files.' })
       if (!/boundary only/i.test(context.prompt))
@@ -150,6 +152,20 @@ export class MockRuntime implements ClaudeRuntime {
       if (/stalls/i.test(context.prompt)) {
         for (let i = 0; i < 1000 && !this.interrupted.has(context.threadId); i += 1) await sleep(10)
         await handlers.onEvent({ type: 'completed', success: false, result: 'interrupted' })
+        return
+      }
+      if (/fails|never ends/i.test(context.prompt)) {
+        const times = /fails (\d+) times/i.exec(context.prompt)?.[1]
+        const attempts = times ? Number(times) : /fails/i.test(context.prompt) ? 1 : 0
+        for (let i = 0; i < attempts; i += 1) {
+          if (i > 0) await handlers.onEvent({ type: 'compaction_started' })
+          await handlers.onEvent({
+            type: 'compaction_failed',
+            message: 'Claude could not compact the conversation: mock safeguard refusal',
+          })
+        }
+        await handlers.onEvent({ type: 'text_delta', delta: 'Done without compacting.' })
+        await handlers.onEvent({ type: 'completed', success: true, result: 'not compacted' })
         return
       }
       await handlers.onEvent({

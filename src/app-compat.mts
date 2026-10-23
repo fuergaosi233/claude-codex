@@ -266,11 +266,11 @@ export const APP_RULES: readonly AppRule[] = [
   },
   {
     id: 'model-menu-settings',
-    app: 'Applies a model picked from the menu of an open chat it has resumed with thread/settings/update (model, effort and multiAgentMode); in a new chat the pick only rides on the first turn/start. When the request fails it shows a “Couldn’t update model settings” toast, adding the error message only for code -32600, and puts the menu back. Only code -32601, or a message saying method not found, or unknown method or unknown variant next to the method name, counts as the server lacking the method.',
+    app: 'Applies a model picked from the menu of an open chat it has resumed with thread/settings/update (model, effort and multiAgentMode); in a new chat the pick only rides on the first turn/start. When the request fails it shows a “Couldn’t update model settings” toast and puts the menu back; only for code -32600 the toast adds “Check your config.toml.” with the error message and an Open config.toml button. Only code -32601, or a message saying method not found, or unknown method or unknown variant next to the method name, counts as the server lacking the method.',
     adapter:
-      "Refuses a model on the other backend from the chat's (a Codex model in a Claude chat, or a Claude model in a Codex chat unless the Codex proxy carries every thread) once the chat has a conversation, with a plain error raised before anything changes, so the menu goes back and the chat keeps its model. With model process profiles configured, a Claude chat with a conversation refuses another profile the same way, and a chat its profile can no longer run (the profile changed or went away, or the chat predates profiles) refuses any model. The chat's current model sent along with other settings is no change.",
+      "Refuses a model on the other backend from the chat's (a Codex model in a Claude chat, or a Claude model in a Codex chat unless the Codex proxy carries every thread) once the chat has a conversation, with an invalid-request error (-32600) raised before anything changes, so the toast gives the reason, the menu goes back and the chat keeps its model. With model process profiles configured, a Claude chat with a conversation refuses another profile the same way, and a chat its profile can no longer run (the profile changed or went away, or the chat predates profiles) refuses any model. The chat's current model sent along with other settings is no change.",
     verify:
-      'With Codex models in the menu, pick one in a Claude chat that has a reply: a toast says the model settings could not be updated and the menu shows the Claude model again; another Claude model still applies.',
+      'With Codex models in the menu, pick one in a Claude chat that has a reply: a toast says the model settings could not be updated, with the reason, and the menu shows the Claude model again; another Claude model still applies.',
   },
   {
     id: 'reasoning-summary',
@@ -417,10 +417,26 @@ export const APP_RULES: readonly AppRule[] = [
       'With approvals on, have Claude run `cat README.md && touch x`: the card shows the whole command.',
   },
   {
+    id: 'turn-notices',
+    app: 'Shows an `error` notification with willRetry as a dim row of its own under the turn it names, with its message as written, whether that turn still runs or has ended, without failing or ending the turn; only a "Reconnecting... n/m" message replaces the row before it. It does not keep the row when the chat is reopened, and it ignores `warning` notifications.',
+    adapter:
+      "Sends what Claude Code reports beside a turn (a compaction it could not do, a model it switched to, an urgent CLI notification, a call it denied or an MCP request it declined while no turn was running) as a `warning`, as Codex does, and as such an `error` with no code: each message once per turn, the first 5 as rows. A notice between turns goes under the thread's running or last turn. A turn that then fails repeats its notices in the error's additionalDetails, stored with the turn, which the App shows only in a diagnostics view it does not always offer. A structured-output helper turn sends warnings only, and CLAUDE_CODEX_NOTICE_ROWS=0 turns the rows off.",
+    verify:
+      'Have a background task call a tool that needs approval after the turn ended: a row under the last turn says the call was denied and how to run it again, and the turn stays completed.',
+  },
+  {
+    id: 'compaction-marker',
+    app: 'Draws a contextCompaction item as "Context compacted" once item/completed arrives or when it is stored in a turn, and an open one as compacting while its turn is in progress and as "Compaction interrupted" once the turn has ended.',
+    adapter:
+      'Stores a contextCompaction only when the compaction completes, in the place it started, as Codex keeps only finished compactions. A compaction an interrupt or a failed turn cuts short stays open, so it shows as interrupted until the chat is reopened, where it is gone.',
+    verify:
+      'Interrupt a long /compact: the item shows as interrupted, not compacted; let one finish: it shows as compacted, also after the chat is reopened.',
+  },
+  {
     id: 'item-completed-replaces',
     app: 'Replaces the item with the same id on item/completed, whatever type it started as.',
     adapter:
-      'Completes an image Read that fails or is stopped as its failed Read command in place of the imageView it started as.',
+      'Completes an image Read that fails or is stopped as its failed Read command in place of the imageView it started as, and a compaction Claude could not do while the turn went on as an empty reasoning item, which the App does not draw, in place of the contextCompaction it started as.',
     verify:
       'Ask Claude to read an image file that does not exist: the turn shows the failed Read, not an empty image.',
   },

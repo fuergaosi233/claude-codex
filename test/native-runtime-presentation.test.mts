@@ -513,11 +513,10 @@ test('Claude compacting the conversation becomes compaction events; a subagent c
     { type: 'compaction_completed', trigger: 'manual', preTokens: 90_000, postTokens: null },
     { type: 'compaction_started' },
     {
-      type: 'notice',
-      level: 'warning',
+      type: 'compaction_failed',
       message: 'Claude could not compact the conversation: prompt too long',
     },
-    { type: 'notice', level: 'warning', message: 'Claude could not compact the conversation.' },
+    { type: 'compaction_failed', message: 'Claude could not compact the conversation.' },
   ])
   // /compact compacts the session, unless Claude Code has the command off.
   const disabled = process.env.DISABLE_COMPACT
