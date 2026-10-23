@@ -187,7 +187,12 @@ regular file owned by that user with mode `0600`, not a symbolic link; the
 adapter opens it without following links and rejects it if it changes while
 being read. A profiles file that breaks these rules, or that cannot be parsed,
 fails the requests that need it with the reason rather than falling back to
-another Claude Code.
+another Claude Code. The reason is one line of at most 300 characters that
+names the file (or `CLAUDE_CODEX_MODEL_PROFILES`) and says what is wrong, such
+as the JSON error and where it is, without quoting the file's text, so a
+credential pasted into it does not end up on screen or in the logs. A model
+change it fails is an invalid request (`-32600`), so the model menu's toast
+shows the reason.
 
 ### Fingerprints
 

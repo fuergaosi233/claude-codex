@@ -81,6 +81,13 @@ versioning or publishing metadata.
   The model menu's "Couldn't update model settings" toast now gives the
   reason, after the App's own "Check your config.toml." line. Failures inside
   the adapter stay `-32000`.
+- Model process profiles that fail to load fail with one line of at most 300
+  characters that names the file (or `CLAUDE_CODEX_MODEL_PROFILES`) and says
+  what is wrong. The message used to carry the JSON parser's excerpt of the
+  file's text, which could include a credential, and the id or
+  `defaultModel` value that was not valid. A model change from the menu or
+  `turn/settings/update` that fails on them is now an invalid request
+  (`-32600`) like one from `turn/start`, so the toast shows the reason.
 - A workflow agent that fails (one that stalled on every attempt, or hit an
   API error) ends its thread's turn as failed, with the reason the workflow
   reported, and counts as a failed subagent of its parent. It used to show as

@@ -3265,7 +3265,7 @@ export class CodexClaudeAppServer {
     if (params.model != null) {
       // Unlike turn/start, an unknown model fails instead of falling back.
       const requested = stringOr(params.model, '')
-      const model = allSelectableModelOptions().find(
+      const model = invalidRequestIfThrows(allSelectableModelOptions).find(
         (option) => option.id.toLowerCase() === requested.toLowerCase(),
       )?.id
       if (!model) throw invalidRequest(`unknown model: ${requested}`)
@@ -7954,14 +7954,16 @@ export class CodexClaudeAppServer {
   // The model a settings or metadata update moves the thread to, or null. The
   // App sends the chat's current model along with other settings; that is no
   // change, even when the picker no longer lists it and repairing it would
-  // pick a model on the other backend.
+  // pick a model on the other backend. Model process profiles that fail to
+  // load are the user's to fix, like a model the thread cannot take.
+  // App rule: model-menu-settings
   private requestedModelChange(
     thread: ThreadRecord,
     params: Record<string, unknown>,
   ): string | null {
     const rawModel = modelFromParams(params, null)
     if (!rawModel || rawModel === thread.model) return null
-    const model = normalizeSelectableModelId(rawModel, thread.model)
+    const model = invalidRequestIfThrows(() => normalizeSelectableModelId(rawModel, thread.model))
     return model === thread.model ? null : model
   }
 
