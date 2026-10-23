@@ -40,6 +40,7 @@ line a rule touches.
 | `subagent-close-hides` | removes a child from the panel when `closeAgent` follows its successful wait | a finished subagent stays in the panel |
 | `completed-wait` | marks every working agent of the thread done when a wait completes | with two agents, the first to finish does not end the second |
 | `agent-states` | shows `interrupted` as done and `errored` as failed | a stopped subagent shows as done |
+| `subagent-failure-reason` | shows a failed turn's `error.message` as an error row in that turn (not an interrupted one's), and an agent's `agentsStates` message after its status on a `spawnAgent` or `sendInput` row, never on a wait or `closeAgent` | a subagent whose run fails ends its thread with an error row naming the cause, without stack frames; the parent's failed turn says how many subagents failed and why the first did |
 | `subagent-read` | reads a child with `includeTurns: false` and shows one without turns as loading | a finished subagent opens with its prompt and reply |
 | `child-prompt` | creates the child conversation from `thread/started` with an empty turn | a running subagent shows its prompt |
 | `subagent-titles` | titles a subagent thread with the `name` its `thread/started` carries, and otherwise generates one from the parent's `spawnAgent` prompt with a model turn of its own | a subagent's and a workflow agent's threads show the description or label at once, with no title turn for them |

@@ -626,6 +626,15 @@ versioning or publishing metadata.
   for every subagent, which named workflow agents after the workflow's
   relayed user request; a workflow agent's prompt is now the task the
   workflow computed for it.
+- A subagent that fails says why: its thread's turn fails with the reason
+  Claude Code gave instead of "subagent failed", the agent's state on the
+  parent's wait carries the reason, and a parent turn that fails after its
+  subagents failed says how many did and why the first did, keeping its
+  error code. A background agent that fails tells the reason its task
+  notification gives (a stall, an API error), not the last thing it said.
+  Stopped, interrupted and orphaned subagents say how they ended and do not
+  count as failed. Stopping a foreground subagent whose Agent call returned
+  before Claude Code confirmed the stop no longer ends its thread twice.
 
 ### Rust-first protocol groundwork
 

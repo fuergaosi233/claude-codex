@@ -411,6 +411,21 @@ turn for it, and the name stays the same in the thread's history and after
 the adapter restarts. A workflow agent's prompt is the task the workflow
 computed for it, not the user request the workflow relays to every agent.
 
+A subagent that fails says why. Its thread's turn fails with the reason Claude
+Code gave, such as an API error or the error its run ended with, without the
+CLI's tags and usage trailer, and the agent's state on the parent's agent
+calls carries the same reason. A background subagent's reason is the one
+Claude Code reports when it ends, such as a stall, rather than the last thing
+it said. When the parent turn fails after some of its subagents failed, its
+error also says how many did and why the first one did. A subagent the user
+stops says it was stopped by the user, one an interrupt of the parent ends
+says it was interrupted, and one still running when the parent turn fails says
+it ended because the parent turn failed, and why; none of these count as
+failed subagents. Each of these endings is also the subagent thread's last
+message. The App draws a turn's error only when the turn failed, and does not
+draw the agent's state on the parent's wait card; both are there for clients
+that read them.
+
 ## Background work and the unread dot
 
 Claude can leave background subagents (`run_in_background` Agent calls) and

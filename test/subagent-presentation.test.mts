@@ -7,7 +7,14 @@ import {
   clipText,
   firstPromptLine,
   isRelayedUserRequest,
+  SUBAGENT_FAILED_WITHOUT_REASON,
+  SUBAGENT_STOPPED,
+  subagentFailureReason,
+  subagentFailureSummary,
   subagentThreadName,
+  subagentTurnError,
+  taskEndReason,
+  withSubagentFailures,
   workflowAgentPrompt,
 } from '../src/subagent-presentation.mjs'
 import {
@@ -120,6 +127,130 @@ test('a workflow agent is described by its label, else the first line of its tas
   assert.equal(workflowAgentDescription(prompt, 'abc', '   '), 'Review the lexer')
   assert.equal(workflowAgentDescription('', 'abc'), 'Workflow agent abc')
   assert.equal(Array.from(workflowAgentDescription('', 'abc', 'x'.repeat(300))).length, 120)
+})
+
+test('a subagent failure reason drops the trailer, error tags and stack frames', () => {
+  const stalled = [
+    'Workflow ended before the agent published an individual result.',
+    'Dynamic workflow "review" failed: Error: agent stalled on all 6 attempts (no progress for 180000ms each)',
+    '    at Bo (file:///cli.js:1:2)',
+    '    at async unknown (file:///cli.js:3:4)',
+    'agentId: 0123456789abcdef',
+  ].join('\n')
+  assert.equal(
+    subagentFailureReason(stalled),
+    'Workflow ended before the agent published an individual result. Dynamic workflow "review" failed: Error: agent stalled on all 6 attempts (no progress for 180000ms each)',
+  )
+  assert.equal(
+    subagentFailureReason(
+      '<tool_use_error>Agent type "nope" not found.</tool_use_error>\n<usage>total_tokens: 12\nduration_ms: 3</usage>',
+    ),
+    'Agent type "nope" not found.',
+  )
+  assert.equal(
+    subagentFailureReason('{"error":{"type":"overloaded_error","message":"Overloaded"}}'),
+    'Overloaded',
+  )
+  assert.equal(subagentFailureReason('{"error":"Rate limited"}'), 'Rate limited')
+  assert.equal(subagentFailureReason('{"message":"Bad request"}'), 'Bad request')
+  // JSON that is not an error body is told as it is.
+  assert.equal(subagentFailureReason('{"ok":true}'), '{"ok":true}')
+  assert.equal(subagentFailureReason('{not json}'), '{not json}')
+  assert.equal(subagentFailureReason(''), SUBAGENT_FAILED_WITHOUT_REASON)
+  assert.equal(
+    subagentFailureReason('agentId: abc\n<usage>x</usage>'),
+    SUBAGENT_FAILED_WITHOUT_REASON,
+  )
+  assert.equal(subagentFailureReason('  ', 'Ended.'), 'Ended.')
+  const long = subagentFailureReason('x'.repeat(1000))
+  assert.equal(Array.from(long).length, 400)
+  assert.ok(long.endsWith('…'))
+  // A line that only mentions "at" mid-text is kept.
+  assert.equal(subagentFailureReason('Failed at step 3'), 'Failed at step 3')
+  assert.deepEqual(subagentTurnError('Why'), {
+    message: 'Why',
+    codexErrorInfo: null,
+    additionalDetails: null,
+  })
+})
+
+test('a background task tells why it ended from its summary unless that is its description', () => {
+  const stall = 'Agent stalled: no progress for 600s (stream watchdog did not recover)'
+  assert.equal(taskEndReason('failed', stall, 'Reading files next.', 'Survey'), stall)
+  // A summary that is only the description says nothing; the result might.
+  assert.equal(
+    taskEndReason('failed', '  Survey ', 'Error: boom\n    at x (file:///cli.js:1:1)', 'Survey'),
+    'Error: boom',
+  )
+  assert.equal(taskEndReason('failed', '', null, 'Survey'), SUBAGENT_FAILED_WITHOUT_REASON)
+  // A long description is matched against the clipped name.
+  const long = 'word '.repeat(60)
+  assert.equal(
+    taskEndReason('failed', long, 'Error: late', subagentThreadName({ description: long })),
+    'Error: late',
+  )
+  // A stop says what stopped it when the CLI does, else only that it stopped.
+  assert.equal(
+    taskEndReason('stopped', 'Stopped by a worker restart: Survey', 'Half done.', 'Survey'),
+    'Stopped by a worker restart: Survey',
+  )
+  assert.equal(taskEndReason('stopped', 'Survey', 'Half done.', 'Survey'), SUBAGENT_STOPPED)
+  assert.equal(taskEndReason('stopped', '', null, null), SUBAGENT_STOPPED)
+})
+
+test('a failed parent turn counts its failed subagents and repeats the first reason', () => {
+  assert.equal(
+    subagentFailureSummary('Claude turn failed', { count: 1, firstReason: 'Disk full' }),
+    'Claude turn failed. A subagent failed: Disk full',
+  )
+  assert.equal(
+    subagentFailureSummary('Claude turn failed!', { count: 3, firstReason: 'Disk full' }),
+    'Claude turn failed! 3 subagents failed; the first: Disk full',
+  )
+  // An error that already tells the reason does not repeat it.
+  assert.equal(
+    subagentFailureSummary('Stopped: Disk  full.', { count: 1, firstReason: 'Disk full' }),
+    'Stopped: Disk  full. A subagent failed.',
+  )
+  assert.equal(
+    subagentFailureSummary('Failed. Disk full', { count: 2, firstReason: 'Disk full' }),
+    'Failed. Disk full. 2 subagents failed.',
+  )
+  assert.equal(
+    subagentFailureSummary('', { count: 1, firstReason: 'Disk full' }),
+    'A subagent failed: Disk full',
+  )
+  assert.equal(subagentFailureSummary('Failed', { count: 0, firstReason: 'x' }), 'Failed')
+  assert.equal(
+    subagentFailureSummary('Failed', { count: 1, firstReason: '' }),
+    'Failed. A subagent failed.',
+  )
+  const clipped = subagentFailureSummary('Failed', { count: 1, firstReason: 'y'.repeat(500) })
+  assert.equal(Array.from(clipped).length, 'Failed. A subagent failed: '.length + 200)
+})
+
+test('the parent error told with its subagents keeps its Codex error code', () => {
+  const original = Object.assign(new Error('API Error: 529 Overloaded'), {
+    codexErrorInfo: { serverOverloaded: null },
+    additionalDetails: 'HTTP 529',
+  })
+  const told = withSubagentFailures(original, { count: 1, firstReason: 'Disk full' }) as Error & {
+    codexErrorInfo?: unknown
+    additionalDetails?: unknown
+  }
+  assert.notEqual(told, original)
+  assert.equal(told.message, 'API Error: 529 Overloaded. A subagent failed: Disk full')
+  assert.deepEqual(told.codexErrorInfo, { serverOverloaded: null })
+  assert.equal(told.additionalDetails, 'HTTP 529')
+  assert.equal(told.cause, original)
+
+  const plain = withSubagentFailures(new Error('boom'), { count: 2, firstReason: null })
+  assert.equal(plain.message, 'boom. 2 subagents failed.')
+  assert.equal('codexErrorInfo' in plain, false)
+  assert.equal('additionalDetails' in plain, false)
+
+  const untouched = new Error('boom')
+  assert.equal(withSubagentFailures(untouched, { count: 0, firstReason: null }), untouched)
 })
 
 async function workflowTranscript(

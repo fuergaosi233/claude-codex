@@ -192,7 +192,16 @@ import {
   wrapMcpToolResult,
 } from './server-helpers.mjs'
 import { PINNED_SECTION_ID, type SessionStore, settledTurn } from './store.mjs'
-import { subagentThreadName } from './subagent-presentation.mjs'
+import {
+  clipText,
+  collapseWhitespace,
+  SUBAGENT_STOPPED_BY_USER,
+  subagentFailureReason,
+  subagentThreadName,
+  subagentTurnError,
+  taskEndReason,
+  withSubagentFailures,
+} from './subagent-presentation.mjs'
 import {
   findOccurrences,
   forkTurns,
@@ -358,6 +367,10 @@ interface SubagentContext {
   // The user stopped this child from its own thread; its Agent call then
   // returns early and the child counts as interrupted, not failed.
   stoppedByUser?: boolean
+  // The user asked to stop this child and the CLI has not confirmed it yet.
+  // Its Agent call can return first: an error it returns meanwhile is the
+  // stop's own.
+  stopRequested?: boolean
   // An agent another subagent launched hangs off that agent's child thread
   // (its host), as in Codex: its spawn, wait and activity items go to the
   // host's turn. Absent for an agent the main thread launched, whose items
@@ -4308,6 +4321,13 @@ export class CodexClaudeAppServer {
     // parent state so Codex App retains the terminal snapshot.
     const subagentContexts = new Map<string, SubagentContext>()
     const activeSubagents = new Set<string>()
+    // Agents of this turn that failed on their own (not stopped, not ended by
+    // the turn's own end): a turn that then fails says how many and why the
+    // first one did.
+    const selfFailedSubagents: { count: number; firstReason: string | null } = {
+      count: 0,
+      firstReason: null,
+    }
     // A Workflow launch can be pending before it has produced a journal
     // agent (or after its last projected agent has completed). Keep the
     // watchdog armed for that whole async operation, not only while a child
@@ -5117,7 +5137,8 @@ export class CodexClaudeAppServer {
               return
             }
             const rawResultText = toolResultText(event.content)
-            const stopped = ctx.stoppedByUser === true
+            const stopped =
+              ctx.stoppedByUser === true || (event.isError === true && ctx.stopRequested === true)
             const collabStatus: 'completed' | 'failed' =
               event.isError && !stopped ? 'failed' : 'completed'
             const agentStatus: 'completed' | 'errored' | 'interrupted' = stopped
@@ -5139,18 +5160,34 @@ export class CodexClaudeAppServer {
             // for a nested agent, this one otherwise.
             const hostThreadId = ctx.hostThreadId ?? thread.id
             const hostTurnId = ctx.hostTurnId ?? turn.id
+            // Why the agent did not complete, told in its child turn's error
+            // and in its state on the parent's collab items. Its full text
+            // stays the child's last message.
+            // App rule: subagent-failure-reason
+            const failureReason = stopped
+              ? SUBAGENT_STOPPED_BY_USER
+              : event.isError
+                ? subagentFailureReason(resultText)
+                : null
+            if (event.isError && !stopped && failureReason) {
+              selfFailedSubagents.count += 1
+              selfFailedSubagents.firstReason ??= failureReason
+            }
 
-            // A child the user stopped already ended as interrupted.
+            // A child the user stopped ends as interrupted, once: the stop
+            // has usually ended it already.
+            const currentChildTurn = this.store.getTurn(ctx.childTurnId)
             const childTurn =
-              (stopped ? this.store.getTurn(ctx.childTurnId) : null) ??
-              this.completeSubagentChildTurn(
-                peer,
-                ctx,
-                resultText,
-                event.isError ? 'failed' : 'completed',
-                event.isError ? { message: 'subagent failed' } : null,
-                parsed.usage?.durationMs ?? null,
-              )
+              stopped && currentChildTurn && currentChildTurn.status !== 'inProgress'
+                ? currentChildTurn
+                : this.completeSubagentChildTurn(
+                    peer,
+                    ctx,
+                    stopped ? SUBAGENT_STOPPED_BY_USER : resultText,
+                    stopped ? 'interrupted' : event.isError ? 'failed' : 'completed',
+                    failureReason ? subagentTurnError(failureReason) : null,
+                    parsed.usage?.durationMs ?? null,
+                  )
             recordRunEvent('subagent.completed', {
               parentThreadId: hostThreadId,
               parentTurnId: hostTurnId,
@@ -5242,7 +5279,9 @@ export class CodexClaudeAppServer {
               prompt: null,
               model: null,
               reasoningEffort: null,
-              agentsStates: { [ctx.childThreadId]: { status: agentStatus, message: null } },
+              agentsStates: {
+                [ctx.childThreadId]: { status: agentStatus, message: failureReason },
+              },
             }
             this.store.updateItemAndMoveToEnd(hostTurnId, ctx.waitItemId, () => waitEnd)
             this.notify(peer, {
@@ -5268,7 +5307,7 @@ export class CodexClaudeAppServer {
                 hostTurnId,
                 ctx.childThreadId,
                 collabStatus,
-                { [ctx.childThreadId]: { status: agentStatus, message: null } },
+                { [ctx.childThreadId]: { status: agentStatus, message: failureReason } },
               )
             }
             // Keep the context discoverable until the child turn and wait
@@ -5929,10 +5968,22 @@ export class CodexClaudeAppServer {
       if (this.store.getTurn(turn.id)?.status === 'inProgress') {
         completeMessage()
         completeOpenToolItems(outcome.error.message)
-        this.finalizeOrphanedSubagents(peer, thread, turn, subagentContexts, activeSubagents)
+        // An agent still running ends with its parent, which says why.
+        // App rule: subagent-failure-reason
+        const parentReason = clipText(collapseWhitespace(outcome.error.message), 200)
+        this.finalizeOrphanedSubagents(
+          peer,
+          thread,
+          turn,
+          subagentContexts,
+          activeSubagents,
+          parentReason
+            ? `Ended because the parent turn failed: ${parentReason}`
+            : 'Ended because the parent turn failed.',
+        )
       }
       this.subagentStateByTurn.delete(turn.id)
-      throw outcome.error
+      throw withSubagentFailures(outcome.error, selfFailedSubagents)
     }
     if (this.store.getTurn(turn.id)?.status === 'inProgress') {
       completeOpenToolItems('Claude finished the turn without a result for this tool.')
@@ -6329,12 +6380,15 @@ export class CodexClaudeAppServer {
       const hostTurnId = context.hostTurnId ?? turn.id
 
       const message = failureMessage
+      // The child's turn says why it ended, interrupted as well as failed;
+      // the App draws the error of a failed turn only.
+      // App rule: subagent-failure-reason
       const childTurn = this.completeSubagentChildTurn(
         peer,
         context,
         message,
         status,
-        status === 'failed' ? { message } : null,
+        subagentTurnError(message),
       )
       recordRunEvent('subagent.completed', {
         parentThreadId: hostThreadId,
@@ -6656,6 +6710,14 @@ export class CodexClaudeAppServer {
           event.status === 'stopped' ? 'interrupted' : event.status,
           event.result ?? event.summary,
           event.usage,
+          event.status === 'completed'
+            ? undefined
+            : taskEndReason(
+                event.status,
+                event.summary,
+                event.result,
+                this.store.getThread(entry.context.childThreadId)?.name ?? null,
+              ),
         )
         return
     }
@@ -6718,6 +6780,8 @@ export class CodexClaudeAppServer {
     status: 'completed' | 'failed' | 'interrupted',
     text: string,
     usage: RuntimeTaskUsage | null,
+    // Why it did not complete, when `text` is not that already.
+    reason?: string,
   ): void {
     if (!entry.running) return
     entry.running = false
@@ -6728,7 +6792,7 @@ export class CodexClaudeAppServer {
         context,
         text,
         status,
-        status === 'completed' ? null : { message: text },
+        status === 'completed' ? null : subagentTurnError(reason ?? subagentFailureReason(text)),
         usage?.durationMs ?? null,
       )
       recordRunEvent('subagent.completed', {
@@ -7115,7 +7179,7 @@ export class CodexClaudeAppServer {
       taskId,
       stopped: stopped === true,
     })
-    this.settleBackgroundSubagent(entry, 'interrupted', 'Stopped by the user.', null)
+    this.settleBackgroundSubagent(entry, 'interrupted', SUBAGENT_STOPPED_BY_USER, null)
   }
 
   // Stops one foreground child of a running parent turn through its CLI task.
@@ -7124,11 +7188,20 @@ export class CodexClaudeAppServer {
     for (const state of this.subagentStateByTurn.values()) {
       for (const toolUseId of state.active) {
         const context = state.contexts.get(toolUseId)
-        if (context?.childThreadId !== childThreadId || context.stoppedByUser) continue
+        if (
+          context?.childThreadId !== childThreadId ||
+          context.stoppedByUser ||
+          context.stopRequested
+        )
+          continue
         const taskId = this.taskIdByToolUse.get(toolUseId)
+        // The agent's call can return before the CLI confirms the stop.
+        // App rule: subagent-failure-reason
+        if (taskId) context.stopRequested = true
         const stopped = taskId
           ? await this.runtime.stopTask?.(state.thread.id, taskId).catch(() => false)
           : false
+        context.stopRequested = false
         debugLog('subagent.foreground.stop', {
           parentThreadId: state.thread.id,
           childThreadId,
@@ -7139,7 +7212,15 @@ export class CodexClaudeAppServer {
         // still finishes the agent and its result replaces this state.
         if (stopped !== true) return false
         context.stoppedByUser = true
-        this.completeSubagentChildTurn(peer, context, 'Stopped by the user.', 'interrupted', null)
+        // Unless its call returned meanwhile and ended it.
+        if (this.store.getTurn(context.childTurnId)?.status === 'inProgress')
+          this.completeSubagentChildTurn(
+            peer,
+            context,
+            SUBAGENT_STOPPED_BY_USER,
+            'interrupted',
+            subagentTurnError(SUBAGENT_STOPPED_BY_USER),
+          )
         return true
       }
     }

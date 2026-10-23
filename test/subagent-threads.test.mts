@@ -160,6 +160,11 @@ const childStarts = (messages: any[], parentThreadId: string) =>
       message.params.thread.parentThreadId === parentThreadId,
   )
 
+const turnCompleted = (messages: any[], threadId: string) =>
+  messages.find(
+    (message) => message.method === 'turn/completed' && message.params.threadId === threadId,
+  )
+
 const collabItems = (messages: any[], tool: string) =>
   messages
     .filter(
@@ -175,6 +180,8 @@ const spawnedChild = (messages: any[], prompt: string): string => {
   assert.ok(spawn, `spawnAgent for ${prompt}`)
   return String(spawn.receiverThreadIds[0])
 }
+
+const turnError = (message: string) => ({ message, codexErrorInfo: null, additionalDetails: null })
 
 test('a subagent thread is named when it starts, and keeps the name in history and after a restart', async () => {
   const script: Script = async (_context, handlers) => {
@@ -246,3 +253,376 @@ test('a subagent thread is named when it starts, and keeps the name in history a
     assert.deepEqual(await names(), expected, 'the name is stored with the child thread')
   })
 })
+
+test('a failed subagent tells why in its turn and in its state on the parent', async () => {
+  const stall = [
+    'Workflow ended before the agent published an individual result.',
+    'Dynamic workflow "review" failed: Error: agent stalled on all 6 attempts',
+    '    at Bo (file:///cli.js:1:2)',
+    '    at async unknown (file:///cli.js:3:4)',
+    'agentId: 0123456789abcdef',
+    '<usage>total_tokens: 12</usage>',
+  ].join('\n')
+  const reason =
+    'Workflow ended before the agent published an individual result. Dynamic workflow "review" failed: Error: agent stalled on all 6 attempts'
+  const script: Script = async (_context, handlers) => {
+    await handlers.onEvent({
+      type: 'tool_use',
+      toolUseId: 'agent-stalled',
+      toolName: 'Agent',
+      input: { description: 'Review', prompt: 'review it' },
+    })
+    await handlers.onEvent({
+      type: 'tool_result',
+      toolUseId: 'agent-stalled',
+      content: stall,
+      isError: true,
+    })
+    await handlers.onEvent({
+      type: 'tool_use',
+      toolUseId: 'agent-silent',
+      toolName: 'Agent',
+      input: { description: 'Silent', prompt: 'say nothing' },
+    })
+    await handlers.onEvent({
+      type: 'tool_result',
+      toolUseId: 'agent-silent',
+      content: '',
+      isError: true,
+    })
+    await handlers.onEvent({ type: 'completed', success: true, result: 'went on' })
+  }
+  await withScriptedServer(script, async ({ startThread, runTurn, request }) => {
+    const threadId = await startThread()
+    const live = await runTurn(threadId, 'fail an agent')
+    const stalled = spawnedChild(live, 'review it')
+    const silent = spawnedChild(live, 'say nothing')
+
+    const childTurn = turnCompleted(live, stalled).params.turn
+    assert.equal(childTurn.status, 'failed')
+    assert.deepEqual(childTurn.error, turnError(reason))
+    assert.deepEqual(
+      turnCompleted(live, silent).params.turn.error,
+      turnError('The subagent failed without saying why.'),
+    )
+
+    const waits = collabItems(live, 'wait')
+    assert.deepEqual(
+      waits.map((item) => [item.status, item.agentsStates]),
+      [
+        ['failed', { [stalled]: { status: 'errored', message: reason } }],
+        [
+          'failed',
+          { [silent]: { status: 'errored', message: 'The subagent failed without saying why.' } },
+        ],
+      ],
+    )
+    assert.deepEqual(
+      collabItems(live, 'closeAgent').map((item) => item.agentsStates),
+      [
+        { [stalled]: { status: 'errored', message: reason } },
+        { [silent]: { status: 'errored', message: 'The subagent failed without saying why.' } },
+      ],
+    )
+
+    // History keeps the reason, and the child's message keeps the full text.
+    const child = (await request('thread/read', { threadId: stalled, includeTurns: true })).thread
+    assert.deepEqual(child.turns.at(-1).error, turnError(reason))
+    const childText = child.turns
+      .at(-1)
+      .items.filter((item: any) => item.type === 'agentMessage')
+      .map((item: any) => item.text)
+      .join('\n')
+    assert.match(childText, /at Bo \(file:\/\/\/cli\.js:1:2\)/)
+
+    // A parent that carried on did not fail.
+    const parent = turnCompleted(live, threadId).params.turn
+    assert.equal(parent.status, 'completed')
+    assert.equal(parent.error, null)
+  })
+})
+
+test('a parent turn that fails after its subagents failed says how many and why the first did', async () => {
+  const failure = { terminalReason: 'api_error', category: 'overloaded', status: 529 }
+  const script: Script = async (context, handlers) => {
+    if (context.prompt.includes('with agents')) {
+      for (const [id, text] of [
+        ['agent-disk', '<tool_use_error>Disk full</tool_use_error>'],
+        ['agent-net', 'Network down'],
+      ] as const) {
+        await handlers.onEvent({
+          type: 'tool_use',
+          toolUseId: id,
+          toolName: 'Agent',
+          input: { description: id, prompt: id },
+        })
+        await handlers.onEvent({ type: 'tool_result', toolUseId: id, content: text, isError: true })
+      }
+    }
+    await handlers.onEvent({
+      type: 'completed',
+      success: false,
+      result: 'API Error: 529 Overloaded',
+      failure,
+    })
+  }
+  await withScriptedServer(script, async ({ startThread, runTurn, request }) => {
+    const alone = await startThread()
+    const plain = turnCompleted(await runTurn(alone, 'fail alone'), alone).params.turn.error
+    assert.equal(plain.message, 'API Error: 529 Overloaded')
+
+    const threadId = await startThread()
+    const live = await runTurn(threadId, 'fail with agents')
+    const expected = {
+      ...plain,
+      message: 'API Error: 529 Overloaded. 2 subagents failed; the first: Disk full',
+    }
+    const parent = turnCompleted(live, threadId).params.turn
+    assert.equal(parent.status, 'failed')
+    assert.deepEqual(parent.error, expected, 'the Codex error code and details stay')
+    const errors = live.filter(
+      (message) => message.method === 'error' && message.params.threadId === threadId,
+    )
+    assert.deepEqual(
+      errors.map((message) => [message.params.willRetry, message.params.error]),
+      [[false, expected]],
+    )
+    const read = (await request('thread/read', { threadId, includeTurns: true })).thread
+    assert.deepEqual(read.turns.at(-1).error, expected)
+  })
+})
+
+test('agents a failed parent leaves running end with its reason, and do not count as failed', async () => {
+  const script: Script = async (_context, handlers) => {
+    await handlers.onEvent({
+      type: 'tool_use',
+      toolUseId: 'agent-orphan',
+      toolName: 'Agent',
+      input: { description: 'Orphan', prompt: 'keep going' },
+    })
+    await handlers.onEvent({
+      type: 'completed',
+      success: false,
+      result: 'Claude   turn\nfailed hard',
+    })
+  }
+  await withScriptedServer(script, async ({ startThread, runTurn }) => {
+    const threadId = await startThread()
+    const live = await runTurn(threadId, 'orphan an agent')
+    const orphan = spawnedChild(live, 'keep going')
+    const reason = 'Ended because the parent turn failed: Claude turn failed hard'
+    const child = turnCompleted(live, orphan).params.turn
+    assert.equal(child.status, 'failed')
+    assert.deepEqual(child.error, turnError(reason))
+    assert.deepEqual(collabItems(live, 'wait')[0].agentsStates, {
+      [orphan]: { status: 'errored', message: reason },
+    })
+    assert.equal(
+      turnCompleted(live, threadId).params.turn.error.message,
+      'Claude   turn\nfailed hard',
+    )
+  })
+})
+
+test('a subagent the user stops says so in its turn and its state, and does not count as failed', async () => {
+  const script: Script = async (context, handlers, tools) => {
+    await handlers.onEvent({
+      type: 'tool_use',
+      toolUseId: 'agent-slow',
+      toolName: 'Agent',
+      input: { description: 'Slow', prompt: 'take your time' },
+    })
+    const stopped = tools.stopped('slow-task')
+    await tools.listener().onTaskEvent(context.threadId, {
+      type: 'task_started',
+      taskId: 'slow-task',
+      toolUseId: 'agent-slow',
+      taskType: 'local_agent',
+      description: 'Slow',
+      subagentType: null,
+      prompt: 'take your time',
+      backgrounded: false,
+    })
+    await stopped
+    // The CLI returns the stopped agent's call before it confirms the stop,
+    // or after.
+    if (context.prompt.includes('after')) await new Promise((resolve) => setTimeout(resolve, 20))
+    await handlers.onEvent({
+      type: 'tool_result',
+      toolUseId: 'agent-slow',
+      content: '[Request interrupted by user for tool use]',
+      isError: true,
+    })
+    await handlers.onEvent({ type: 'completed', success: false, result: 'Claude turn failed' })
+  }
+  for (const order of ['before', 'after']) {
+    await withScriptedServer(
+      script,
+      async ({ startThread, startTurn, waitFor, request, messages }) => {
+        const threadId = await startThread()
+        await startTurn(threadId, `stop an agent, its result ${order} the stop`)
+        const childStarted = await waitFor(
+          (message) => message.method === 'turn/started' && message.params.threadId !== threadId,
+          'the child turn',
+        )
+        const childThreadId = childStarted.params.threadId
+        await waitFor(
+          (message) => message.method === 'item/started' && message.params.item?.tool === 'wait',
+          'the wait',
+        )
+        await request('turn/interrupt', {
+          threadId: childThreadId,
+          turnId: childStarted.params.turn.id,
+        })
+        await waitFor(
+          (message) => message.method === 'turn/completed' && message.params.threadId === threadId,
+          'the parent turn',
+        )
+        const childDone = messages.filter(
+          (message) =>
+            message.method === 'turn/completed' && message.params.threadId === childThreadId,
+        )
+        assert.deepEqual(
+          childDone.map((message) => [message.params.turn.status, message.params.turn.error]),
+          [['interrupted', turnError('Stopped by the user.')]],
+          `the child ends once, as interrupted (result ${order} the stop)`,
+        )
+        const wait = collabItems(messages, 'wait')
+        assert.deepEqual(
+          wait.map((item) => item.agentsStates),
+          [{ [childThreadId]: { status: 'interrupted', message: 'Stopped by the user.' } }],
+        )
+        const child = (
+          await request('thread/read', { threadId: childThreadId, includeTurns: true })
+        ).thread
+        assert.deepEqual(child.turns.at(-1).error, turnError('Stopped by the user.'))
+        assert.equal(
+          turnCompleted(messages, threadId).params.turn.error.message,
+          'Claude turn failed',
+          'an agent the user stopped did not fail',
+        )
+      },
+    )
+  }
+})
+
+test('interrupting the parent ends its running agents as interrupted, saying so', async () => {
+  const script: Script = async (_context, handlers, tools) => {
+    const interrupted = tools.interrupted()
+    await handlers.onEvent({
+      type: 'tool_use',
+      toolUseId: 'agent-busy',
+      toolName: 'Agent',
+      input: { description: 'Busy', prompt: 'work hard' },
+    })
+    await interrupted
+  }
+  await withScriptedServer(
+    script,
+    async ({ startThread, startTurn, waitFor, request, messages }) => {
+      const threadId = await startThread()
+      await startTurn(threadId, 'interrupt the parent')
+      await waitFor(
+        (message) => message.method === 'item/started' && message.params.item?.tool === 'wait',
+        'the wait',
+      )
+      await request('turn/interrupt', { threadId })
+      await waitFor(
+        (message) => message.method === 'turn/completed' && message.params.threadId === threadId,
+        'the parent turn',
+      )
+      const child = spawnedChild(messages, 'work hard')
+      const childTurn = turnCompleted(messages, child).params.turn
+      assert.equal(childTurn.status, 'interrupted')
+      assert.deepEqual(childTurn.error, turnError('Interrupted by the user.'))
+      assert.deepEqual(collabItems(messages, 'wait')[0].agentsStates, {
+        [child]: { status: 'interrupted', message: 'Interrupted by the user.' },
+      })
+    },
+  )
+})
+
+// A turn that launches one background agent (task bg-task) and ends; `then`
+// runs in it once the agent is launched.
+const backgroundAgent =
+  (then: (handlers: RuntimeHandlers) => Promise<void> | void = () => {}): Script =>
+  async (context, handlers, tools) => {
+    await handlers.onEvent({
+      type: 'tool_use',
+      toolUseId: 'agent-bg',
+      toolName: 'Agent',
+      input: { description: 'Background', prompt: 'survey', run_in_background: true },
+    })
+    await tools.listener().onTaskEvent(context.threadId, {
+      type: 'task_started',
+      taskId: 'bg-task',
+      toolUseId: 'agent-bg',
+      taskType: 'local_agent',
+      description: 'Background',
+      subagentType: null,
+      prompt: 'survey',
+      backgrounded: true,
+    })
+    await handlers.onEvent({
+      type: 'tool_result',
+      toolUseId: 'agent-bg',
+      content: 'Async agent launched successfully.\nagentId: bg-task',
+      structured: { isAsync: true, status: 'async_launched', agentId: 'bg-task', prompt: 'survey' },
+    })
+    await then(handlers)
+    await handlers.onEvent({ type: 'completed', success: true, result: 'launched' })
+  }
+
+for (const { summary, result, reason } of [
+  // The CLI puts the error that ended a local agent in the summary; the
+  // result is the last thing the agent said.
+  {
+    summary: 'Agent stalled: no progress for 600s (stream watchdog did not recover)',
+    result: 'Reading the config files next.',
+    reason: 'Agent stalled: no progress for 600s (stream watchdog did not recover)',
+  },
+  // A summary that is only the agent's description says nothing.
+  {
+    summary: 'Background',
+    result: 'Error: the tool crashed\n    at run (file:///cli.js:9:9)\nagentId: bg-task',
+    reason: 'Error: the tool crashed',
+  },
+]) {
+  test(`a background subagent that fails tells why: ${reason}`, async () => {
+    await withScriptedServer(
+      backgroundAgent(),
+      async ({ startThread, runTurn, waitFor, listener, messages }) => {
+        const threadId = await startThread()
+        const child = spawnedChild(await runTurn(threadId, 'background agent'), 'survey')
+        // The agent fails after the turn that launched it ended.
+        const from = messages.length
+        await listener().onTaskEvent(threadId, {
+          type: 'task_notification',
+          taskId: 'bg-task',
+          toolUseId: 'agent-bg',
+          status: 'failed',
+          summary,
+          result,
+          usage: null,
+        })
+        const done = await waitFor(
+          (message) => message.method === 'turn/completed' && message.params.threadId === child,
+          'the background child turn',
+          from,
+        )
+        assert.equal(done.params.turn.status, 'failed')
+        assert.deepEqual(done.params.turn.error, turnError(reason))
+        const said = messages
+          .slice(from)
+          .filter(
+            (message) =>
+              message.method === 'item/completed' &&
+              message.params.threadId === child &&
+              message.params.item.type === 'agentMessage',
+          )
+          .map((message) => message.params.item.text)
+        assert.deepEqual(said, [result], 'its full text stays its last message')
+      },
+    )
+  })
+}
