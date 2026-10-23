@@ -1230,6 +1230,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
           `${server} asked for your input while no turn was running, so the request was declined. Ask Claude to try again in a new message.`,
         )
       }
+      // A decline carries no reason: what Claude hears is up to the server,
+      // so only the notice tells the user why.
       return { action: 'decline' }
     }
     const url = stringOrNull(request.url)

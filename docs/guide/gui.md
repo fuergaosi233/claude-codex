@@ -165,10 +165,13 @@ the warning alone. Title and other helper turns send warnings only.
 A background agent, a workflow or a cron job can call a tool that needs your
 approval, ask for your input through an MCP server, or call an App tool after
 your turn has ended. With no turn running there is nowhere to ask, so the
-call is refused, as before, but not silently: Claude is told no user turn was
-active and that you can run it again in a turn, and a notice row under the
-chat's running or last turn says what was refused. Nothing is queued; ask
-Claude to run it again in a new message.
+request is turned down, as before, but not silently. A tool call or an App
+tool call is refused, and Claude is told no user turn was active and that you
+can run it again in a turn. An MCP server's request for your input is
+declined: the server gets only a plain decline, so what Claude hears of it is
+up to that server. In every case a notice row under the chat's running or
+last turn says what was turned down. Nothing is queued; ask Claude to run it
+again in a new message.
 
 ### Request errors
 

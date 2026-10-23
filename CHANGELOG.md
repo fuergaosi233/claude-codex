@@ -76,9 +76,12 @@ versioning or publishing metadata.
   `CLAUDE_CODEX_NOTICE_ROWS=0` sends the warnings alone.
 - A tool call, MCP elicitation or client dynamic tool call that background work
   (a background agent, a workflow, a cron job) makes while no turn runs is
-  still refused, but no longer silently: Claude is told no user turn was active
-  and that the user can run it again in a turn, and the user sees a notice row
-  under the thread's running or last turn. Nothing is queued.
+  still turned down, but no longer silently. For a tool call or client dynamic
+  tool call, Claude is told no user turn was active and that the user can run
+  it again in a turn. An MCP elicitation is declined, and the server gets only
+  a plain decline, so what Claude sees of it is up to that server. In every
+  case the user sees a notice row under the thread's running or last turn.
+  Nothing is queued.
 - A turn keeps a `contextCompaction` item only once the compaction completes,
   in the place it started, like Codex. A compaction an interrupt cuts short no
   longer reads as "Context compacted" after a reload, and one Claude Code could
