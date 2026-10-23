@@ -473,6 +473,90 @@ test('the App MCP settings are off unless CLAUDE_CODEX_APP_MCP_SERVERS=1', async
   }
 })
 
+test('config writes keep credentials out of the debug log', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'app-settings-debug-log-'))
+  const debugLog = join(root, 'debug.jsonl')
+  try {
+    await withServer(root, { ...appServersOn, CLAUDE_CODEX_DEBUG_LOG: debugLog }, async (app) => {
+      await app.request(
+        'config/batchWrite',
+        saveServer(root, 'local', { command: '/bin/kept', env: { GREETING: 'env-value-1' } }),
+      )
+      await app.request(
+        'config/batchWrite',
+        saveServer(root, 'remote', {
+          url: 'https://someone:url-password-2@example.com/mcp?key=url-query-3',
+          http_headers: { 'X-Custom': 'header-value-4' },
+          env_http_headers: { 'X-Other': 'HEADER_VARIABLE_5' },
+          bearer_token_env_var: 'BEARER_VARIABLE_6',
+        }),
+      )
+      // A write of the map itself, or of one of its values.
+      await app.request('config/value/write', {
+        keyPath: 'mcp_servers.local.env',
+        value: { OTHER: 'env-value-7' },
+        mergeStrategy: 'upsert',
+        filePath: null,
+      })
+      await app.send('config/value/write', {
+        keyPath: 'mcp_servers.local.env.THIRD',
+        value: 'env-value-8',
+        mergeStrategy: 'replace',
+        filePath: null,
+      })
+      // A credential-named key anywhere in a config value.
+      await app.request('config/batchWrite', {
+        edits: [
+          {
+            keyPath: 'desktop.integration',
+            value: { name: 'kept-name', access_token: 'token-value-9' },
+            mergeStrategy: 'replace',
+          },
+        ],
+        filePath: null,
+      })
+      // Config overrides on thread/start, keyed by dotted paths.
+      await app.send('thread/start', {
+        cwd: root,
+        model: 'sonnet',
+        config: { 'mcp_servers.local.env.FOURTH': 'env-value-10' },
+      })
+    })
+    const log = await readFile(debugLog, 'utf8')
+    for (const secret of [
+      'env-value-1',
+      'url-password-2',
+      'url-query-3',
+      'header-value-4',
+      'HEADER_VARIABLE_5',
+      'BEARER_VARIABLE_6',
+      'env-value-7',
+      'env-value-8',
+      'token-value-9',
+      'env-value-10',
+    ])
+      assert.ok(!log.includes(secret), secret)
+    // Key names and the rest of each value stay, for debugging.
+    for (const kept of [
+      'GREETING',
+      'X-Custom',
+      'X-Other',
+      'bearer_token_env_var',
+      'OTHER',
+      'mcp_servers.local.env.THIRD',
+      'access_token',
+      'kept-name',
+      '/bin/kept',
+      'example.com/mcp',
+      'mcp_servers.local.env.FOURTH',
+      '[redacted]',
+    ])
+      assert.ok(log.includes(kept), kept)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('settings Claude threads have no counterpart for are refused, and read back as they hold', async () => {
   const root = await mkdtemp(join(tmpdir(), 'app-settings-unsupported-'))
   const write = (keyPath: string, value: unknown) => ({

@@ -578,6 +578,13 @@ versioning or publishing metadata.
   form: the servers are not used for Claude threads unless the adapter runs
   with `CLAUDE_CODEX_APP_MCP_SERVERS=1`, and a server can also go into Claude
   Code's own MCP config. Servers saved earlier stay saved, unused.
+- The debug log no longer records credentials from config writes. For
+  `config/value/write`, `config/batchWrite` and the `config` of a request
+  such as `thread/start`, it keeps every key name but replaces the values of
+  an MCP server's `env`, `headers`, `http_headers` and `env_http_headers`,
+  of any key named like a token, secret, password, API key, auth setting,
+  cookie or credential (such as `bearer_token_env_var`), and the user,
+  password and query of a server's `url`.
 - Settings a Claude thread cannot honor are refused with `INVALID_REQUEST`
   instead of being saved and ignored, so the App shows "Couldn't update this
   setting": `model_verbosity`, a service tier other than the default, network
