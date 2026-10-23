@@ -635,7 +635,8 @@ versioning or publishing metadata.
   unset (or has network access off), and would otherwise preselect Custom
   (config.toml) in new chats.
 - `web_search = "disabled"` saved in the App's settings takes WebSearch from
-  Claude threads; `cached`, `indexed` and `live` keep it.
+  Claude threads, including the summary `/compact` writes in a session of its
+  own; `cached`, `indexed` and `live` keep it.
 - **Behavior change:** `CLAUDE_CODEX_WEBSEARCH=0` now takes Claude Code's
   WebSearch tool away from Claude threads too, while the App's settings saved
   no web search mode. Before, it only made `config/read` report

@@ -3842,6 +3842,8 @@ export class CodexClaudeAppServer {
         forkSession: false,
         mcpServers: null,
         allowedTools: ['Read', 'Glob', 'Grep'],
+        // With web search off, the summary cannot search either.
+        disallowedTools: this.effectiveWebSearch() === 'disabled' ? ['WebSearch'] : [],
         addDirs: [],
         enableFileCheckpointing: false,
         outputFormat: null,
