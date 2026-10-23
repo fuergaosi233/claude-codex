@@ -1,6 +1,8 @@
 // How a subagent thread is named and how its failure is told, kept apart from
 // the server so the wording can be tested on its own.
 
+import { appendSentence } from './util.mjs'
+
 // The CLI puts a provenance header in front of the task text a workflow
 // computes for its agents (and of the user request it relays to them): one
 // line starting like this, then the text indented by two spaces.
@@ -12,23 +14,13 @@ const WORKFLOW_USER_REQUEST_HEADER = '[Workflow harness — user request]'
 // title on screen; the limit only keeps a pasted paragraph out of the record.
 export const SUBAGENT_NAME_MAX_CHARS = 120
 // Longest failure reason; the full text stays in the child's last message.
-export const SUBAGENT_REASON_MAX_CHARS = 400
+const SUBAGENT_REASON_MAX_CHARS = 400
 // How much of the first reason a parent turn's error repeats.
 const SUMMARY_REASON_MAX_CHARS = 200
 
 export const SUBAGENT_FAILED_WITHOUT_REASON = 'The subagent failed without saying why.'
 export const SUBAGENT_STOPPED_BY_USER = 'Stopped by the user.'
 export const SUBAGENT_STOPPED = 'Stopped before it finished.'
-
-// A subagent child turn's error, in Codex's TurnError shape. The reason has
-// no Codex error code: what failed was the agent's run, not a request.
-export function subagentTurnError(message: string): {
-  message: string
-  codexErrorInfo: null
-  additionalDetails: null
-} {
-  return { message, codexErrorInfo: null, additionalDetails: null }
-}
 
 // One line of plain text: terminal escape sequences and bidirectional
 // embedding, override and isolate marks go, runs of whitespace and other
@@ -185,11 +177,11 @@ function jsonErrorMessage(text: string): string | null {
 // how many, and why the first one did, unless the error says so already.
 export function subagentFailureSummary(
   parentMessage: string,
-  failures: { count: number; firstReason: string },
+  failures: { count: number; firstReason: string | null },
 ): string {
   const base = parentMessage.trim()
   if (failures.count <= 0) return base
-  const reason = clipText(collapseWhitespace(failures.firstReason), SUMMARY_REASON_MAX_CHARS)
+  const reason = clipText(collapseWhitespace(failures.firstReason ?? ''), SUMMARY_REASON_MAX_CHARS)
   const known = reason.length > 0 && collapseWhitespace(base).includes(reason)
   const told =
     failures.count === 1
@@ -199,8 +191,7 @@ export function subagentFailureSummary(
       : known || !reason
         ? `${failures.count} subagents failed.`
         : `${failures.count} subagents failed; the first: ${reason}`
-  if (!base) return told
-  return `${/[.!?。！？]$/.test(base) ? base : `${base}.`} ${told}`
+  return appendSentence(base, told)
 }
 
 // The error a failed parent turn ends with, told with its failed subagents.
@@ -210,10 +201,7 @@ export function withSubagentFailures(
   failures: { count: number; firstReason: string | null },
 ): Error {
   if (failures.count <= 0) return error
-  const message = subagentFailureSummary(error.message, {
-    count: failures.count,
-    firstReason: failures.firstReason ?? '',
-  })
+  const message = subagentFailureSummary(error.message, failures)
   if (message === error.message) return error
   const carried = error as Error & { codexErrorInfo?: unknown; additionalDetails?: unknown }
   return Object.assign(new Error(message, { cause: error }), {

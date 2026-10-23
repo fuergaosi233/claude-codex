@@ -304,7 +304,7 @@ export class WorkflowJournalMonitor {
       if (now - since < this.failureReasonWaitMs) return null
     }
     this.endedWithoutResult.delete(agentId)
-    return { agentId, content: `${reason || fallback}\nagentId: ${agentId}`, isError: true }
+    return { agentId, content: agentResultContent(reason || fallback, agentId), isError: true }
   }
 
   private async ensureStarted(
@@ -550,6 +550,12 @@ async function readRegularTextFile(
   }
 }
 
+// A workflow agent's result as an Agent call's: the text, then the
+// `agentId:` trailer the CLI ends an Agent result with.
+export function agentResultContent(body: string, agentId: string): string {
+  return `${body}\nagentId: ${agentId}`
+}
+
 async function workflowAgentResult(
   transcriptDir: string,
   agentId: string,
@@ -567,11 +573,7 @@ async function workflowAgentResult(
     status === 'failure'
   const body = resultText(result) || (await readAgentResult(transcriptDir, agentId))
   if (!body) return null
-  return {
-    agentId,
-    content: `${body}\nagentId: ${agentId}`,
-    isError,
-  }
+  return { agentId, content: agentResultContent(body, agentId), isError }
 }
 
 async function readAgentResult(transcriptDir: string, agentId: string): Promise<string | null> {

@@ -176,6 +176,7 @@ import {
   permissionProfileList,
   permissionProfilePolicy,
   personalityPromptCue,
+  plainTurnError,
   projectMetadata,
   projectName,
   projectRoots,
@@ -219,7 +220,6 @@ import {
   SUBAGENT_STOPPED_BY_USER,
   subagentFailureReason,
   subagentThreadName,
-  subagentTurnError,
   taskEndReason,
   withSubagentFailures,
 } from './subagent-presentation.mjs'
@@ -237,6 +237,7 @@ import {
 import {
   capOutput,
   exploreToolCommand,
+  failedImageRead,
   imageReadPath,
   isExploreTool,
   splitMcpToolName,
@@ -250,12 +251,7 @@ import {
   type TurnPrompt,
   turnPrompt,
 } from './turn-context.mjs'
-import {
-  noticeRowsEnabled,
-  noticeTurnError,
-  TurnNoticeLog,
-  withTurnNotices,
-} from './turn-notices.mjs'
+import { noticeRowsEnabled, TurnNoticeLog, withTurnNotices } from './turn-notices.mjs'
 import { TurnWatchdog } from './turn-watchdog.mjs'
 import type {
   ClaudeResumePoint,
@@ -3624,23 +3620,10 @@ export class CodexClaudeAppServer {
     // draws a stored contextCompaction as compacted, and Codex keeps only
     // the compactions that finished.
     // App rule: compaction-marker
-    const completeCompactItem = (): void => {
+    const endCompactItem = (compacted: boolean): void => {
       if (!compactOpen) return
       compactOpen = false
-      this.store.insertItemAfter(turnId, null, compactItem)
-      this.notify(peer, {
-        method: 'item/completed',
-        params: { threadId, turnId, item: compactItem, completedAtMs: nowMillis() },
-      })
-    }
-    const dropCompactItem = (): void => {
-      if (!compactOpen) return
-      compactOpen = false
-      const item: ThreadItem = { type: 'reasoning', id: compactItem.id, summary: [], content: [] }
-      this.notify(peer, {
-        method: 'item/completed',
-        params: { threadId, turnId, item, completedAtMs: nowMillis() },
-      })
+      this.endCompactionItem(peer, threadId, turnId, compactItem.id, compacted)
     }
     // Set once Claude was asked to compact the session and did not.
     let sessionFailed = false
@@ -3675,12 +3658,8 @@ export class CodexClaudeAppServer {
         current.claudeSessionId &&
         this.runtime.compactsSessions?.() === true
       ) {
-        compacted = await this.runSessionCompaction(
-          peer,
-          current,
-          turnId,
-          active,
-          completeCompactItem,
+        compacted = await this.runSessionCompaction(peer, current, turnId, active, () =>
+          endCompactItem(true),
         ).catch((error) => {
           debugLog('thread.compact.session_failed', {
             threadId,
@@ -3691,7 +3670,7 @@ export class CodexClaudeAppServer {
         sessionFailed = !compacted
       }
       // The summary written next is not the session's compaction.
-      if (sessionFailed && active()) dropCompactItem()
+      if (sessionFailed && active()) endCompactItem(false)
       if (compacted || !active()) return
       const item: ThreadItem = {
         type: 'agentMessage',
@@ -3726,7 +3705,7 @@ export class CodexClaudeAppServer {
     } finally {
       // stop() has already settled the turn and closes SQLite.
       if (!this.stopped) {
-        if (active()) completeCompactItem()
+        if (active()) endCompactItem(true)
         completeAgentItem()
         // An interrupt already ended the turn and told the client.
         const completed = this.endTurn(turn, 'completed', null)
@@ -3742,6 +3721,30 @@ export class CodexClaudeAppServer {
         }
       }
     }
+  }
+
+  // Ends a compaction item. One whose compaction happened is stored in the
+  // turn after `afterItemId` (first in it when null) and completes as
+  // itself; one whose compaction did not happen completes as an empty
+  // reasoning item, which the App does not draw and the turn does not keep.
+  // App rule: compaction-marker
+  // App rule: item-completed-replaces
+  private endCompactionItem(
+    peer: RpcPeer,
+    threadId: string,
+    turnId: string,
+    itemId: string,
+    compacted: boolean,
+    afterItemId: string | null = null,
+  ): void {
+    const item: ThreadItem = compacted
+      ? { type: 'contextCompaction', id: itemId }
+      : { type: 'reasoning', id: itemId, summary: [], content: [] }
+    if (compacted) this.store.insertItemAfter(turnId, afterItemId, item)
+    this.notify(peer, {
+      method: 'item/completed',
+      params: { threadId, turnId, item, completedAtMs: nowMillis() },
+    })
   }
 
   // Sends `/compact` to the thread's Claude session the way the thread's
@@ -4601,16 +4604,6 @@ export class CodexClaudeAppServer {
     // the item becomes this failed Read command instead.
     // App rule: item-completed-replaces
     const imageReadFallbacks = new Map<string, ThreadItem>()
-    const failedImageRead = (
-      itemId: string,
-      output: string | null,
-      exitCode: number | null,
-      durationMs: number | null,
-    ): ThreadItem | null => {
-      const fallback = imageReadFallbacks.get(itemId)
-      if (fallback?.type !== 'commandExecution') return null
-      return { ...fallback, status: 'failed', aggregatedOutput: output, exitCode, durationMs }
-    }
     // What Claude's auto-memory recalled for the turn's prompts.
     const recalledMemories: RecalledMemory[] = []
     // The item/tool/call requests of dynamic tool items still open, by item.
@@ -4768,7 +4761,7 @@ export class CodexClaudeAppServer {
       const updated = this.store.updateItem(turn.id, itemId, (item) => {
         if (item.type === 'commandExecution') return { ...item, status: 'failed', durationMs }
         if (item.type === 'imageView')
-          return failedImageRead(itemId, null, null, durationMs) ?? item
+          return failedImageRead(imageReadFallbacks.get(itemId), null, null, durationMs) ?? item
         if (item.type === 'fileChange') return { ...item, status: 'failed' }
         if (item.type === 'mcpToolCall')
           return { ...item, status: 'failed', error: { message }, durationMs }
@@ -4811,24 +4804,11 @@ export class CodexClaudeAppServer {
         params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: nowMillis() },
       })
     }
-    const completeCompactionItem = (): void => {
+    const endCompaction = (compacted: boolean): void => {
       if (!compaction) return
-      const item: ThreadItem = { type: 'contextCompaction', id: compaction.id }
-      this.store.insertItemAfter(turn.id, compaction.afterItemId, item)
+      const { id, afterItemId } = compaction
       compaction = null
-      this.notify(peer, {
-        method: 'item/completed',
-        params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
-      })
-    }
-    const dropCompactionItem = (): void => {
-      if (!compaction) return
-      const item: ThreadItem = { type: 'reasoning', id: compaction.id, summary: [], content: [] }
-      compaction = null
-      this.notify(peer, {
-        method: 'item/completed',
-        params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
-      })
+      this.endCompactionItem(peer, thread.id, turn.id, id, compacted, afterItemId)
     }
     // File tool calls drawn from Claude's streamed input whose finished call
     // has not arrived yet. Codex streams its own apply_patch input the same
@@ -4989,8 +4969,6 @@ export class CodexClaudeAppServer {
           resolveWatchdog = resolve
         })
       : null
-    const disarmWatchdog = (): void => watchdog.disarm()
-    const noteProgress = (): void => watchdog.noteProgress()
     this.sleptAtTurnProgress.set(turn.id, this.sleepMonitor.suspendedMs())
     const armWatchdog = (): void => {
       if (!acceptRuntimeEvents || (activeSubagents.size === 0 && !workflowInFlight)) return
@@ -5001,7 +4979,7 @@ export class CodexClaudeAppServer {
       turn,
       contexts: subagentContexts,
       active: activeSubagents,
-      noteProgress,
+      noteProgress: () => watchdog.noteProgress(),
     })
     this.closeStreamingItemsByTurn.set(turn.id, () => {
       completeMessage()
@@ -5043,7 +5021,7 @@ export class CodexClaudeAppServer {
           // Anything else the turn still hears (a child's output, its
           // progress, a projected workflow agent) shows it is moving; the
           // watchdog only gives up after a whole window without any of it.
-          noteProgress()
+          watchdog.noteProgress()
           if (showsProgress(event))
             this.sleptAtTurnProgress.set(turn.id, this.sleepMonitor.suspendedMs())
           if (event.type === 'subagent_progress') return
@@ -5411,7 +5389,7 @@ export class CodexClaudeAppServer {
               activeSubagents.delete(event.toolUseId)
               subagentContexts.delete(event.toolUseId)
               itemIds.delete(event.toolUseId)
-              if (activeSubagents.size === 0 && !workflowInFlight) disarmWatchdog()
+              if (activeSubagents.size === 0 && !workflowInFlight) watchdog.disarm()
               return
             }
             const rawResultText = toolResultText(event.content)
@@ -5447,23 +5425,23 @@ export class CodexClaudeAppServer {
               : event.isError
                 ? subagentFailureReason(resultText)
                 : null
-            if (event.isError && !stopped && failureReason) {
+            if (event.isError && !stopped) {
               selfFailedSubagents.count += 1
               selfFailedSubagents.firstReason ??= failureReason
             }
 
             // A child the user stopped ends as interrupted, once: the stop
             // has usually ended it already.
-            const currentChildTurn = this.store.getTurn(ctx.childTurnId)
+            const stoppedTurn = stopped ? this.store.getTurn(ctx.childTurnId) : null
             const childTurn =
-              stopped && currentChildTurn && currentChildTurn.status !== 'inProgress'
-                ? currentChildTurn
+              stoppedTurn && stoppedTurn.status !== 'inProgress'
+                ? stoppedTurn
                 : this.completeSubagentChildTurn(
                     peer,
                     ctx,
                     stopped ? SUBAGENT_STOPPED_BY_USER : resultText,
                     stopped ? 'interrupted' : event.isError ? 'failed' : 'completed',
-                    failureReason ? subagentTurnError(failureReason) : null,
+                    failureReason ? plainTurnError(failureReason) : null,
                     parsed.usage?.durationMs ?? null,
                   )
             recordRunEvent('subagent.completed', {
@@ -5593,7 +5571,7 @@ export class CodexClaudeAppServer {
             // the outer settlement path can still finalize the child as failed.
             activeSubagents.delete(event.toolUseId)
             subagentContexts.delete(event.toolUseId)
-            if (activeSubagents.size === 0 && !workflowInFlight) disarmWatchdog()
+            if (activeSubagents.size === 0 && !workflowInFlight) watchdog.disarm()
             return
           }
           if (event.type === 'text_delta') {
@@ -5729,7 +5707,7 @@ export class CodexClaudeAppServer {
           if (event.type === 'tool_result') {
             if (workflowLaunchToolUseIds.delete(event.toolUseId)) {
               workflowInFlight = workflowLaunchToolUseIds.size > 0
-              if (activeSubagents.size === 0 && !workflowInFlight) disarmWatchdog()
+              if (activeSubagents.size === 0 && !workflowInFlight) watchdog.disarm()
             }
             const itemId = itemIds.get(event.toolUseId)
             if (!itemId || declinedToolUseIds.has(event.toolUseId)) return
@@ -5756,8 +5734,10 @@ export class CodexClaudeAppServer {
                   durationMs,
                 }
               }
-              if (item.type === 'imageView' && event.isError)
-                return failedImageRead(itemId, output, parsedExitCode, durationMs) ?? item
+              if (item.type === 'imageView' && event.isError) {
+                const fallback = imageReadFallbacks.get(itemId)
+                return failedImageRead(fallback, output, parsedExitCode, durationMs) ?? item
+              }
               if (item.type === 'fileChange')
                 return { ...item, status: event.isError ? 'failed' : 'completed' }
               if (item.type === 'mcpToolCall') {
@@ -5822,7 +5802,7 @@ export class CodexClaudeAppServer {
             // A boundary can arrive without the status before it.
             completeMessage()
             startCompactionItem()
-            completeCompactionItem()
+            endCompaction(true)
             this.notify(peer, {
               method: 'thread/compacted',
               params: { threadId: thread.id, turnId: turn.id },
@@ -5836,7 +5816,7 @@ export class CodexClaudeAppServer {
               turnId: turn.id,
               message: event.message,
             })
-            dropCompactionItem()
+            endCompaction(false)
             publishNotice(event.message)
             return
           }
@@ -5882,32 +5862,19 @@ export class CodexClaudeAppServer {
             // runs; one whose agent is gone or unknown shows nowhere, never
             // in this turn. Its Agent call names it, else its task id.
             // App rule: reconnecting-errors
+            let target = { threadId: thread.id, turnId: turn.id }
             if (event.toolUseId || event.agentId) {
               const agent =
                 (event.toolUseId
                   ? (subagentContexts.get(event.toolUseId) ??
                     this.findBackgroundSubagent(thread.id, { toolUseId: event.toolUseId })?.context)
                   : undefined) ?? this.nestingHost(thread.id, subagentContexts, event.agentId)
-              if (!agent || this.store.getTurn(agent.childTurnId)?.status !== 'inProgress') return
-              this.notify(peer, {
-                method: 'error',
-                params: {
-                  threadId: agent.childThreadId,
-                  turnId: agent.childTurnId,
-                  willRetry: true,
-                  error: retryTurnError(event),
-                },
-              })
-              return
+              if (!agent || this.store.turnStatus(agent.childTurnId) !== 'inProgress') return
+              target = { threadId: agent.childThreadId, turnId: agent.childTurnId }
             }
             this.notify(peer, {
               method: 'error',
-              params: {
-                threadId: thread.id,
-                turnId: turn.id,
-                willRetry: true,
-                error: retryTurnError(event),
-              },
+              params: { ...target, willRetry: true, error: retryTurnError(event) },
             })
             return
           }
@@ -6222,7 +6189,7 @@ export class CodexClaudeAppServer {
           watchdogPromise.then(() => ({ kind: 'timeout' as const })),
         ])
       : await runtimeOutcome
-    disarmWatchdog()
+    watchdog.disarm()
     acceptRuntimeEvents = false
     // stop() has already settled this turn and closes SQLite once the runtime
     // stops, so a turn that winds down after that has nothing left to record.
@@ -6293,7 +6260,7 @@ export class CodexClaudeAppServer {
       completeOpenToolItems('Claude finished the turn without a result for this tool.')
       // A compaction that never reached its boundary failed; the turn went
       // on without it, and the context was not compacted.
-      dropCompactionItem()
+      endCompaction(false)
       this.finalizeOrphanedSubagents(peer, thread, turn, subagentContexts, activeSubagents)
     }
     this.subagentStateByTurn.delete(turn.id)
@@ -6391,7 +6358,9 @@ export class CodexClaudeAppServer {
       phase: null,
       memoryCitation: null,
     }
-    this.store.appendItem(childTurnId, startedItem)
+    // App rule: visualize-line
+    const completedItem: ThreadItem = { ...startedItem, text: markVisualizeLines(resultText) }
+    this.store.appendItem(childTurnId, completedItem)
     this.notify(peer, {
       method: 'item/started',
       params: {
@@ -6401,10 +6370,6 @@ export class CodexClaudeAppServer {
         startedAtMs: nowMillis(),
       },
     })
-
-    // App rule: visualize-line
-    const completedItem: ThreadItem = { ...startedItem, text: markVisualizeLines(resultText) }
-    this.store.updateItem(childTurnId, agentItemId, () => completedItem)
     if (resultText) {
       this.notify(peer, {
         method: 'item/agentMessage/delta',
@@ -6432,7 +6397,7 @@ export class CodexClaudeAppServer {
     context: SubagentContext,
     resultText: string,
     status: 'completed' | 'failed' | 'interrupted',
-    error: unknown | null,
+    error: CodexTurnError | null,
     durationMs: number | null = null,
   ): TurnRecord {
     let childTurn = this.store.getTurn(context.childTurnId)
@@ -6465,12 +6430,7 @@ export class CodexClaudeAppServer {
 
     // The child's work ends with it: calls still open fail and the message
     // it was writing closes, as its answer when it is the answer.
-    const errorMessage =
-      error &&
-      typeof error === 'object' &&
-      typeof (error as { message?: unknown }).message === 'string'
-        ? (error as { message: string }).message
-        : null
+    const errorMessage = error?.message ?? null
     const answered = this.subagentItems.finish(
       peer,
       childTurn.id,
@@ -6481,11 +6441,7 @@ export class CodexClaudeAppServer {
     )
     if (!answered) this.appendSubagentAnswer(peer, context, childTurn.id, resultText)
 
-    const completed = this.store.completeTurn(childTurn.id, status, error) ?? childTurn
-    if (durationMs != null) {
-      completed.durationMs = durationMs
-      this.store.upsertTurn(completed)
-    }
+    const completed = this.store.completeTurn(childTurn.id, status, error, durationMs) ?? childTurn
     this.setThreadStatus(peer, context.childThreadId, { type: 'idle' })
     this.notify(peer, {
       method: 'turn/completed',
@@ -6724,7 +6680,7 @@ export class CodexClaudeAppServer {
         context,
         message,
         status,
-        subagentTurnError(message),
+        plainTurnError(message),
       )
       recordRunEvent('subagent.completed', {
         parentThreadId: hostThreadId,
@@ -6899,15 +6855,7 @@ export class CodexClaudeAppServer {
     contexts: Map<string, SubagentContext>,
     event: SubagentOutputEvent,
   ): SubagentContext | null {
-    let agent: SubagentContext | null = null
-    if (event.agentId) {
-      for (const [toolUseId, context] of contexts) {
-        if (this.taskIdByToolUse.get(toolUseId) !== event.agentId) continue
-        agent = context
-        break
-      }
-      agent ??= this.findBackgroundSubagent(threadId, { taskId: event.agentId })?.context ?? null
-    }
+    let agent = event.agentId ? this.agentByTaskId(threadId, contexts, event.agentId, false) : null
     if (!agent) {
       const foreground = contexts.get(event.toolUseId)
       const entry = foreground
@@ -6935,18 +6883,23 @@ export class CodexClaudeAppServer {
     agentId: string | undefined,
   ): SubagentContext | null {
     if (!agentId) return null
-    let host: SubagentContext | null = null
-    for (const [toolUseId, context] of contexts) {
-      if (this.taskIdByToolUse.get(toolUseId) !== agentId) continue
-      host = context
-      break
-    }
-    if (!host) {
-      const entry = this.findBackgroundSubagent(threadId, { taskId: agentId })
-      if (entry?.running) host = entry.context
-    }
-    if (!host || this.store.getTurn(host.childTurnId)?.status !== 'inProgress') return null
+    const host = this.agentByTaskId(threadId, contexts, agentId, true)
+    if (!host || this.store.turnStatus(host.childTurnId) !== 'inProgress') return null
     return host
+  }
+
+  // The agent a task id names: one of this turn's, else one in the
+  // background, which with `runningOnly` must still be running.
+  private agentByTaskId(
+    threadId: string,
+    contexts: Map<string, SubagentContext>,
+    taskId: string,
+    runningOnly: boolean,
+  ): SubagentContext | null {
+    for (const [toolUseId, context] of contexts)
+      if (this.taskIdByToolUse.get(toolUseId) === taskId) return context
+    const entry = this.findBackgroundSubagent(threadId, { taskId })
+    return entry && (!runningOnly || entry.running) ? entry.context : null
   }
 
   private hostHasRunningBackgroundSubagent(hostThreadId: string): boolean {
@@ -7204,13 +7157,13 @@ export class CodexClaudeAppServer {
     if (!entry.running) return
     entry.running = false
     const { context } = entry
-    if (this.store.getTurn(context.childTurnId)?.status === 'inProgress') {
+    if (this.store.turnStatus(context.childTurnId) === 'inProgress') {
       const childTurn = this.completeSubagentChildTurn(
         this.peerForThread(context.childThreadId),
         context,
         text,
         status,
-        status === 'completed' ? null : subagentTurnError(reason ?? subagentFailureReason(text)),
+        status === 'completed' ? null : plainTurnError(reason ?? subagentFailureReason(text)),
         usage?.durationMs ?? null,
       )
       recordRunEvent('subagent.completed', {
@@ -7429,12 +7382,11 @@ export class CodexClaudeAppServer {
       id: newId(),
       content: [{ type: 'text', text: message, text_elements: [] }],
     }
-    const childTurn = this.store.getTurn(context.childTurnId)
-    if (childTurn?.status === 'inProgress') {
+    if (this.store.turnStatus(context.childTurnId) === 'inProgress') {
       // Still running: Claude queues the message for its next step.
-      this.subagentItems.interject(peer, childTurn.id)
-      this.store.appendItem(childTurn.id, userItem)
-      this.emitItemLifecycle(peer, context.childThreadId, childTurn.id, userItem)
+      this.subagentItems.interject(peer, context.childTurnId)
+      this.store.appendItem(context.childTurnId, userItem)
+      this.emitItemLifecycle(peer, context.childThreadId, context.childTurnId, userItem)
     } else {
       const turn: TurnRecord = {
         id: newId(),
@@ -7646,13 +7598,13 @@ export class CodexClaudeAppServer {
         if (stopped !== true) return false
         context.stoppedByUser = true
         // Unless its call returned meanwhile and ended it.
-        if (this.store.getTurn(context.childTurnId)?.status === 'inProgress')
+        if (this.store.turnStatus(context.childTurnId) === 'inProgress')
           this.completeSubagentChildTurn(
             peer,
             context,
             SUBAGENT_STOPPED_BY_USER,
             'interrupted',
-            subagentTurnError(SUBAGENT_STOPPED_BY_USER),
+            plainTurnError(SUBAGENT_STOPPED_BY_USER),
           )
         return true
       }
@@ -9887,7 +9839,7 @@ export class CodexClaudeAppServer {
     if (!decision.show || !visible || !turnId || !noticeRowsEnabled()) return
     this.notify(peer, {
       method: 'error',
-      params: { threadId, turnId, willRetry: true, error: noticeTurnError(message) },
+      params: { threadId, turnId, willRetry: true, error: plainTurnError(message) },
     })
   }
 

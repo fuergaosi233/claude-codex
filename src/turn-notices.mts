@@ -65,21 +65,12 @@ export class TurnNoticeLog {
   messages(key: string): string[] {
     return [...(this.turns.get(key)?.seen ?? [])]
   }
-
-  forget(key: string): void {
-    this.turns.delete(key)
-  }
 }
 
 // CLAUDE_CODEX_NOTICE_ROWS=0 keeps notices to the `warning` alone, as
 // before the rows.
 export function noticeRowsEnabled(): boolean {
   return process.env.CLAUDE_CODEX_NOTICE_ROWS !== '0'
-}
-
-// The `error` notification that shows a notice under a turn.
-export function noticeTurnError(message: string): CodexTurnError {
-  return { message, codexErrorInfo: null, additionalDetails: null }
 }
 
 // A failed turn's error with the turn's notices added to its details, so the

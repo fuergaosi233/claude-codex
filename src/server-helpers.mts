@@ -673,6 +673,13 @@ export interface CodexTurnError {
   additionalDetails: string | null
 }
 
+// A TurnError that is only its message: a notice shown under a turn, or why
+// a subagent's own run ended. It has no Codex error code, since no request
+// failed.
+export function plainTurnError(message: string): CodexTurnError {
+  return { message, codexErrorInfo: null, additionalDetails: null }
+}
+
 // Why Claude Code refused to start (the SDK's SDKStartupFailureReason), told
 // as what fixes it. Only these messages are shown: the CLI's own text can
 // carry a proxy URL with its credentials. `retry` marks the failures a retry

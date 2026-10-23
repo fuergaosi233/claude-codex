@@ -175,7 +175,7 @@ function contextBlocks(lead: string, entries: readonly ContextEntry[]): string |
 
 // The prompt Claude gets for a message: the context injected before it, the
 // message, then the context above.
-export function withTurnContext(
+function withTurnContext(
   prompt: string,
   context: ReadonlyArray<string | null>,
   injected: string | null = null,

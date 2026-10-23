@@ -18,13 +18,14 @@
 // that only gives the watchdog more time or adds a sentence to an error.
 
 import type { CodexTurnError } from './server-helpers.mjs'
+import { appendSentence } from './util.mjs'
 
 export interface SleepClock {
   wall(): number
   monotonic(): number
 }
 
-export const systemClock: SleepClock = {
+const systemClock: SleepClock = {
   wall: () => Date.now(),
   monotonic: () => performance.now(),
 }
@@ -81,10 +82,6 @@ export class SleepTracker implements SleepMonitor {
       options.clearInterval ?? ((handle) => clearInterval(handle as ReturnType<typeof setInterval>))
     this.lastWall = this.clock.wall()
     this.lastMonotonic = this.clock.monotonic()
-  }
-
-  get running(): boolean {
-    return this.timer !== null
   }
 
   start(): void {
@@ -207,8 +204,5 @@ export function withSleepNotice(
   if (info === 'other' && error.additionalDetails?.startsWith('Claude Code startup failure')) {
     return error
   }
-  const message = error.message.trimEnd()
-  const joined =
-    message === '' ? notice : `${message}${/[.!?]$/.test(message) ? '' : '.'} ${notice}`
-  return { ...error, message: joined }
+  return { ...error, message: appendSentence(error.message.trimEnd(), notice) }
 }

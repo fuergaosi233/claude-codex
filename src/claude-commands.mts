@@ -1,7 +1,6 @@
-import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
-import { adapterHome, debugLog } from './util.mjs'
+import { adapterHome, debugLog, stableHash } from './util.mjs'
 
 // Claude Code's own prompt skills (/simplify, /code-review, ...) live inside
 // the CLI binary, so nothing on disk lists them. Nor does anything the adapter
@@ -142,7 +141,7 @@ export function claudeCommandManifest(name: string, folder?: string): string {
 }
 
 function folderManifestDir(folder: string): string {
-  const key = createHash('sha256').update(folder).digest('hex').slice(0, 16)
+  const key = stableHash(folder).slice(0, 16)
   return join(claudeCommandsDir(), FOLDER_MANIFESTS, key)
 }
 

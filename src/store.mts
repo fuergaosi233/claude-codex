@@ -1385,7 +1385,7 @@ export class SessionStore {
     return inherited ? this.rowToTurn(inherited) : null
   }
 
-  listInheritedTurns(threadId: string): TurnRecord[] {
+  private listInheritedTurns(threadId: string): TurnRecord[] {
     const rows = this.db
       .prepare('SELECT * FROM thread_inherited_turns WHERE thread_id = ? ORDER BY position ASC')
       .all(threadId)
@@ -1525,19 +1525,28 @@ export class SessionStore {
   }
 
   private historyCheckpoints(threadId: string): Array<{ checkpoint: ClaudeCheckpoint | null }> {
-    const inherited = this.db
-      .prepare(
-        'SELECT claude_session_id, claude_message_uuid FROM thread_inherited_turns WHERE thread_id = ? ORDER BY position ASC',
-      )
-      .all(threadId) as Array<{ claude_session_id?: unknown; claude_message_uuid?: unknown }>
-    const own = this.db
-      .prepare(
-        'SELECT claude_session_id, claude_message_uuid FROM turns WHERE thread_id = ? ORDER BY started_at ASC, rowid ASC',
-      )
-      .all(threadId) as Array<{ claude_session_id?: unknown; claude_message_uuid?: unknown }>
-    return [...inherited, ...own].map((row) => ({
+    return this.historyRows(threadId, 'claude_session_id, claude_message_uuid').map((row) => ({
       checkpoint: checkpointFrom(row.claude_session_id, row.claude_message_uuid),
     }))
+  }
+
+  // The given columns of the first `limit` turns of a thread's history (all
+  // of them when null), its inherited turns first, as stored.
+  private historyRows(threadId: string, columns: string, limit: number | null = null): any[] {
+    // SQLite reads a negative LIMIT as none.
+    const cap = limit === null ? -1 : Math.max(0, limit)
+    const inherited = this.db
+      .prepare(
+        `SELECT ${columns} FROM thread_inherited_turns WHERE thread_id = ? ORDER BY position ASC LIMIT ?`,
+      )
+      .all(threadId, cap) as any[]
+    if (cap >= 0 && inherited.length >= cap) return inherited
+    const own = this.db
+      .prepare(
+        `SELECT ${columns} FROM turns WHERE thread_id = ? ORDER BY started_at ASC, rowid ASC LIMIT ?`,
+      )
+      .all(threadId, cap < 0 ? -1 : cap - inherited.length) as any[]
+    return [...inherited, ...own]
   }
 
   // Where Claude's context stands before the first turn of a thread's
@@ -1562,18 +1571,7 @@ export class SessionStore {
     this.db.prepare('DELETE FROM thread_inherited_turns WHERE thread_id = ?').run(threadId)
     const columns =
       'id, status, started_at, completed_at, duration_ms, items_json, diff, error_json, root_turn_id, claude_session_id, claude_message_uuid'
-    const rows = [
-      ...(this.db
-        .prepare(
-          `SELECT ${columns} FROM thread_inherited_turns WHERE thread_id = ? ORDER BY position ASC`,
-        )
-        .all(parentId) as any[]),
-      ...(this.db
-        .prepare(
-          `SELECT ${columns} FROM turns WHERE thread_id = ? ORDER BY started_at ASC, rowid ASC`,
-        )
-        .all(parentId) as any[]),
-    ].slice(0, Math.max(0, count))
+    const rows = this.historyRows(parentId, columns, count)
     const insert = this.db.prepare(
       `INSERT INTO thread_inherited_turns (thread_id, position, ${columns})
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -1686,10 +1684,13 @@ export class SessionStore {
     turnId: string,
     status: TurnStatus,
     error: unknown | null = null,
+    durationMs: number | null = null,
   ): TurnRecord | null {
     const turn = this.getTurn(turnId)
     if (!turn) return null
     const completed = settledTurn(turn, status, error)
+    // A duration the runtime measured, in place of the one the turn's times give.
+    if (durationMs != null) completed.durationMs = durationMs
     this.upsertTurn(completed)
     return completed
   }
