@@ -30,8 +30,16 @@ export function subagentTurnError(message: string): {
   return { message, codexErrorInfo: null, additionalDetails: null }
 }
 
+// One line of plain text: terminal escape sequences and bidirectional
+// embedding, override and isolate marks go, runs of whitespace and other
+// control characters become one space, and the ends are trimmed. Names and
+// reasons come from model output and error text the App shows as they are.
 export function collapseWhitespace(text: string): string {
-  return text.replace(/\s+/g, ' ').trim()
+  return text
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/[\u202a-\u202e\u2066-\u2069]/g, '')
+    .replace(/[\s\p{Cc}]+/gu, ' ')
+    .trim()
 }
 
 // Cuts by code point so an emoji or CJK character is never split.

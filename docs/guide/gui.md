@@ -407,9 +407,10 @@ thread's own servers.
 Each subagent Claude launches gets its own thread under the chat. The adapter
 names the thread when the subagent starts: with the Agent call's
 `description` or a workflow agent's label, else with the agent's type and the
-first line of its prompt, at most 120 characters. The App then runs no title
-turn for it, and the name stays the same in the thread's history and after
-the adapter restarts. A workflow agent's prompt is the task the workflow
+first line of its prompt, as one line of at most 120 characters without
+control characters or terminal escapes. The App then runs no title turn for
+it, and the name stays the same in the thread's history and after the
+adapter restarts. A workflow agent's prompt is the task the workflow
 computed for it, not the user request the workflow relays to every agent.
 
 A subagent that fails says why. Its thread's turn fails with the reason Claude

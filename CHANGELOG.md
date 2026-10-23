@@ -625,7 +625,9 @@ versioning or publishing metadata.
   `thread/list` and after a restart. The Codex App used to run a title turn
   for every subagent, which named workflow agents after the workflow's
   relayed user request; a workflow agent's prompt is now the task the
-  workflow computed for it.
+  workflow computed for it. Names and failure reasons are one line of plain
+  text, without control characters, terminal escapes or bidirectional
+  overrides.
 - A subagent that fails says why: its thread's turn fails with the reason
   Claude Code gave instead of "subagent failed", the agent's state on the
   parent's wait carries the reason, and a parent turn that fails after its

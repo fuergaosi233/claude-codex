@@ -120,6 +120,29 @@ test('a subagent thread is named by its description, else its type and first pro
   assert.equal(clipText('short', 120), 'short')
 })
 
+test('names and failure reasons keep no control characters or terminal escapes', () => {
+  // A bell, a NUL, a C1 control, DEL, terminal colors and a right-to-left
+  // override would garble the sidebar or reorder the text after them.
+  const noisy = '\u001b[1;31mFix\u0007 the\u0000parser\u0085now\u007f \u202eevil\u202c\u2066x\u2069'
+  assert.equal(subagentThreadName({ description: noisy }), 'Fix the parser now evilx')
+  assert.equal(
+    subagentThreadName({
+      description: '\u0007\u001b[0m',
+      subType: 'Explore',
+      prompt: 'Look\u0000 up',
+    }),
+    'Explore: Look up',
+  )
+  assert.equal(
+    subagentFailureReason('\u001b[31mError:\u001b[0m disk\u0000full\r\n\u001b[2K'),
+    'Error: disk full',
+  )
+  assert.equal(taskEndReason('failed', 'Agent\u0007 stalled', null, 'Survey'), 'Agent stalled')
+  assert.equal(workflowAgentDescription('', 'abc', 'Lexer\u0000review\u202e'), 'Lexer review')
+  // Emoji sequences keep their joiners.
+  assert.equal(subagentThreadName({ description: 'Ship 👩\u200d💻 it' }), 'Ship 👩\u200d💻 it')
+})
+
 test('a workflow agent is described by its label, else the first line of its task', () => {
   const prompt = workflowAgentPrompt([relay, task]) ?? ''
   assert.equal(workflowAgentDescription(prompt, 'abc', '  Lexer \n review '), 'Lexer review')
