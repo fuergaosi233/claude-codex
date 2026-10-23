@@ -43,13 +43,14 @@ versioning or publishing metadata.
   computer slept, that this broke Claude's connection to the model, and that a
   message (or Continue) picks up where it left off; on macOS it also points to
   the App's **Prevent sleep while running** setting. A sleep the turn went on
-  from is not blamed (API retries, a subagent's included, notices, hooks,
-  Claude Code's heartbeats for a running tool call, the message Claude Code
-  writes to name the failed request, the result of a subagent that ended on
-  one and the failing result do not count as going on). The error code and
-  details are unchanged, and
-  refusals such as usage limits, an overloaded API or a Claude Code start that
-  a retry cannot fix are left alone.
+  from is not blamed: only what Claude or a subagent wrote or ran after waking
+  counts as going on, not API retries (a subagent's included), notices, hooks,
+  the heartbeats and other frames Claude Code sends while an agent runs or
+  after its request failed, the message naming the failed request, or the
+  error result of an agent (nested ones included) whose request failed. The
+  error code and details are unchanged, and refusals such as usage limits, an
+  overloaded API or a Claude Code start that a retry cannot fix are left
+  alone.
 - The subagent watchdog (`CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS`) no longer fails a
   turn over quiet that is not a stall. The wait is paused while the turn waits
   on the user (an approval, a question, an MCP elicitation or a client dynamic

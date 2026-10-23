@@ -1362,20 +1362,16 @@ test('native turn reports progress of the agents it waits on, not of those it ha
   await runtime.stop()
 })
 
-test("an agent's failed requests and the CLI's heartbeats keep the turn alive, marked as no progress of its work", async () => {
+test("only an agent's work is its progress: not its failed requests, the CLI's heartbeats or the frames around a retry", async () => {
   const { runtime, queries } = fakeRuntime()
   const events: RuntimeEvent[] = []
   const turn = runtime.runTurn(context, handlers(events))
   const query = await waitFor(() => queries[0], 'session')
   const progress = () =>
     events.flatMap((event) =>
-      event.type !== 'subagent_progress'
-        ? []
-        : event.failedRequest
-          ? ['failed']
-          : event.heartbeat
-            ? ['heartbeat']
-            : ['progress'],
+      event.type === 'subagent_progress'
+        ? [`${event.toolUseId} ${event.idle ? 'idle' : 'work'}`]
+        : [],
     )
   // One frame at a time, past the interval between two reports.
   const send = async (frame: Record<string, unknown>, reports: number) => {
@@ -1383,148 +1379,165 @@ test("an agent's failed requests and the CLI's heartbeats keep the turn alive, m
     await waitFor(() => progress().length === reports, `progress report ${reports}`)
     await sleep(300)
   }
-  query.push(
-    init,
-    assistant('m1', [
-      { type: 'tool_use', id: 'agent-1', name: 'Agent', input: { prompt: 'check the build' } },
+  // The frames as Claude Code sends them without forwardSubagentText: of
+  // the agent's own messages only its tool calls and their results.
+  const agentCall = (id: string, call: string, parent: string | null = null) => ({
+    ...assistant(id, [
+      { type: 'tool_use', id: call, name: 'Agent', input: { description: call, prompt: call } },
     ]),
-  )
-  // The CLI tells the agent's retry as its Agent call's tool_progress...
-  await send(
-    {
-      type: 'tool_progress',
-      tool_use_id: 'agent_msg_child',
-      tool_name: 'Agent',
-      parent_tool_use_id: 'agent-1',
-      elapsed_time_seconds: 3,
-      subagent_retry: {
-        agent_id: 'a1b2c3d4e5f60718',
-        attempt: 1,
-        max_retries: 10,
-        retry_delay_ms: 1000,
-        error_status: null,
-        error_category: 'unknown',
-      },
+    parent_tool_use_id: parent,
+  })
+  const taskStarted = (call: string) => ({
+    type: 'system',
+    subtype: 'task_started',
+    task_id: `task-${call}`,
+    tool_use_id: call,
+    task_type: 'local_agent',
+    description: call,
+  })
+  const work = (call: string, id: string) => ({
+    type: 'assistant',
+    parent_tool_use_id: call,
+    message: {
+      id: `sub-${id}`,
+      content: [{ type: 'tool_use', id, name: 'Bash', input: { command: 'ls' } }],
     },
-    1,
-  )
-  // ...an api_retry naming the call is the agent's too...
+  })
+  const retry = (call: string, attempt: number) => ({
+    type: 'tool_progress',
+    tool_use_id: `agent_msg_${call}`,
+    tool_name: 'Agent',
+    parent_tool_use_id: call,
+    elapsed_time_seconds: 0,
+    subagent_type: 'general-purpose',
+    subagent_retry: {
+      agent_id: `task-${call}`,
+      attempt,
+      max_retries: 10,
+      retry_delay_ms: 1000,
+      error_status: null,
+      error_category: 'unknown',
+    },
+  })
+  // Sent once the agent's next message comes after a retry, whether the
+  // request went through or that message is the error it ended on.
+  const retryOver = (call: string) => {
+    const { subagent_retry: _, ...frame } = retry(call, 0)
+    return frame
+  }
+  const heartbeat = (call: string, tick: number) => ({
+    type: 'tool_progress',
+    tool_use_id: `${call}-heartbeat-${tick}`,
+    tool_name: 'Agent',
+    parent_tool_use_id: call,
+    elapsed_time_seconds: 30 * (tick + 1),
+    heartbeat: true,
+  })
+  const result = (
+    call: string,
+    content: string,
+    isError = false,
+    parent: string | null = null,
+  ) => ({
+    type: 'user',
+    parent_tool_use_id: parent,
+    message: {
+      content: [
+        { type: 'tool_result', tool_use_id: call, content, ...(isError ? { is_error: true } : {}) },
+      ],
+    },
+  })
+  const failure = 'API Error: Connection error.'
+
+  // A retry that went through, then the agent's work.
+  query.push(init, agentCall('m1', 'agent-1'), taskStarted('agent-1'))
+  await send(retry('agent-1', 1), 1)
+  await send(retryOver('agent-1'), 2)
+  await send(work('agent-1', 'bash-1'), 3)
+  query.push(result('agent-1', 'built'))
+  // A retry that went through to an answer, which is no tool call: Claude
+  // Code forwards nothing of it, and the call's result is no failure.
+  query.push(agentCall('m2', 'agent-2'), taskStarted('agent-2'))
+  await send(retry('agent-2', 1), 4)
+  await send(retryOver('agent-2'), 5)
+  query.push(result('agent-2', 'All tests pass.'))
+  // The CLI's timer ticks every 30 s whatever the agent does; its work goes
+  // out at once even right after a tick.
+  query.push(agentCall('m3', 'agent-3'), taskStarted('agent-3'))
+  query.push(heartbeat('agent-3', 0), work('agent-3', 'bash-3'))
+  await waitFor(() => progress().length === 7, 'progress report 7')
+  await sleep(300)
+  // Retries that ran out: the frame after the last one, the failed task's
+  // update and notification and the call's error result tell of no work.
+  await send(heartbeat('agent-3', 1), 8)
+  await send(retry('agent-3', 1), 9)
+  await send(retry('agent-3', 2), 10)
+  await send(retryOver('agent-3'), 11)
   await send(
     {
       type: 'system',
-      subtype: 'api_retry',
-      attempt: 2,
-      max_retries: 10,
-      retry_delay_ms: 2000,
-      error_status: null,
-      error: 'unknown',
-      parent_tool_use_id: 'agent-1',
+      subtype: 'task_updated',
+      task_id: 'task-agent-3',
+      patch: { status: 'failed', end_time: 1, error: failure },
     },
-    2,
+    12,
   )
-  // ...and so is the message naming the error once the request failed for good.
   await send(
     {
-      type: 'assistant',
-      parent_tool_use_id: 'agent-1',
-      error: 'unknown',
-      message: { id: 'sub-error', model: '<synthetic>', content: [text('API Error')] },
+      type: 'system',
+      subtype: 'task_notification',
+      task_id: 'task-agent-3',
+      tool_use_id: 'agent-3',
+      status: 'failed',
+      summary: 'agent-3',
+      output_file: '',
     },
-    3,
+    13,
   )
-  // The frame saying a retried request went through (no subagent_retry), or
-  // the agent's own output, is progress.
-  await send(
-    {
-      type: 'tool_progress',
-      tool_use_id: 'agent_msg_child',
-      tool_name: 'Agent',
-      parent_tool_use_id: 'agent-1',
-      elapsed_time_seconds: 0,
-      subagent_type: 'general-purpose',
-    },
-    4,
-  )
-  query.push(
-    {
-      type: 'user',
-      parent_tool_use_id: null,
-      message: { content: [{ type: 'tool_result', tool_use_id: 'agent-1', content: 'built' }] },
-    },
-    assistant('m2', [
-      { type: 'tool_use', id: 'agent-2', name: 'Agent', input: { prompt: 'run the tests' } },
-    ]),
-  )
-  // The CLI's timer ticks every 30 s whatever the agent does: no progress of
-  // its work. The agent's output goes out at once even right after one.
-  query.push(
-    {
-      type: 'tool_progress',
-      tool_use_id: 'agent-2-heartbeat-0',
-      tool_name: 'Agent',
-      parent_tool_use_id: 'agent-2',
-      elapsed_time_seconds: 30,
-      heartbeat: true,
-    },
-    {
-      type: 'assistant',
-      parent_tool_use_id: 'agent-2',
-      message: { id: 'sub-2', content: [text('Running the tests.')] },
-    },
-  )
-  await waitFor(() => progress().length === 6, 'progress report 6')
-  await sleep(300)
-  // An agent that ended on a request that failed for good: its call's
-  // result tells of the failure, and is no progress either...
-  await send(
-    {
-      type: 'assistant',
-      parent_tool_use_id: 'agent-2',
-      error: 'unknown',
-      message: { id: 'sub-error-2', model: '<synthetic>', content: [text('API Error')] },
-    },
-    7,
-  )
-  // ...even with a heartbeat after the failure.
-  await send(
-    {
-      type: 'tool_progress',
-      tool_use_id: 'agent-2-heartbeat-1',
-      tool_name: 'Agent',
-      parent_tool_use_id: 'agent-2',
-      elapsed_time_seconds: 60,
-      heartbeat: true,
-    },
-    8,
-  )
-  query.push(
-    {
-      type: 'user',
-      parent_tool_use_id: null,
-      message: {
-        content: [{ type: 'tool_result', tool_use_id: 'agent-2', content: 'API Error' }],
-      },
-    },
-    { type: 'result', subtype: 'success', result: 'Built.' },
-  )
+  query.push(result('agent-3', failure, true))
+  // A nested agent that ended on a failed request: its error result, which
+  // comes as its host's frame, is no work of the host's either.
+  query.push(agentCall('m4', 'agent-4'), taskStarted('agent-4'))
+  await send(agentCall('sub-4', 'agent-5', 'agent-4'), 14)
+  await send(retry('agent-5', 1), 15)
+  await send(retryOver('agent-5'), 16)
+  await send(result('agent-5', failure, true, 'agent-4'), 17)
+  await send(retry('agent-4', 1), 18)
+  await send(retryOver('agent-4'), 19)
+  query.push(result('agent-4', failure, true), { type: 'result', subtype: 'success', result: '' })
   await turn
   assert.deepEqual(progress(), [
-    'failed',
-    'failed',
-    'failed',
-    'progress',
-    'heartbeat',
-    'progress',
-    'failed',
-    'heartbeat',
+    'agent-1 idle',
+    'agent-1 idle',
+    'agent-1 work',
+    'agent-2 idle',
+    'agent-2 idle',
+    'agent-3 idle',
+    'agent-3 work',
+    'agent-3 idle',
+    'agent-3 idle',
+    'agent-3 idle',
+    'agent-3 idle',
+    'agent-3 idle',
+    'agent-3 idle',
+    'agent-4 work',
+    'agent-5 idle',
+    'agent-5 idle',
+    'agent-4 idle',
+    'agent-4 idle',
+    'agent-4 idle',
   ])
+  // The result of a call whose agent's requests ran out tells of the failure.
   assert.deepEqual(
     events.flatMap((event) =>
       event.type === 'tool_result' ? [[event.toolUseId, event.failedRequest === true]] : [],
     ),
     [
       ['agent-1', false],
-      ['agent-2', true],
+      ['agent-2', false],
+      ['agent-3', true],
+      ['agent-5', true],
+      ['agent-4', true],
     ],
   )
   await runtime.stop()
