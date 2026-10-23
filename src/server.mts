@@ -689,6 +689,7 @@ export class CodexClaudeAppServer {
       onAutonomousTurn: (threadId) => this.handleAutonomousTurn(threadId),
       onSessionReleased: (threadId, liveTaskIds) =>
         this.handleSessionReleased(threadId, liveTaskIds),
+      onNotice: (threadId, message) => this.handleRuntimeNotice(threadId, message),
     })
   }
 
@@ -7024,6 +7025,19 @@ export class CodexClaudeAppServer {
       return
     }
     this.startAutonomousTurn(threadId)
+  }
+
+  // A notice the runtime raises outside any turn's stream, such as a call a
+  // background agent made between turns that had to be refused. It shows
+  // under the thread's running turn, else under its last one; a thread
+  // without turns only gets the warning.
+  // App rule: turn-notices
+  private handleRuntimeNotice(threadId: string, message: string): void {
+    if (this.stopped || !this.store.getThread(threadId)) return
+    const turnId =
+      this.activeTurnByThread.get(threadId) ?? this.store.lastTurnRef(threadId)?.id ?? null
+    debugLog('thread.notice', { threadId, turnId })
+    this.publishNotice(this.peerForThread(threadId), threadId, turnId, message)
   }
 
   // Claude answers a background agent's report without a user prompt. Open

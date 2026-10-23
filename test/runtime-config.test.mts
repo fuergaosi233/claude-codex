@@ -579,7 +579,12 @@ test('native SDK runtime offers dynamic tools as MCP servers and routes calls to
   })
   session.current = null
   assert.deepEqual(await app.tools[0].handler({ query: 'x' }, { signal }), {
-    content: [{ type: 'text', text: 'dynamic tools are only available during a turn' }],
+    content: [
+      {
+        type: 'text',
+        text: 'list_artifacts was not run because no user turn was active to answer it; the user can re-run it in a turn.',
+      },
+    ],
     isError: true,
   })
   assert.equal(calls.length, 2)

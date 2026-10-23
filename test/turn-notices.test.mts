@@ -163,3 +163,53 @@ test("a failed turn keeps the notices it had in its error's details", async () =
     assert.ok(stored?.additionalDetails?.endsWith(details))
   })
 })
+
+test('a notice between turns shows under the running turn, else the last one', async () => {
+  let release: (() => void) | null = null
+  const runtime = scriptedRuntime(async (context, handlers) => {
+    if (context.prompt.includes('hold')) {
+      await new Promise<void>((resolve) => {
+        release = resolve
+      })
+    }
+    await handlers.onEvent({ type: 'text_delta', delta: 'done' })
+    await handlers.onEvent({ type: 'completed', success: true, result: 'done' })
+  })
+  await withInProcessApp(runtime, async (app) => {
+    const listener = runtime.listener
+    assert.ok(listener?.onNotice)
+    const denied =
+      'Bash was denied: background work asked for it while no turn was running, so there was nowhere to ask you for approval. Ask Claude to run it again in a new message to approve it.'
+
+    // A thread without turns has nothing to show it under.
+    const fresh = await app.startThread()
+    listener.onNotice(fresh, denied)
+    assert.deepEqual(app.notified('warning'), [{ threadId: fresh, message: denied }])
+    assert.deepEqual(app.notified('error'), [])
+
+    const threadId = await app.startThread()
+    const firstTurn = await app.startTurn(threadId, 'go')
+    await app.turnCompleted(firstTurn)
+    listener.onNotice(threadId, denied)
+    assert.deepEqual(app.notified('error'), [
+      {
+        threadId,
+        turnId: firstTurn,
+        willRetry: true,
+        error: { message: denied, codexErrorInfo: null, additionalDetails: null },
+      },
+    ])
+    // The ended turn stays as it was.
+    assert.equal(app.store.getTurn(firstTurn)?.status, 'completed')
+    // The same notice again for that turn is not repeated.
+    listener.onNotice(threadId, denied)
+    assert.equal(app.notified('error').length, 1)
+
+    const running = await app.startTurn(threadId, 'hold')
+    const releaseTurn = await app.waitFor(() => release ?? undefined)
+    listener.onNotice(threadId, 'tracker asked for your input while no turn was running.')
+    assert.equal(app.notified('error').at(-1)?.turnId, running)
+    releaseTurn()
+    assert.equal((await app.turnCompleted(running)).status, 'completed')
+  })
+})

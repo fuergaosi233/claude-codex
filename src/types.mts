@@ -1021,6 +1021,9 @@ export interface RuntimeBackgroundListener {
   // The thread's live session ended. `liveTaskIds` are the background tasks
   // it still tracked as running; nothing will report on them any more.
   onSessionReleased(threadId: string, liveTaskIds: string[]): void
+  // Something the user should hear about that happened while no turn of the
+  // thread was running, such as a tool call refused for want of one.
+  onNotice?(threadId: string, message: string): void
 }
 
 export interface RuntimeSteerOptions {

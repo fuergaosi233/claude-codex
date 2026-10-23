@@ -420,9 +420,9 @@ export const APP_RULES: readonly AppRule[] = [
     id: 'turn-notices',
     app: 'Shows an `error` notification with willRetry as a dim row of its own under the turn it names, with its message as written, whether that turn still runs or has ended, without failing or ending the turn; only a "Reconnecting... n/m" message replaces the row before it. It does not keep the row when the chat is reopened, and it ignores `warning` notifications.',
     adapter:
-      "Sends what Claude Code reports beside a turn (a compaction it could not do, a model it switched to, an urgent CLI notification, a tool call it denied) as a `warning`, as Codex does, and as such an `error` with no code: each message once per turn, the first 5 as rows. A turn that then fails repeats its notices in the error's additionalDetails, which the App keeps. A structured-output helper turn sends warnings only, and CLAUDE_CODEX_NOTICE_ROWS=0 turns the rows off.",
+      "Sends what Claude Code reports beside a turn (a compaction it could not do, a model it switched to, an urgent CLI notification, a call it denied or an MCP request it declined while no turn was running) as a `warning`, as Codex does, and as such an `error` with no code: each message once per turn, the first 5 as rows. A notice between turns goes under the thread's running or last turn. A turn that then fails repeats its notices in the error's additionalDetails, which the App keeps. A structured-output helper turn sends warnings only, and CLAUDE_CODEX_NOTICE_ROWS=0 turns the rows off.",
     verify:
-      'Run /compact in a chat whose conversation Claude Code refuses to compact: a row under the turn says why, and the turn completes.',
+      'Have a background task call a tool that needs approval after the turn ended: a row under the last turn says the call was denied and how to run it again, and the turn stays completed.',
   },
   {
     id: 'compaction-marker',
