@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { autoCompactWindowEnv } from './auto-compact.mjs'
 import { autoMemoryEnv } from './memories.mjs'
+import { flatPrompt } from './turn-context.mjs'
 import type { ClaudeRuntime, RuntimeHandlers, RuntimeTurnContext } from './types.mjs'
 
 export interface ClaudePRuntimeOptions {
@@ -28,7 +29,7 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
   async runTurn(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void> {
     const tmp = await mkdtemp(join(tmpdir(), 'claude-codex-claude-p-'))
     const inputFile = join(tmp, 'prompt.txt')
-    await writeFile(inputFile, context.prompt, 'utf8')
+    await writeFile(inputFile, flatPrompt(context.prompt, context.promptContext), 'utf8')
 
     try {
       if (context.imageInputs.length > 0) {
@@ -121,6 +122,11 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
     if (resume && !context.forkSession && !context.resumeSessionAt) args.push('--resume', resume)
     const allowedTools = allowedToolsForContext(context)
     if (allowedTools) args.push('--allowedTools', allowedTools)
+    // The tools the thread must not have (WebSearch with web search off,
+    // permission deny rules, MCP tools the config disables), as the SDK
+    // route passes them; claude-p hands the flag on to Claude Code.
+    if (context.disallowedTools && context.disallowedTools.length > 0)
+      args.push('--disallowedTools', context.disallowedTools.join(','))
     if (
       this.options.skipPermissions ||
       context.approvalPolicy === 'never' ||
@@ -320,10 +326,12 @@ function parseClaudePJson(stdout: string): ParsedClaudePResult | null {
 }
 
 function allowedToolsForContext(context: RuntimeTurnContext): string | null {
-  if (context.sandboxMode === 'read-only') return READ_ONLY_TOOLS.join(',')
-  return context.allowedTools && context.allowedTools.length > 0
-    ? context.allowedTools.join(',')
-    : null
+  // A tool the thread must not have is not pre-approved either.
+  const denied = new Set(context.disallowedTools ?? [])
+  const tools = (
+    context.sandboxMode === 'read-only' ? READ_ONLY_TOOLS : (context.allowedTools ?? [])
+  ).filter((tool) => !denied.has(tool))
+  return tools.length > 0 ? tools.join(',') : null
 }
 
 function claudePResumeId(value: string | null): string | null {

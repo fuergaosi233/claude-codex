@@ -96,8 +96,9 @@ export const APP_RULES: readonly AppRule[] = [
     id: 'skills-popup',
     app: 'Fills the Skills group of the "/" popup from skills/list, refetches it on skills/changed, and sends a picked skill as a [$name](path) link inside the prompt text.',
     adapter:
-      "Lists Claude Code's built-in commands as skills and turns the first such link back into `/name args`.",
-    verify: 'Type "/" in the composer: /simplify is listed, and picking it runs the command.',
+      "Lists the commands Claude Code reports as skills: its built-in skills, and per folder the user's, the project's, plugins' and MCP servers' commands. Turns the first such link back into `/name args`, and sends a message that starts with a command with that text as its last block, after the message's context and images, since Claude Code runs a command only from there.",
+    verify:
+      'Type "/" in the composer: /simplify is listed, and so is a command from .claude/commands once a chat in that folder has run a turn; picking either runs it, in a side chat and with an image attached too.',
   },
   {
     id: 'optimistic-user-message',
@@ -399,6 +400,37 @@ export const APP_RULES: readonly AppRule[] = [
       "Only with CLAUDE_CODEX_MEMORIES=1: lists memories as a beta feature, on only when features.memories in the config, or else the connection's enablement, turns it on, serves the memories table in config/read, and keeps each thread's mode. It then runs Claude Code with auto-memory only for threads whose mode is enabled while the feature is on, switching it off with CLAUDE_CODE_DISABLE_AUTO_MEMORY otherwise. Without the switch it lists no features, acknowledges thread/memoryMode/set without effect and leaves auto-memory to Claude Code's own settings. Either way it refuses memory/reset, since Claude Code's memory folders are shared with Claude Code outside the App.",
     verify:
       'With CLAUDE_CODEX_MEMORIES=1, turn Memories on in Settings > Personalization: the switch stays on after a reload, and /memories shows in the composer of a chat. Without it, Settings > Personalization shows no Memories settings.',
+  },
+  {
+    id: 'mcp-settings',
+    app: 'Lists the servers of Settings > MCP servers from config/read mcp_servers, and saves to the file of the first user layer, or else of the user, system or project origin of mcp_servers (or of mcp_servers.<name>); with neither it says "MCP server settings are unavailable". Adding, editing or deleting a server sends config/batchWrite with one replace edit of mcp_servers.<name> (null deletes); its switch sends config/value/write of mcp_servers.<name>.enabled with upsert. A server whose origin is a project file cannot be edited, and a server mcpServerStatus/list reports that config/read does not list shows apart from the others. A refused save shows the error message under the form.',
+    adapter:
+      "Reports the user config file as the origin of mcp_servers. Only with CLAUDE_CODEX_APP_MCP_SERVERS=1: lists the servers the App added with that origin each, keeps them in its own config file, and starts the enabled ones in Claude threads; a write naming no command or URL, a field of the wrong type, or the switch of a server the App never added is refused. Without it, config/read lists no server and every write that would add, change or delete one is refused with a message naming the switch and Claude Code's own MCP config.",
+    verify:
+      'With CLAUDE_CODEX_APP_MCP_SERVERS=1, add a stdio server under Settings > MCP servers: it stays listed after a reload, mcpServerStatus/list reports it, and a Claude chat can call its tools; switching it off takes the tools away in the next turn. Without it, saving a new server shows the message under the form.',
+  },
+  {
+    id: 'desktop-mcp-servers',
+    app: "Writes mcp_servers.node_repl (its desktop REPL, with the App's own environment) and mcp_servers.cua_repl into the user config with config/batchWrite each time it starts, for its own Codex threads, and treats both names as its desktop servers.",
+    adapter:
+      'Accepts those writes and keeps neither, so Claude threads never start them and the App settings list does not show them.',
+    verify:
+      'In the bundle, the main process still writes only those two servers, and the MCP settings page still treats them as desktop servers.',
+  },
+  {
+    id: 'settings-write-errors',
+    app: 'Writes Settings > Configuration (approval policy, sandbox mode, network access, web search, verbosity, reasoning summaries) with config/value/write, reads the values back from config/read, and shows "Couldn\'t update this setting" next to a setting whose write fails.',
+    adapter:
+      'Refuses a write of a setting Claude threads have no counterpart for, such as model verbosity, a service tier or network access off, and reports in config/read what Claude threads do for it, except the network access the permission-presets rule keeps unset.',
+    verify: 'Picking a verbosity, or turning network access off, shows the error next to it.',
+  },
+  {
+    id: 'permission-presets',
+    app: "Takes config/read's approval_policy on-request with sandbox_mode workspace-write for its Default permissions preset only while sandbox_workspace_write is null, or a table with no writable_roots and network_access, exclude_tmpdir_env_var and exclude_slash_tmp all false (app-shared y4e/v4e; $_t/Q_t in 26.930). Otherwise it lists Custom (config.toml) in the composer's permissions menu and preselects it for a new chat with no stored choice. Settings > Configuration shows network access as that table's network_access, off when it is null.",
+    adapter:
+      'Reports sandbox_workspace_write as null, as Codex does without a [sandbox_workspace_write] table, although Claude threads always have network access; Settings shows network access off for them, and turning it off is refused under settings-write-errors.',
+    verify:
+      'With no permissions picked before, start a new chat: the composer shows Default permissions and the menu lists no Custom (config.toml).',
   },
   {
     id: 'dynamic-tools',

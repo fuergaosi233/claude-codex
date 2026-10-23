@@ -13,7 +13,12 @@ import {
   CONTEXT_ENTRY_LIMIT,
   SKILL_FILE_LIMIT,
 } from '../src/turn-context.mjs'
-import type { ClaudeRuntime, RpcPeer, RuntimeTurnContext } from '../src/types.mjs'
+import type {
+  ClaudeRuntime,
+  RpcPeer,
+  RuntimeSteerOptions,
+  RuntimeTurnContext,
+} from '../src/types.mjs'
 import { threadVisualizationDir } from '../src/util.mjs'
 
 const noInstructions = {
@@ -56,9 +61,10 @@ async function withPromptServer(
     store: SessionStore
     request: (method: string, params: Record<string, unknown>) => Promise<any>
     turn: (threadId: string, params?: Record<string, unknown>) => Promise<RuntimeTurnContext>
-    // Prompts steered into a turn. A turn whose prompt holds `[hold]` runs
-    // until the first steer arrives.
+    // Prompts steered into a turn, and their options. A turn whose prompt
+    // holds `[hold]` runs until the first steer arrives.
     steers: string[]
+    steerOptions: RuntimeSteerOptions[]
     nextCompletion: () => Promise<void>
   }) => Promise<void>,
   setup?: (directory: string) => Promise<void>,
@@ -75,6 +81,7 @@ async function withPromptServer(
   let finish: (() => void) | undefined
   let timeout: NodeJS.Timeout | undefined
   const steers: string[] = []
+  const steerOptions: RuntimeSteerOptions[] = []
   let steered: () => void = () => {}
   const firstSteer = new Promise<void>((resolve) => {
     steered = resolve
@@ -85,8 +92,9 @@ async function withPromptServer(
       if (context.prompt.includes('[hold]')) await firstSteer
       await handlers.onEvent({ type: 'completed', success: true, result: 'done' })
     },
-    steer: async (_threadId, prompt) => {
+    steer: async (_threadId, prompt, options) => {
       steers.push(prompt)
+      steerOptions.push(options ?? {})
       steered()
     },
     interrupt: async () => {},
@@ -133,7 +141,7 @@ async function withPromptServer(
     return context
   }
   try {
-    await body({ directory, store, request, turn, steers, nextCompletion })
+    await body({ directory, store, request, turn, steers, steerOptions, nextCompletion })
   } finally {
     if (timeout) clearTimeout(timeout)
     await server.stop()
@@ -421,6 +429,128 @@ test('server adds the SKILL.md of a picked skill to the prompt Claude reads', as
     })
     assert.equal(summary.prompt, text)
   })
+})
+
+// Claude Code runs a message as a command only when the text block it ends
+// with starts with `/name`, and reads the rest of that block as the
+// command's arguments.
+test('a message that runs a Claude Code command keeps its text as typed, after its context', async () => {
+  await withPromptServer(
+    async ({ directory, request, turn, steers, steerOptions, nextCompletion }) => {
+      const skillFile = join(directory, '.claude', 'skills', 'style', 'SKILL.md')
+      await mkdir(dirname(skillFile), { recursive: true })
+      await writeFile(skillFile, 'Write short sentences.\n')
+      const { thread } = await request('thread/start', { cwd: directory, model: 'sonnet' })
+      const page = { page: { value: 'Page text.', kind: 'application' } }
+      const pageBlock =
+        'The Codex App attached this context to the message.\n\n<app_context key="page" kind="application">\nPage text.\n</app_context>'
+      const simplify = `[$simplify](${claudeCommandManifest('simplify')})`
+
+      // Nothing else to add: the command's text alone.
+      const bare = await turn(thread.id, { input: [{ type: 'text', text: `${simplify} src` }] })
+      assert.equal(bare.prompt, '/simplify src')
+      assert.deepEqual(bare.promptContext, [])
+
+      // A skill picked with it and the App's context go before the text, not
+      // into the arguments.
+      const picked = await turn(thread.id, {
+        input: [{ type: 'text', text: `${simplify} src [$style](${skillFile})` }],
+        additionalContext: page,
+      })
+      assert.equal(picked.prompt, `/simplify src [$style](${skillFile})`)
+      assert.deepEqual(picked.promptContext, [
+        `The user picked these skills for this message; follow their instructions.\n\n<skill>\n<name>style</name>\n<path>${skillFile}</path>\nWrite short sentences.\n</skill>`,
+        pageBlock,
+      ])
+
+      // A file mentioned with it is an argument, as `@path` typed after it is;
+      // an image goes with the message.
+      const notes = join(directory, 'notes.md')
+      const files = await turn(thread.id, {
+        input: [
+          { type: 'text', text: '/simplify' },
+          { type: 'mention', name: 'notes.md', path: notes },
+          { type: 'image', url: 'data:image/png;base64,AAAA' },
+        ],
+      })
+      assert.equal(files.prompt, `/simplify\n@${notes}`)
+      assert.deepEqual(files.promptContext, [])
+      assert.equal(files.imageInputs.length, 1)
+
+      // Items the App injected come first, as for any message.
+      await request('thread/inject_items', {
+        threadId: thread.id,
+        items: [
+          {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Side conversation boundary.' }],
+          },
+        ],
+      })
+      const injected = await turn(thread.id, {
+        input: [{ type: 'text', text: '/simplify src' }],
+        additionalContext: page,
+      })
+      assert.equal(injected.prompt, '/simplify src')
+      assert.deepEqual(injected.promptContext, [
+        'The Codex App added this context to the conversation before the message below.\n\n<app_context key="user message" kind="application">\nSide conversation boundary.\n</app_context>',
+        pageBlock,
+      ])
+
+      // A command named with a dot, as a file release.notes.md names it, is
+      // one too: Claude Code runs any command it has before it checks a name.
+      const notesCommand = `[$release.notes](${claudeCommandManifest('release.notes')})`
+      const dotted = await turn(thread.id, {
+        input: [{ type: 'text', text: `${notesCommand} v2` }],
+        additionalContext: page,
+      })
+      assert.equal(dotted.prompt, '/release.notes v2')
+      assert.deepEqual(dotted.promptContext, [pageBlock])
+
+      // A path is no command name: the message reads as any other.
+      const path = await turn(thread.id, {
+        input: [{ type: 'text', text: '/tmp/notes.md says what?' }],
+        additionalContext: page,
+      })
+      assert.equal(path.prompt, `/tmp/notes.md says what?\n\n${pageBlock}`)
+      assert.deepEqual(path.promptContext, [])
+
+      // A steer that runs a command is laid out the same way.
+      const completed = nextCompletion()
+      const { turn: held } = await request('turn/start', {
+        threadId: thread.id,
+        input: [{ type: 'text', text: '[hold] Draft the reply.' }],
+      })
+      await request('turn/steer', {
+        threadId: thread.id,
+        expectedTurnId: held.id,
+        input: [{ type: 'text', text: '/simplify src' }],
+        additionalContext: page,
+      })
+      await completed
+      assert.deepEqual(steers, ['/simplify src'])
+      assert.deepEqual(steerOptions[0]?.promptContext, [pageBlock])
+
+      // So is one in a side conversation, whose instructions come first.
+      const fork = await request('thread/fork', {
+        threadId: thread.id,
+        developerInstructions: 'Focus on the storage layer.',
+      })
+      const side = await turn(fork.thread.id, { input: [{ type: 'text', text: '/simplify src' }] })
+      assert.equal(side.prompt, '/simplify src')
+      assert.equal(side.promptContext?.length, 1)
+      assert.match(
+        side.promptContext?.[0] ?? '',
+        /^<side-conversation-instructions>\nFocus on the storage layer\.[\s\S]*<\/side-conversation-instructions>$/,
+      )
+      const sideDotted = await turn(fork.thread.id, {
+        input: [{ type: 'text', text: '/release.notes' }],
+      })
+      assert.equal(sideDotted.prompt, '/release.notes')
+      assert.match(sideDotted.promptContext?.[0] ?? '', /^<side-conversation-instructions>/)
+    },
+  )
 })
 
 test('server adds the App context of a message to the prompt Claude reads only', async () => {

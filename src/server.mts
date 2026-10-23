@@ -6,6 +6,15 @@ import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { rendersCompletedSubagentActivity, unverifiedAppWarning } from './app-compat.mjs'
 import { type InstalledAppPlugin, stopAppPluginServers } from './app-plugin-mcp.mjs'
+import {
+  appMcpServerOrigins,
+  appMcpServers,
+  appMcpServersEnabled,
+  appMcpServerTable,
+  editMcpServers,
+  pruneLegacySettings,
+  unsupportedSettingWrite,
+} from './app-settings.mjs'
 import { AUTO_COMPACT_KEY, autoCompactTokenLimit, autoCompactWindow } from './auto-compact.mjs'
 import {
   type AppPlugin,
@@ -230,8 +239,10 @@ import {
   type AppToolNoteOptions,
   additionalContextBlocks,
   injectedItemsContext,
+  isCommandPrompt,
   skillInstructions,
-  withTurnContext,
+  type TurnPrompt,
+  turnPrompt,
 } from './turn-context.mjs'
 import {
   noticeRowsEnabled,
@@ -741,7 +752,7 @@ export class CodexClaudeAppServer {
       sendInput: (threadId, text) => this.sendLeaderInput(threadId, text),
     })
     this.loadPersistedConfig()
-    // A CLI reported a different set of built-in commands: the App refetches
+    // A CLI reported a different set of commands: the App refetches
     // skills/list, which serves them as skills.
     // App rule: skills-popup
     this.stopCommandsListener = onClaudeCommandsChanged(() => {
@@ -913,7 +924,7 @@ export class CodexClaudeAppServer {
             method: 'account/updated',
             params: { authMode: 'apikey', planType: null },
           })
-          for (const status of readMcpConfig().startupStatuses) {
+          for (const status of readMcpConfig(this.appMcpScope()).startupStatuses) {
             this.notify(peer, {
               method: 'mcpServer/startupStatus/updated',
               params: { name: status.name, status: status.status, error: status.error ?? null },
@@ -1101,10 +1112,9 @@ export class CodexClaudeAppServer {
         return {
           namespaceTools: true,
           imageGeneration: false,
-          // Claude Code SDK ships a WebSearch tool. Default to advertising it
-          // so Codex App shows the search affordance; CLAUDE_CODEX_WEBSEARCH=0
-          // turns it off for environments where the tool is rate-limited.
-          webSearch: process.env.CLAUDE_CODEX_WEBSEARCH !== '0',
+          // Whether Claude threads have their WebSearch tool: the same web
+          // search mode config/read reports and turns apply.
+          webSearch: this.effectiveWebSearch() !== 'disabled',
         }
       case 'experimentalFeature/list':
         return this.experimentalFeatureList(asRecord(params))
@@ -1190,7 +1200,7 @@ export class CodexClaudeAppServer {
         // sign-in, and every App window hears the servers configured now.
         resetMcpStatusCache()
         void this.runtime.reloadMcpServers?.()
-        for (const status of readMcpConfig().startupStatuses) {
+        for (const status of readMcpConfig(this.appMcpScope()).startupStatuses) {
           this.notifyAll({
             method: 'mcpServer/startupStatus/updated',
             params: { name: status.name, status: status.status, error: status.error ?? null },
@@ -1625,7 +1635,7 @@ export class CodexClaudeAppServer {
     return {
       ...this.threadEnvelope(
         thread,
-        params.excludeTurns === true ? [] : this.store.listTurns(thread.id),
+        params.excludeTurns === true ? [] : this.store.historyTurns(thread.id),
       ),
       // Codex reports the thread's effective mode on resume.
       collaborationMode: collaborationModeEnvelope(thread),
@@ -1635,12 +1645,14 @@ export class CodexClaudeAppServer {
   private threadFork(peer: RpcPeer, params: Record<string, unknown>): unknown {
     const parentId = stringOr(params.threadId, '')
     const parent = this.store.getThread(parentId)
-    if (!parent) throw new Error(`unknown thread: ${parentId}`)
+    if (!parent) throw unknownThread(parentId)
     this.checkModelProfileBinding(parent)
     // A fork from one of the parent's turns keeps the history up to it, and
-    // Claude's context with it.
-    const parentTurns = this.store.listTurns(parent.id)
+    // Claude's context with it. The parent's history includes the turns it
+    // inherited itself, so a fork of a fork can start from one of those.
+    const parentTurns = this.store.historyTurns(parent.id)
     const kept = forkTurns(parentTurns, params)
+    const inheritedTurns = kept ?? parentTurns
     const now = nowSeconds()
     const id = newThreadId()
     const requestedModel = modelFromParams(params, parent.model)
@@ -1665,7 +1677,7 @@ export class CodexClaudeAppServer {
     // in its model process profile. A Codex parent's lives in Codex, so its
     // fork may take any profile, as it takes any Claude model without them.
     if (parent.runtimeBackend === 'claude') {
-      assertModelProfileTransition(parent.model, forkModel)
+      invalidRequestIfThrows(() => assertModelProfileTransition(parent.model, forkModel))
     }
     const profileFingerprint = profileFingerprintForModel(forkModel, runtimeBackend)
     const requestedCwd = stringOr(params.cwd, parent.cwd)
@@ -1755,6 +1767,11 @@ export class CodexClaudeAppServer {
       gitInfo: cwd === parent.cwd ? (parent.gitInfo ?? null) : null,
     }
     this.store.upsertThread(thread)
+    // As in Codex, a fork that is kept holds a copy of the turns it was forked
+    // with, ids and all, and every history read returns them ahead of its own:
+    // the App resumes a new fork and shows what thread/resume returns. An
+    // ephemeral fork's history is in this response only, as in Codex.
+    if (!thread.ephemeral) this.store.copyInheritedHistory(id, parent.id, inheritedTurns.length)
     // A fork compacts like its parent unless its own config says otherwise.
     const parentLimit = this.threadAutoCompactLimits.get(parent.id)
     if (parentLimit != null) this.threadAutoCompactLimits.set(id, parentLimit)
@@ -1795,7 +1812,14 @@ export class CodexClaudeAppServer {
         },
       })
     }
-    return this.threadEnvelope(thread, params.excludeTurns === true ? [] : (kept ?? parentTurns))
+    return this.threadEnvelope(
+      thread,
+      params.excludeTurns === true
+        ? []
+        : thread.ephemeral
+          ? inheritedTurns
+          : this.store.historyTurns(id),
+    )
   }
 
   // Where a fork of `thread` picks up Claude's context. A fork that keeps
@@ -1928,7 +1952,7 @@ export class CodexClaudeAppServer {
         scanned = thread
         const snippet = threadSnippet(
           [thread.name, thread.preview],
-          () => this.store.listTurns(thread.id),
+          () => this.store.historyTurns(thread.id),
           searchTerm,
         )
         if (!snippet) continue
@@ -2117,7 +2141,7 @@ export class CodexClaudeAppServer {
     // child transcript so Prompt/Response and the terminal state can render.
     // App rule: subagent-read
     const includeTurns = params.includeTurns !== false || thread.threadSource === 'subagent'
-    const turns = includeTurns ? this.store.listTurns(threadId) : []
+    const turns = includeTurns ? this.store.historyTurns(threadId) : []
     return { thread: this.toThread(thread, turns) }
   }
 
@@ -2126,7 +2150,7 @@ export class CodexClaudeAppServer {
   private threadTurnsList(params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     const itemsView = turnItemsView(params.itemsView)
-    const page = pageTurns(this.store.listTurns(threadId), {
+    const page = pageTurns(this.store.historyTurns(threadId), {
       cursor: params.cursor,
       limit: pageLimit(params.limit),
       sortDirection: sortDirectionOr(params.sortDirection, 'desc'),
@@ -2135,7 +2159,7 @@ export class CodexClaudeAppServer {
   }
 
   private threadItemsList(params: Record<string, unknown>): unknown {
-    return pageItems(this.store.listTurns(stringOr(params.threadId, '')), {
+    return pageItems(this.store.historyTurns(stringOr(params.threadId, '')), {
       turnId: stringOr(params.turnId, '') || null,
       cursor: params.cursor,
       limit: pageLimit(params.limit),
@@ -2144,7 +2168,7 @@ export class CodexClaudeAppServer {
   }
 
   private threadTimelineList(params: Record<string, unknown>): unknown {
-    return pageTimeline(this.store.listTurns(stringOr(params.threadId, '')), {
+    return pageTimeline(this.store.historyTurns(stringOr(params.threadId, '')), {
       cursor: params.cursor,
       limit: pageLimit(params.limit),
     })
@@ -2156,7 +2180,7 @@ export class CodexClaudeAppServer {
     const threadId = stringOr(params.threadId, '')
     if (!this.store.getThread(threadId)) throw unknownThread(threadId)
     const searchTerm = typeof params.searchTerm === 'string' ? params.searchTerm : ''
-    const occurrences = findOccurrences(this.store.listTurns(threadId), searchTerm)
+    const occurrences = findOccurrences(this.store.historyTurns(threadId), searchTerm)
     const start = offsetCursor(params.cursor, 'occurrence')
     const end = start + (pageLimit(params.limit, 1000) ?? 250)
     return {
@@ -2249,7 +2273,9 @@ export class CodexClaudeAppServer {
 
   private threadTurnItemsList(params: Record<string, unknown>): unknown {
     const turnId = stringOr(params.turnId, '')
-    const turn = this.store.getTurn(turnId)
+    const threadId = stringOr(params.threadId, '')
+    // A fork's inherited turns keep their ids, so the thread names which copy.
+    const turn = threadId ? this.store.historyTurn(threadId, turnId) : this.store.getTurn(turnId)
     return {
       data: turn?.items ?? [],
       nextCursor: null,
@@ -2278,7 +2304,7 @@ export class CodexClaudeAppServer {
     if (!archived) {
       const thread = this.store.getThread(threadId)
       if (!thread) throw unknownThread(threadId)
-      return { thread: this.toThread(thread, this.store.listTurns(threadId)) }
+      return { thread: this.toThread(thread, this.store.historyTurns(threadId)) }
     }
     this.clearThreadState(threadId)
     return {}
@@ -2906,7 +2932,7 @@ export class CodexClaudeAppServer {
     thread.updatedAt = nowSeconds()
     this.store.upsertThread(thread)
 
-    return this.threadEnvelope(thread, this.store.listTurns(threadId))
+    return this.threadEnvelope(thread, this.store.historyTurns(threadId))
   }
 
   private threadSettingsUpdate(peer: RpcPeer, params: Record<string, unknown>): unknown {
@@ -3027,12 +3053,10 @@ export class CodexClaudeAppServer {
     const numTurns =
       typeof params.numTurns === 'number' && params.numTurns >= 1 ? Math.floor(params.numTurns) : 0
     if (numTurns > 0) {
-      const dropped = this.rewindThread(thread, () =>
-        this.store.deleteRecentTurns(threadId, numTurns),
-      )
+      const dropped = this.rewindThread(thread, () => this.dropNewestTurns(thread, numTurns))
       debugLog('thread.rollback', { threadId, requested: numTurns, dropped })
     }
-    return { thread: this.toThread(thread, this.store.listTurns(threadId)) }
+    return { thread: this.toThread(thread, this.store.historyTurns(threadId)) }
   }
 
   // thread/revert is the paginated-history form of rollback: drop a turn and
@@ -3043,13 +3067,11 @@ export class CodexClaudeAppServer {
     const beforeTurnId = stringOr(params.beforeTurnId, '')
     const thread = this.store.getThread(threadId)
     if (!thread) throw unknownThread(threadId)
-    if (!this.store.listTurns(threadId).some((turn) => turn.id === beforeTurnId))
-      throw invalidRequest(`unknown turn: ${beforeTurnId}`)
-    const dropped = this.rewindThread(thread, () =>
-      this.store.deleteTurnsFrom(threadId, beforeTurnId),
-    )
+    const index = this.store.historyTurns(threadId).findIndex((turn) => turn.id === beforeTurnId)
+    if (index < 0) throw invalidRequest(`unknown turn: ${beforeTurnId}`)
+    const dropped = this.rewindThread(thread, () => this.dropTurnsFrom(thread, index))
     debugLog('thread.revert', { threadId, beforeTurnId, dropped })
-    const kept = this.store.listTurns(threadId)
+    const kept = this.store.historyTurns(threadId)
     const last = kept.at(-1)
     const lastItem = last?.items.at(-1)
     this.notify(peer, { method: 'thread/reverted', params: { threadId } })
@@ -3069,12 +3091,14 @@ export class CodexClaudeAppServer {
       throw invalidRequest(`cannot rewind thread ${thread.id} while a turn is running`)
     const dropped = drop()
     if (dropped === 0) return 0
-    const remaining = this.store.listTurns(thread.id)
     if (thread.runtimeBackend === 'codex') {
-      // `codex exec resume` cannot truncate a session; only a full rewind is exact.
-      if (remaining.length === 0) this.store.updateCodexSessionId(thread.id, null)
+      // `codex exec resume` cannot truncate a session; only a full rewind is
+      // exact. A fork's Codex session starts with its own first turn.
+      if (this.store.listTurns(thread.id).length === 0)
+        this.store.updateCodexSessionId(thread.id, null)
       return dropped
     }
+    const remaining = this.store.historyTurns(thread.id)
     this.runtime.resetSession?.(thread.id)
     const point = this.claudeContextAfter(thread, remaining)
     if (point) {
@@ -3092,17 +3116,56 @@ export class CodexClaudeAppServer {
     return dropped
   }
 
-  // Where Claude's context stands once a thread has run `turns`, its first
-  // turns: the newest of their checkpoints, or with no turns, where the thread
-  // began (its fork point, or a new session). Null when the turns, or the fork
-  // they start from, predate checkpoints.
+  // Where Claude's context stands once a thread has run `turns`, the first
+  // turns of its history: the newest of their checkpoints, or with none of its
+  // own, where the thread began (its fork point, or a new session). Null when
+  // the turns, or the fork they start from, predate checkpoints. A fork's
+  // inherited turns carry the checkpoints they had in the thread they came
+  // from, so a point among them is found in the fork's copy.
   private claudeContextAfter(thread: ThreadRecord, turns: TurnRecord[]): ClaudeResumePoint | null {
-    for (const turn of turns.toReversed()) {
+    const inherited = this.store.inheritedTurnCount(thread.id)
+    if (turns.length < inherited) return this.store.contextAfterInherited(thread.id, turns.length)
+    for (const turn of turns.slice(inherited).toReversed()) {
       const checkpoint = this.store.turnCheckpoint(turn.id)
       if (checkpoint) return checkpoint
     }
-    if (turns.length > 0) return null
+    if (turns.length > inherited) return null
     return thread.forkedFromId ? this.store.forkCheckpoint(thread.id) : 'new'
+  }
+
+  // thread/rollback: the newest `count` turns of the thread's history go, its
+  // own turns first, then the turns it inherited. Returns how many went.
+  private dropNewestTurns(thread: ThreadRecord, count: number): number {
+    const own = this.store.deleteRecentTurns(thread.id, count)
+    if (own >= count) return own
+    const inherited = this.store.inheritedTurnCount(thread.id)
+    return own + this.truncateInheritedTurns(thread, inherited - (count - own))
+  }
+
+  // thread/revert: the turn at `index` in the thread's history and every
+  // later turn go. Returns how many went.
+  private dropTurnsFrom(thread: ThreadRecord, index: number): number {
+    const history = this.store.historyTurns(thread.id)
+    const turn = history[index]
+    if (!turn) return 0
+    const inherited = this.store.inheritedTurnCount(thread.id)
+    if (index >= inherited) return this.store.deleteTurnsFrom(thread.id, turn.id)
+    const own = this.store.deleteRecentTurns(thread.id, history.length)
+    return own + this.truncateInheritedTurns(thread, index)
+  }
+
+  // Keeps a fork's first `keep` inherited turns. Its fork point moves back to
+  // the end of what is left, so a rewind past its own turns lands there.
+  private truncateInheritedTurns(thread: ThreadRecord, keep: number): number {
+    const removed = this.store.truncateInheritedTurns(thread.id, keep)
+    if (removed > 0 && thread.runtimeBackend !== 'codex') {
+      const remaining = this.store.inheritedTurnCount(thread.id)
+      this.store.setForkCheckpoint(
+        thread.id,
+        this.store.contextAfterInherited(thread.id, remaining),
+      )
+    }
+    return removed
   }
 
   // Points a thread's next turn at `point`: a forked session resumed there,
@@ -3628,7 +3691,7 @@ export class CodexClaudeAppServer {
           error: error instanceof Error ? error.message : String(error),
         })
         if (!active()) return
-        const fallback = compactSummary(current, this.store.listTurns(threadId))
+        const fallback = compactSummary(current, this.store.historyTurns(threadId))
         this.store.updateItem(turnId, item.id, (entry) =>
           entry.type === 'agentMessage' ? { ...entry, text: fallback } : entry,
         )
@@ -3674,7 +3737,12 @@ export class CodexClaudeAppServer {
     const built = this.runtimeTurnContext(thread, turnId, '/compact', params)
     // thread/compact/start carries no instructions: a bare /compact, which
     // no side-conversation note may precede either.
-    const context: RuntimeTurnContext = { ...built.context, prompt: '/compact', imageInputs: [] }
+    const context: RuntimeTurnContext = {
+      ...built.context,
+      prompt: '/compact',
+      promptContext: [],
+      imageInputs: [],
+    }
     let compacted = false
     let failure: string | null = null
     await this.runtime
@@ -3758,7 +3826,7 @@ export class CodexClaudeAppServer {
     agentItemId: string,
     active: () => boolean,
   ): Promise<void> {
-    const turns = this.store.listTurns(thread.id)
+    const turns = this.store.historyTurns(thread.id)
     const promptBody = compactSummary(thread, turns)
     const compactPrompt = [
       'You are summarizing a Codex / Claude Code conversation so the user can keep context after compaction.',
@@ -3791,6 +3859,8 @@ export class CodexClaudeAppServer {
         forkSession: false,
         mcpServers: null,
         allowedTools: ['Read', 'Glob', 'Grep'],
+        // With web search off, the summary cannot search either.
+        disallowedTools: this.effectiveWebSearch() === 'disabled' ? ['WebSearch'] : [],
         addDirs: [],
         enableFileCheckpointing: false,
         outputFormat: null,
@@ -4025,14 +4095,17 @@ export class CodexClaudeAppServer {
         this.completeWorkflowListTurn(peer, thread, turn)
         return
       }
-      // Carry parsed images through the params bag so runRuntimeTurn can hand
-      // them to the runtime context without re-parsing user input.
-      this.launchRuntimeTurn(peer, thread, turn, this.modelPrompt(thread, prompt, params), {
+      // Carry parsed images, and the context a command's text goes after,
+      // through the params bag so runRuntimeTurn can hand them to the
+      // runtime context without re-parsing user input.
+      const model = this.modelPrompt(thread, prompt, params)
+      this.launchRuntimeTurn(peer, thread, turn, model.prompt, {
         ...params,
         ...collaborationModeSettings(params),
         ...(helperModel ? { model: helperModel } : {}),
         planMode,
         _imageInputs: images,
+        _promptContext: model.context,
       })
     })
     return { turn: publicTurn }
@@ -4245,6 +4318,9 @@ export class CodexClaudeAppServer {
     // and prepend side-conversation instructions directly into the turn's user prompt.
     let systemPromptAddendum: string | null = null
     let effectivePrompt = prompt
+    const promptContext = Array.isArray(params._promptContext)
+      ? params._promptContext.filter((block): block is string => typeof block === 'string')
+      : []
     if (thread.forkedFromId != null && developerInstructions) {
       const parentThread = this.store.getThread(thread.forkedFromId)
       const parentDev = parentThread?.developerInstructions ?? null
@@ -4263,7 +4339,10 @@ export class CodexClaudeAppServer {
         const sideInstructions = [developerInstructions]
         if (parentSkills.visualizationDir && appSkills.visualizationDir)
           sideInstructions.push(visualizationDirNote(appSkills.visualizationDir))
-        effectivePrompt = `<side-conversation-instructions>\n${sideInstructions.join('\n\n')}\n</side-conversation-instructions>\n\n${prompt}`
+        const side = `<side-conversation-instructions>\n${sideInstructions.join('\n\n')}\n</side-conversation-instructions>`
+        // A command's text stays the last block, as typed (see turnPrompt).
+        if (isCommandPrompt(prompt)) promptContext.unshift(side)
+        else effectivePrompt = `${side}\n\n${prompt}`
       } else {
         systemPromptAddendum = buildSystemPromptAddendum({
           baseInstructions,
@@ -4349,9 +4428,13 @@ export class CodexClaudeAppServer {
     const resumeSessionAt = isCodexThread ? null : this.store.claudeResumeAt(thread.id)
     const turnCwd = stringOr(params.cwd, thread.cwd)
     // A Claude thread's own turns also get the MCP servers, subagents,
-    // permission rules and hooks the Codex and Claude Code configs bring.
+    // permission rules and hooks the Codex and Claude Code configs bring, and
+    // the MCP servers added in the App's settings.
     const inheritConfig = desktopPresentation && !isCodexThread
-    const mcp = readMcpConfig({ cwd: turnCwd, inherit: inheritConfig })
+    const mcp = readMcpConfig({ ...this.appMcpScope(), cwd: turnCwd, inherit: inheritConfig })
+    // The App's Settings > Configuration > Web search, as config/read reports
+    // it: also off with CLAUDE_CODEX_WEBSEARCH=0 while nothing is saved.
+    const webSearchOff = !isCodexThread && this.effectiveWebSearch() === 'disabled'
     const permissionRules = inheritConfig ? inheritedPermissionRules(turnCwd) : null
     // The tools the client registered when it started the thread.
     const dynamicTools =
@@ -4370,6 +4453,7 @@ export class CodexClaudeAppServer {
       turnId,
       purpose: turnPurpose,
       prompt: effectivePrompt,
+      promptContext,
       cwd: turnCwd,
       runtimeType: isCodexThread ? 'codex-proxy' : null,
       model: resolvedModel,
@@ -4387,7 +4471,11 @@ export class CodexClaudeAppServer {
       allowedTools: defaultAllowedTools(),
       inheritedAllowedTools: permissionRules?.allow ?? null,
       inheritedAskRules: permissionRules?.ask ?? null,
-      disallowedTools: [...mcp.toolRules.disallowedTools, ...(permissionRules?.deny ?? [])],
+      disallowedTools: [
+        ...mcp.toolRules.disallowedTools,
+        ...(permissionRules?.deny ?? []),
+        ...(webSearchOff ? ['WebSearch'] : []),
+      ],
       mcpEnabledTools: mcp.toolRules.enabledTools,
       agents: inheritConfig ? inheritedAgents(turnCwd) : null,
       claudeHooks: inheritConfig ? inheritedHooks(turnCwd) : null,
@@ -4839,7 +4927,12 @@ export class CodexClaudeAppServer {
       params._continuation !== true &&
       params._hiddenPrompt == null
     ) {
-      const { _imageInputs: _images, _emitUserMessage: _emit, ...rest } = params
+      const {
+        _imageInputs: _images,
+        _promptContext: _context,
+        _emitUserMessage: _emit,
+        ...rest
+      } = params
       this.lastTurnParamsByThread.set(thread.id, rest)
     }
     const { context, isCodexThread, resumeSessionAt, turnCwd } = this.runtimeTurnContext(
@@ -7909,9 +8002,12 @@ export class CodexClaudeAppServer {
       this.emitItemLifecycle(this.peerForThread(threadId), threadId, activeTurnId, item)
     }
     const thread = this.store.getThread(threadId)
-    const modelPrompt = thread ? this.modelPrompt(thread, prompt, params, { steer: true }) : prompt
-    const steered = await this.steerRunningTurn(threadId, activeTurnId, modelPrompt, {
+    const model = thread
+      ? this.modelPrompt(thread, prompt, params, { steer: true })
+      : { prompt, context: [] }
+    const steered = await this.steerRunningTurn(threadId, activeTurnId, model.prompt, {
       imageInputs: images,
+      promptContext: model.context,
       onAccepted: accept,
     })
     if (steered === false) throw new Error('no active turn to steer')
@@ -7954,6 +8050,19 @@ export class CodexClaudeAppServer {
     this.failTurn(this.peerForThread(threadId), threadId, turn, error)
   }
 
+  // The web search mode of Claude threads, as config/read reports it and
+  // turns apply it: the mode saved in the App's Settings > Configuration, or
+  // else disabled with CLAUDE_CODEX_WEBSEARCH=0 (for a host where the tool is
+  // rate-limited or unwanted) and live, the way Claude's WebSearch tool
+  // searches, otherwise. Claude has the one kind of search, so only disabled
+  // changes what Claude may do: it takes the WebSearch tool away.
+  private effectiveWebSearch(): unknown {
+    return (
+      this.configOverrides.web_search ??
+      (process.env.CLAUDE_CODEX_WEBSEARCH === '0' ? 'disabled' : 'live')
+    )
+  }
+
   private configRead(params: Record<string, unknown>): unknown {
     // Base config = our typed defaults; overrides (whatever the App's
     // settings sheet has written previously via config/value/write) are
@@ -7979,25 +8088,29 @@ export class CodexClaudeAppServer {
         approval_policy: this.configOverrides.approval_policy ?? 'on-request',
         approvals_reviewer: this.configOverrides.approvals_reviewer ?? 'user',
         sandbox_mode: this.configOverrides.sandbox_mode ?? 'workspace-write',
-        sandbox_workspace_write: this.configOverrides.sandbox_workspace_write ?? null,
+        // Claude threads have no network or filesystem sandbox (see
+        // app-settings.mts), but the App takes on-request with workspace-write
+        // for its Default permissions preset only while this is unset, as
+        // Codex reports it without a [sandbox_workspace_write] table. Any
+        // table with network access on would make new chats preselect
+        // Custom (config.toml); Settings shows network access off instead.
+        // App rule: permission-presets
+        sandbox_workspace_write: null,
         forced_chatgpt_workspace_id: null,
         forced_login_method: null,
-        // Claude searches the web live with its WebSearch tool, which
-        // modelProvider/capabilities/read advertises unless
-        // CLAUDE_CODEX_WEBSEARCH=0.
-        web_search:
-          this.configOverrides.web_search ??
-          (process.env.CLAUDE_CODEX_WEBSEARCH === '0' ? 'disabled' : 'live'),
+        // What turns apply, so Settings shows web search off only while
+        // Claude has no WebSearch tool.
+        web_search: this.effectiveWebSearch(),
         tools: this.configOverrides.tools ?? null,
         profile: this.configOverrides.profile ?? null,
         profiles: {},
-        instructions: this.configOverrides.instructions ?? null,
-        developer_instructions: this.configOverrides.developer_instructions ?? null,
-        compact_prompt: this.configOverrides.compact_prompt ?? null,
+        instructions: null,
+        developer_instructions: null,
+        compact_prompt: null,
         model_reasoning_effort: this.configReasoningEffort,
         model_reasoning_summary: this.configOverrides.model_reasoning_summary ?? null,
-        model_verbosity: this.configOverrides.model_verbosity ?? null,
-        service_tier: this.configOverrides.service_tier ?? null,
+        model_verbosity: null,
+        service_tier: null,
         analytics: this.configOverrides.analytics ?? null,
         apps: this.configOverrides.apps ?? null,
         // The App reads its memories switches from the table; the adapter
@@ -8007,6 +8120,7 @@ export class CodexClaudeAppServer {
           ? { memories: memoriesConfigTable(this.configOverrides) }
           : {}),
         model_providers: this.exposedModelProviders(),
+        ...(appMcpServersEnabled() ? { mcp_servers: appMcpServerTable(this.configOverrides) } : {}),
         provider_loop_config: projectProviderLoopConfig(
           undefined,
           this.providerLoopSelectionInput(),
@@ -8018,6 +8132,7 @@ export class CodexClaudeAppServer {
         ...(codexProxyModelOptions().length > 0
           ? { 'model_providers.codex': configLayerMetadata() }
           : {}),
+        ...appMcpServerOrigins(this.configOverrides, configLayerMetadata()),
       },
       layers: null,
     }
@@ -8163,7 +8278,7 @@ export class CodexClaudeAppServer {
   private publicConfigOverrides(): Record<string, unknown> {
     return Object.fromEntries(
       Object.entries(this.configOverrides).filter(
-        ([key]) => !isProviderLoopSelectionConfigKey(key),
+        ([key]) => !isProviderLoopSelectionConfigKey(key) && key !== 'mcp_servers',
       ),
     )
   }
@@ -8939,26 +9054,37 @@ export class CodexClaudeAppServer {
     }
   }
 
+  // config/value/write and config/batchWrite. A write makes all of its edits
+  // or, when one fails, none: the App shows the error and its settings stay
+  // as they were. See app-settings.mts for what each setting does.
   private configWriteResponse(params: Record<string, unknown>): unknown {
+    const overrides = structuredClone(this.configOverrides)
+    let model = this.configModel
+    let effort = this.configReasoningEffort
     for (const edit of configEdits(params)) {
       const { keyPath, value } = edit
       if (keyPath === 'model' && typeof value === 'string' && value.length > 0) {
-        this.configModel = normalizeSelectableModelId(value, this.configModel)
+        model = normalizeSelectableModelId(value, model)
       } else if (keyPath === 'model_reasoning_effort' && typeof value === 'string') {
-        this.configReasoningEffort =
-          normalizeCodexReasoningEffort(value) ?? this.configReasoningEffort
+        effort = normalizeCodexReasoningEffort(value) ?? effort
+      } else if (keyPath === 'mcp_servers' || keyPath.startsWith('mcp_servers.')) {
+        editMcpServers(overrides, edit)
       } else {
-        // Unknown key — store in the generic overrides bag so it survives a
-        // restart even though we don't apply it to typed runtime state. This
-        // captures approvalPolicy, sandboxMode, instruction toggles, anything
-        // the App's settings sheet may emit. `null` value clears the entry.
-        if (value === null || value === undefined) {
-          delete this.configOverrides[keyPath]
+        const unsupported = unsupportedSettingWrite(edit)
+        if (unsupported instanceof RpcError) throw unsupported
+        // Any other key is kept as written, so it survives a restart and
+        // config/read reports it back: settings the adapter applies, and the
+        // App's own. null clears the entry.
+        if (unsupported === 'drop' || value === null || value === undefined) {
+          delete overrides[keyPath]
         } else {
-          this.configOverrides[keyPath] = value
+          overrides[keyPath] = value
         }
       }
     }
+    this.configOverrides = overrides
+    this.configModel = model
+    this.configReasoningEffort = effort
     this.persistConfig()
     const filePath = stringOr(params.filePath, `${codexHome()}/config.toml`)
     return {
@@ -8974,7 +9100,8 @@ export class CodexClaudeAppServer {
   // skill it picks and the context the App attached to it. Helper turns and
   // the adapter's own prompts get none of it, and leave the injected items to
   // the next message. So does a steer: the App injects items only while no
-  // turn runs, for the turn it starts next.
+  // turn runs, for the turn it starts next. A message that runs a Claude
+  // Code command gets all of it before its text, in blocks of its own.
   // App rule: skill-injection
   // App rule: additional-context
   // App rule: injected-context
@@ -8983,13 +9110,14 @@ export class CodexClaudeAppServer {
     prompt: string,
     params: Record<string, unknown>,
     options: { steer?: boolean } = {},
-  ): string {
-    if (params.outputSchema != null || typeof params._hiddenPrompt === 'string') return prompt
+  ): TurnPrompt {
+    if (params.outputSchema != null || typeof params._hiddenPrompt === 'string')
+      return { prompt, context: [] }
     const skillDirs = [
       ...claudeSkillDirs(thread.cwd),
       ...this.appSkillsFor(thread.id).appSkills.map((skill) => dirname(skill.path)),
     ]
-    return withTurnContext(
+    return turnPrompt(
       prompt,
       [skillInstructions(prompt, skillDirs), additionalContextBlocks(params.additionalContext)],
       options.steer ? null : injectedItemsContext(this.store.takeInjectedItems(thread.id)),
@@ -9851,9 +9979,15 @@ export class CodexClaudeAppServer {
     const threadId = stringOr(asRecord(params).threadId, '')
     const thread = threadId ? this.store.getThread(threadId) : null
     return {
+      ...this.appMcpScope(),
       cwd: thread && thread.runtimeBackend !== 'codex' ? thread.cwd : null,
       appPlugins: this.installedAppPlugins,
     }
+  }
+
+  // The MCP servers added in the App's settings, which apply in every folder.
+  private appMcpScope(): McpConfigScope {
+    return { appServers: appMcpServers(this.configOverrides, this.configPath) }
   }
 
   // What the live Claude session of the thread a request names says of its
@@ -10087,6 +10221,7 @@ export class CodexClaudeAppServer {
         !Array.isArray(parsed.overrides)
       ) {
         this.configOverrides = parsed.overrides as Record<string, unknown>
+        if (pruneLegacySettings(this.configOverrides)) shouldRepair = true
       }
       if (Array.isArray(parsed.appPlugins)) {
         this.appPlugins = parsed.appPlugins.flatMap((entry) => {

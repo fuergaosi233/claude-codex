@@ -5143,6 +5143,9 @@ test('capabilities and config/read report live web search unless CLAUDE_CODEX_WE
       await reader.nextResponse(3)
       proc.stdin.write(json({ id: 4, method: 'config/read', params: {} }))
       assert.equal((await reader.nextResponse(4)).result.config.web_search, 'cached')
+      // And Claude threads keep WebSearch with it.
+      proc.stdin.write(json({ id: 5, method: 'modelProvider/capabilities/read', params: {} }))
+      assert.equal((await reader.nextResponse(5)).result.webSearch, true)
     } finally {
       proc.kill()
       await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })

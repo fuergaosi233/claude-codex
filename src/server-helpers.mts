@@ -2,6 +2,7 @@ import { type ChildProcess, execFile, spawn } from 'node:child_process'
 import { type FSWatcher, readFileSync, watch, writeFileSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import { promisify } from 'node:util'
+import type { ConfigEdit } from './app-settings.mjs'
 import type { AppSkill } from './claude-capabilities.mjs'
 import { callMcpTool, readMcpConfig, readMcpResource } from './mcp.mjs'
 import { stripQuietTurnHeartbeat } from './quiet-turns.mjs'
@@ -68,19 +69,27 @@ export function stringOr(value: unknown, fallback: string): string {
   return typeof value === 'string' && value.length > 0 ? value : fallback
 }
 
-export function configEdits(
-  params: Record<string, unknown>,
-): Array<{ keyPath: string; value: unknown }> {
+// The edits of config/value/write (one) or config/batchWrite (each of
+// `edits`), in order. Codex's mergeStrategy is replace unless it says upsert.
+export function configEdits(params: Record<string, unknown>): ConfigEdit[] {
+  const strategy = (value: unknown): ConfigEdit['mergeStrategy'] =>
+    value === 'upsert' ? 'upsert' : 'replace'
   if (Array.isArray(params.edits)) {
     return params.edits
       .map((edit) => {
         const rec = asRecord(edit)
-        return { keyPath: String(rec.keyPath ?? rec.key ?? ''), value: rec.value }
+        return {
+          keyPath: String(rec.keyPath ?? rec.key ?? ''),
+          value: rec.value,
+          mergeStrategy: strategy(rec.mergeStrategy),
+        }
       })
       .filter((edit) => edit.keyPath.length > 0)
   }
   const keyPath = String(params.keyPath ?? params.key ?? '')
-  return keyPath ? [{ keyPath, value: params.value }] : []
+  return keyPath
+    ? [{ keyPath, value: params.value, mergeStrategy: strategy(params.mergeStrategy) }]
+    : []
 }
 
 export function configLayerMetadata(): unknown {
@@ -231,6 +240,78 @@ export function commandArray(value: unknown): string[] {
   return []
 }
 
+// A config value can hold credentials: an MCP server's environment and HTTP
+// headers, a bearer token, an API key, a token passed as a command argument
+// (`--header "Authorization: Bearer …"`), a password or secret path in a URL.
+// The debug log keeps every key name and the shape of the value, and none of
+// those values. Keys whose values can all be credentials (a server's `env`
+// and headers, a command's `args`, a provider's `query_params`) have every
+// value under them replaced; keys named like a credential have their own
+// value replaced; of a `url`, only the scheme and host are kept.
+const CREDENTIAL_HOLDER_KEY = /^(env|headers|http_headers|env_http_headers|args|query_params)$/i
+const CREDENTIAL_KEY = /token|secret|passw|api.?key|auth|cookie|credential|bearer|private.?key/i
+const REDACTED = '[redacted]'
+
+// `value`, written at `keyPath` (dotted, as in config/value/write) of the
+// config, as the debug log may show it.
+function redactConfigValue(keyPath: string, value: unknown): unknown {
+  const segments = keyPath.split('.')
+  if (
+    segments.some((segment) => CREDENTIAL_HOLDER_KEY.test(segment) || CREDENTIAL_KEY.test(segment))
+  )
+    return redactLeaves(value)
+  if (typeof value === 'string' && segments.at(-1) === 'url') return redactUrl(value)
+  if (Array.isArray(value)) return value.map((entry) => redactConfigValue('', entry))
+  if (value && typeof value === 'object')
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [key, redactConfigValue(key, entry)]),
+    )
+  return value
+}
+
+function redactLeaves(value: unknown): unknown {
+  if (value == null) return value
+  if (Array.isArray(value)) return value.map(redactLeaves)
+  if (typeof value === 'object')
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [key, redactLeaves(entry)]),
+    )
+  return REDACTED
+}
+
+// The user and password of a URL, its path (a per-user server URL often has
+// its secret there), its query and its fragment can each be a credential, so
+// only the scheme and host are kept. Text that does not parse as a URL is
+// replaced whole.
+function redactUrl(value: string): string {
+  try {
+    const url = new URL(value)
+    const user = url.username || url.password ? 'redacted@' : ''
+    const rest =
+      (url.pathname !== '' && url.pathname !== '/') || url.search || url.hash ? `/${REDACTED}` : ''
+    return `${url.protocol}//${user}${url.host}${rest}`
+  } catch {
+    return REDACTED
+  }
+}
+
+// What the debug log shows of a config write: config/value/write names one
+// key path, config/batchWrite a list of edits, and thread/start and the like
+// take a config table whose keys may be dotted paths.
+function redactConfigParams(rec: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...rec }
+  if (typeof rec.keyPath === 'string') out.value = redactConfigValue(rec.keyPath, rec.value)
+  if (Array.isArray(rec.edits))
+    out.edits = rec.edits.map((edit) => {
+      const fields = asRecord(edit)
+      return typeof fields.keyPath === 'string'
+        ? { ...fields, value: redactConfigValue(fields.keyPath, fields.value) }
+        : redactConfigValue('', edit)
+    })
+  if (rec.config && typeof rec.config === 'object') out.config = redactConfigValue('', rec.config)
+  return out
+}
+
 export function summarizeRpcParams(method: string, params: unknown): unknown {
   const rec = asRecord(params)
   if (method === 'turn/start') {
@@ -297,7 +378,7 @@ export function summarizeRpcParams(method: string, params: unknown): unknown {
       turn: { id: turn.id, status: turn.status, items },
     }
   }
-  return rec
+  return redactConfigParams(rec)
 }
 
 export function reviewLabel(target: unknown): string {

@@ -55,6 +55,7 @@ test('an unknown thread is an invalid request, whatever the method', async () =>
       ['thread/searchOccurrences', { threadId, searchTerm: 'x' }],
       ['thread/attachment/list', { threadId }],
       ['thread/section/move', { threadId, sectionId: null }],
+      ['thread/fork', { threadId }],
     ] as const)
       await refused(app, method, params, /^unknown thread: nope$/)
   })
@@ -139,6 +140,56 @@ test('an unknown turn, cursor or id, and a bad parameter, are invalid requests',
       'thread/queue/add',
       { threadId: ephemeral, input: [{ type: 'text', text: 'later', text_elements: [] }] },
       /queued messages require a persistent thread/,
+    )
+  })
+})
+
+test('a fork from a turn the thread does not have is an invalid request', async () => {
+  const { runtime, release } = holdingRuntime()
+  await withInProcessApp(runtime, async (app) => {
+    const threadId = await app.startThread()
+    const done = await app.startTurn(threadId, 'hello')
+    await app.turnCompleted(done)
+    const other = await app.startThread()
+    const elsewhere = await app.startTurn(other, 'elsewhere')
+    await app.turnCompleted(elsewhere)
+
+    for (const key of ['lastTurnId', 'beforeTurnId']) {
+      await refused(
+        app,
+        'thread/fork',
+        { threadId, [key]: 'gone' },
+        new RegExp(`^${key} 'gone' was not found in the source thread$`),
+      )
+      // A turn of another thread is not one of this thread's.
+      await refused(
+        app,
+        'thread/fork',
+        { threadId, [key]: elsewhere },
+        new RegExp(`^${key} '${elsewhere}' was not found in the source thread$`),
+      )
+    }
+    await refused(
+      app,
+      'thread/fork',
+      { threadId, lastTurnId: done, beforeTurnId: done },
+      /^`beforeTurnId` cannot be combined with `lastTurnId`$/,
+    )
+    const running = await app.startTurn(threadId, 'hold on')
+    await app.waitFor(() => app.notified('turn/started').length === 3 || undefined)
+    await refused(
+      app,
+      'thread/fork',
+      { threadId, lastTurnId: running },
+      new RegExp(`^lastTurnId '${running}' identifies an in-progress turn$`),
+    )
+    release()
+    await app.turnCompleted(running)
+    // Nothing was forked.
+    const threads = app.store.listThreads({ includeEphemeral: true })
+    assert.deepEqual(
+      threads.filter((thread) => thread.forkedFromId === threadId),
+      [],
     )
   })
 })

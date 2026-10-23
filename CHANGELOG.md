@@ -101,8 +101,10 @@ versioning or publishing metadata.
   as Codex answers an unknown thread or turn and a bad cursor, instead of
   `-32000`, with the same messages: an unknown thread, turn, section, queued
   message or process; a bad cursor or parameter; a model the chat cannot
-  take; a rewind or queued start while a turn runs. (Codex answers some
-  section parameter errors with `-32602`, invalid params.)
+  take; a rewind or queued start while a turn runs; a fork from an unknown
+  thread, from a turn its thread does not have or that still runs, or onto
+  another model process profile. (Codex answers some section parameter errors
+  with `-32602`, invalid params.)
   The model menu's "Couldn't update model settings" toast now gives the
   reason, after the App's own "Check your config.toml." line. Failures inside
   the adapter stay `-32000`, and so do the project store's errors (a project
@@ -587,6 +589,118 @@ versioning or publishing metadata.
   A thread that names no reviewer runs as before, except that a call Claude
   Code says only the user may answer now asks in every mode, Full access
   included, and "Allow for this session" covers only that call.
+
+### Trustworthy history and settings
+
+- A forked chat shows the turns it was forked with on every read, as a Codex
+  fork does: `thread/resume`, `thread/read`, `thread/turns/list`,
+  `thread/items/list`, `thread/turns/items/list`, `thread/timeline/list` and
+  search return them ahead of the fork's own turns, under the same ids, after
+  a restart too. So does a leader chat's `thread_read`, and its
+  `thread_list` names a fork's last inherited turn until the fork has one
+  of its own. The adapter copies them into the fork when it is made, so a
+  rollback or delete of the parent leaves the fork's history alone; a fork of
+  a fork inherits the whole history and can branch from an inherited turn,
+  and a rollback or revert can reach back into the inherited turns. Forks
+  made by an earlier version get their history when first read if their
+  stored fork point says exactly where they branched off. Ephemeral forks
+  still carry their history in the `thread/fork` response only, as in Codex.
+- With `CLAUDE_CODEX_APP_MCP_SERVERS=1`, MCP servers added, edited, switched
+  off or deleted in the App's Settings > MCP servers take effect in Claude
+  threads. The App writes them with
+  `config/batchWrite` and `config/value/write`; the adapter keeps them in its
+  own settings (never in `config.toml`), checks them like `config.toml`
+  entries, passes them to every turn, `mcpServerStatus/list` and
+  `config/mcpServer/reload`, and reports them in `config/read` so the page
+  lists them after a restart. One of them wins a name over a server the
+  Codex or Claude Code config brings, and `CLAUDE_CODEX_MCP_SERVERS` wins
+  over it; the App's own desktop servers (`node_repl`, `cua_repl`) are
+  accepted and not kept. A server or field named `__proto__` is refused
+  with `INVALID_REQUEST`.
+  The switch is off by default, since such a server runs a program or reaches
+  a URL from every Claude thread. Without it the page lists no server, and a
+  save, switch or delete there fails with a message the App shows under the
+  form: the servers are not used for Claude threads unless the adapter runs
+  with `CLAUDE_CODEX_APP_MCP_SERVERS=1`, and a server can also go into Claude
+  Code's own MCP config. Servers saved earlier stay saved, unused.
+- The debug log hides the values in config writes that can hold credentials.
+  For `config/value/write`, `config/batchWrite` and the `config` of a request
+  such as `thread/start`, it keeps every key name and the shape of each value
+  but replaces the values of an MCP server's `env`, `headers`,
+  `http_headers`, `env_http_headers` and `args` (where a `--header` token
+  goes), of a provider's `query_params`, and of any key named like a token,
+  secret, password, API key, auth setting, cookie or credential (such as
+  `bearer_token_env_var`). Of a `url` it keeps only the scheme and host: the
+  user, password, path (where a per-user server URL keeps its secret), query
+  and fragment are replaced. Other values, such as a server's `command`, are
+  still logged.
+- Settings a Claude thread cannot honor are refused with `INVALID_REQUEST`
+  instead of being saved and ignored, so the App shows "Couldn't update this
+  setting": `model_verbosity`, a service tier other than the default, network
+  access off and the other workspace sandbox fields, `instructions`,
+  `developer_instructions` and `compact_prompt`. Writing the value Claude
+  already has, or clearing a key, still succeeds. `config/read` keeps
+  reporting `sandbox_workspace_write` unset, so Settings shows network access
+  off although Claude threads always have it: the App takes the default
+  permissions for its Default permissions preset only while that table is
+  unset (or has network access off), and would otherwise preselect Custom
+  (config.toml) in new chats.
+- `web_search = "disabled"` saved in the App's settings takes WebSearch from
+  Claude threads, including the summary `/compact` writes in a session of its
+  own; `cached`, `indexed` and `live` keep it.
+- **Behavior change:** `CLAUDE_CODEX_WEBSEARCH=0` now takes Claude Code's
+  WebSearch tool away from Claude threads too, while the App's settings saved
+  no web search mode. Before, it only made `config/read` report
+  `web_search = "disabled"` (and capabilities no web search), so Settings
+  showed web search off while Claude could still search. A mode saved in
+  Settings wins, and `modelProvider/capabilities/read` now follows it.
+- Web search off holds on the `claude-p` backend too. It now passes the tools
+  a thread must not have to `claude-p` as `--disallowedTools`, the way the
+  SDK route does, and no longer pre-approves one of them: a read-only thread
+  used to get `--allowedTools` with WebSearch in it whatever the setting
+  said. The same flag carries the Claude Code deny rules the adapter bridges
+  and the MCP tools the config disables, which `claude-p` turns did not get
+  before.
+  The `agent-http` and `agentapi` backends run Claude outside the adapter, so
+  Claude keeps WebSearch there whatever the setting says.
+- A `config/batchWrite` is all or nothing: one refused edit leaves the
+  settings as they were. Keys earlier versions saved but never honored are
+  dropped from the adapter's settings when it starts.
+- The App's `/` popup lists every command Claude Code reports for a folder,
+  not only its built-in skills: the user's and the project's
+  `.claude/commands`, plugin commands and skills (`plugin:name`) and MCP
+  prompts. Picking one runs it as `/name args`. The list is kept per folder
+  from the last chat session there (`supportedCommands()` when a turn starts,
+  then each `commands_changed`), so a folder shows them after its first
+  Claude turn; `skills/changed` makes the App refetch it. Names the App uses
+  itself (every command id it registers, including `/pin`, `/archive`,
+  `/read-aloud` and the hotkey-window and ChatGPT-chat ones), names that are
+  not one slash-command word and rows that share a
+  name with one of Claude Code's own commands are left out, and a skill read
+  from `.claude/skills` keeps its own entry. Each folder gets its own
+  `SKILL.md` per command, so a `/deploy` in two projects no longer shows the
+  description of whichever reported last; the files of commands a folder no
+  longer reports, and of folders no longer kept, are removed.
+- A message that runs a Claude Code command (`/name args`, typed or picked)
+  runs it also when the App sends context with it. Claude Code runs a
+  command only from the last text block of a message, so that block is now
+  the text as typed. Everything else goes in blocks before it, so Claude
+  still reads it and the command's arguments leave it out: the items the App
+  injected, a side chat's instructions, the `SKILL.md` of a skill picked with
+  the command, the App's `additionalContext` and images. Before, any of
+  these made the message a plain prompt or ended up in the arguments. A file
+  mentioned with the command stays in its arguments as `@path`. A command
+  sent while a turn runs is not folded into it: Claude Code runs it once the
+  current answer ends, and the turn stays open until it is done. A name with
+  a dot, such as `/release.notes` from a file `release.notes.md`, counts as
+  a command too, as the `/` popup lists it.
+  This is on the default Agent SDK backend. The `claude-p`, `agent-http` and
+  `agentapi` backends get a message as one flat text, now with that context
+  ahead of the command, so there a command sent with context does not run:
+  Claude reads the text as a plain message. Before, context other than
+  injected items followed the command into its arguments. A message with no
+  context still goes as typed. Codex chats on the `codex-proxy` route get the
+  same flat text and have no Claude Code commands.
 
 ### Provider and multi-agent boundaries
 

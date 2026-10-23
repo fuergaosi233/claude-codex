@@ -81,6 +81,20 @@ function checkpointFrom(sessionId: unknown, messageUuid: unknown): ClaudeCheckpo
     : null
 }
 
+function serializeResumePoint(point: ClaudeResumePoint | null): string | null {
+  return point == null ? null : JSON.stringify(point)
+}
+
+function parseResumePoint(json: unknown): ClaudeResumePoint | null {
+  if (typeof json !== 'string') return null
+  try {
+    const value = JSON.parse(json)
+    return value === 'new' ? 'new' : checkpointFrom(value?.sessionId, value?.messageUuid)
+  } catch {
+    return null
+  }
+}
+
 function parseGitInfo(json: unknown): GitInfo | null {
   if (typeof json !== 'string') return null
   try {
@@ -199,6 +213,22 @@ export class SessionStore {
       );
       CREATE INDEX IF NOT EXISTS idx_leader_threads_leader
         ON leader_threads(leader_thread_id, created_at);
+      CREATE TABLE IF NOT EXISTS thread_inherited_turns (
+        thread_id TEXT NOT NULL,
+        position INTEGER NOT NULL,
+        id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        started_at INTEGER,
+        completed_at INTEGER,
+        duration_ms INTEGER,
+        items_json TEXT NOT NULL,
+        diff TEXT NOT NULL DEFAULT '',
+        error_json TEXT,
+        root_turn_id TEXT,
+        claude_session_id TEXT,
+        claude_message_uuid TEXT,
+        PRIMARY KEY (thread_id, position)
+      );
     `)
     this.ensureColumn('threads', 'is_pinned', 'INTEGER NOT NULL DEFAULT 0')
     this.ensureColumn('threads', 'section_id', 'TEXT')
@@ -253,6 +283,12 @@ export class SessionStore {
     this.ensureColumn('threads', 'memory_mode', 'TEXT')
     // Codex GitInfo as JSON; written only by setThreadGitInfo.
     this.ensureColumn('threads', 'git_info_json', 'TEXT')
+    // A fork's copy of the history it was forked with (thread_inherited_turns):
+    // NULL until known, 1 once copied, 2 when a fork made before forks kept
+    // their history cannot tell where it branched off. The base is where
+    // Claude's context stands before the first inherited turn.
+    this.ensureColumn('threads', 'inherited_history', 'INTEGER')
+    this.ensureColumn('threads', 'inherited_base_json', 'TEXT')
     this.ensurePinnedSection()
     this.migrateLegacyPinState()
     this.sanitizeLegacyEnumColumns()
@@ -504,9 +540,11 @@ export class SessionStore {
       const json = likePattern(JSON.stringify(options.searchTerm).slice(1, -1))
       where.push(
         `(t.name LIKE ? ESCAPE '\\' OR t.preview LIKE ? ESCAPE '\\' OR EXISTS (
-           SELECT 1 FROM turns u WHERE u.thread_id = t.id AND u.items_json LIKE ? ESCAPE '\\'))`,
+           SELECT 1 FROM turns u WHERE u.thread_id = t.id AND u.items_json LIKE ? ESCAPE '\\')
+           OR EXISTS (SELECT 1 FROM thread_inherited_turns h
+             WHERE h.thread_id = t.id AND h.items_json LIKE ? ESCAPE '\\'))`,
       )
-      args.push(text, text, json)
+      args.push(text, text, json, json)
     }
     const parentThreadId = options.parentThreadId ?? null
     const ancestorThreadId = options.ancestorThreadId ?? null
@@ -1318,6 +1356,242 @@ export class SessionStore {
     this.db.prepare('UPDATE threads SET claude_resume_at = NULL WHERE id = ?').run(threadId)
   }
 
+  // A thread's history as clients see it: the turns it was forked with, then
+  // its own. As in Codex, a fork holds a copy of the turns it inherited, ids
+  // and all, so they outlive a rollback or delete of the thread it came from.
+  historyTurns(threadId: string): TurnRecord[] {
+    this.ensureInheritedHistory(threadId)
+    return [...this.listInheritedTurns(threadId), ...this.listTurns(threadId)]
+  }
+
+  // One turn of the thread's history: its own, or one it inherited.
+  historyTurn(threadId: string, turnId: string): TurnRecord | null {
+    const own = this.db
+      .prepare('SELECT * FROM turns WHERE id = ? AND thread_id = ?')
+      .get(turnId, threadId)
+    if (own) return this.rowToTurn(own)
+    this.ensureInheritedHistory(threadId)
+    const inherited = this.db
+      .prepare('SELECT * FROM thread_inherited_turns WHERE thread_id = ? AND id = ?')
+      .get(threadId, turnId)
+    return inherited ? this.rowToTurn(inherited) : null
+  }
+
+  listInheritedTurns(threadId: string): TurnRecord[] {
+    const rows = this.db
+      .prepare('SELECT * FROM thread_inherited_turns WHERE thread_id = ? ORDER BY position ASC')
+      .all(threadId)
+    return rows.map((row: unknown) => this.rowToTurn(row))
+  }
+
+  // Id and status of the newest turn the thread's history holds, its own or,
+  // for a fork with none yet, the last one it inherited; without decoding
+  // items.
+  lastHistoryTurnRef(threadId: string): { id: string; status: TurnRecord['status'] } | null {
+    const own = this.lastTurnRef(threadId)
+    if (own) return own
+    this.ensureInheritedHistory(threadId)
+    const row = this.db
+      .prepare(
+        'SELECT id, status FROM thread_inherited_turns WHERE thread_id = ? ORDER BY position DESC LIMIT 1',
+      )
+      .get(threadId) as { id?: unknown; status?: unknown } | undefined
+    if (typeof row?.id !== 'string' || typeof row.status !== 'string') return null
+    return { id: row.id, status: row.status as TurnRecord['status'] }
+  }
+
+  inheritedTurnCount(threadId: string): number {
+    const row = this.db
+      .prepare('SELECT COUNT(*) AS count FROM thread_inherited_turns WHERE thread_id = ?')
+      .get(threadId) as { count?: unknown } | undefined
+    return Number(row?.count ?? 0)
+  }
+
+  // Gives the fork `threadId` a copy of the first `count` turns of its
+  // parent's history, each with its Claude checkpoint. A turn still running
+  // is copied as interrupted: the fork never sees the rest of it.
+  copyInheritedHistory(threadId: string, parentId: string, count: number): void {
+    this.ensureInheritedHistory(parentId)
+    this.transaction(() => this.writeInheritedHistory(threadId, parentId, count))
+  }
+
+  // Drops the inherited turns from position `keep` on. Returns how many went.
+  truncateInheritedTurns(threadId: string, keep: number): number {
+    const result = this.db
+      .prepare('DELETE FROM thread_inherited_turns WHERE thread_id = ? AND position >= ?')
+      .run(threadId, Math.max(0, keep)) as { changes?: number | bigint }
+    return Number(result.changes ?? 0)
+  }
+
+  // Where Claude's context stands after the first `count` inherited turns:
+  // the newest of their checkpoints, or with none of them, the base the
+  // copy recorded. Null when those turns predate checkpoints.
+  contextAfterInherited(threadId: string, count: number): ClaudeResumePoint | null {
+    if (count > 0) {
+      const row = this.db
+        .prepare(
+          `SELECT claude_session_id, claude_message_uuid FROM thread_inherited_turns
+           WHERE thread_id = ? AND position < ? AND claude_session_id IS NOT NULL
+             AND claude_message_uuid IS NOT NULL
+           ORDER BY position DESC LIMIT 1`,
+        )
+        .get(threadId, count) as
+        | { claude_session_id?: unknown; claude_message_uuid?: unknown }
+        | undefined
+      return checkpointFrom(row?.claude_session_id, row?.claude_message_uuid)
+    }
+    const row = this.db
+      .prepare('SELECT inherited_base_json FROM threads WHERE id = ?')
+      .get(threadId) as { inherited_base_json?: unknown } | undefined
+    return parseResumePoint(row?.inherited_base_json)
+  }
+
+  // A fork made before forks kept their history gets the turns it was forked
+  // with the first time anything reads it, when its fork checkpoint shows
+  // exactly where it branched off. Otherwise it keeps only its own turns.
+  private ensureInheritedHistory(threadId: string, depth = 0): void {
+    const row = this.db
+      .prepare(
+        'SELECT forked_from_id, ephemeral, thread_source, inherited_history FROM threads WHERE id = ?',
+      )
+      .get(threadId) as
+      | {
+          forked_from_id?: unknown
+          ephemeral?: unknown
+          thread_source?: unknown
+          inherited_history?: unknown
+        }
+      | undefined
+    if (
+      !row ||
+      row.inherited_history != null ||
+      typeof row.forked_from_id !== 'string' ||
+      Number(row.ephemeral) === 1 ||
+      row.thread_source === 'subagent' ||
+      depth > 64
+    )
+      return
+    const parentId = row.forked_from_id
+    this.ensureInheritedHistory(parentId, depth + 1)
+    this.transaction(() => {
+      const state = this.db
+        .prepare('SELECT inherited_history FROM threads WHERE id = ?')
+        .get(threadId) as { inherited_history?: unknown } | undefined
+      if (state?.inherited_history != null) return
+      const count = this.legacyForkLength(threadId, parentId)
+      if (count === null) {
+        this.db.prepare('UPDATE threads SET inherited_history = 2 WHERE id = ?').run(threadId)
+      } else {
+        this.writeInheritedHistory(threadId, parentId, count)
+      }
+    })
+  }
+
+  // How many turns of its parent's history a fork made before forks kept
+  // their history was forked with, read off its fork checkpoint. Null when
+  // that is not certain: the checkpoint is gone from the parent (rolled back,
+  // deleted), or turns without a checkpoint sit where the fork could have
+  // stopped instead.
+  private legacyForkLength(threadId: string, parentId: string): number | null {
+    if (!this.getThread(parentId)) return null
+    const point = this.forkCheckpoint(threadId)
+    if (point === 'new') return 0
+    if (!point) return null
+    const entries = this.historyCheckpoints(parentId)
+    const index = entries.findLastIndex(
+      (entry) =>
+        entry.checkpoint?.sessionId === point.sessionId &&
+        entry.checkpoint.messageUuid === point.messageUuid,
+    )
+    if (index < 0) return null
+    // A fork that stopped right after the match, at a turn without a
+    // checkpoint, got the match's checkpoint too.
+    const next = entries[index + 1]
+    if (next && !next.checkpoint) return null
+    // Turns without a checkpoint at the start of the parent's own turns let
+    // a fork stop there and resume the parent's whole session instead.
+    const ownStart = this.inheritedTurnCount(parentId)
+    const firstOwn = entries[ownStart]
+    if (firstOwn && ownStart <= index && !firstOwn.checkpoint) return null
+    return index + 1
+  }
+
+  private historyCheckpoints(threadId: string): Array<{ checkpoint: ClaudeCheckpoint | null }> {
+    const inherited = this.db
+      .prepare(
+        'SELECT claude_session_id, claude_message_uuid FROM thread_inherited_turns WHERE thread_id = ? ORDER BY position ASC',
+      )
+      .all(threadId) as Array<{ claude_session_id?: unknown; claude_message_uuid?: unknown }>
+    const own = this.db
+      .prepare(
+        'SELECT claude_session_id, claude_message_uuid FROM turns WHERE thread_id = ? ORDER BY started_at ASC, rowid ASC',
+      )
+      .all(threadId) as Array<{ claude_session_id?: unknown; claude_message_uuid?: unknown }>
+    return [...inherited, ...own].map((row) => ({
+      checkpoint: checkpointFrom(row.claude_session_id, row.claude_message_uuid),
+    }))
+  }
+
+  // Where Claude's context stands before the first turn of a thread's
+  // history: a fork's base, else its fork point, else a new session.
+  private historyBase(threadId: string): ClaudeResumePoint | null {
+    const row = this.db
+      .prepare(
+        'SELECT forked_from_id, inherited_history, inherited_base_json FROM threads WHERE id = ?',
+      )
+      .get(threadId) as
+      | { forked_from_id?: unknown; inherited_history?: unknown; inherited_base_json?: unknown }
+      | undefined
+    if (!row) return null
+    if (Number(row.inherited_history) === 1) return parseResumePoint(row.inherited_base_json)
+    if (row.forked_from_id == null) return 'new'
+    return this.forkCheckpoint(threadId)
+  }
+
+  // Inside a transaction: replaces the fork's inherited turns with the first
+  // `count` turns of its parent's history.
+  private writeInheritedHistory(threadId: string, parentId: string, count: number): void {
+    this.db.prepare('DELETE FROM thread_inherited_turns WHERE thread_id = ?').run(threadId)
+    const columns =
+      'id, status, started_at, completed_at, duration_ms, items_json, diff, error_json, root_turn_id, claude_session_id, claude_message_uuid'
+    const rows = [
+      ...(this.db
+        .prepare(
+          `SELECT ${columns} FROM thread_inherited_turns WHERE thread_id = ? ORDER BY position ASC`,
+        )
+        .all(parentId) as any[]),
+      ...(this.db
+        .prepare(
+          `SELECT ${columns} FROM turns WHERE thread_id = ? ORDER BY started_at ASC, rowid ASC`,
+        )
+        .all(parentId) as any[]),
+    ].slice(0, Math.max(0, count))
+    const insert = this.db.prepare(
+      `INSERT INTO thread_inherited_turns (thread_id, position, ${columns})
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    for (const [position, row] of rows.entries()) {
+      insert.run(
+        threadId,
+        position,
+        row.id,
+        row.status === 'inProgress' ? 'interrupted' : row.status,
+        row.started_at ?? null,
+        row.completed_at ?? null,
+        row.duration_ms ?? null,
+        row.items_json,
+        row.diff ?? '',
+        row.error_json ?? null,
+        row.root_turn_id ?? null,
+        row.claude_session_id ?? null,
+        row.claude_message_uuid ?? null,
+      )
+    }
+    this.db
+      .prepare('UPDATE threads SET inherited_history = 1, inherited_base_json = ? WHERE id = ?')
+      .run(serializeResumePoint(this.historyBase(parentId)), threadId)
+  }
+
   // thread/delete: the thread, the subagent threads it spawned (recursively)
   // and everything stored for them. Returns the deleted thread ids.
   deleteThread(threadId: string): string[] {
@@ -1336,6 +1610,7 @@ export class SessionStore {
     ).map((row) => row.id)
     for (const id of ids) {
       this.db.prepare('DELETE FROM turns WHERE thread_id = ?').run(id)
+      this.db.prepare('DELETE FROM thread_inherited_turns WHERE thread_id = ?').run(id)
       this.db.prepare('DELETE FROM thread_goals WHERE thread_id = ?').run(id)
       this.db.prepare('DELETE FROM thread_queues WHERE thread_id = ?').run(id)
       this.db.prepare('DELETE FROM thread_dynamic_tools WHERE thread_id = ?').run(id)

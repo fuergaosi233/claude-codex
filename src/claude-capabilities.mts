@@ -2,7 +2,12 @@ import { createHash } from 'node:crypto'
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
-import { claudeCommandManifest, firstSentence, listClaudeCommands } from './claude-commands.mjs'
+import {
+  claudeCommandManifest,
+  firstSentence,
+  listClaudeCommands,
+  listFolderCommands,
+} from './claude-commands.mjs'
 import { claudeHookFiles, claudeHookScope } from './claude-hooks.mjs'
 import { bridgedClaudeConfigDir, claudeSkillFolders } from './project-instructions.mjs'
 import { isPathInside } from './util.mjs'
@@ -75,9 +80,26 @@ export function listClaudeSkills(params: Record<string, unknown>): SkillsListEnt
   )
   return roots.map((cwd) => {
     const repo = repoSkillDirs(cwd).map((dir) => readSkillDir(dir, 'repo'))
+    const listed = [...userSkills.skills, ...repo.flatMap((entry) => entry.skills), ...builtins]
+    // The folder's other Claude Code commands. Claude Code reports the
+    // skills read from disk above among them; those stay as they are.
+    // App rule: skills-popup
+    const taken = new Set(listed.map((skill) => skill.name))
+    const commands = listFolderCommands(cwd)
+      .filter((command) => !taken.has(command.name))
+      .map(
+        (command): SkillMetadata => ({
+          name: command.name,
+          description: command.description,
+          shortDescription: firstSentence(command.description),
+          path: claudeCommandManifest(command.name, cwd),
+          scope: 'user',
+          enabled: true,
+        }),
+      )
     return {
       cwd,
-      skills: [...userSkills.skills, ...repo.flatMap((entry) => entry.skills), ...builtins],
+      skills: [...listed, ...commands],
       errors: [...userSkills.errors, ...repo.flatMap((entry) => entry.errors)],
     }
   })

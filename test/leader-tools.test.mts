@@ -297,6 +297,58 @@ test('thread_start leaves a chat without a title for the App to title from its p
   })
 })
 
+test('thread_read and thread_list show a fork with the turns it was forked with', async () => {
+  await withServer(LEADER_ENV, async (server) => {
+    const leader = await server.startThread()
+    const source = await server.startThread()
+    await server.ask(source, 'first question')
+    await server.ask(source, 'second question')
+    const { thread: fork } = await server.request('thread/fork', { threadId: source })
+    const historyIds = async (): Promise<string[]> => {
+      const { thread } = await server.request('thread/read', {
+        threadId: fork.id,
+        includeTurns: true,
+      })
+      return thread.turns.map((turn: any) => turn.id)
+    }
+    const inherited = await historyIds()
+    assert.equal(inherited.length, 2)
+
+    // The leader reads the fork as the App shows it, and lists it with the
+    // last turn it inherited.
+    const read = await server.tool(leader, 'thread_read', { threadId: fork.id })
+    assert.deepEqual(
+      read.turns.map((turn: any) => turn.turnId),
+      inherited,
+    )
+    assert.deepEqual(read.turns[0].items[0], { type: 'user', text: 'first question' })
+    const listed = await server.tool(leader, 'thread_list', { scope: 'all' })
+    const entry = listed.threads.find((thread: any) => thread.threadId === fork.id)
+    assert.equal(entry.turnId, inherited[1])
+    assert.equal(entry.turnStatus, 'completed')
+    assert.equal(entry.status, 'idle')
+
+    // Its own turns follow the inherited ones; the cursor reads on from there.
+    await server.ask(fork.id, 'third question')
+    const all = await historyIds()
+    assert.equal(all.length, 3)
+    const again = await server.tool(leader, 'thread_read', { threadId: fork.id })
+    assert.deepEqual(
+      again.turns.map((turn: any) => turn.turnId),
+      all,
+    )
+    const next = await server.tool(leader, 'thread_read', {
+      threadId: fork.id,
+      sinceCursor: read.cursor,
+    })
+    assert.deepEqual(
+      next.turns.map((turn: any) => turn.turnId),
+      [all[2]],
+    )
+    assert.deepEqual(next.turns[0].items[0], { type: 'user', text: 'third question' })
+  })
+})
+
 test('thread_wait returns when a chat blocks on an approval, and thread_prompt refuses it', async () => {
   await withServer(LEADER_ENV, async (server) => {
     const leader = await server.startThread({

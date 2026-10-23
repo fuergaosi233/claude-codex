@@ -2,7 +2,12 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { NativeClaudeRuntime } from '../src/native-runtime.mjs'
 import { TurnInput, type TurnInputMessage } from '../src/native-turn-input.mjs'
-import type { RuntimeEvent, RuntimeTurnContext } from '../src/types.mjs'
+import type {
+  ImageInput,
+  RuntimeEvent,
+  RuntimeSteerOptions,
+  RuntimeTurnContext,
+} from '../src/types.mjs'
 
 const context: RuntimeTurnContext = {
   threadId: 'thread',
@@ -248,5 +253,86 @@ test('a steered native turn completes with the answer to the steer', async () =>
   assert.deepEqual(
     events.filter((event) => event.type === 'text_delta').map((event) => event.delta),
     ['Working on it.', 'Also done.'],
+  )
+})
+
+// The content of the message a turn sends, and of a message steered into it
+// once Claude starts answering.
+async function sentContents(
+  turn: Partial<RuntimeTurnContext>,
+  steer?: { prompt: string; options: RuntimeSteerOptions },
+): Promise<unknown[]> {
+  const contents: unknown[] = []
+  const runtime = runtimeWith(async function* (prompt) {
+    const sent = (await prompt.next()).value
+    contents.push(sent?.message.content)
+    yield assistant('first', 'Working on it.')
+    const answered = (uuid: unknown, queued: number) =>
+      result({ user_message_uuid: uuid, user_message_uuids: [uuid], queued_turn_count: queued })
+    if (!steer) {
+      yield answered(sent?.uuid, 0)
+      return
+    }
+    const steered = (await prompt.next()).value
+    contents.push(steered?.message.content)
+    yield answered(sent?.uuid, 1)
+    yield answered(steered?.uuid, 0)
+  })
+  let steered = false
+  await runtime.runTurn(
+    { ...context, ...turn },
+    {
+      onEvent: async (event) => {
+        if (!steer || steered || event.type !== 'text_delta') return
+        steered = true
+        void runtime.steer(context.threadId, steer.prompt, steer.options)
+      },
+      onPermissionRequest: async () => ({ decision: 'accept' }),
+      onUserInputRequest: async () => ({ answers: {} }),
+    },
+  )
+  return contents
+}
+
+test('a native message that runs a command ends with its text, after its context and images', async () => {
+  const image: ImageInput = {
+    kind: 'base64',
+    mediaType: 'image/png',
+    data: 'AAAA',
+    displayPath: 'shot.png',
+  }
+  const imageBlock = {
+    type: 'image',
+    source: { type: 'base64', media_type: 'image/png', data: 'AAAA' },
+  }
+  const text = (value: string) => ({ type: 'text', text: value })
+
+  assert.deepEqual(
+    await sentContents({
+      prompt: '/review src',
+      promptContext: ['Context.'],
+      imageInputs: [image],
+    }),
+    [[text('Context.'), imageBlock, text('/review src')]],
+  )
+  // Claude Code reads a command only from the text block a message ends with.
+  assert.deepEqual(await sentContents({ prompt: '/review src', imageInputs: [image] }), [
+    [imageBlock, text('/review src')],
+  ])
+  assert.deepEqual(await sentContents({ prompt: '/review src' }), ['/review src'])
+  // So does one named with a dot, as a file release.notes.md names it.
+  assert.deepEqual(await sentContents({ prompt: '/release.notes', imageInputs: [image] }), [
+    [imageBlock, text('/release.notes')],
+  ])
+  // Any other message keeps its text first.
+  assert.deepEqual(await sentContents({ prompt: 'Look at this.', imageInputs: [image] }), [
+    [text('Look at this.'), imageBlock],
+  ])
+  assert.deepEqual(
+    await sentContents(
+      { prompt: 'Draft the reply.' },
+      { prompt: '/review src', options: { promptContext: ['Context.'] } },
+    ),
+    ['Draft the reply.', [text('Context.'), text('/review src')]],
   )
 })

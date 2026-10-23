@@ -206,6 +206,29 @@ creates. Listing chats never runs git; switching branches by hand shows after
 the chat's next turn. Chats from before this version get their branch when
 they are next opened.
 
+## Forks and rewinds
+
+A forked chat shows the conversation it was forked with, then its own
+messages, as a Codex fork does: when it opens, after the adapter restarts,
+when the App pages its history and in Find. Like Codex, the adapter keeps a
+copy of those turns with the fork, under the same turn and item ids, so
+rewinding or deleting the original chat leaves the fork as it was. Forking a
+fork carries the whole conversation along, and forking from one of its
+earlier messages works on the inherited ones too. Claude's context follows
+the same cut: the fork remembers what it shows and nothing after it.
+
+Rewinding a fork (editing an earlier message, or **Fork from here** on a
+message before the fork point) can reach back into the inherited
+conversation: those turns go from the fork only, and Claude resumes after the
+newest one left, or in a new session when none is left.
+
+Forks made by an earlier adapter version showed only their own messages. Such
+a fork gets its inherited conversation the first time it is opened, when the
+adapter can tell exactly where it branched off; when it cannot (the original
+chat was rewound past that point or deleted, or its turns predate Claude
+checkpoints) the fork keeps showing only its own messages. Side chats and the
+other temporary forks the App makes are not kept, as in Codex.
+
 ## How tool calls show
 
 Claude's tool calls show as the items Codex uses for its own:
@@ -330,9 +353,47 @@ file. That covers the skills in your Claude Code and project `.claude/skills`
 folders and the App's own skills Claude can run, up to 64 KiB per skill;
 Claude reads any other skill file itself. Your message shows only the chip.
 
+The `/` popup also lists the commands Claude Code finds for a folder beyond
+its own: your and the project's `.claude/commands`, the commands and skills of
+your Claude Code plugins (`plugin:name`) and the prompts of MCP servers. They
+show as "Local file" skills and run as slash commands, with the rest of your
+message as their arguments. A command's "Local file" is a short page the
+adapter writes for that folder with the description Claude Code reported
+there, so two projects with a `/deploy` of their own each show theirs; it is
+removed when the folder stops reporting the command. Claude Code reports
+them when a chat's turn starts, so a folder no Claude chat has worked in yet
+lists them after its first turn, and a command added later appears once the
+next turn starts in that folder. A Claude CLI started with its setting
+sources turned off (see `CLAUDE_CODEX_CLAUDE_CONFIG_DIR` in
+[Configuration](/guide/configuration#reference-table)) finds no user,
+project or plugin commands, so none are listed. Commands named like one of
+the App's own are left out: `/init`, `/compact`, `/review-mode` and the rest,
+including the ones the App offers only in some windows or chats (`/pin`,
+`/archive`, `/read-aloud`, `/hotkey-window-new`, …). Claude Code's plain
+built-ins such as `/cost` are not listed.
+
+A message that starts with a command, typed or picked, runs it with the rest
+of the message as its arguments, a file you mention included (as `@path`).
+That includes a command named with a dot, such as `/release.notes` from a
+file `release.notes.md`. Images, a skill you pick with it, a side chat's instructions and context the
+App sends along reach Claude with the command, ahead of it, and stay out of
+its arguments. A command you send while Claude is still working is not
+folded into the running answer the way other messages are: Claude Code runs
+it once that answer ends, and the turn ends after it.
+
+That is on the default Agent SDK backend. The `claude-p`, `agent-http` and
+`agentapi` backends (see [Backends](/guide/backends)) get a message as one
+flat text, with that context ahead of the command, so a command sent with any
+of it does not run there: Claude reads the whole text as a plain message.
+Only a message with no such context goes as typed. The context cannot follow
+the command instead, as it would become the command's arguments. Codex chats
+on the `codex-proxy` route get the same flat text, and have no Claude Code
+commands to run.
+
 Context the App attaches to a message without showing it, such as the follow-up
-after you connect a suggested plugin, reaches Claude after the message, marked
-as data rather than instructions when the App does not vouch for it.
+after you connect a suggested plugin, reaches Claude after the message (before
+it for a command), marked as data rather than instructions when the App does
+not vouch for it.
 
 The App's instructions to the model describe tools only Codex chats have:
 starting and messaging other threads, worktrees, automations and the sidebar.
@@ -566,6 +627,43 @@ setting decides there.
 With or without `CLAUDE_CODEX_MEMORIES`, the adapter refuses `memory/reset`
 rather than delete Claude Code's notes.
 
+## MCP servers and other settings
+
+**Settings > MCP servers** works for Claude chats only when the adapter runs
+with `CLAUDE_CODEX_APP_MCP_SERVERS=1`. Without it (the default) the page lists
+no server you added, and saving, switching or deleting one shows this under
+the form instead:
+
+> MCP servers added in the App are not used for Claude threads unless the
+> adapter runs with CLAUDE_CODEX_APP_MCP_SERVERS=1. You can also add a server
+> to Claude Code's own MCP config (claude mcp add, or a project's .mcp.json).
+
+With the switch, a server you add, edit or switch off there is saved by the
+adapter (in its own config, not in `config.toml`) and used by Claude chats from
+their next turn; Claude can call its tools, and the App lists the server with
+its tools. A server without a command or URL is refused with an error. The
+App's own desktop servers, which it writes there for its Codex chats each time
+it starts, are never kept, with or without the switch. Servers from the Codex and Claude Code
+configs and from `CLAUDE_CODEX_MCP_SERVERS` are listed apart from the ones you
+added; see [MCP, tools & directories](/guide/configuration#mcp-tools-directories).
+
+**Settings > Configuration** shows what Claude chats do, but for one row:
+Network access shows off, although Claude chats always have network access, as
+they have no network sandbox. The adapter leaves that setting unset, as Codex
+does without a `[sandbox_workspace_write]` table, because the App takes the
+default permissions for its Default permissions preset only then; reported on,
+new chats would preselect Custom (config.toml). Turning it on changes nothing.
+Turning it off, or picking a verbosity, says "Couldn't update this setting",
+since Claude chats have neither setting. Web search off takes Claude's
+WebSearch tool away; the other search modes keep it. It shows off, and Claude
+has no WebSearch, also when the adapter runs with `CLAUDE_CODEX_WEBSEARCH=0`
+and no mode was picked there. That is on the default backend and `claude-p`:
+the `agent-http` and `agentapi` backends run Claude outside the adapter, so
+Claude keeps WebSearch there whatever this shows (see
+[Backends](/guide/backends)). The approval policy and sandbox mode are saved
+and apply to the chats you start. The full list is under
+[App settings](/guide/configuration#app-settings).
+
 ## App tools
 
 On a remote connection the Codex App registers tools of its own when it starts
@@ -610,7 +708,7 @@ need the default native Claude Agent SDK backend:
 | `thread_list` | The chats this one started, each `working`, `blocked` (waiting on you), `done-unread` (finished a turn the leader has not read) or `idle`. `scope: "all"` adds your other recent chats. |
 | `thread_wait` | Waits until `any` (default) or `all` of the given chats finish their turn or get blocked, then returns each one's status and last agent message, truncated. |
 | `thread_prompt` | Sends a chat a message, as you would: into its running turn while it works (the App's default for follow-ups), otherwise as a new turn. `wait: true` also waits for that turn. |
-| `thread_read` | A chat's transcript as structured items in pages of bounded size, with a cursor for reading only what is new. |
+| `thread_read` | A chat's transcript as structured items in pages of bounded size, with a cursor for reading only what is new. A forked chat's transcript starts with the turns it was forked with, as the App shows it. |
 
 When Claude's reply repeats the `::created-thread{threadId="…"}` line, the
 Codex App shows a card for the new chat in the reply, as it does for chats Codex
