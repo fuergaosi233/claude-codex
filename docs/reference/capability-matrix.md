@@ -89,7 +89,7 @@ Agent SDK sidecar; runtime selection is pluggable. Status legend: **Supported**,
 | Background terminals | Supported | Claude's background Bash shells are listed by `thread/backgroundTerminals/list` and stopped by `terminate`/`clean`, and their output keeps streaming into the item of the Bash call that started them. The CLI runs them, so there is no OS pid or usage. Claude Code 2.1.285+ stops them after 30 minutes in Agent SDK sessions, or after the call's own `timeout` up to 2 hours. |
 | Thread attachments | Supported | `thread/attachment/*` keeps the App's per-thread JSON (archived worktree, linked pull requests), and `thread/attachmentOwner/list` finds the threads holding one. As in Codex, a fork that is not ephemeral starts with copies of its parent's attachments. |
 | Running-turn settings | Supported | `turn/settings/update` switches the running turn's model and effort in place; the next turn runs on its own settings again. A model must be one `model/list` offers for the thread's backend; the effort `none`, which `model/list` gives a model without efforts, leaves the effort as it is. An `approvalsReviewer` switches the running session into or out of auto mode (see Auto-review) and holds for the thread's later turns; `summary` and `serviceTier` have no Claude counterpart. The verified App sends only the reviewer, when permissions change during a turn. |
-| App settings | Supported | `config/value/write` and `config/batchWrite` keep what a Claude thread honors (model, effort, approval policy, sandbox mode, `web_search`, whose `disabled` takes WebSearch from Claude, MCP servers, memories, the auto-compact window) and refuse with `INVALID_REQUEST` what it cannot (`model_verbosity`, a service tier, network access off or other workspace sandbox fields, instructions, `compact_prompt`), so the App shows "Couldn't update this setting" instead of a switch that does nothing; a batch is all or nothing. `config/read` reports `sandbox_workspace_write` unset, so the App keeps its Default permissions preset and Settings shows network access off, although Claude threads always have it. The App's desktop servers (`node_repl`, `cua_repl`) are accepted and not kept. See [App settings](/guide/configuration#app-settings). |
+| App settings | Supported | `config/value/write` and `config/batchWrite` keep what a Claude thread honors (model, effort, approval policy, sandbox mode, `web_search`, whose `disabled` takes WebSearch from Claude but on the `agent-http` and `agentapi` backends, MCP servers, memories, the auto-compact window) and refuse with `INVALID_REQUEST` what it cannot (`model_verbosity`, a service tier, network access off or other workspace sandbox fields, instructions, `compact_prompt`), so the App shows "Couldn't update this setting" instead of a switch that does nothing; a batch is all or nothing. `config/read` reports `sandbox_workspace_write` unset, so the App keeps its Default permissions preset and Settings shows network access off, although Claude threads always have it. The App's desktop servers (`node_repl`, `cua_repl`) are accepted and not kept. See [App settings](/guide/configuration#app-settings). |
 
 ## Not applicable / unsupported
 
@@ -161,7 +161,9 @@ codex.
   searches, unless the App saved another value or, with none saved,
   `CLAUDE_CODEX_WEBSEARCH=0` turns it off; `disabled` either way takes
   WebSearch from Claude threads, and `modelProvider/capabilities/read` reports
-  web search only while they have it. `model_context_window` stays null, as
+  web search only while they have it. The `agent-http` and `agentapi` backends
+  run Claude outside the adapter and keep WebSearch whatever both report.
+  `model_context_window` stays null, as
   Codex reports it only when `config.toml` sets it.
 - `turn/plan/updated` is reserved for the `update_plan`/TodoWrite checklist tool
   and ships the spec shape `{ explanation, plan: [{ step, status }] }` (status

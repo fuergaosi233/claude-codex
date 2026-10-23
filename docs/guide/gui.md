@@ -652,7 +652,10 @@ Turning it off, or picking a verbosity, says "Couldn't update this setting",
 since Claude chats have neither setting. Web search off takes Claude's
 WebSearch tool away; the other search modes keep it. It shows off, and Claude
 has no WebSearch, also when the adapter runs with `CLAUDE_CODEX_WEBSEARCH=0`
-and no mode was picked there. The approval policy and sandbox mode are saved
+and no mode was picked there. That is on the default backend and `claude-p`:
+the `agent-http` and `agentapi` backends run Claude outside the adapter, so
+Claude keeps WebSearch there whatever this shows (see
+[Backends](/guide/backends)). The approval policy and sandbox mode are saved
 and apply to the chats you start. The full list is under
 [App settings](/guide/configuration#app-settings).
 

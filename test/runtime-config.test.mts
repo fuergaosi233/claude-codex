@@ -3224,6 +3224,73 @@ test('claude-p runtime passes the auto-compact window only when the thread has o
   }
 })
 
+test('claude-p runtime keeps the tools a thread must not have from Claude', async () => {
+  const tmp = await mkdtemp(join(tmpdir(), 'claude-codex-claude-p-tools-test-'))
+  const command = join(tmp, 'fake-claude-p.mjs')
+  await writeFile(
+    command,
+    [
+      '#!/usr/bin/env node',
+      'const args = process.argv.slice(2);',
+      'const flag = (name) => (args.includes(name) ? args[args.indexOf(name) + 1] : null);',
+      'const result = JSON.stringify({ allowed: flag("--allowedTools"), disallowed: flag("--disallowedTools") });',
+      'console.log(JSON.stringify({ result, session_id: null, is_error: false }));',
+    ].join('\n'),
+  )
+  await chmod(command, 0o755)
+  const runtime = new ClaudePTranscriptRuntime({
+    command,
+    extraArgs: [],
+    timeoutMs: 20_000,
+    skipPermissions: false,
+    resume: false,
+  })
+  const run = async (
+    name: string,
+    overrides: Partial<RuntimeTurnContext>,
+  ): Promise<{ allowed: string | null; disallowed: string | null }> => {
+    let text = ''
+    await runtime.runTurn(
+      nativeTurnContext({ threadId: `thread-${name}`, cwd: tmp, ...overrides }),
+      {
+        onEvent: (event) => {
+          if (event.type === 'text_delta') text += event.delta
+        },
+        onPermissionRequest: async () => ({ decision: 'accept' }),
+      },
+    )
+    return JSON.parse(text)
+  }
+  try {
+    const [readOnly, readOnlyOff, allowList, onlyDenied] = await Promise.all([
+      run('read-only', { sandboxMode: 'read-only' }),
+      // Web search off on a read-only thread: WebSearch is neither
+      // pre-approved nor left to Claude.
+      run('read-only-off', {
+        sandboxMode: 'read-only',
+        disallowedTools: ['WebSearch', 'mcp__docs__search'],
+      }),
+      run('allow-list', {
+        allowedTools: ['WebSearch', 'Bash(git status:*)'],
+        disallowedTools: ['WebSearch'],
+      }),
+      run('only-denied', { allowedTools: ['WebSearch'], disallowedTools: ['WebSearch'] }),
+    ])
+    assert.deepEqual(readOnly, {
+      allowed: 'Read,Glob,Grep,WebSearch,WebFetch,TodoWrite,Task',
+      disallowed: null,
+    })
+    assert.deepEqual(readOnlyOff, {
+      allowed: 'Read,Glob,Grep,WebFetch,TodoWrite,Task',
+      disallowed: 'WebSearch,mcp__docs__search',
+    })
+    assert.deepEqual(allowList, { allowed: 'Bash(git status:*)', disallowed: 'WebSearch' })
+    assert.deepEqual(onlyDenied, { allowed: null, disallowed: 'WebSearch' })
+  } finally {
+    await rm(tmp, { recursive: true, force: true })
+  }
+})
+
 test('claude-p runtime timeout terminates spawned process tree', async () => {
   const tmp = await mkdtemp(join(tmpdir(), 'claude-codex-claude-p-timeout-test-'))
   const command = join(tmp, 'hanging-claude-p.mjs')

@@ -635,6 +635,15 @@ versioning or publishing metadata.
   `web_search = "disabled"` (and capabilities no web search), so Settings
   showed web search off while Claude could still search. A mode saved in
   Settings wins, and `modelProvider/capabilities/read` now follows it.
+- Web search off holds on the `claude-p` backend too. It now passes the tools
+  a thread must not have to `claude-p` as `--disallowedTools`, the way the
+  SDK route does, and no longer pre-approves one of them: a read-only thread
+  used to get `--allowedTools` with WebSearch in it whatever the setting
+  said. The same flag carries the Claude Code deny rules the adapter bridges
+  and the MCP tools the config disables, which `claude-p` turns did not get
+  before.
+  The `agent-http` and `agentapi` backends run Claude outside the adapter, so
+  Claude keeps WebSearch there whatever the setting says.
 - A `config/batchWrite` is all or nothing: one refused edit leaves the
   settings as they were. Keys earlier versions saved but never honored are
   dropped from the adapter's settings when it starts.
