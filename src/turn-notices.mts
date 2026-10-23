@@ -11,7 +11,8 @@
 // ended takes the row too. Only a message of the exact form "Reconnecting...
 // n/m" merges with others, which a notice never has. The App does not keep
 // these rows, so when the turn then fails its error's details repeat the
-// turn's notices, and a failed turn is persisted.
+// turn's notices and are stored with it; the App shows those details only in
+// a diagnostics view it does not always offer.
 // App rule: turn-notices
 
 import type { CodexTurnError } from './server-helpers.mjs'

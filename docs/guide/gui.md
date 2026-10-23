@@ -141,9 +141,10 @@ Notices the Claude CLI would show an interactive user at once show as a dim
 row under the turn, which goes on: a compaction Claude Code could not do, a
 switch to a fallback model, an urgent CLI notification, or a call refused
 while no turn was running. Each message shows once a turn, and a turn shows
-at most five. The App does not keep these rows when the chat is reopened, so a
-turn that then fails repeats its notices in the error's details, which it does
-keep.
+at most five. The App does not keep these rows when the chat is reopened. A
+turn that then fails repeats its notices in its error's details, which are
+stored with the turn and returned by `thread/read`, but the App shows those
+details only in an error diagnostics view it does not always offer.
 
 The adapter sends each notice as an `error` notification with `willRetry` and
 no error code, which the App draws as such a row without failing the turn,
@@ -167,7 +168,9 @@ A request you can put right, such as a model the chat cannot take, an unknown
 chat or a bad parameter, fails with the JSON-RPC code Codex uses for it,
 `-32600` (invalid request), and its message says why. Picking a Codex model in
 a Claude chat that has a reply, for example, shows the **Couldn't update model
-settings** toast with the reason, and the menu goes back to the Claude model.
+settings** toast with the reason (below the App's own "Check your config.toml."
+line, which the App adds to every such error), and the menu goes back to the
+Claude model.
 A failure inside the adapter stays a server error (`-32000`).
 
 ## The context gauge

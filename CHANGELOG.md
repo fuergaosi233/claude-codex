@@ -61,8 +61,10 @@ versioning or publishing metadata.
   notice also goes out as an `error` notification with `willRetry: true` and
   no error code, which the App draws that way; the `warning` is still sent.
   Each message shows once a turn and at most five rows a turn, and a turn that
-  then fails repeats its notices in the error's `additionalDetails`, which the
-  App keeps. `CLAUDE_CODEX_NOTICE_ROWS=0` sends the warnings alone.
+  then fails repeats its notices in the error's `additionalDetails`, which are
+  stored with the turn and returned by `thread/read`; the App shows them only
+  in an error diagnostics view it does not always offer.
+  `CLAUDE_CODEX_NOTICE_ROWS=0` sends the warnings alone.
 - A tool call, MCP elicitation or client dynamic tool call that background work
   (a background agent, a workflow, a cron job) makes while no turn runs is
   still refused, but no longer silently: Claude is told no user turn was active
@@ -77,7 +79,8 @@ versioning or publishing metadata.
   thread, turn, section, queued message or process; a bad cursor or parameter;
   a model the chat cannot take; a rewind or queued start while a turn runs.
   The model menu's "Couldn't update model settings" toast now gives the
-  reason. Failures inside the adapter stay `-32000`.
+  reason, after the App's own "Check your config.toml." line. Failures inside
+  the adapter stay `-32000`.
 - The goal tools (`codex_goal`) and leader tools (`codex_leader`) load with the
   session instead of behind Claude Code's tool search, so Claude knows they are
   there in a session with many tools.
