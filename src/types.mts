@@ -820,16 +820,14 @@ export type RuntimeEvent =
   // A subagent or workflow the turn waits on is still working: its own
   // output, a task progress frame or a tool_progress heartbeat, which a
   // backend that filters nested events would otherwise keep to itself.
-  // `toolUseId` is the call that started it. `failedRequest` marks a frame
-  // that tells of a request of the agent's that failed (a retry, or the
-  // message naming the error), and `heartbeat` the CLI's timer tick for a
-  // call that still runs: either keeps the turn alive, but is no sign the
-  // agent got on with its work.
+  // `toolUseId` is the call that started it. `idle` marks a frame that keeps
+  // the turn alive but tells of none of the agent's work: a request of its
+  // that failed, the CLI's timer tick for a call that still runs, and the
+  // like (see the native runtime's subagentFrame).
   | {
       type: 'subagent_progress'
       toolUseId: string
-      failedRequest?: boolean
-      heartbeat?: boolean
+      idle?: boolean
     }
   // A subagent's own work: its text, thinking, tool calls and their results.
   // `toolUseId` is the Agent call the frame came under and `agentId` the task
