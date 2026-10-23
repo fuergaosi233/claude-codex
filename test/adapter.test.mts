@@ -11145,8 +11145,8 @@ async function runWatchdogScript(windowMs: number, body: string): Promise<void> 
         messages.find(
           (message) => message.method === 'turn/completed' && message.params.turn.id === turnId,
         )
-      const waitFor = async (probe, label) => {
-        const deadline = performance.now() + 5000
+      const waitFor = async (probe, label, timeoutMs = 5000) => {
+        const deadline = performance.now() + timeoutMs
         while (performance.now() < deadline) {
           const value = probe()
           if (value) return value
@@ -11286,10 +11286,15 @@ test('subagent watchdog does not take a jump of the wall clock for a quiet agent
 })
 
 test('workflow watchdog waits while overlapping workflow agents keep starting and finishing', async () => {
+  // A tick is a twelfth of the window, so a slow machine that stretches one
+  // still leaves the next start or finish well inside it; each agent runs
+  // fourteen ticks, longer than the window however slow the ticks are.
+  const windowMs = 1_200
   await runWatchdogScript(
-    300,
+    windowMs,
     `
       const interrupted = []
+      const ranMs = []
       const server = new CodexClaudeAppServer(store, {
         async runTurn(context, handlers) {
           const launch = 'workflow-' + context.turnId
@@ -11300,11 +11305,16 @@ test('workflow watchdog waits while overlapping workflow agents keep starting an
             input: { command: '/workflows review' },
           })
           await handlers.onEvent({ type: 'tool_result', toolUseId: launch, content: 'launch accepted' })
-          // Projected from the workflow journal: six agents, each running
-          // longer than the window and always one running.
+          // Projected from the workflow journal: twenty agents, each running
+          // longer than the window and always one running, while one starts
+          // or finishes every tick.
+          const agents = 20
+          const runsTicks = 14
           const agent = (index) => 'workflow-agent:task-1:a' + index
-          for (let tick = 0; tick < 9; tick += 1) {
-            if (tick < 6)
+          const startedAt = []
+          for (let tick = 0; tick < agents + runsTicks; tick += 1) {
+            if (tick < agents) {
+              startedAt[tick] = performance.now()
               await handlers.onEvent({
                 type: 'tool_use',
                 toolUseId: agent(tick),
@@ -11315,13 +11325,17 @@ test('workflow watchdog waits while overlapping workflow agents keep starting an
                   subagent_type: 'workflow',
                 },
               })
-            if (tick >= 3)
+            }
+            if (tick >= runsTicks) {
+              const index = tick - runsTicks
               await handlers.onEvent({
                 type: 'tool_result',
-                toolUseId: agent(tick - 3),
-                content: 'part ' + (tick - 3) + ' reviewed',
+                toolUseId: agent(index),
+                content: 'part ' + index + ' reviewed',
               })
-            await sleep(150)
+              ranMs.push(performance.now() - startedAt[index])
+            }
+            await sleep(100)
           }
           await handlers.onEvent({ type: 'completed', success: true, result: 'review done' })
         },
@@ -11332,11 +11346,13 @@ test('workflow watchdog waits while overlapping workflow agents keep starting an
         async stop() {},
       })
       const { turnId } = await startTurn(server, '/workflows review')
-      const completed = await waitFor(() => completion(turnId), 'turn completion')
+      const completed = await waitFor(() => completion(turnId), 'turn completion', 60_000)
       assert.equal(completed.params.turn.status, 'completed')
       assert.equal(completed.params.turn.error, null)
       assert.deepEqual(interrupted, [])
-      for (let index = 0; index < 6; index += 1)
+      assert.equal(ranMs.length, 20)
+      for (const ran of ranMs) assert.ok(ran > ${windowMs}, 'an agent ran ' + ran + ' ms')
+      for (let index = 0; index < 20; index += 1)
         assert.equal(childStatus('review part ' + index), 'completed')
       await server.stop()
     `,
