@@ -123,6 +123,7 @@ import {
   asRecord,
   autoReviewAction,
   buildSystemPromptAddendum,
+  type CodexTurnError,
   coerceStructuredValue,
   collaborationModeEnvelope,
   collaborationModeFromParams,
@@ -191,6 +192,7 @@ import {
   wrapMcpToolError,
   wrapMcpToolResult,
 } from './server-helpers.mjs'
+import { type SleepMonitor, SleepTracker, withSleepNotice } from './sleep-notice.mjs'
 import { PINNED_SECTION_ID, type SessionStore, settledTurn } from './store.mjs'
 import {
   findOccurrences,
@@ -540,6 +542,12 @@ function codexRoutingDisabledError(model: string): Error {
   )
 }
 
+export interface ServerOptions {
+  sleepMonitor?: SleepMonitor
+  // Where the adapter runs, for advice that names an App setting.
+  platform?: NodeJS.Platform
+}
+
 export class CodexClaudeAppServer {
   // Keyed by request id. A request goes to every peer following its thread;
   // the first answer resolves it.
@@ -644,10 +652,16 @@ export class CodexClaudeAppServer {
   private readonly stopCommandsListener: () => void
   private readonly store: SessionStore
   private readonly runtime: ClaudeRuntime
+  // Notices that the computer slept, for failed turns.
+  private readonly sleepMonitor: SleepMonitor
+  private readonly platform: NodeJS.Platform
 
-  constructor(store: SessionStore, runtime: ClaudeRuntime) {
+  constructor(store: SessionStore, runtime: ClaudeRuntime, options: ServerOptions = {}) {
     this.store = store
     this.runtime = runtime
+    this.sleepMonitor = options.sleepMonitor ?? new SleepTracker()
+    this.sleepMonitor.start?.()
+    this.platform = options.platform ?? process.platform
     this.leaderThreads = new LeaderThreads({
       store,
       activeTurnId: (threadId) => this.activeTurnByThread.get(threadId) ?? null,
@@ -709,6 +723,7 @@ export class CodexClaudeAppServer {
     if (this.stopped) return
     this.stopped = true
     this.stopCommandsListener()
+    this.sleepMonitor.stop?.()
     this.leaderThreads.stop()
     try {
       // Child turns are created directly from Task/Workflow events and are not
@@ -9597,7 +9612,7 @@ export class CodexClaudeAppServer {
   // ended, e.g. through turn/interrupt.
   private failTurn(peer: RpcPeer, threadId: string, turn: TurnRecord, error: Error): boolean {
     this.exitReviewMode(peer, threadId, turn.id)
-    const turnError = turnErrorOf(error)
+    const turnError = this.explainTurnError(turn, turnErrorOf(error))
     const completed = this.endTurn(turn, 'failed', turnError)
     if (!completed) {
       // Its end was recorded, but whatever ended it never let go of the
@@ -9619,6 +9634,17 @@ export class CodexClaudeAppServer {
     this.clearActiveTurn(threadId)
     this.setThreadStatus(peer, threadId, { type: 'idle' })
     return true
+  }
+
+  // What a failed turn's error leaves out: that the computer slept during
+  // the turn, which is the likely reason a model request broke off.
+  private explainTurnError(turn: TurnRecord, error: CodexTurnError): CodexTurnError {
+    const sleptMs = turn.startedAt == null ? 0 : this.sleepMonitor.sleptSince(turn.startedAt * 1000)
+    const explained = withSleepNotice(error, sleptMs, this.platform)
+    if (explained !== error) {
+      debugLog('turn.slept', { threadId: turn.threadId, turnId: turn.id, sleptMs })
+    }
+    return explained
   }
 
   // Writes a turn's terminal state. Returns null when the turn already ended,
