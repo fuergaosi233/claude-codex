@@ -583,14 +583,21 @@ rather than delete Claude Code's notes.
 
 ## MCP servers and other settings
 
-**Settings > MCP servers** works for Claude chats. A server you add, edit or
-switch off there is saved by the adapter (in its own config, not in
-`config.toml`) and used by Claude chats from their next turn; Claude can call
-its tools, and the App lists the server with its tools. A server without a
-command or URL is refused with an error. The App's own desktop servers, which
-it writes there for its Codex chats each time it starts, are not kept.
-`CLAUDE_CODEX_APP_MCP_SERVERS=0` leaves these servers out, and the App then
-says its MCP settings are unavailable. Servers from the Codex and Claude Code
+**Settings > MCP servers** works for Claude chats only when the adapter runs
+with `CLAUDE_CODEX_APP_MCP_SERVERS=1`. Without it (the default) the page lists
+no server you added, and saving, switching or deleting one shows this under
+the form instead:
+
+> MCP servers added in the App are not used for Claude threads unless the
+> adapter runs with CLAUDE_CODEX_APP_MCP_SERVERS=1. You can also add a server
+> to Claude Code's own MCP config (claude mcp add, or a project's .mcp.json).
+
+With the switch, a server you add, edit or switch off there is saved by the
+adapter (in its own config, not in `config.toml`) and used by Claude chats from
+their next turn; Claude can call its tools, and the App lists the server with
+its tools. A server without a command or URL is refused with an error. The
+App's own desktop servers, which it writes there for its Codex chats each time
+it starts, are never kept, with or without the switch. Servers from the Codex and Claude Code
 configs and from `CLAUDE_CODEX_MCP_SERVERS` are listed apart from the ones you
 added; see [MCP, tools & directories](/guide/configuration#mcp-tools-directories).
 

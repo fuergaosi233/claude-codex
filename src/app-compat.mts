@@ -403,11 +403,11 @@ export const APP_RULES: readonly AppRule[] = [
   },
   {
     id: 'mcp-settings',
-    app: 'Lists the servers of Settings > MCP servers from config/read mcp_servers, and saves to the file of the first user layer, or else of the user, system or project origin of mcp_servers (or of mcp_servers.<name>); with neither it says "MCP server settings are unavailable". Adding, editing or deleting a server sends config/batchWrite with one replace edit of mcp_servers.<name> (null deletes); its switch sends config/value/write of mcp_servers.<name>.enabled with upsert. A server whose origin is a project file cannot be edited, and a server mcpServerStatus/list reports that config/read does not list shows apart from the others.',
+    app: 'Lists the servers of Settings > MCP servers from config/read mcp_servers, and saves to the file of the first user layer, or else of the user, system or project origin of mcp_servers (or of mcp_servers.<name>); with neither it says "MCP server settings are unavailable". Adding, editing or deleting a server sends config/batchWrite with one replace edit of mcp_servers.<name> (null deletes); its switch sends config/value/write of mcp_servers.<name>.enabled with upsert. A server whose origin is a project file cannot be edited, and a server mcpServerStatus/list reports that config/read does not list shows apart from the others. A refused save shows the error message under the form.',
     adapter:
-      'Reports the user config file as the origin of mcp_servers and of each server the App added, keeps those servers in its own config file, and starts the enabled ones in Claude threads (CLAUDE_CODEX_APP_MCP_SERVERS=0 leaves them out and reports no origin). A write naming no command or URL, a field of the wrong type, or the switch of a server the App never added is refused.',
+      "Reports the user config file as the origin of mcp_servers. Only with CLAUDE_CODEX_APP_MCP_SERVERS=1: lists the servers the App added with that origin each, keeps them in its own config file, and starts the enabled ones in Claude threads; a write naming no command or URL, a field of the wrong type, or the switch of a server the App never added is refused. Without it, config/read lists no server and every write that would add, change or delete one is refused with a message naming the switch and Claude Code's own MCP config.",
     verify:
-      'Add a stdio server under Settings > MCP servers: it stays listed after a reload, mcpServerStatus/list reports it, and a Claude chat can call its tools; switching it off takes the tools away in the next turn.',
+      'With CLAUDE_CODEX_APP_MCP_SERVERS=1, add a stdio server under Settings > MCP servers: it stays listed after a reload, mcpServerStatus/list reports it, and a Claude chat can call its tools; switching it off takes the tools away in the next turn. Without it, saving a new server shows the message under the form.',
   },
   {
     id: 'desktop-mcp-servers',

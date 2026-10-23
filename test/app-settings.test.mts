@@ -153,12 +153,15 @@ function switchServer(root: string, name: string, enabled: boolean): Record<stri
 const servers = (context: RuntimeTurnContext) =>
   (context.mcpServers ?? null) as Record<string, Record<string, unknown>> | null
 
+// The servers added in the App's MCP settings apply only with this.
+const appServersOn = { CLAUDE_CODEX_APP_MCP_SERVERS: '1' }
+
 test('servers added in the App MCP settings run in Claude threads and survive a restart', async () => {
   const root = await mkdtemp(join(tmpdir(), 'app-mcp-settings-'))
   const userFile = join(root, 'codex', 'config.toml')
   const entry = { command: process.execPath, args: [fixture], env: { GREETING: 'hello' } }
   try {
-    await withServer(root, {}, async ({ request, turn, notifications }) => {
+    await withServer(root, appServersOn, async ({ request, turn, notifications }) => {
       // The App saves to the file named as the origin of mcp_servers, and
       // says the settings are unavailable without one.
       const before = await request('config/read', {})
@@ -237,7 +240,7 @@ test('servers added in the App MCP settings run in Claude threads and survive a 
     assert.equal(saved.overrides.mcp_servers.fixture.command, process.execPath)
     await assert.rejects(readFile(userFile, 'utf8'))
 
-    await withServer(root, {}, async ({ request, turn }) => {
+    await withServer(root, appServersOn, async ({ request, turn }) => {
       const read = await request('config/read', {})
       assert.deepEqual(Object.keys(read.config.mcp_servers), ['fixture'])
       const started = await request('thread/start', { cwd: root, model: 'sonnet' })
@@ -256,7 +259,7 @@ test('servers added in the App MCP settings run in Claude threads and survive a 
 test("the App's desktop servers are accepted and never kept", async () => {
   const root = await mkdtemp(join(tmpdir(), 'app-mcp-desktop-'))
   try {
-    await withServer(root, {}, async ({ request, turn }) => {
+    await withServer(root, appServersOn, async ({ request, turn }) => {
       // What the App's main process writes each time it starts.
       await request('config/batchWrite', {
         edits: [
@@ -306,6 +309,7 @@ command = "/codex/only"
 `,
   )
   const env = {
+    ...appServersOn,
     CLAUDE_CODEX_CODEX_MCP_SERVERS: '1',
     CLAUDE_CODEX_MCP_SERVERS: JSON.stringify({ explicit: { command: '/env/explicit' } }),
   }
@@ -344,7 +348,7 @@ command = "/codex/only"
 test('a write the App MCP settings cannot hold fails and changes nothing', async () => {
   const root = await mkdtemp(join(tmpdir(), 'app-mcp-invalid-'))
   try {
-    await withServer(root, {}, async ({ request, send }) => {
+    await withServer(root, appServersOn, async ({ request, send }) => {
       await request('config/batchWrite', saveServer(root, 'kept', { command: '/bin/kept' }))
       const failures: Array<[Record<string, unknown>, RegExp]> = [
         // Neither a command nor a URL, or both.
@@ -404,46 +408,63 @@ test('a write the App MCP settings cannot hold fails and changes nothing', async
   }
 })
 
-test('CLAUDE_CODEX_APP_MCP_SERVERS=0 leaves the App MCP settings out', async () => {
+test('the App MCP settings are off unless CLAUDE_CODEX_APP_MCP_SERVERS=1', async () => {
   const root = await mkdtemp(join(tmpdir(), 'app-mcp-off-'))
+  const userFile = join(root, 'codex', 'config.toml')
   try {
-    await withServer(root, {}, async ({ request }) => {
+    await withServer(root, appServersOn, async ({ request }) => {
       await request('config/batchWrite', saveServer(root, 'fixture', { command: '/bin/kept' }))
     })
-    await withServer(root, { CLAUDE_CODEX_APP_MCP_SERVERS: '0' }, async (app) => {
-      const read = await app.request('config/read', {})
-      // No origin: the App says its MCP settings are unavailable.
-      assert.equal(read.config.mcp_servers, undefined)
-      assert.equal(read.origins.mcp_servers, undefined)
-      const response = await app.send(
-        'config/batchWrite',
-        saveServer(root, 'other', { command: '/bin/other' }),
-      )
-      assert.equal(response.error?.code, INVALID_REQUEST)
-      assert.match(response.error?.message ?? '', /CLAUDE_CODEX_APP_MCP_SERVERS=0/)
-      // Nor can a saved server be deleted, one by one or with the whole table.
-      for (const edit of [
-        { keyPath: 'mcp_servers.fixture', value: null, mergeStrategy: 'replace' },
-        { keyPath: 'mcp_servers', value: {}, mergeStrategy: 'replace' },
-        { keyPath: 'mcp_servers', value: null, mergeStrategy: 'replace' },
-      ]) {
-        const deleted = await app.send('config/batchWrite', { edits: [edit], filePath: null })
-        assert.equal(deleted.error?.code, INVALID_REQUEST, JSON.stringify(edit))
-        assert.match(deleted.error?.message ?? '', /CLAUDE_CODEX_APP_MCP_SERVERS=0/)
-      }
-      // The desktop servers the App writes at startup are still accepted.
-      await app.request('config/batchWrite', {
-        edits: [
-          { keyPath: 'mcp_servers.node_repl', value: { command: '/x' }, mergeStrategy: 'replace' },
-        ],
-        filePath: null,
+    for (const value of [undefined, '0', 'true']) {
+      await withServer(root, { CLAUDE_CODEX_APP_MCP_SERVERS: value }, async (app) => {
+        const read = await app.request('config/read', {})
+        // No server is listed, but the settings stay writable, so that a
+        // save shows why it is refused rather than a page that is only
+        // unavailable.
+        assert.equal(read.config.mcp_servers, undefined, String(value))
+        assert.deepEqual(read.origins.mcp_servers.name, { type: 'user', file: userFile })
+        assert.equal(read.origins['mcp_servers.fixture'], undefined)
+        const writes: Array<[string, Record<string, unknown>]> = [
+          ['config/batchWrite', saveServer(root, 'other', { command: '/bin/other' })],
+          ['config/value/write', switchServer(root, 'fixture', false)],
+          // Nor can a saved server be deleted, one by one or with the whole
+          // table.
+          ['config/batchWrite', saveServer(root, 'fixture', null)],
+          [
+            'config/batchWrite',
+            { edits: [{ keyPath: 'mcp_servers', value: {}, mergeStrategy: 'replace' }] },
+          ],
+          [
+            'config/batchWrite',
+            { edits: [{ keyPath: 'mcp_servers', value: null, mergeStrategy: 'replace' }] },
+          ],
+        ]
+        for (const [method, params] of writes) {
+          const response = await app.send(method, { filePath: null, ...params })
+          assert.equal(response.error?.code, INVALID_REQUEST, JSON.stringify(params))
+          const message = response.error?.message ?? ''
+          assert.match(message, /^MCP servers added in the App are not used for Claude threads/)
+          assert.match(message, /CLAUDE_CODEX_APP_MCP_SERVERS=1/)
+          assert.match(message, /Claude Code's own MCP config/)
+        }
+        // The desktop servers the App writes at startup are still accepted.
+        await app.request('config/batchWrite', {
+          edits: [
+            {
+              keyPath: 'mcp_servers.node_repl',
+              value: { command: '/x' },
+              mergeStrategy: 'replace',
+            },
+          ],
+          filePath: null,
+        })
+        const started = await app.request('thread/start', { cwd: root, model: 'sonnet' })
+        assert.equal(servers(await app.turn(started.thread.id)), null)
+        assert.deepEqual((await app.request('mcpServerStatus/list', {})).data, [])
       })
-      const started = await app.request('thread/start', { cwd: root, model: 'sonnet' })
-      assert.equal(servers(await app.turn(started.thread.id)), null)
-      assert.deepEqual((await app.request('mcpServerStatus/list', {})).data, [])
-    })
-    // What was saved stays for when the switch is gone.
-    await withServer(root, {}, async ({ request }) => {
+    }
+    // What was saved stays for when the servers are turned on.
+    await withServer(root, appServersOn, async ({ request }) => {
       const read = await request('config/read', {})
       assert.deepEqual(read.config.mcp_servers, { fixture: { command: '/bin/kept' } })
     })
@@ -587,7 +608,7 @@ test('settings saved before the App settings were checked are cleaned up on star
     }),
   )
   try {
-    await withServer(root, {}, async ({ request }) => {
+    await withServer(root, appServersOn, async ({ request }) => {
       const { config } = await request('config/read', {})
       assert.deepEqual(config.mcp_servers, { kept: { command: '/bin/kept' } })
       assert.equal(config['mcp_servers.node_repl'], undefined)

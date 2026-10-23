@@ -8007,9 +8007,7 @@ export class CodexClaudeAppServer {
         ...(codexProxyModelOptions().length > 0
           ? { 'model_providers.codex': configLayerMetadata() }
           : {}),
-        ...(appMcpServersEnabled()
-          ? appMcpServerOrigins(this.configOverrides, configLayerMetadata())
-          : {}),
+        ...appMcpServerOrigins(this.configOverrides, configLayerMetadata()),
       },
       layers: null,
     }

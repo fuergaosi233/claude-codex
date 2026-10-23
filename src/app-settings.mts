@@ -7,9 +7,10 @@ import { codexHome } from './util.mjs'
 // keeps the settings in its own config file rather than in config.toml, so a
 // write is honest only where a Claude thread acts on it:
 //
-// - mcp_servers.<name>: the servers added under Settings > MCP servers. Claude
-//   threads run them (see appMcpServers), unless
-//   CLAUDE_CODEX_APP_MCP_SERVERS=0.
+// - mcp_servers.<name>: the servers added under Settings > MCP servers. With
+//   CLAUDE_CODEX_APP_MCP_SERVERS=1 Claude threads run them (see
+//   appMcpServers); otherwise a write that would change them is refused with
+//   a message saying so, and the servers already saved stay saved, unused.
 // - A setting Claude has no counterpart for fails when it sets a value, so the
 //   App shows the setting as not saved; clearing it succeeds. config/read
 //   reports what Claude threads actually do for it.
@@ -29,9 +30,16 @@ export interface ConfigEdit {
 }
 
 // Whether the servers added in the App's MCP settings apply to Claude threads.
+// Off unless asked for: a server added there starts a program, or reaches a
+// URL, from every Claude thread, which is more than the settings page says.
 export function appMcpServersEnabled(): boolean {
-  return process.env.CLAUDE_CODEX_APP_MCP_SERVERS !== '0'
+  return process.env.CLAUDE_CODEX_APP_MCP_SERVERS === '1'
 }
+
+// What the App's MCP settings show when a save, switch or delete is refused
+// because the servers do not apply.
+export const APP_MCP_SERVERS_OFF =
+  "MCP servers added in the App are not used for Claude threads unless the adapter runs with CLAUDE_CODEX_APP_MCP_SERVERS=1. You can also add a server to Claude Code's own MCP config (claude mcp add, or a project's .mcp.json)."
 
 // App rule: desktop-mcp-servers
 // The servers the App's main process writes into the user config each time it
@@ -129,16 +137,12 @@ export function editMcpServers(settings: Table, edit: ConfigEdit): void {
       throw invalid(`mcp_servers.${name} must be a table`)
     servers = withPath(prior, [name, ...field], edit.value, upsert)
   }
-  // A server the edit removes is a change too: with the switch off, what was
+  // A server the edit removes is a change too: with the servers off, what was
   // saved stays as it is.
   const changed = [...new Set([...Object.keys(prior), ...Object.keys(servers)])].filter(
     (key) => servers[key] !== prior[key],
   )
-  if (changed.length > 0 && !appMcpServersEnabled()) {
-    throw invalid(
-      'MCP servers from the App settings are turned off for Claude threads (CLAUDE_CODEX_APP_MCP_SERVERS=0)',
-    )
-  }
+  if (changed.length > 0 && !appMcpServersEnabled()) throw invalid(APP_MCP_SERVERS_OFF)
   for (const key of changed) {
     if (!Object.hasOwn(servers, key)) continue
     if (!SERVER_NAME.test(key)) throw invalid(`invalid MCP server name: ${key}`)
@@ -151,8 +155,8 @@ export function editMcpServers(settings: Table, edit: ConfigEdit): void {
   else delete settings.mcp_servers
 }
 
-// The servers the App's settings hold, for config/read: what its MCP
-// settings list and edit.
+// The servers the App's settings hold: what its MCP settings list and edit
+// (config/read reports them only while they apply).
 export function appMcpServerTable(settings: Table): Table {
   const out: Table = {}
   for (const [name, entry] of Object.entries(asTable(settings.mcp_servers) ?? {})) {
@@ -163,10 +167,14 @@ export function appMcpServerTable(settings: Table): Table {
 
 // The App's MCP settings save to the file config/read names as the origin of
 // mcp_servers, and say they are unavailable without one; a server whose
-// origin is a user file can be edited there.
+// origin is a user file can be edited there. With the servers off the origin
+// is still reported, but no server: the page lists none, and a save shows
+// APP_MCP_SERVERS_OFF under the form rather than a page that only says the
+// settings are unavailable.
 // App rule: mcp-settings
 export function appMcpServerOrigins(settings: Table, origin: unknown): Table {
   const out: Table = { mcp_servers: origin }
+  if (!appMcpServersEnabled()) return out
   for (const name of Object.keys(appMcpServerTable(settings))) out[`mcp_servers.${name}`] = origin
   return out
 }

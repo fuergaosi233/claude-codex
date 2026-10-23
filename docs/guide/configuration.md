@@ -263,9 +263,9 @@ export CLAUDE_CODEX_ALLOWED_TOOLS="Read,Glob,Grep"
 export CLAUDE_CODEX_ADD_DIRS="/repo/shared,/repo/docs"
 export CLAUDE_CODEX_ENABLE_FILE_CHECKPOINTING=1
 
-# Leave out the servers added under the App's Settings > MCP servers (on by
-# default).
-export CLAUDE_CODEX_APP_MCP_SERVERS=0
+# Use the servers added under the App's Settings > MCP servers in Claude
+# threads (off by default).
+export CLAUDE_CODEX_APP_MCP_SERVERS=1
 ```
 
 A Claude thread's own turns start these MCP servers, each source winning a
@@ -273,10 +273,12 @@ name from the ones before it:
 
 1. the Codex config's `[mcp_servers]`, with `CLAUDE_CODEX_CODEX_MCP_SERVERS=1`;
 2. the Claude Code config's servers, with `CLAUDE_CODEX_CLAUDE_MCP_SERVERS=1`;
-3. the servers added under the App's **Settings > MCP servers**;
+3. the servers added under the App's **Settings > MCP servers**, with
+   `CLAUDE_CODEX_APP_MCP_SERVERS=1`;
 4. `CLAUDE_CODEX_MCP_SERVERS`.
 
-The App's MCP settings add, edit, switch off and delete servers through the
+With `CLAUDE_CODEX_APP_MCP_SERVERS=1` the App's MCP settings add, edit, switch
+off and delete servers through the
 adapter, which keeps them in its own `config.json` under `CLAUDE_CODEX_HOME`
 (not in `CODEX_HOME/config.toml`) and reads them as Codex reads an
 `[mcp_servers.<name>]` entry: a `command` with `args`, `env`, `env_vars` and
@@ -287,9 +289,17 @@ field of the wrong type, fails and the App shows the error. The servers the App
 itself writes at startup for its Codex threads (`node_repl`, `cua_repl`) are
 never kept. `mcpServerStatus/list` and `config/mcpServer/reload` include the
 App's servers, and title, summary and other internal turns start none of them.
-With `CLAUDE_CODEX_APP_MCP_SERVERS=0` Claude threads leave them out and the
-App's MCP settings say they are unavailable; what was saved stays for when the
-switch is removed.
+Without the switch (the default) the page lists none of them, and saving,
+switching or deleting a server there fails with this message under the form:
+
+> MCP servers added in the App are not used for Claude threads unless the
+> adapter runs with CLAUDE_CODEX_APP_MCP_SERVERS=1. You can also add a server
+> to Claude Code's own MCP config (claude mcp add, or a project's .mcp.json).
+
+Servers saved while the switch was on stay saved, unused, until it is set
+again. The switch is off by default because such a server starts a program,
+or reaches a URL with the headers and environment it names, from every Claude
+thread's turns.
 
 ## App settings
 
@@ -508,7 +518,7 @@ the profile's `env` or env file.
 | `CLAUDE_CODEX_CODEX_NOTIFY` | `1` runs the Codex config's `notify` program when a Claude thread's turn completes; off otherwise, since the Codex App sets `notify` to its own turn-ended program. See [Inherited configuration](https://github.com/fuergaosi233/claude-codex#inherited-configuration). |
 | `CLAUDE_CODEX_CODEX_AUTO_COMPACT` | `1` takes `model_auto_compact_token_limit` from the Codex config files (user `config.toml` and trusted project `.codex/config.toml`) as the auto-compact window of Claude threads; off otherwise, since users set it there for Codex models and it would replace their Claude Code window. See [Context compaction](#context-compaction). |
 | `CLAUDE_CODEX_APP_PLUGIN_MCP` | `1` runs the MCP server of the Codex App's bundled `code-review` plugin for the App's Pull Requests panel calls, from the plugin's folder with a short environment allowlist; a comma-separated list names other plugins instead (`codex-app-tools` and `browser-use` never run). Off otherwise; Claude threads never get these servers. The plugin uses the host's GitHub credentials, such as an existing `gh` login; the adapter passes it no token. See [Pull Requests panel](/guide/gui#pull-requests-panel). |
-| `CLAUDE_CODEX_APP_MCP_SERVERS` | `0` leaves the servers added under the App's Settings > MCP servers out of Claude threads, and the App's MCP settings then say they are unavailable. On otherwise: the App can add, edit, switch off and delete servers, which the adapter keeps in its own config and starts in Claude threads' own turns, below `CLAUDE_CODEX_MCP_SERVERS`. See [MCP, tools & directories](#mcp-tools-directories). |
+| `CLAUDE_CODEX_APP_MCP_SERVERS` | `1` lets the App's Settings > MCP servers add, edit, switch off and delete servers, which the adapter keeps in its own config and starts in Claude threads' own turns, below `CLAUDE_CODEX_MCP_SERVERS`. Off otherwise (the default): the page lists no server and every save, switch or delete there fails with a message naming this switch and Claude Code's own MCP config; servers saved earlier stay saved, unused. See [MCP, tools & directories](#mcp-tools-directories). |
 | `CLAUDE_CODEX_ALLOWED_TOOLS` | Pre-approved tools. |
 | `CLAUDE_CODEX_ADD_DIRS` | Extra directories exposed to Claude. |
 | `CLAUDE_CODEX_CLAUDE_CONFIG_DIR` | Claude Code config folder (such as `~/.claude`) whose `CLAUDE.md`, rules and skills the adapter passes to Claude itself, together with the project's `CLAUDE.md` files, rules and skills. For a Claude CLI started with its setting sources turned off. `AGENTS.md` files reach Claude either way. Its MCP servers, subagents, permission rules and command hooks come along only with the switches below. |

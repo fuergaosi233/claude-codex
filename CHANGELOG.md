@@ -561,8 +561,9 @@ versioning or publishing metadata.
   made by an earlier version get their history when first read if their
   stored fork point says exactly where they branched off. Ephemeral forks
   still carry their history in the `thread/fork` response only, as in Codex.
-- MCP servers added, edited, switched off or deleted in the App's Settings >
-  MCP servers now take effect in Claude threads. The App writes them with
+- With `CLAUDE_CODEX_APP_MCP_SERVERS=1`, MCP servers added, edited, switched
+  off or deleted in the App's Settings > MCP servers take effect in Claude
+  threads. The App writes them with
   `config/batchWrite` and `config/value/write`; the adapter keeps them in its
   own settings (never in `config.toml`), checks them like `config.toml`
   entries, passes them to every turn, `mcpServerStatus/list` and
@@ -571,7 +572,12 @@ versioning or publishing metadata.
   Codex or Claude Code config brings, and `CLAUDE_CODEX_MCP_SERVERS` wins
   over it; the App's own desktop servers (`node_repl`, `cua_repl`) are
   accepted and not kept.
-  `CLAUDE_CODEX_APP_MCP_SERVERS=0` turns this off and refuses the writes.
+  The switch is off by default, since such a server runs a program or reaches
+  a URL from every Claude thread. Without it the page lists no server, and a
+  save, switch or delete there fails with a message the App shows under the
+  form: the servers are not used for Claude threads unless the adapter runs
+  with `CLAUDE_CODEX_APP_MCP_SERVERS=1`, and a server can also go into Claude
+  Code's own MCP config. Servers saved earlier stay saved, unused.
 - Settings a Claude thread cannot honor are refused with `INVALID_REQUEST`
   instead of being saved and ignored, so the App shows "Couldn't update this
   setting": `model_verbosity`, a service tier other than the default, network
