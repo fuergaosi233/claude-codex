@@ -673,6 +673,9 @@ export type SubagentOutput =
   | { type: 'reasoning'; text: string }
   | { type: 'tool_use'; toolUseId: string; toolName: string; input: Record<string, unknown> }
   | { type: 'tool_result'; toolUseId: string; content: unknown; isError: boolean }
+  // It launched an agent of its own (an Agent call), which shows apart from
+  // its work: only what it was saying ends there.
+  | { type: 'agent_call'; toolUseId: string }
 
 export interface SubagentOutputEvent {
   type: 'subagent_output'

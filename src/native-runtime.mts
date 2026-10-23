@@ -3769,8 +3769,9 @@ function workflowAgentToolUseId(taskId: string, agentId: string): string {
 
 // What a subagent's own frame (an assistant or user message of its
 // transcript) shows in its child thread: its text, thinking, tool calls and
-// their results. Its Agent calls are not among them: those launch agents of
-// their own.
+// their results. Its Agent calls launch agents of their own, which show
+// apart from its work if at all (a turn draws them; one launched between
+// turns shows nowhere): such a call only marks where what it was saying ends.
 function subagentOutputEvents(
   type: string,
   message: Record<string, unknown>,
@@ -3796,7 +3797,12 @@ function subagentOutputEvents(
     } else if (type === 'assistant' && blockType === 'tool_use') {
       const id = String(block.id ?? '')
       const name = String(block.name ?? '')
-      if (!id || isSubagentTool(name) || filter.skipTool(name)) continue
+      if (!id) continue
+      if (isSubagentTool(name)) {
+        push({ type: 'agent_call', toolUseId: id })
+        continue
+      }
+      if (filter.skipTool(name)) continue
       push({
         type: 'tool_use',
         toolUseId: id,

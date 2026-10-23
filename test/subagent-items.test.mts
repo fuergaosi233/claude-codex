@@ -661,6 +661,85 @@ test('an agent that launches one of its own ends what it was saying there; its a
   })
 })
 
+test('an agent call whose agent shows elsewhere still ends what the caller was saying', async () => {
+  const sentence = { type: 'text', text: 'I will ask a helper.' } as const
+  const agentCall = { type: 'agent_call', toolUseId: 'agent-inner' } as const
+  const script: Script = async (context, handlers, tools) => {
+    if (context.prompt.includes('older CLI')) {
+      // A CLI that names no agent behind a frame: the helper hangs off the
+      // parent thread, and nothing but the call marks where it went.
+      await startAgent(context, handlers, tools, 'agent-outer', 'task-outer', 'outer work')
+      await handlers.onEvent(out('agent-outer', sentence))
+      await handlers.onEvent(out('agent-outer', agentCall))
+      await startAgent(context, handlers, tools, 'agent-inner', 'task-inner', 'inner work')
+      await handlers.onEvent({ type: 'tool_result', toolUseId: 'agent-inner', content: 'done' })
+      await handlers.onEvent(out('agent-outer', { type: 'text', text: 'outer done' }))
+      await handlers.onEvent({
+        type: 'tool_result',
+        toolUseId: 'agent-outer',
+        content: 'outer done',
+      })
+    } else {
+      await startAgent(context, handlers, tools, 'agent-bg', 'bg-task', 'survey', {
+        background: true,
+      })
+      await handlers.onEvent({
+        type: 'tool_result',
+        toolUseId: 'agent-bg',
+        content: 'Async agent launched successfully.\nagentId: bg-task',
+        structured: { isAsync: true, status: 'async_launched', agentId: 'bg-task' },
+      })
+    }
+    await handlers.onEvent({ type: 'completed', success: true, result: 'done' })
+  }
+  await withServer(
+    script,
+    async ({ startThread, runTurn, listener, waitFor, request, messages }) => {
+      const answered = async (child: string, prompt: string, answer: string) => {
+        assert.deepEqual((await threadItems(request, child)).map(shape), [
+          ['user', prompt],
+          ['message', 'commentary', 'I will ask a helper.'],
+          ['message', null, answer],
+        ])
+        assert.deepEqual(leftOpen(messages, child), [])
+      }
+      const threadId = await startThread()
+      const live = await runTurn(threadId, 'nest on an older CLI')
+      const outer = spawnedChild(live, 'outer work')
+      assert.equal(
+        (await request('thread/read', { threadId: spawnedChild(live, 'inner work') })).thread
+          .parentThreadId,
+        threadId,
+      )
+      await answered(outer, 'outer work', 'outer done')
+
+      // A background agent launches one between turns, when no turn draws it.
+      const child = spawnedChild(await runTurn(threadId, 'launch in the background'), 'survey')
+      const from = messages.length
+      const send = (output: SubagentOutput) =>
+        listener().onTaskEvent(threadId, out('agent-bg', output, 'bg-task'))
+      await send(sentence)
+      await send(agentCall)
+      await send({ type: 'text', text: 'Two TODOs.' })
+      await listener().onTaskEvent(threadId, {
+        type: 'task_notification',
+        taskId: 'bg-task',
+        toolUseId: 'agent-bg',
+        status: 'completed',
+        summary: 'Agent "survey" completed',
+        result: 'Two TODOs.',
+        usage: null,
+      })
+      await waitFor(
+        (message) => message.method === 'turn/completed' && message.params.threadId === child,
+        'the background child',
+        from,
+      )
+      await answered(child, 'survey', 'Two TODOs.')
+    },
+  )
+})
+
 test('a subagent stopped mid-call closes the call as failed; what it sends later shows nowhere', async () => {
   const script: Script = async (context, handlers, tools) => {
     await startAgent(context, handlers, tools, 'agent-slow', 'slow-task', 'run the suite')

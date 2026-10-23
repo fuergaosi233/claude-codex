@@ -117,6 +117,12 @@ export class SubagentItems {
   }
 
   add(peer: RpcPeer, target: SubagentItemsTarget, output: SubagentOutput): void {
+    // The agent it launched shows apart from its work, under it or not:
+    // only what it was saying ends at the call.
+    if (output.type === 'agent_call') {
+      this.interject(peer, target.turnId)
+      return
+    }
     let state = this.turns.get(target.turnId)
     if (!state) {
       this.prune(peer)

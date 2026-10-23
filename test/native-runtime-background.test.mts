@@ -1888,7 +1888,7 @@ async function runNestedWork(): Promise<{
   return { events, options: options[0] ?? {} }
 }
 
-test("a subagent's own work reaches the turn as its output; its Agent calls stay with the tree", async () => {
+test("a subagent's own work reaches the turn as its output; its Agent calls stay with the tree, marking where its message ends", async () => {
   const on = await withSubagentItems(undefined, runNestedWork)
   assert.equal(on.options.forwardSubagentText, true, 'the CLI forwards its text and thinking')
   assert.deepEqual(subagentOutputs(on.events), [
@@ -1904,6 +1904,8 @@ test("a subagent's own work reaches the turn as its output; its Agent calls stay
       'task-1',
       { type: 'tool_result', toolUseId: 'grep-1', content: 'hit', isError: false },
     ],
+    // Its Agent call only ends what it was saying.
+    ['agent-1', 'task-1', { type: 'agent_call', toolUseId: 'agent-2' }],
     ['agent-1', 'task-2', { type: 'text', text: 'Deeper.' }],
   ])
   const tree = (events: RuntimeEvent[]) =>
@@ -1949,6 +1951,7 @@ test("a background subagent's work between turns goes to the listener, not to a 
           frame('assistant', text('Looking.')),
           frame('assistant', { type: 'tool_use', id: 'grep-1', name: 'Grep', input: {} }),
           frame('user', { type: 'tool_result', tool_use_id: 'grep-1', content: 'hit' }),
+          frame('assistant', { type: 'tool_use', id: 'agent-2', name: 'Agent', input: {} }),
         )
         const expected =
           value === '0'
@@ -1965,6 +1968,7 @@ test("a background subagent's work between turns goes to the listener, not to a 
                   'a1',
                   { type: 'tool_result', toolUseId: 'grep-1', content: 'hit', isError: false },
                 ],
+                ['agent-use', 'a1', { type: 'agent_call', toolUseId: 'agent-2' }],
               ]
         if (expected.length > 0)
           await waitFor(() => subagentOutputs(listener.tasks).length >= expected.length, 'output')

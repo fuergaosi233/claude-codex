@@ -742,8 +742,10 @@ versioning or publishing metadata.
   backend the adapter asks Claude Code for the subagent's text and thinking
   (`forwardSubagentText`) and routes each frame by its agent id, so a nested
   agent's work lands in its own thread, and its cards land in the launching
-  agent's thread after what that agent said before the call, which its
-  answer then follows once. The items are stored with the child
+  agent's thread after what that agent said before the call. What an agent
+  says after launching one is a message of its own, also when the launched
+  agent hangs off the parent thread (a CLI without agent ids) or starts
+  between turns, so its answer shows once. The items are stored with the child
   turn (`thread/read`, `thread/turns/list`, `thread/items/list`, resume,
   followers), keep the parent's output caps (other long text of a call is
   cut the same way, a diff at a line within 30,000 bytes), stop at 256 per
