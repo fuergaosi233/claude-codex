@@ -717,6 +717,9 @@ export type RuntimeEvent =
       // agent ran), not because the agent finished: the agent ends with the
       // turn, for the turn's reason.
       endedWithTurn?: boolean
+      // The agent's last word was a request of its that failed for good: the
+      // result tells of that failure, and is no sign the turn got on.
+      failedRequest?: boolean
     }
   | {
       type: 'permission_request'
@@ -801,9 +804,15 @@ export type RuntimeEvent =
   // backend that filters nested events would otherwise keep to itself.
   // `toolUseId` is the call that started it. `failedRequest` marks a frame
   // that tells of a request of the agent's that failed (a retry, or the
-  // message naming the error): it keeps the turn alive, but is no sign the
+  // message naming the error), and `heartbeat` the CLI's timer tick for a
+  // call that still runs: either keeps the turn alive, but is no sign the
   // agent got on with its work.
-  | { type: 'subagent_progress'; toolUseId: string; failedRequest?: boolean }
+  | {
+      type: 'subagent_progress'
+      toolUseId: string
+      failedRequest?: boolean
+      heartbeat?: boolean
+    }
   | {
       type: 'metrics'
       durationMs: number | null

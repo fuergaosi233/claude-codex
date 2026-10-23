@@ -373,6 +373,31 @@ function failedRequestFrames(sessionId: string): Record<string, unknown>[] {
   ]
 }
 
+const textBlock = (text: string) => ({ type: 'text', text })
+
+// The main loop's call of an agent, and a frame of that agent's.
+function agentCall(sessionId: string): Record<string, unknown> {
+  return {
+    type: 'assistant',
+    parent_tool_use_id: null,
+    session_id: sessionId,
+    uuid: `${sessionId}-call`,
+    message: {
+      id: 'msg_call',
+      model: 'claude-test',
+      role: 'assistant',
+      content: [
+        { type: 'tool_use', id: 'agent-1', name: 'Agent', input: { prompt: 'check the build' } },
+      ],
+      usage: { input_tokens: 10, output_tokens: 5 },
+    },
+  }
+}
+
+function agentFrame(frame: Record<string, unknown>): Record<string, unknown> {
+  return { parent_tool_use_id: 'agent-1', agent_id: 'task-1', ...frame }
+}
+
 function reply(sessionId: string, id: string, text: string): Record<string, unknown> {
   return {
     type: 'assistant',
@@ -438,6 +463,62 @@ test('a native turn whose request failed for good says the computer slept, unles
         const early = await app.turnCompleted(await app.startTurn(threadId, 'slept, then went on'))
         assert.equal(early.status, 'failed')
         assert.equal(early.error.message, awake.error.message)
+
+        // The sleep broke a request of an agent the turn waited on: Claude
+        // Code's timer ticks on waking, the agent retries and fails, its call
+        // ends on the error, and the main loop's next request fails too.
+        sessions.push([
+          init('s-agent'),
+          agentCall('s-agent'),
+          25,
+          {
+            type: 'tool_progress',
+            tool_use_id: 'agent-1-heartbeat-50',
+            tool_name: 'Agent',
+            parent_tool_use_id: 'agent-1',
+            elapsed_time_seconds: 1530,
+            heartbeat: true,
+          },
+          agentFrame({
+            type: 'tool_progress',
+            tool_use_id: 'agent_sub_2',
+            tool_name: 'Agent',
+            elapsed_time_seconds: 1530,
+            subagent_retry: { agent_id: 'task-1', attempt: 1, max_retries: 10 },
+          }),
+          agentFrame({
+            type: 'assistant',
+            error: 'unknown',
+            message: {
+              id: 'sub_synthetic',
+              model: '<synthetic>',
+              content: [textBlock('API Error: Connection error.')],
+            },
+          }),
+          {
+            type: 'user',
+            parent_tool_use_id: null,
+            session_id: 's-agent',
+            uuid: 's-agent-result',
+            message: {
+              role: 'user',
+              content: [
+                {
+                  type: 'tool_result',
+                  tool_use_id: 'agent-1',
+                  content: [textBlock('API Error: Connection error.')],
+                },
+              ],
+            },
+          },
+          ...failedRequestFrames('s-agent'),
+        ])
+        const agent = await app.turnCompleted(await app.startTurn(threadId, 'an agent slept'))
+        assert.equal(agent.status, 'failed')
+        assert.equal(
+          agent.error.message,
+          `API Error: Connection error. ${sleepNotice(25 * MINUTE, 'linux')}`,
+        )
       },
       {
         server: {
