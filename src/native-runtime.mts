@@ -84,6 +84,7 @@ import { sdkHooks } from './sdk-hooks.mjs'
 import { subagentItemsEnabled } from './subagent-items.mjs'
 import { readTaskResult } from './task-output.mjs'
 import { ToolInputPreviews } from './tool-input-preview.mjs'
+import { isCommandPrompt } from './turn-context.mjs'
 import type {
   ClaudeRuntime,
   DynamicToolServer,
@@ -96,6 +97,7 @@ import type {
   PermissionDecision,
   RecalledMemory,
   RuntimeBackgroundListener,
+  RuntimeEvent,
   RuntimeFailure,
   RuntimeHandlers,
   RuntimeLiveTask,
@@ -119,6 +121,7 @@ import { parseWorkflowCommand, workflowRuntimePrompt } from './workflow-command.
 import {
   defaultWorkflowTranscriptRoots,
   parseWorkflowLaunchInfo,
+  WorkflowAgentFailures,
   WorkflowJournalMonitor,
   type WorkflowLaunchInfo,
 } from './workflow-subagents.mjs'
@@ -231,6 +234,8 @@ interface WorkflowTaskState {
   aggregateStarted: boolean
   terminal: boolean
   monitorFailed?: boolean
+  // Why its agents failed, from its progress reports.
+  agentFailures?: WorkflowAgentFailures
 }
 
 interface PendingPermission {
@@ -442,7 +447,10 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       await session.firstPrompt
       if (session.closed) return false
     }
-    const uuid = this.send(session, this.buildUserMessage(prompt, options.imageInputs ?? []))
+    const uuid = this.send(
+      session,
+      this.buildUserMessage(prompt, options.imageInputs ?? [], options.promptContext ?? []),
+    )
     if (!uuid) return false
     // Accepted once the CLI starts consuming it (command_lifecycle `started`)
     // or, on CLIs without lifecycle frames, once a result echoes it.
@@ -816,30 +824,38 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   }
 
   private buildPromptMessage(context: RuntimeTurnContext): TurnInputMessage {
-    return this.buildUserMessage(context.prompt, context.imageInputs)
+    return this.buildUserMessage(context.prompt, context.imageInputs, context.promptContext ?? [])
   }
 
-  private buildUserMessage(prompt: string, images: ImageInput[] | undefined): TurnInputMessage {
+  private buildUserMessage(
+    prompt: string,
+    images: ImageInput[] | undefined,
+    context: readonly string[] = [],
+  ): TurnInputMessage {
     const text = workflowRuntimePrompt(prompt)
     // Pure text — keep the simple string form so the SDK doesn't have to
     // re-stitch content blocks.
-    if (!images || images.length === 0) return humanUserMessage(text)
+    if ((!images || images.length === 0) && context.length === 0) return humanUserMessage(text)
     // Multimodal — assemble the Anthropic MessageParam content array.
-    const content: unknown[] = []
-    if (text) content.push({ type: 'text', text })
-    for (const img of images) {
-      if (img.kind === 'base64') {
-        content.push({
-          type: 'image',
-          source: { type: 'base64', media_type: img.mediaType, data: img.data },
-        })
-      } else {
-        content.push({
-          type: 'image',
-          source: { type: 'url', url: img.data },
-        })
-      }
-    }
+    const imageBlocks = (images ?? []).map((img) =>
+      img.kind === 'base64'
+        ? {
+            type: 'image',
+            source: { type: 'base64', media_type: img.mediaType, data: img.data },
+          }
+        : { type: 'image', source: { type: 'url', url: img.data } },
+    )
+    const textBlocks = text ? [{ type: 'text', text }] : []
+    // Claude Code runs a command only from the text block a message ends
+    // with, so a command's context and images go before its text.
+    const content: unknown[] =
+      context.length > 0 || isCommandPrompt(text)
+        ? [
+            ...context.map((block) => ({ type: 'text', text: block })),
+            ...imageBlocks,
+            ...textBlocks,
+          ]
+        : [...textBlocks, ...imageBlocks]
     return humanUserMessage(content as TurnInputMessage['message']['content'])
   }
 
@@ -2515,6 +2531,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       case 'result':
         await this.handleResult(pending, message)
         break
+      case 'tool_progress': {
+        // Beyond the heartbeat above, one may tell a subagent's retry.
+        const retry = subagentRetryEvent(message)
+        if (retry) await pending.handlers.onEvent(retry)
+        break
+      }
       default:
         // Rate-limit notifications and other non-system frames.
         await this.handleOther(pending, type, message)
@@ -2652,8 +2674,10 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     if (subtype === 'api_retry') {
       const status = numberOrNull(message.error_status)
       const category = stringOrNull(message.error)
-      // A subagent's retry is told against its Agent call; it says nothing
-      // about why the main loop might fail.
+      // The CLI tells only the main loop's retries this way (a subagent's
+      // come as tool_progress, see subagentRetryEvent). One that names an
+      // Agent call all the same is that subagent's, and says nothing about
+      // why the main loop might fail.
       const toolUseId = stringOrNull(message.parent_tool_use_id)
       if (!toolUseId) pending.apiError = { category, status }
       await pending.handlers.onEvent({
@@ -2789,6 +2813,17 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         state.description ||
         state.workflowName
       this.attachDeferredWorkflowJournal(pending, state, sourceToolUseId)
+      return
+    }
+    if (subtype === 'task_progress') {
+      // A workflow's progress says why its agents failed; its journal does
+      // not.
+      // App rule: subagent-failure-reason
+      const state = pending.workflowTasks?.get(String(message.task_id ?? ''))
+      if (state && Array.isArray(message.workflow_progress)) {
+        state.agentFailures ??= new WorkflowAgentFailures()
+        state.agentFailures.note(message.workflow_progress)
+      }
       return
     }
     if (subtype === 'task_notification') {
@@ -3288,6 +3323,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   ): WorkflowJournalMonitor {
     return new WorkflowJournalMonitor({
       launch,
+      failureReason: (agentId) => state.agentFailures?.reason(agentId),
       onStarted: async (agent) => {
         if (state.terminal) return
         const toolUseId = workflowAgentToolUseId(state.taskId, agent.agentId)
@@ -3616,6 +3652,33 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       })
       return
     }
+  }
+}
+
+// A foreground subagent's model request that failed and will be sent again.
+// The CLI tells it as the Agent call's tool_progress with subagent_retry:
+// parent_tool_use_id is the Agent call (tool_use_id is a made-up
+// `agent_<message id>`) and agent_id the subagent's task. The next such frame
+// without subagent_retry means the request went through, and is only a
+// heartbeat. A subagent's retry says nothing about why the main loop might
+// fail.
+function subagentRetryEvent(
+  message: Record<string, unknown>,
+): Extract<RuntimeEvent, { type: 'retrying' }> | null {
+  const retry = recordOrNull(message.subagent_retry)
+  if (!retry) return null
+  const toolUseId = stringOrNull(message.parent_tool_use_id)
+  const agentId = stringOrNull(retry.agent_id)
+  if (!toolUseId && !agentId) return null
+  return {
+    type: 'retrying',
+    attempt: numberOrNull(retry.attempt) ?? 1,
+    maxRetries: numberOrNull(retry.max_retries) ?? 1,
+    status: numberOrNull(retry.error_status),
+    category: stringOrNull(retry.error_category),
+    delayMs: numberOrNull(retry.retry_delay_ms),
+    ...(toolUseId ? { toolUseId } : {}),
+    ...(agentId ? { agentId } : {}),
   }
 }
 

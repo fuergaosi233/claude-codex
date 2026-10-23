@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { appendFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -521,6 +521,131 @@ test('the workflow agents a native turn closes as it ends are marked as ended wi
   )
 })
 
+test('a workflow agent that fails ends its child turn with the reason the workflow gave, and counts as failed', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'claude-codex-failed-workflow-agent-'))
+  const runId = 'wf_failed_agent_run'
+  const transcriptDir = join(root, 'projects', 'project', 'subagents', 'workflows', runId)
+  const failed = 'c000000000000001'
+  const done = 'c000000000000002'
+  const key = (n: number) => `v1:${String(n).repeat(64)}`
+  const journal = (...entries: unknown[]) =>
+    appendFile(
+      join(transcriptDir, 'journal.jsonl'),
+      entries.map((entry) => `${JSON.stringify(entry)}\n`).join(''),
+    )
+  await mkdir(transcriptDir, { recursive: true })
+  for (const agentId of [failed, done]) {
+    await writeFile(
+      join(transcriptDir, `agent-${agentId}.jsonl`),
+      `${JSON.stringify({ message: { role: 'user', content: `step ${agentId}` } })}\n`,
+    )
+  }
+  // The native runtime projects the workflow's journal into the turn.
+  const script: Script = async (_context, handlers) => {
+    const runtime = new NativeClaudeRuntime()
+    const pending = {
+      activeSubagents: new Set<string>(),
+      completedWorkflowTasks: new Set<string>(),
+      workflowToolUseIds: new Set(['wf-launch']),
+      workflowTranscriptRoots: [root],
+      handlers,
+    }
+    const handleSystem = Reflect.get(runtime, 'handleSystem')
+    try {
+      await handleSystem.call(runtime, pending, {
+        subtype: 'task_started',
+        task_id: 'wf-task',
+        tool_use_id: 'wf-launch',
+        task_type: 'local_workflow',
+        workflow_name: 'review',
+      })
+      await Reflect.get(runtime, 'handleUser').call(runtime, pending, {
+        type: 'user',
+        tool_use_result: {
+          status: 'async_launched',
+          taskId: 'wf-task',
+          taskType: 'local_workflow',
+          workflowName: 'review',
+          runId,
+          transcriptDir,
+        },
+        message: {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 'wf-launch', content: 'Launched.' }],
+        },
+      })
+      await journal(
+        { type: 'started', key: key(1), agentId: failed },
+        { type: 'started', key: key(2), agentId: done },
+      )
+      // The workflow reports why the agent failed; the journal only that it
+      // did.
+      await handleSystem.call(runtime, pending, {
+        subtype: 'task_progress',
+        task_id: 'wf-task',
+        workflow_progress: [
+          {
+            type: 'workflow_agent',
+            index: 1,
+            agentId: failed,
+            state: 'error',
+            error: `stalled \x1b[2m—\x1b[0m no progress\nfor ${'9'.repeat(500)}ms`,
+          },
+        ],
+      })
+      await journal(
+        { type: 'failed', key: key(1), agentId: failed },
+        { type: 'result', key: key(2), agentId: done, result: 'All checks pass' },
+      )
+      // The workflow itself completes.
+      await handleSystem.call(runtime, pending, {
+        subtype: 'task_notification',
+        task_id: 'wf-task',
+        status: 'completed',
+        summary: 'Review completed',
+      })
+    } finally {
+      await Reflect.get(runtime, 'stopWorkflowTasks').call(runtime, pending)
+    }
+    await handlers.onEvent({
+      type: 'completed',
+      success: false,
+      result: 'API Error: 529 Overloaded',
+      failure: { terminalReason: 'api_error', category: 'overloaded', status: 529 },
+    })
+  }
+  try {
+    await withScriptedServer(script, async ({ startThread, runTurn }) => {
+      const threadId = await startThread()
+      const live = await runTurn(threadId, 'run a workflow')
+      // Cleaned and clipped like any subagent's reason.
+      const told = 'stalled — no progress for '
+      const reason = `${told}${'9'.repeat(399 - told.length)}…`
+      const failedChild = spawnedChild(live, `step ${failed}`)
+      const doneChild = spawnedChild(live, `step ${done}`)
+      const failedTurn = turnCompleted(live, failedChild).params.turn
+      assert.equal(failedTurn.status, 'failed')
+      assert.deepEqual(failedTurn.error, turnError(reason))
+      const doneTurn = turnCompleted(live, doneChild).params.turn
+      assert.equal(doneTurn.status, 'completed')
+      assert.equal(doneTurn.error, null)
+      assert.deepEqual(
+        collabItems(live, 'wait').map((item) => item.agentsStates),
+        [
+          { [failedChild]: { status: 'errored', message: reason } },
+          { [doneChild]: { status: 'completed', message: null } },
+        ],
+      )
+      assert.equal(
+        turnCompleted(live, threadId).params.turn.error.message,
+        `API Error: 529 Overloaded. A subagent failed: ${Array.from(reason).slice(0, 199).join('')}…`,
+      )
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('a parent turn the subagent watchdog ends says how many of its subagents failed', async () => {
   const previousTimeout = process.env.CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS
   process.env.CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS = '150'
@@ -770,7 +895,7 @@ for (const { summary, result, reason } of [
   })
 }
 
-const retry = (attempt: number, toolUseId?: string) => ({
+const retry = (attempt: number, toolUseId?: string, agentId?: string) => ({
   type: 'retrying' as const,
   attempt,
   maxRetries: 10,
@@ -778,24 +903,39 @@ const retry = (attempt: number, toolUseId?: string) => ({
   category: 'overloaded',
   delayMs: 2_000,
   ...(toolUseId ? { toolUseId } : {}),
+  ...(agentId ? { agentId } : {}),
 })
 
 test("a subagent's API retries show in its own thread while it runs, never in the parent", async () => {
-  const script: Script = async (_context, handlers) => {
+  const script: Script = async (context, handlers, tools) => {
     await handlers.onEvent({
       type: 'tool_use',
       toolUseId: 'agent-retrying',
       toolName: 'Agent',
       input: { description: 'Retrying', prompt: 'call the API' },
     })
-    await handlers.onEvent(retry(1, 'agent-retrying'))
+    await tools.listener().onTaskEvent(context.threadId, {
+      type: 'task_started',
+      taskId: 'retrying-task',
+      toolUseId: 'agent-retrying',
+      taskType: 'local_agent',
+      description: 'Retrying',
+      subagentType: null,
+      prompt: 'call the API',
+      backgrounded: false,
+    })
+    await handlers.onEvent(retry(1, 'agent-retrying', 'retrying-task'))
+    // One that names only the agent's task finds it too.
+    await handlers.onEvent(retry(2, undefined, 'retrying-task'))
     // An agent the turn does not know shows its retry nowhere.
-    await handlers.onEvent(retry(2, 'agent-unknown'))
+    await handlers.onEvent(retry(3, 'agent-unknown'))
+    await handlers.onEvent(retry(4, undefined, 'unknown-task'))
     // The main loop's own retry shows in the parent, as before.
-    await handlers.onEvent(retry(3))
+    await handlers.onEvent(retry(5))
     await handlers.onEvent({ type: 'tool_result', toolUseId: 'agent-retrying', content: 'done' })
     // A late retry of an agent that already finished shows nowhere.
-    await handlers.onEvent(retry(4, 'agent-retrying'))
+    await handlers.onEvent(retry(6, 'agent-retrying', 'retrying-task'))
+    await handlers.onEvent(retry(7, undefined, 'retrying-task'))
     await handlers.onEvent({ type: 'completed', success: true, result: 'done' })
   }
   await withScriptedServer(script, async ({ startThread, runTurn, request }) => {
@@ -818,10 +958,11 @@ test("a subagent's API retries show in its own thread while it runs, never in th
       ]),
       [
         [child, childTurnId, true, 'Reconnecting... 1/10'],
-        [threadId, parentTurnId, true, 'Reconnecting... 3/10'],
+        [child, childTurnId, true, 'Reconnecting... 2/10'],
+        [threadId, parentTurnId, true, 'Reconnecting... 5/10'],
       ],
     )
-    assert.deepEqual(errors[0].params.error.codexErrorInfo, errors[1].params.error.codexErrorInfo)
+    assert.deepEqual(errors[0].params.error.codexErrorInfo, errors[2].params.error.codexErrorInfo)
     // Like Codex, a retry is not kept: both turns end without an error.
     assert.equal(turnCompleted(live, child).params.turn.error, null)
     assert.equal(turnCompleted(live, threadId).params.turn.error, null)
@@ -830,9 +971,14 @@ test("a subagent's API retries show in its own thread while it runs, never in th
   })
 })
 
+// Claude Code reports no background agent's retries today; one that names the
+// agent, by its Agent call or its task, shows in its thread all the same.
 test("a background subagent's API retries show in its own thread", async () => {
   await withScriptedServer(
-    backgroundAgent((handlers) => handlers.onEvent(retry(3, 'agent-bg'))),
+    backgroundAgent(async (handlers) => {
+      await handlers.onEvent(retry(3, 'agent-bg'))
+      await handlers.onEvent(retry(4, undefined, 'bg-task'))
+    }),
     async ({ startThread, runTurn }) => {
       const threadId = await startThread()
       const live = await runTurn(threadId, 'background agent')
@@ -849,8 +995,106 @@ test("a background subagent's API retries show in its own thread", async () => {
             message.params.willRetry,
             message.params.error.message,
           ]),
-        [[child, childTurnId, true, 'Reconnecting... 3/10']],
+        [
+          [child, childTurnId, true, 'Reconnecting... 3/10'],
+          [child, childTurnId, true, 'Reconnecting... 4/10'],
+        ],
       )
     },
   )
+})
+
+test("a foreground subagent's API retries, as Claude Code reports them, show in its own thread", async () => {
+  const runtime = new NativeClaudeRuntime()
+  // The CLI tells a subagent's retry as its Agent call's tool_progress
+  // (parent_tool_use_id), with a tool_use_id of its own making.
+  const agentProgress = (subagentRetry?: Record<string, unknown>) => ({
+    type: 'tool_progress',
+    tool_use_id: 'agent_msg_child',
+    tool_name: 'Agent',
+    parent_tool_use_id: 'toolu_agent',
+    elapsed_time_seconds: 0,
+    subagent_type: 'general-purpose',
+    session_id: 'session-retry',
+    ...(subagentRetry ? { subagent_retry: subagentRetry } : {}),
+  })
+  const subagentRetry = (attempt: number) => ({
+    agent_id: 'a1b2c3d4e5f60718',
+    attempt,
+    max_retries: 10,
+    retry_delay_ms: 2_000,
+    error_status: 529,
+    error_category: 'overloaded',
+  })
+  const frames = [
+    {
+      type: 'assistant',
+      parent_tool_use_id: null,
+      message: {
+        id: 'msg_parent',
+        content: [
+          {
+            type: 'tool_use',
+            id: 'toolu_agent',
+            name: 'Agent',
+            input: { description: 'Survey', prompt: 'survey the API' },
+          },
+        ],
+      },
+    },
+    agentProgress(subagentRetry(1)),
+    agentProgress(subagentRetry(2)),
+    // The request went through.
+    agentProgress(),
+    {
+      type: 'user',
+      parent_tool_use_id: null,
+      message: {
+        content: [{ type: 'tool_result', tool_use_id: 'toolu_agent', content: 'Surveyed.' }],
+      },
+    },
+    {
+      type: 'assistant',
+      parent_tool_use_id: null,
+      message: { id: 'msg_end', content: [{ type: 'text', text: 'Surveyed.' }] },
+    },
+    { type: 'result', subtype: 'success', result: 'Surveyed.' },
+  ]
+  Reflect.set(runtime, 'sdk', {
+    query: async function* () {
+      yield* frames
+    },
+  })
+  try {
+    await withScriptedServer(
+      (context, handlers) => runtime.runTurn(context, handlers),
+      async ({ startThread, runTurn }) => {
+        const threadId = await startThread()
+        const live = await runTurn(threadId, 'survey with a subagent')
+        const child = spawnedChild(live, 'survey the API')
+        const childTurnId = live.find(
+          (message) => message.method === 'turn/started' && message.params.threadId === child,
+        ).params.turn.id
+        assert.deepEqual(
+          live
+            .filter((message) => message.method === 'error')
+            .map((message) => [
+              message.params.threadId,
+              message.params.turnId,
+              message.params.willRetry,
+              message.params.error.message,
+            ]),
+          [
+            [child, childTurnId, true, 'Reconnecting... 1/10'],
+            [child, childTurnId, true, 'Reconnecting... 2/10'],
+          ],
+        )
+        // The subagent's retries say nothing about the parent turn.
+        assert.equal(turnCompleted(live, threadId).params.turn.status, 'completed')
+        assert.equal(turnCompleted(live, child).params.turn.status, 'completed')
+      },
+    )
+  } finally {
+    await runtime.stop()
+  }
 })

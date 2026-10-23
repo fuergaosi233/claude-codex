@@ -1392,6 +1392,22 @@ export class SessionStore {
     return rows.map((row: unknown) => this.rowToTurn(row))
   }
 
+  // Id and status of the newest turn the thread's history holds, its own or,
+  // for a fork with none yet, the last one it inherited; without decoding
+  // items.
+  lastHistoryTurnRef(threadId: string): { id: string; status: TurnRecord['status'] } | null {
+    const own = this.lastTurnRef(threadId)
+    if (own) return own
+    this.ensureInheritedHistory(threadId)
+    const row = this.db
+      .prepare(
+        'SELECT id, status FROM thread_inherited_turns WHERE thread_id = ? ORDER BY position DESC LIMIT 1',
+      )
+      .get(threadId) as { id?: unknown; status?: unknown } | undefined
+    if (typeof row?.id !== 'string' || typeof row.status !== 'string') return null
+    return { id: row.id, status: row.status as TurnRecord['status'] }
+  }
+
   inheritedTurnCount(threadId: string): number {
     const row = this.db
       .prepare('SELECT COUNT(*) AS count FROM thread_inherited_turns WHERE thread_id = ?')

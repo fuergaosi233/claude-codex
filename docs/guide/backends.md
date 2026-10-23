@@ -12,6 +12,12 @@ default Agent SDK route.
 | `claude-p` | Experimental | None (one-shot) | No |
 | `codex` (native passthrough) | Stable | Native Codex | Native Codex |
 
+Only the SDK route gets a message's context (injected items, a picked skill's
+`SKILL.md`, the App's `additionalContext`) in blocks of its own. `agent-http`,
+`agentapi` and `claude-p` get one flat text with the context ahead of the
+message, so a Claude Code command (`/name args`) sent with any context does not
+run there; see [Skills and the App's tools](/guide/gui#skills-and-the-app-s-tools).
+
 ## Switching routes
 
 Install the host helper next to the shim:

@@ -38,13 +38,14 @@ versioning or publishing metadata.
 
 ### Failures you can see and act on
 
-- A turn that fails after the computer slept for a minute or more during it
-  says so in its error: roughly how long the computer slept, that this broke
-  Claude's connection to the model, and that a message (or Continue) picks up
-  where it left off; on macOS it also points to the App's **Prevent sleep
-  while running** setting. The error code and details are
-  unchanged, and refusals such as usage limits or startup failures are left
-  alone.
+- A turn that fails after the computer slept for a minute or more since
+  Claude last made progress in it says so in its error: roughly how long the
+  computer slept, that this broke Claude's connection to the model, and that a
+  message (or Continue) picks up where it left off; on macOS it also points to
+  the App's **Prevent sleep while running** setting. A sleep the turn went on
+  from is not blamed (API retries, notices and the failing result do not
+  count as going on). The error code and details are unchanged, and refusals
+  such as usage limits, an overloaded API or startup failures are left alone.
 - The subagent watchdog (`CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS`) no longer fails a
   turn over quiet that is not a stall. The wait is paused while the turn waits
   on the user (an approval, a question, an MCP elicitation or a client dynamic
@@ -53,8 +54,14 @@ versioning or publishing metadata.
 - Opt-in `CLAUDE_CODEX_PREVENT_IDLE_SLEEP=1` keeps a Mac from idle-sleeping
   while Claude works: the adapter holds `caffeinate -i -w <adapter pid>` while
   any turn, background agent or other background work runs, and stops it once
-  nothing does. Closing the lid still sleeps. Off by default, and it does
-  nothing on other platforms.
+  nothing does. A command Claude runs in the background with Bash, such as a
+  dev server or file watcher, counts as background work and keeps the Mac
+  awake until its Claude session closes, `CLAUDE_CODEX_BACKGROUND_IDLE_MS`
+  (default 2 hours) after the session's last message. Closing the lid still
+  sleeps. A `caffeinate` that fails or ends on its own is started again while
+  work runs; the adapter stops trying until it restarts only after three in a
+  row end within a minute of starting.
+  Off by default, and it does nothing on other platforms.
 - What Claude Code reports beside a turn (a compaction it could not do, a
   switch to a fallback model, an urgent CLI notification, a call it refused)
   now shows in the Codex App as a dim row under the turn, which goes on. Each
@@ -73,14 +80,32 @@ versioning or publishing metadata.
 - A turn keeps a `contextCompaction` item only once the compaction completes,
   in the place it started, like Codex. A compaction an interrupt cuts short no
   longer reads as "Context compacted" after a reload, and one Claude Code could
-  not do leaves no marker; its notice says what happened.
+  not do leaves no marker; its notice says what happened. That includes a
+  `/compact` (`thread/compact/start`) Claude Code could not do: its turn keeps
+  only the summary written instead, and no `thread/compacted` is sent.
 - Requests the user can correct fail with JSON-RPC `-32600` (invalid request),
   the code Codex uses, instead of `-32000`, with the same messages: an unknown
   thread, turn, section, queued message or process; a bad cursor or parameter;
-  a model the chat cannot take; a rewind or queued start while a turn runs.
+  a model the chat cannot take; a rewind or queued start while a turn runs; a
+  fork from an unknown thread, from a turn its thread does not have or that
+  still runs, or onto another model process profile.
   The model menu's "Couldn't update model settings" toast now gives the
   reason, after the App's own "Check your config.toml." line. Failures inside
   the adapter stay `-32000`.
+- Model process profiles that fail to load fail with one line of at most 300
+  characters that names the file (or `CLAUDE_CODEX_MODEL_PROFILES`) and says
+  what is wrong. The message used to carry the JSON parser's excerpt of the
+  file's text, which could include a credential, and the id or
+  `defaultModel` value that was not valid. A model change from the menu or
+  `turn/settings/update` that fails on them is now an invalid request
+  (`-32600`) like one from `turn/start`, so the toast shows the reason.
+- A workflow agent that fails (one that stalled on every attempt, or hit an
+  API error) ends its thread's turn as failed, with the reason the workflow
+  reported, and counts as a failed subagent of its parent. It used to show as
+  running until the workflow ended and then as completed. An attempt the
+  workflow ran again after a stall ends as failed too, as soon as the next
+  attempt starts, saying the workflow ran the agent again, instead of staying
+  open. Claude Code's progress report does not keep that attempt's own error.
 - The goal tools (`codex_goal`) and leader tools (`codex_leader`) load with the
   session instead of behind Claude Code's tool search, so Claude knows they are
   there in a session with many tools.
@@ -552,15 +577,18 @@ versioning or publishing metadata.
   fork does: `thread/resume`, `thread/read`, `thread/turns/list`,
   `thread/items/list`, `thread/turns/items/list`, `thread/timeline/list` and
   search return them ahead of the fork's own turns, under the same ids, after
-  a restart too. The adapter copies them into the fork when it is made, so a
+  a restart too. So does a leader chat's `thread_read`, and its
+  `thread_list` names a fork's last inherited turn until the fork has one
+  of its own. The adapter copies them into the fork when it is made, so a
   rollback or delete of the parent leaves the fork's history alone; a fork of
   a fork inherits the whole history and can branch from an inherited turn,
   and a rollback or revert can reach back into the inherited turns. Forks
   made by an earlier version get their history when first read if their
   stored fork point says exactly where they branched off. Ephemeral forks
   still carry their history in the `thread/fork` response only, as in Codex.
-- MCP servers added, edited, switched off or deleted in the App's Settings >
-  MCP servers now take effect in Claude threads. The App writes them with
+- With `CLAUDE_CODEX_APP_MCP_SERVERS=1`, MCP servers added, edited, switched
+  off or deleted in the App's Settings > MCP servers take effect in Claude
+  threads. The App writes them with
   `config/batchWrite` and `config/value/write`; the adapter keeps them in its
   own settings (never in `config.toml`), checks them like `config.toml`
   entries, passes them to every turn, `mcpServerStatus/list` and
@@ -568,17 +596,45 @@ versioning or publishing metadata.
   lists them after a restart. One of them wins a name over a server the
   Codex or Claude Code config brings, and `CLAUDE_CODEX_MCP_SERVERS` wins
   over it; the App's own desktop servers (`node_repl`, `cua_repl`) are
-  accepted and not kept.
-  `CLAUDE_CODEX_APP_MCP_SERVERS=0` turns this off and refuses the writes.
+  accepted and not kept. A server or field named `__proto__` is refused
+  with `INVALID_REQUEST`, where it would have reported success and been
+  dropped unchecked.
+  The switch is off by default, since such a server runs a program or reaches
+  a URL from every Claude thread. Without it the page lists no server, and a
+  save, switch or delete there fails with a message the App shows under the
+  form: the servers are not used for Claude threads unless the adapter runs
+  with `CLAUDE_CODEX_APP_MCP_SERVERS=1`, and a server can also go into Claude
+  Code's own MCP config. Servers saved earlier stay saved, unused.
+- The debug log hides the values in config writes that can hold credentials.
+  For `config/value/write`, `config/batchWrite` and the `config` of a request
+  such as `thread/start`, it keeps every key name and the shape of each value
+  but replaces the values of an MCP server's `env`, `headers`,
+  `http_headers`, `env_http_headers` and `args` (where a `--header` token
+  goes), of a provider's `query_params`, and of any key named like a token,
+  secret, password, API key, auth setting, cookie or credential (such as
+  `bearer_token_env_var`). Of a `url` it keeps only the scheme and host: the
+  user, password, path (where a per-user server URL keeps its secret), query
+  and fragment are replaced. Other values, such as a server's `command`, are
+  still logged.
 - Settings a Claude thread cannot honor are refused with `INVALID_REQUEST`
   instead of being saved and ignored, so the App shows "Couldn't update this
   setting": `model_verbosity`, a service tier other than the default, network
   access off and the other workspace sandbox fields, `instructions`,
-  `developer_instructions` and `compact_prompt`. `config/read` reports network
-  access on, as Claude threads have it. Writing the value Claude already has,
-  or clearing a key, still succeeds.
+  `developer_instructions` and `compact_prompt`. Writing the value Claude
+  already has, or clearing a key, still succeeds. `config/read` keeps
+  reporting `sandbox_workspace_write` unset, so Settings shows network access
+  off although Claude threads always have it: the App takes the default
+  permissions for its Default permissions preset only while that table is
+  unset (or has network access off), and would otherwise preselect Custom
+  (config.toml) in new chats.
 - `web_search = "disabled"` saved in the App's settings takes WebSearch from
   Claude threads; `cached`, `indexed` and `live` keep it.
+- **Behavior change:** `CLAUDE_CODEX_WEBSEARCH=0` now takes Claude Code's
+  WebSearch tool away from Claude threads too, while the App's settings saved
+  no web search mode. Before, it only made `config/read` report
+  `web_search = "disabled"` (and capabilities no web search), so Settings
+  showed web search off while Claude could still search. A mode saved in
+  Settings wins, and `modelProvider/capabilities/read` now follows it.
 - A `config/batchWrite` is all or nothing: one refused edit leaves the
   settings as they were. Keys earlier versions saved but never honored are
   dropped from the adapter's settings when it starts.
@@ -589,9 +645,34 @@ versioning or publishing metadata.
   from the last chat session there (`supportedCommands()` when a turn starts,
   then each `commands_changed`), so a folder shows them after its first
   Claude turn; `skills/changed` makes the App refetch it. Names the App uses
-  itself, names that are not one slash-command word and rows that share a
+  itself (every command id it registers, including `/pin`, `/archive`,
+  `/read-aloud` and the hotkey-window and ChatGPT-chat ones), names that are
+  not one slash-command word and rows that share a
   name with one of Claude Code's own commands are left out, and a skill read
-  from `.claude/skills` keeps its own entry.
+  from `.claude/skills` keeps its own entry. Each folder gets its own
+  `SKILL.md` per command, so a `/deploy` in two projects no longer shows the
+  description of whichever reported last; the files of commands a folder no
+  longer reports, and of folders no longer kept, are removed.
+- A message that runs a Claude Code command (`/name args`, typed or picked)
+  runs it also when the App sends context with it. Claude Code runs a
+  command only from the last text block of a message, so that block is now
+  the text as typed. Everything else goes in blocks before it, so Claude
+  still reads it and the command's arguments leave it out: the items the App
+  injected, a side chat's instructions, the `SKILL.md` of a skill picked with
+  the command, the App's `additionalContext` and images. Before, any of
+  these made the message a plain prompt or ended up in the arguments. A file
+  mentioned with the command stays in its arguments as `@path`. A command
+  sent while a turn runs is not folded into it: Claude Code runs it once the
+  current answer ends, and the turn stays open until it is done. A name with
+  a dot, such as `/release.notes` from a file `release.notes.md`, counts as
+  a command too, as the `/` popup lists it.
+  This is on the default Agent SDK backend. The `claude-p`, `agent-http` and
+  `agentapi` backends get a message as one flat text, now with that context
+  ahead of the command, so there a command sent with context does not run:
+  Claude reads the text as a plain message. Before, context other than
+  injected items followed the command into its arguments. A message with no
+  context still goes as typed. Codex chats on the `codex-proxy` route get the
+  same flat text and have no Claude Code commands.
 
 ### Provider and multi-agent boundaries
 
@@ -733,8 +814,10 @@ versioning or publishing metadata.
   Stopped, interrupted and orphaned subagents say how they ended and do not
   count as failed. Stopping a foreground subagent whose Agent call returned
   before Claude Code confirmed the stop no longer ends its thread twice.
-- A subagent's API retries show as **Reconnecting n/m** in the subagent's
-  thread while it runs, instead of not at all, and never in the parent.
+- A foreground subagent's API retries show as **Reconnecting n/m** in the
+  subagent's thread while it runs, instead of not at all, and never in the
+  parent. Claude Code reports them as the Agent call's `tool_progress` with
+  `subagent_retry` (and none for a background agent).
 - A subagent's thread shows the subagent's own work, not just its prompt and
   answer: its messages, thinking, and tool calls with their results, as the
   same command, file change, MCP, web search and image items the parent's

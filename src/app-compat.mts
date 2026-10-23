@@ -96,9 +96,9 @@ export const APP_RULES: readonly AppRule[] = [
     id: 'skills-popup',
     app: 'Fills the Skills group of the "/" popup from skills/list, refetches it on skills/changed, and sends a picked skill as a [$name](path) link inside the prompt text.',
     adapter:
-      "Lists the commands Claude Code reports as skills: its built-in skills, and per folder the user's, the project's, plugins' and MCP servers' commands. Turns the first such link back into `/name args`.",
+      "Lists the commands Claude Code reports as skills: its built-in skills, and per folder the user's, the project's, plugins' and MCP servers' commands. Turns the first such link back into `/name args`, and sends a message that starts with a command with that text as its last block, after the message's context and images, since Claude Code runs a command only from there.",
     verify:
-      'Type "/" in the composer: /simplify is listed, and so is a command from .claude/commands once a chat in that folder has run a turn; picking either runs it.',
+      'Type "/" in the composer: /simplify is listed, and so is a command from .claude/commands once a chat in that folder has run a turn; picking either runs it, in a side chat and with an image attached too.',
   },
   {
     id: 'optimistic-user-message',
@@ -188,7 +188,7 @@ export const APP_RULES: readonly AppRule[] = [
     id: 'subagent-failure-reason',
     app: "Shows a failed turn's error.message as an error row at the end of that turn, unless the turn holds an `error` item that will not be retried; it shows nothing for an interrupted turn's error. A spawnAgent or sendInput row adds the agent's agentsStates message after its status; a wait is never drawn and a closeAgent row shows no state.",
     adapter:
-      "Ends a child that failed, was stopped or was ended with its parent with a turn error saying why: the CLI's error text without its tags, usage trailer or stack frames, a JSON error body told by its message, or what ended it. The same reason is the agent's agentsStates message on its wait and closeAgent items. A parent turn that fails after agents of its own failed adds how many and the first one's reason to its error.",
+      "Ends a child that failed, was stopped or was ended with its parent with a turn error saying why: the CLI's error text without its tags, usage trailer or stack frames, a JSON error body told by its message, or what ended it. A workflow agent fails once the workflow's journal records it failed, with the error the workflow's progress reports for it, and an attempt the workflow ran again fails once the next attempt starts, saying the workflow ran the agent again. The same reason is the agent's agentsStates message on its wait and closeAgent items. A parent turn that fails after agents of its own failed adds how many and the first one's reason to its error.",
     verify:
       "Have a subagent fail (a workflow agent that stalls, or one whose tool call errors): its thread ends with an error row naming the cause, without stack frames, and the parent's failed turn says a subagent failed and why.",
   },
@@ -286,7 +286,7 @@ export const APP_RULES: readonly AppRule[] = [
     id: 'model-menu-settings',
     app: 'Applies a model picked from the menu of an open chat it has resumed with thread/settings/update (model, effort and multiAgentMode); in a new chat the pick only rides on the first turn/start. When the request fails it shows a “Couldn’t update model settings” toast and puts the menu back; only for code -32600 the toast adds “Check your config.toml.” with the error message and an Open config.toml button. Only code -32601, or a message saying method not found, or unknown method or unknown variant next to the method name, counts as the server lacking the method.',
     adapter:
-      "Refuses a model on the other backend from the chat's (a Codex model in a Claude chat, or a Claude model in a Codex chat unless the Codex proxy carries every thread) once the chat has a conversation, with an invalid-request error (-32600) raised before anything changes, so the toast gives the reason, the menu goes back and the chat keeps its model. With model process profiles configured, a Claude chat with a conversation refuses another profile the same way, and a chat its profile can no longer run (the profile changed or went away, or the chat predates profiles) refuses any model. The chat's current model sent along with other settings is no change.",
+      "Refuses a model on the other backend from the chat's (a Codex model in a Claude chat, or a Claude model in a Codex chat unless the Codex proxy carries every thread) once the chat has a conversation, with an invalid-request error (-32600) raised before anything changes, so the toast gives the reason, the menu goes back and the chat keeps its model. With model process profiles configured, a Claude chat with a conversation refuses another profile the same way, and a chat its profile can no longer run (the profile changed or went away, or the chat predates profiles) refuses any model. Model process profiles that fail to load refuse a model change the same way, with a one-line reason that names the file or variable and quotes none of it. The chat's current model sent along with other settings is no change.",
     verify:
       'With Codex models in the menu, pick one in a Claude chat that has a reply: a toast says the model settings could not be updated, with the reason, and the menu shows the Claude model again; another Claude model still applies.',
   },
@@ -302,9 +302,9 @@ export const APP_RULES: readonly AppRule[] = [
     id: 'reconnecting-errors',
     app: 'Shows an `error` notification with willRetry as a passing stream-error row in the turn that replaces the one before it, and reads the attempt count only from a message of the form "Reconnecting... n/m"; any other message shows as it is.',
     adapter:
-      'Turns each retry the Claude CLI reports for a chat\'s main loop (system/api_retry) into an `error` with willRetry, the message "Reconnecting... n/m" and the HTTP status and wait in additionalDetails, and does not store it, as Codex does not. A retry inside a subagent (one with a parent_tool_use_id) shows the same way in that subagent\'s thread while its turn runs, and never in the parent; retries in a structured-output helper turn show nothing.',
+      "Turns each retry the Claude CLI reports for a chat's main loop (system/api_retry) into an `error` with willRetry, the message \"Reconnecting... n/m\" and the HTTP status and wait in additionalDetails, and does not store it, as Codex does not. A foreground subagent's retry, which the CLI reports as its Agent call's tool_progress with subagent_retry, shows the same way in that subagent's thread while its turn runs, and never in the parent (the CLI reports none for a background agent); retries in a structured-output helper turn show nothing.",
     verify:
-      'Point the adapter at an API that answers 529 for a while: the turn shows "Reconnecting 1/10", counting up, and then the reply; a subagent running then shows its own retries in its thread.',
+      'Point the adapter at an API that answers 529 for a while: the turn shows "Reconnecting 1/10", counting up, and then the reply; a foreground subagent running then shows its own retries in its thread.',
   },
   {
     id: 'error-codes',
@@ -404,11 +404,11 @@ export const APP_RULES: readonly AppRule[] = [
   },
   {
     id: 'mcp-settings',
-    app: 'Lists the servers of Settings > MCP servers from config/read mcp_servers, and saves to the file of the first user layer, or else of the user, system or project origin of mcp_servers (or of mcp_servers.<name>); with neither it says "MCP server settings are unavailable". Adding, editing or deleting a server sends config/batchWrite with one replace edit of mcp_servers.<name> (null deletes); its switch sends config/value/write of mcp_servers.<name>.enabled with upsert. A server whose origin is a project file cannot be edited, and a server mcpServerStatus/list reports that config/read does not list shows apart from the others.',
+    app: 'Lists the servers of Settings > MCP servers from config/read mcp_servers, and saves to the file of the first user layer, or else of the user, system or project origin of mcp_servers (or of mcp_servers.<name>); with neither it says "MCP server settings are unavailable". Adding, editing or deleting a server sends config/batchWrite with one replace edit of mcp_servers.<name> (null deletes); its switch sends config/value/write of mcp_servers.<name>.enabled with upsert. A server whose origin is a project file cannot be edited, and a server mcpServerStatus/list reports that config/read does not list shows apart from the others. A refused save shows the error message under the form.',
     adapter:
-      'Reports the user config file as the origin of mcp_servers and of each server the App added, keeps those servers in its own config file, and starts the enabled ones in Claude threads (CLAUDE_CODEX_APP_MCP_SERVERS=0 leaves them out and reports no origin). A write naming no command or URL, a field of the wrong type, or the switch of a server the App never added is refused.',
+      "Reports the user config file as the origin of mcp_servers. Only with CLAUDE_CODEX_APP_MCP_SERVERS=1: lists the servers the App added with that origin each, keeps them in its own config file, and starts the enabled ones in Claude threads; a write naming no command or URL, a field of the wrong type, or the switch of a server the App never added is refused. Without it, config/read lists no server and every write that would add, change or delete one is refused with a message naming the switch and Claude Code's own MCP config.",
     verify:
-      'Add a stdio server under Settings > MCP servers: it stays listed after a reload, mcpServerStatus/list reports it, and a Claude chat can call its tools; switching it off takes the tools away in the next turn.',
+      'With CLAUDE_CODEX_APP_MCP_SERVERS=1, add a stdio server under Settings > MCP servers: it stays listed after a reload, mcpServerStatus/list reports it, and a Claude chat can call its tools; switching it off takes the tools away in the next turn. Without it, saving a new server shows the message under the form.',
   },
   {
     id: 'desktop-mcp-servers',
@@ -422,9 +422,16 @@ export const APP_RULES: readonly AppRule[] = [
     id: 'settings-write-errors',
     app: 'Writes Settings > Configuration (approval policy, sandbox mode, network access, web search, verbosity, reasoning summaries) with config/value/write, reads the values back from config/read, and shows "Couldn\'t update this setting" next to a setting whose write fails.',
     adapter:
-      'Refuses a write of a setting Claude threads have no counterpart for, such as model verbosity, a service tier or network access off, and reports in config/read what Claude threads do for it.',
+      'Refuses a write of a setting Claude threads have no counterpart for, such as model verbosity, a service tier or network access off, and reports in config/read what Claude threads do for it, except the network access the permission-presets rule keeps unset.',
+    verify: 'Picking a verbosity, or turning network access off, shows the error next to it.',
+  },
+  {
+    id: 'permission-presets',
+    app: "Takes config/read's approval_policy on-request with sandbox_mode workspace-write for its Default permissions preset only while sandbox_workspace_write is null, or a table with no writable_roots and network_access, exclude_tmpdir_env_var and exclude_slash_tmp all false (app-shared y4e/v4e; $_t/Q_t in 26.930). Otherwise it lists Custom (config.toml) in the composer's permissions menu and preselects it for a new chat with no stored choice. Settings > Configuration shows network access as that table's network_access, off when it is null.",
+    adapter:
+      'Reports sandbox_workspace_write as null, as Codex does without a [sandbox_workspace_write] table, although Claude threads always have network access; Settings shows network access off for them, and turning it off is refused under settings-write-errors.',
     verify:
-      'Settings > Configuration shows network access on, and picking a verbosity shows the error next to it.',
+      'With no permissions picked before, start a new chat: the composer shows Default permissions and the menu lists no Custom (config.toml).',
   },
   {
     id: 'dynamic-tools',
@@ -470,15 +477,15 @@ export const APP_RULES: readonly AppRule[] = [
     id: 'compaction-marker',
     app: 'Draws a contextCompaction item as "Context compacted" once item/completed arrives or when it is stored in a turn, and an open one as compacting while its turn is in progress and as "Compaction interrupted" once the turn has ended.',
     adapter:
-      'Stores a contextCompaction only when the compaction completes, in the place it started, as Codex keeps only finished compactions. A compaction an interrupt or a failed turn cuts short stays open, so it shows as interrupted until the chat is reopened, where it is gone.',
+      'Stores a contextCompaction only when the compaction completes, in the place it started, as Codex keeps only finished compactions. A compaction an interrupt or a failed turn cuts short stays open, so it shows as interrupted until the chat is reopened, where it is gone. A /compact Claude Code could not do is neither stored nor completed as a contextCompaction (see item-completed-replaces), and sends no thread/compacted.',
     verify:
-      'Interrupt a long /compact: the item shows as interrupted, not compacted; let one finish: it shows as compacted, also after the chat is reopened.',
+      'Interrupt a long /compact: the item shows as interrupted, not compacted; let one finish: it shows as compacted, also after the chat is reopened; one Claude Code refuses shows its notice row and the summary, and no "Context compacted".',
   },
   {
     id: 'item-completed-replaces',
     app: 'Replaces the item with the same id on item/completed, whatever type it started as.',
     adapter:
-      'Completes an image Read that fails or is stopped as its failed Read command in place of the imageView it started as, and a compaction Claude could not do while the turn went on as an empty reasoning item, which the App does not draw, in place of the contextCompaction it started as.',
+      'Completes an image Read that fails or is stopped as its failed Read command in place of the imageView it started as, and a compaction Claude could not do, while the turn went on or for a /compact, as an empty reasoning item, which the App does not draw, in place of the contextCompaction it started as.',
     verify:
       'Ask Claude to read an image file that does not exist: the turn shows the failed Read, not an empty image.',
   },

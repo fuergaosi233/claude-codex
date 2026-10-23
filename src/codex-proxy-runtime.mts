@@ -14,6 +14,7 @@
 
 import { type ChildProcess, spawn } from 'node:child_process'
 import { createInterface, type Interface } from 'node:readline'
+import { flatPrompt } from './turn-context.mjs'
 import type { ClaudeRuntime, RuntimeHandlers, RuntimeTurnContext } from './types.mjs'
 import { debugLog, resolveCodexBinary } from './util.mjs'
 
@@ -95,7 +96,7 @@ export class CodexProxyRuntime implements ClaudeRuntime {
           for (const dir of context.addDirs) args.push('--add-dir', dir)
         }
       }
-      args.push(context.prompt)
+      args.push(flatPrompt(context.prompt, context.promptContext))
 
       debugLog('codex-proxy.spawn', {
         binary,

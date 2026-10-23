@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { autoCompactWindowEnv } from './auto-compact.mjs'
 import { autoMemoryEnv } from './memories.mjs'
+import { flatPrompt } from './turn-context.mjs'
 import type { ClaudeRuntime, RuntimeHandlers, RuntimeTurnContext } from './types.mjs'
 
 export interface ClaudePRuntimeOptions {
@@ -28,7 +29,7 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
   async runTurn(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void> {
     const tmp = await mkdtemp(join(tmpdir(), 'claude-codex-claude-p-'))
     const inputFile = join(tmp, 'prompt.txt')
-    await writeFile(inputFile, context.prompt, 'utf8')
+    await writeFile(inputFile, flatPrompt(context.prompt, context.promptContext), 'utf8')
 
     try {
       if (context.imageInputs.length > 0) {

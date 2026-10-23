@@ -324,6 +324,89 @@ test('model profile config must be owner-controlled and cannot be a symbolic lin
   }
 })
 
+test('profiles that fail to load say where and why in one short line, quoting none of them', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'claude-codex-model-profiles-'))
+  const configFile = join(root, 'models.json')
+  const failure = (env: Record<string, string>): string => {
+    try {
+      loadClaudeModelProfiles({ HOME: root, ...env })
+    } catch (error) {
+      const message = (error as Error).message
+      assert.ok(message.length <= 300, message)
+      assert.doesNotMatch(message, /\n/)
+      return message
+    }
+    assert.fail('the profiles loaded')
+  }
+  const inline = (value: unknown) =>
+    failure({
+      CLAUDE_CODEX_MODEL_PROFILES: typeof value === 'string' ? value : JSON.stringify(value),
+    })
+  try {
+    // A credential pasted without quotes: JSON.parse quotes the text around it.
+    const pasted = inline(
+      '[{"id": "main-model", "env": {"ANTHROPIC_AUTH_TOKEN": sk-pasted-credential}}]',
+    )
+    assert.match(
+      pasted,
+      /^cannot load Claude model profiles from CLAUDE_CODEX_MODEL_PROFILES: invalid Claude model profiles JSON: Unexpected token 's'$/,
+    )
+
+    const fromFile = { CLAUDE_CODEX_MODEL_PROFILES_FILE: configFile }
+    const fileSource = `cannot load Claude model profiles from ${configFile} (CLAUDE_CODEX_MODEL_PROFILES_FILE): `
+    await writeFile(
+      configFile,
+      '{\n  "models": [\n    { "id": "main-model",\n      "env": { "API_KEY": sk-file-credential } }\n  ]\n}\n',
+      { mode: 0o600 },
+    )
+    const quoted = failure(fromFile)
+    assert.ok(quoted.startsWith(`${fileSource}invalid Claude model profiles JSON: `), quoted)
+    assert.doesNotMatch(quoted, /file-credential|API_KEY|"/)
+    // A message that quotes nothing stays whole, with where the error is.
+    await writeFile(configFile, '{\n  "models": [{ "id": "main-model" }],\n}\n', { mode: 0o600 })
+    assert.match(
+      failure(fromFile),
+      /: invalid Claude model profiles JSON: Expected double-quoted property name in JSON at position \d+ \(line 3 column 1\)$/,
+    )
+    assert.equal(
+      failure({ CLAUDE_CODEX_MODEL_PROFILES_FILE: join(root, 'missing.json') }),
+      `cannot load Claude model profiles from ${join(root, 'missing.json')} (CLAUDE_CODEX_MODEL_PROFILES_FILE): the file does not exist`,
+    )
+    // A long path keeps its end, where the file name is.
+    const deep = join(root, 'a'.repeat(100), 'b'.repeat(100))
+    await mkdir(deep, { recursive: true })
+    await writeFile(join(deep, 'models.json'), '{', { mode: 0o600 })
+    assert.match(
+      failure({ CLAUDE_CODEX_MODEL_PROFILES_FILE: join(deep, 'models.json') }),
+      /^cannot load Claude model profiles from …b{67}\/models\.json \(CLAUDE_CODEX_MODEL_PROFILES_FILE\): invalid Claude model profiles JSON: Expected property name or '}' in JSON at position 1 \(line 1 column 2\)$/,
+    )
+    assert.equal(
+      failure({ CLAUDE_CODEX_MODEL_PROFILES: '[{"id":"a"}]', ...fromFile }),
+      'cannot load Claude model profiles: set only one of CLAUDE_CODEX_MODEL_PROFILES_FILE or CLAUDE_CODEX_MODEL_PROFILES',
+    )
+
+    // What was put where an id belongs is no id, so it is not quoted.
+    assert.equal(
+      inline([{ id: 'main-model' }, { id: 'sk-pasted credential' }]),
+      "cannot load Claude model profiles from CLAUDE_CODEX_MODEL_PROFILES: invalid Claude model profile id at index 1: use letters, digits, '.', '_' and '-', at most 128 characters",
+    )
+    assert.equal(
+      inline({ defaultModel: 'sk-pasted credential', models: [{ id: 'main-model' }] }),
+      'cannot load Claude model profiles from CLAUDE_CODEX_MODEL_PROFILES: Claude model profiles defaultModel is unknown',
+    )
+    assert.match(
+      inline({ defaultModel: 'other-model', models: [{ id: 'main-model' }] }),
+      /: Claude model profiles defaultModel is unknown: other-model$/,
+    )
+    // A longer reason is cut short.
+    const clipped = inline([{ id: 'a', env: { [`PROVIDER_TOKEN_${'X'.repeat(400)}`]: 'literal' } }])
+    assert.equal(clipped.length, 300)
+    assert.match(clipped, /must reference a parent environment variable: PROVIDER_TOKEN_X+…$/)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('model profile env files must be private regular files', async () => {
   const root = await mkdtemp(join(tmpdir(), 'claude-codex-model-profiles-'))
   const envFile = join(root, 'provider.env')
@@ -409,10 +492,13 @@ test('the App describes a profile thread in a fork on the same profile', async (
     assert.equal(summary?.modelProfileFingerprint, modelProfileFingerprint('main-model'))
 
     // The user's own fork still cannot leave the profile.
+    // The App shows why, as it does for the model menu.
     const userFork = await call('thread/fork', { threadId: parent, model: 'gpt-5.6-luna' })
     assert.match(userFork.error?.message ?? '', /unknown configured Claude model profile/)
+    assert.equal(userFork.error?.code, INVALID_REQUEST)
     const otherProfile = await call('thread/fork', { threadId: parent, model: 'second-model' })
     assert.match(otherProfile.error?.message ?? '', /cannot change model process profile/)
+    assert.equal(otherProfile.error?.code, INVALID_REQUEST)
     const sameProfile = await call('thread/fork', { threadId: parent })
     assert.equal(sameProfile.result.model, 'main-model')
   } finally {
@@ -517,6 +603,69 @@ test('a running profile turn switches model only within its profile', async () =
     const same = await update({ model: 'main-model', effort: 'high' })
     assert.deepEqual(same.result, { status: 'applied' })
     assert.deepEqual(updates, [{ model: 'vendor/main-1', effort: 'high' }])
+  } finally {
+    release()
+    await harness.close()
+  }
+})
+
+test('a model change refuses profiles that fail to load as an invalid request, quoting none of them', async () => {
+  let release = () => {}
+  const released = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  let running = false
+  const harness = await profileServer(
+    TWO_PROFILES,
+    {},
+    {
+      runTurn: async (_context, handlers) => {
+        running = true
+        await released
+        await handlers.onEvent({ type: 'completed', success: true, result: 'done' })
+      },
+      updateTurnSettings: async () => true,
+    },
+  )
+  const { call } = harness
+  try {
+    const { result: held } = await call('thread/start', { cwd: harness.root, model: 'main-model' })
+    const { result: fresh } = await call('thread/start', { cwd: harness.root, model: 'main-model' })
+    const { result: turn } = await call('turn/start', {
+      threadId: held.thread.id,
+      input: [{ type: 'text', text: 'Hold this turn.' }],
+    })
+    for (let waited = 0; !running; waited += 10) {
+      assert.ok(waited < 5_000, 'turn did not start')
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+
+    // A credential pasted without quotes: JSON.parse quotes the text around it.
+    await writeFile(
+      harness.configFile,
+      '{"models": [{"id": "main-model", "env": {"API_KEY": sk-pasted-credential}}]}',
+      { mode: 0o600 },
+    )
+    const reason = `cannot load Claude model profiles from ${harness.configFile} (CLAUDE_CODEX_MODEL_PROFILES_FILE): invalid Claude model profiles JSON: Unexpected token 's'`
+    // The model menu, a running turn's settings, and a turn on another model.
+    // App rule: model-menu-settings
+    const refusals = [
+      await call('thread/settings/update', { threadId: fresh.thread.id, model: 'second-model' }),
+      await call('turn/settings/update', {
+        threadId: held.thread.id,
+        turnId: turn.turn.id,
+        model: 'second-model',
+      }),
+      await call('turn/start', {
+        threadId: fresh.thread.id,
+        model: 'second-model',
+        input: [{ type: 'text', text: 'Switch.' }],
+      }),
+    ]
+    for (const refused of refusals) {
+      assert.deepEqual(refused.error, { code: INVALID_REQUEST, message: reason })
+    }
+    assert.equal(harness.store.getThread(fresh.thread.id)?.model, 'main-model')
   } finally {
     release()
     await harness.close()

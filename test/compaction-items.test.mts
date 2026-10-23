@@ -128,7 +128,7 @@ test('a compaction an interrupt cuts short is not stored, so it never reads as c
   })
 })
 
-test('a /compact Claude refuses shows the refusal as a row, and the summary still lands', async () => {
+test('a /compact Claude refuses shows the refusal as a row and the summary, not a compaction', async () => {
   await withInProcessApp(new MockRuntime(), async (app) => {
     const threadId = await app.startThread()
     const first = await app.startTurn(threadId, 'next compaction fails')
@@ -145,7 +145,46 @@ test('a /compact Claude refuses shows the refusal as a row, and the summary stil
         .map((params) => [params.turnId, params.willRetry, params.error.message]),
       [[compactTurn, true, message]],
     )
-    // The summary written instead compacts the thread: stored first.
-    assert.equal(storedTypes(app, compactTurn)[0], 'contextCompaction')
+    // The item that showed it compacting closes as an empty reasoning item,
+    // which the App does not draw, before the summary written instead.
+    const [started] = compactionEvents(app, 'item/started').filter(
+      (params) => params.turnId === compactTurn,
+    )
+    assert.ok(started)
+    const closedAt = app.messages.findIndex(
+      (message) =>
+        message.method === 'item/completed' && message.params.item.id === started.item.id,
+    )
+    assert.deepEqual(app.messages[closedAt]?.params.item, {
+      type: 'reasoning',
+      id: started.item.id,
+      summary: [],
+      content: [],
+    })
+    const summaryAt = app.messages.findIndex(
+      (message) =>
+        message.method === 'item/started' &&
+        message.params.turnId === compactTurn &&
+        message.params.item.type === 'agentMessage',
+    )
+    assert.ok(closedAt < summaryAt)
+    assert.deepEqual(compactionEvents(app, 'item/completed'), [])
+    assert.deepEqual(app.notified('thread/compacted'), [])
+    // The turn keeps the summary alone, so nothing reads as compacted.
+    assert.deepEqual(storedTypes(app, compactTurn), ['agentMessage'])
+    const [summary] = app.store.getTurn(compactTurn)?.items ?? []
+    assert.ok(summary?.type === 'agentMessage' && summary.text.length > 0)
+
+    // A /compact Claude does compacts the thread, and says so.
+    await app.request('thread/compact/start', { threadId })
+    const nextTurn = await app.waitFor(
+      () =>
+        app
+          .notified('turn/started')
+          .find((params) => params.turn.id !== first && params.turn.id !== compactTurn)?.turn.id,
+    )
+    await app.turnCompleted(nextTurn)
+    assert.deepEqual(storedTypes(app, nextTurn), ['contextCompaction'])
+    assert.deepEqual(app.notified('thread/compacted'), [{ threadId, turnId: nextTurn }])
   })
 })

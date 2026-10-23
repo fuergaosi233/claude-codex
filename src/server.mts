@@ -11,7 +11,6 @@ import {
   appMcpServers,
   appMcpServersEnabled,
   appMcpServerTable,
-  claudeSandboxWorkspaceWrite,
   editMcpServers,
   pruneLegacySettings,
   unsupportedSettingWrite,
@@ -246,8 +245,10 @@ import {
   type AppToolNoteOptions,
   additionalContextBlocks,
   injectedItemsContext,
+  isCommandPrompt,
   skillInstructions,
-  withTurnContext,
+  type TurnPrompt,
+  turnPrompt,
 } from './turn-context.mjs'
 import {
   noticeRowsEnabled,
@@ -459,6 +460,20 @@ const MAX_TRACKED_TASK_IDS = 512
 // Command items a background shell's later output may still go to.
 const MAX_TRACKED_COMMAND_ITEMS = 512
 const MAX_QUEUED_ACTIVITY = 64
+
+// What a turn hears that does not show Claude getting on with it: a request
+// it will send again, a notice, an error, and the usage, figures and end of
+// the result that closes it. After a sleep broke its connection, a turn
+// hears only these until it fails. Usage also comes with each message, after
+// the message itself.
+const NO_PROGRESS_EVENTS: ReadonlySet<RuntimeEvent['type']> = new Set([
+  'retrying',
+  'notice',
+  'error',
+  'usage',
+  'metrics',
+  'completed',
+])
 
 // A hidden goal continuation that does no tool work ends the run of
 // continuations until the user or the goal changes something.
@@ -708,6 +723,10 @@ export class CodexClaudeAppServer {
   private readonly runtime: ClaudeRuntime
   // Notices that the computer slept, for the turn watchdog and failed turns.
   private readonly sleepMonitor: SleepMonitor
+  // For each running turn, how long the computer had slept in all
+  // (sleepMonitor.suspendedMs()) when Claude last made progress in it: only
+  // a sleep since then can explain the turn's failure.
+  private readonly sleptAtTurnProgress = new Map<string, number>()
   private readonly platform: NodeJS.Platform
   // The CLI notices each recent turn has shown (see turn-notices.mts).
   private readonly turnNotices: TurnNoticeLog
@@ -1101,10 +1120,9 @@ export class CodexClaudeAppServer {
         return {
           namespaceTools: true,
           imageGeneration: false,
-          // Claude Code SDK ships a WebSearch tool. Default to advertising it
-          // so Codex App shows the search affordance; CLAUDE_CODEX_WEBSEARCH=0
-          // turns it off for environments where the tool is rate-limited.
-          webSearch: process.env.CLAUDE_CODEX_WEBSEARCH !== '0',
+          // Whether Claude threads have their WebSearch tool: the same web
+          // search mode config/read reports and turns apply.
+          webSearch: this.effectiveWebSearch() !== 'disabled',
         }
       case 'experimentalFeature/list':
         return this.experimentalFeatureList(asRecord(params))
@@ -1635,7 +1653,7 @@ export class CodexClaudeAppServer {
   private threadFork(peer: RpcPeer, params: Record<string, unknown>): unknown {
     const parentId = stringOr(params.threadId, '')
     const parent = this.store.getThread(parentId)
-    if (!parent) throw new Error(`unknown thread: ${parentId}`)
+    if (!parent) throw unknownThread(parentId)
     this.checkModelProfileBinding(parent)
     // A fork from one of the parent's turns keeps the history up to it, and
     // Claude's context with it. The parent's history includes the turns it
@@ -1667,7 +1685,7 @@ export class CodexClaudeAppServer {
     // in its model process profile. A Codex parent's lives in Codex, so its
     // fork may take any profile, as it takes any Claude model without them.
     if (parent.runtimeBackend === 'claude') {
-      assertModelProfileTransition(parent.model, forkModel)
+      invalidRequestIfThrows(() => assertModelProfileTransition(parent.model, forkModel))
     }
     const profileFingerprint = profileFingerprintForModel(forkModel, runtimeBackend)
     const requestedCwd = stringOr(params.cwd, parent.cwd)
@@ -3351,7 +3369,7 @@ export class CodexClaudeAppServer {
     if (params.model != null) {
       // Unlike turn/start, an unknown model fails instead of falling back.
       const requested = stringOr(params.model, '')
-      const model = allSelectableModelOptions().find(
+      const model = invalidRequestIfThrows(allSelectableModelOptions).find(
         (option) => option.id.toLowerCase() === requested.toLowerCase(),
       )?.id
       if (!model) throw invalidRequest(`unknown model: ${requested}`)
@@ -3491,15 +3509,17 @@ export class CodexClaudeAppServer {
       void this.runRuntimeTurn(peer, thread, turn, prompt, {
         model: thread.model,
         effort: thread.reasoningEffort,
-      }).catch((error) => {
-        if (!this.failTurn(peer, threadId, turn, error)) return
-        recordRunEvent('turn.failed', {
-          threadId,
-          turnId,
-          runtimeBackend: thread.runtimeBackend,
-          error: { message: error.message },
-        })
       })
+        .catch((error) => {
+          if (!this.failTurn(peer, threadId, turn, error)) return
+          recordRunEvent('turn.failed', {
+            threadId,
+            turnId,
+            runtimeBackend: thread.runtimeBackend,
+            error: { message: error.message },
+          })
+        })
+        .finally(() => this.sleptAtTurnProgress.delete(turnId))
     })
     return { turn: responseTurn, reviewThreadId: threadId }
   }
@@ -3561,7 +3581,12 @@ export class CodexClaudeAppServer {
   // Compacts the thread like Codex's /compact: Claude compacts the thread's
   // own session, so the next turn goes on from its summary. A thread with no
   // Claude session yet, or whose compaction fails, gets a summary written in
-  // a session of its own instead, and keeps its session as it was.
+  // a session of its own instead, and keeps its session as it was. When
+  // Claude could not compact the session, nothing claims it did: the item
+  // ends as an empty reasoning item, which the App does not draw and the
+  // turn does not keep, and no thread/compacted follows; the notice row says
+  // why and the summary still lands.
+  // App rule: item-completed-replaces
   private async compactThread(
     peer: RpcPeer,
     thread: ThreadRecord,
@@ -3584,6 +3609,17 @@ export class CodexClaudeAppServer {
         params: { threadId, turnId, item: compactItem, completedAtMs: nowMillis() },
       })
     }
+    const dropCompactItem = (): void => {
+      if (!compactOpen) return
+      compactOpen = false
+      const item: ThreadItem = { type: 'reasoning', id: compactItem.id, summary: [], content: [] }
+      this.notify(peer, {
+        method: 'item/completed',
+        params: { threadId, turnId, item, completedAtMs: nowMillis() },
+      })
+    }
+    // Set once Claude was asked to compact the session and did not.
+    let sessionFailed = false
     let agentItem: ThreadItem | null = null
     const completeAgentItem = (): void => {
       if (!agentItem) return
@@ -3628,7 +3664,10 @@ export class CodexClaudeAppServer {
           })
           return false
         })
+        sessionFailed = !compacted
       }
+      // The summary written next is not the session's compaction.
+      if (sessionFailed && active()) dropCompactItem()
       if (compacted || !active()) return
       const item: ThreadItem = {
         type: 'agentMessage',
@@ -3674,7 +3713,8 @@ export class CodexClaudeAppServer {
             method: 'turn/completed',
             params: { threadId, turn: this.toLifecycleTurn(completed) },
           })
-          this.notify(peer, { method: 'thread/compacted', params: { threadId, turnId } })
+          if (!sessionFailed)
+            this.notify(peer, { method: 'thread/compacted', params: { threadId, turnId } })
         }
       }
     }
@@ -3696,7 +3736,12 @@ export class CodexClaudeAppServer {
     const built = this.runtimeTurnContext(thread, turnId, '/compact', params)
     // thread/compact/start carries no instructions: a bare /compact, which
     // no side-conversation note may precede either.
-    const context: RuntimeTurnContext = { ...built.context, prompt: '/compact', imageInputs: [] }
+    const context: RuntimeTurnContext = {
+      ...built.context,
+      prompt: '/compact',
+      promptContext: [],
+      imageInputs: [],
+    }
     let compacted = false
     let failure: string | null = null
     await this.runtime.runTurn(context, {
@@ -4035,14 +4080,17 @@ export class CodexClaudeAppServer {
         this.completeWorkflowListTurn(peer, thread, turn)
         return
       }
-      // Carry parsed images through the params bag so runRuntimeTurn can hand
-      // them to the runtime context without re-parsing user input.
-      this.launchRuntimeTurn(peer, thread, turn, this.modelPrompt(thread, prompt, params), {
+      // Carry parsed images, and the context a command's text goes after,
+      // through the params bag so runRuntimeTurn can hand them to the
+      // runtime context without re-parsing user input.
+      const model = this.modelPrompt(thread, prompt, params)
+      this.launchRuntimeTurn(peer, thread, turn, model.prompt, {
         ...params,
         ...collaborationModeSettings(params),
         ...(helperModel ? { model: helperModel } : {}),
         planMode,
         _imageInputs: images,
+        _promptContext: model.context,
       })
     })
     return { turn: publicTurn }
@@ -4086,7 +4134,10 @@ export class CodexClaudeAppServer {
       .catch((error) => {
         this.failTurn(peer, thread.id, turn, error)
       })
-      .finally(() => this.runtimeRuns.delete(turn.id))
+      .finally(() => {
+        this.runtimeRuns.delete(turn.id)
+        this.sleptAtTurnProgress.delete(turn.id)
+      })
   }
 
   private completeWorkflowListTurn(peer: RpcPeer, thread: ThreadRecord, turn: TurnRecord): void {
@@ -4252,6 +4303,9 @@ export class CodexClaudeAppServer {
     // and prepend side-conversation instructions directly into the turn's user prompt.
     let systemPromptAddendum: string | null = null
     let effectivePrompt = prompt
+    const promptContext = Array.isArray(params._promptContext)
+      ? params._promptContext.filter((block): block is string => typeof block === 'string')
+      : []
     if (thread.forkedFromId != null && developerInstructions) {
       const parentThread = this.store.getThread(thread.forkedFromId)
       const parentDev = parentThread?.developerInstructions ?? null
@@ -4270,7 +4324,10 @@ export class CodexClaudeAppServer {
         const sideInstructions = [developerInstructions]
         if (parentSkills.visualizationDir && appSkills.visualizationDir)
           sideInstructions.push(visualizationDirNote(appSkills.visualizationDir))
-        effectivePrompt = `<side-conversation-instructions>\n${sideInstructions.join('\n\n')}\n</side-conversation-instructions>\n\n${prompt}`
+        const side = `<side-conversation-instructions>\n${sideInstructions.join('\n\n')}\n</side-conversation-instructions>`
+        // A command's text stays the last block, as typed (see turnPrompt).
+        if (isCommandPrompt(prompt)) promptContext.unshift(side)
+        else effectivePrompt = `${side}\n\n${prompt}`
       } else {
         systemPromptAddendum = buildSystemPromptAddendum({
           baseInstructions,
@@ -4360,9 +4417,9 @@ export class CodexClaudeAppServer {
     // the MCP servers added in the App's settings.
     const inheritConfig = desktopPresentation && !isCodexThread
     const mcp = readMcpConfig({ ...this.appMcpScope(), cwd: turnCwd, inherit: inheritConfig })
-    // The App's Settings > Configuration > Web search. Claude has the one
-    // kind of search, so only turning it off changes what Claude may do.
-    const webSearchOff = !isCodexThread && this.configOverrides.web_search === 'disabled'
+    // The App's Settings > Configuration > Web search, as config/read reports
+    // it: also off with CLAUDE_CODEX_WEBSEARCH=0 while nothing is saved.
+    const webSearchOff = !isCodexThread && this.effectiveWebSearch() === 'disabled'
     const permissionRules = inheritConfig ? inheritedPermissionRules(turnCwd) : null
     // The tools the client registered when it started the thread.
     const dynamicTools =
@@ -4381,6 +4438,7 @@ export class CodexClaudeAppServer {
       turnId,
       purpose: turnPurpose,
       prompt: effectivePrompt,
+      promptContext,
       cwd: turnCwd,
       runtimeType: isCodexThread ? 'codex-proxy' : null,
       model: resolvedModel,
@@ -4854,7 +4912,12 @@ export class CodexClaudeAppServer {
       params._continuation !== true &&
       params._hiddenPrompt == null
     ) {
-      const { _imageInputs: _images, _emitUserMessage: _emit, ...rest } = params
+      const {
+        _imageInputs: _images,
+        _promptContext: _context,
+        _emitUserMessage: _emit,
+        ...rest
+      } = params
       this.lastTurnParamsByThread.set(thread.id, rest)
     }
     const { context, isCodexThread, resumeSessionAt, turnCwd } = this.runtimeTurnContext(
@@ -4890,6 +4953,7 @@ export class CodexClaudeAppServer {
       : null
     const disarmWatchdog = (): void => watchdog.disarm()
     const noteProgress = (): void => watchdog.noteProgress()
+    this.sleptAtTurnProgress.set(turn.id, this.sleepMonitor.suspendedMs())
     const armWatchdog = (): void => {
       if (!acceptRuntimeEvents || (activeSubagents.size === 0 && !workflowInFlight)) return
       watchdog.arm()
@@ -4942,6 +5006,8 @@ export class CodexClaudeAppServer {
           // progress, a projected workflow agent) shows it is moving; the
           // watchdog only gives up after a whole window without any of it.
           noteProgress()
+          if (!NO_PROGRESS_EVENTS.has(event.type))
+            this.sleptAtTurnProgress.set(turn.id, this.sleepMonitor.suspendedMs())
           if (event.type === 'subagent_progress') return
           if (event.type === 'session') {
             this.store.updateClaudeSessionId(thread.id, event.claudeSessionId)
@@ -5776,12 +5842,14 @@ export class CodexClaudeAppServer {
             if (context.purpose !== 'normal') return
             // A subagent's retry shows in its own thread, while its turn
             // runs; one whose agent is gone or unknown shows nowhere, never
-            // in this turn.
+            // in this turn. Its Agent call names it, else its task id.
             // App rule: reconnecting-errors
-            if (event.toolUseId) {
+            if (event.toolUseId || event.agentId) {
               const agent =
-                subagentContexts.get(event.toolUseId) ??
-                this.findBackgroundSubagent(thread.id, { toolUseId: event.toolUseId })?.context
+                (event.toolUseId
+                  ? (subagentContexts.get(event.toolUseId) ??
+                    this.findBackgroundSubagent(thread.id, { toolUseId: event.toolUseId })?.context)
+                  : undefined) ?? this.nestingHost(thread.id, subagentContexts, event.agentId)
               if (!agent || this.store.getTurn(agent.childTurnId)?.status !== 'inProgress') return
               this.notify(peer, {
                 method: 'error',
@@ -6818,9 +6886,10 @@ export class CodexClaudeAppServer {
 
   // The agent whose own Agent call this is, when the frame names it by task
   // id (agent_id, newer CLIs) and it is still working in this turn or in the
-  // background: the new child then hangs off that agent's child thread.
-  // Null for the main loop's calls, for an older CLI and for a host whose
-  // child turn is over, which leaves the child under the parent thread.
+  // background: the new child then hangs off that agent's child thread (and
+  // a retry the agent reports shows there). Null for the main loop's calls,
+  // for an older CLI and for a host whose child turn is over, which leaves
+  // the child under the parent thread.
   private nestingHost(
     threadId: string,
     contexts: Map<string, SubagentContext>,
@@ -8054,9 +8123,12 @@ export class CodexClaudeAppServer {
       this.emitItemLifecycle(this.peerForThread(threadId), threadId, activeTurnId, item)
     }
     const thread = this.store.getThread(threadId)
-    const modelPrompt = thread ? this.modelPrompt(thread, prompt, params, { steer: true }) : prompt
-    const steered = await this.steerRunningTurn(threadId, activeTurnId, modelPrompt, {
+    const model = thread
+      ? this.modelPrompt(thread, prompt, params, { steer: true })
+      : { prompt, context: [] }
+    const steered = await this.steerRunningTurn(threadId, activeTurnId, model.prompt, {
       imageInputs: images,
+      promptContext: model.context,
       onAccepted: accept,
     })
     if (steered === false) throw new Error('no active turn to steer')
@@ -8099,6 +8171,19 @@ export class CodexClaudeAppServer {
     this.failTurn(this.peerForThread(threadId), threadId, turn, error)
   }
 
+  // The web search mode of Claude threads, as config/read reports it and
+  // turns apply it: the mode saved in the App's Settings > Configuration, or
+  // else disabled with CLAUDE_CODEX_WEBSEARCH=0 (for a host where the tool is
+  // rate-limited or unwanted) and live, the way Claude's WebSearch tool
+  // searches, otherwise. Claude has the one kind of search, so only disabled
+  // changes what Claude may do: it takes the WebSearch tool away.
+  private effectiveWebSearch(): unknown {
+    return (
+      this.configOverrides.web_search ??
+      (process.env.CLAUDE_CODEX_WEBSEARCH === '0' ? 'disabled' : 'live')
+    )
+  }
+
   private configRead(params: Record<string, unknown>): unknown {
     // Base config = our typed defaults; overrides (whatever the App's
     // settings sheet has written previously via config/value/write) are
@@ -8124,17 +8209,19 @@ export class CodexClaudeAppServer {
         approval_policy: this.configOverrides.approval_policy ?? 'on-request',
         approvals_reviewer: this.configOverrides.approvals_reviewer ?? 'user',
         sandbox_mode: this.configOverrides.sandbox_mode ?? 'workspace-write',
-        // Claude threads have no network or filesystem sandbox; see
-        // app-settings.mts for the settings Claude has no counterpart for.
-        sandbox_workspace_write: claudeSandboxWorkspaceWrite(),
+        // Claude threads have no network or filesystem sandbox (see
+        // app-settings.mts), but the App takes on-request with workspace-write
+        // for its Default permissions preset only while this is unset, as
+        // Codex reports it without a [sandbox_workspace_write] table. Any
+        // table with network access on would make new chats preselect
+        // Custom (config.toml); Settings shows network access off instead.
+        // App rule: permission-presets
+        sandbox_workspace_write: null,
         forced_chatgpt_workspace_id: null,
         forced_login_method: null,
-        // Claude searches the web live with its WebSearch tool, which
-        // modelProvider/capabilities/read advertises unless
-        // CLAUDE_CODEX_WEBSEARCH=0.
-        web_search:
-          this.configOverrides.web_search ??
-          (process.env.CLAUDE_CODEX_WEBSEARCH === '0' ? 'disabled' : 'live'),
+        // What turns apply, so Settings shows web search off only while
+        // Claude has no WebSearch tool.
+        web_search: this.effectiveWebSearch(),
         tools: this.configOverrides.tools ?? null,
         profile: this.configOverrides.profile ?? null,
         profiles: {},
@@ -8166,9 +8253,7 @@ export class CodexClaudeAppServer {
         ...(codexProxyModelOptions().length > 0
           ? { 'model_providers.codex': configLayerMetadata() }
           : {}),
-        ...(appMcpServersEnabled()
-          ? appMcpServerOrigins(this.configOverrides, configLayerMetadata())
-          : {}),
+        ...appMcpServerOrigins(this.configOverrides, configLayerMetadata()),
       },
       layers: null,
     }
@@ -8190,14 +8275,16 @@ export class CodexClaudeAppServer {
   // The model a settings or metadata update moves the thread to, or null. The
   // App sends the chat's current model along with other settings; that is no
   // change, even when the picker no longer lists it and repairing it would
-  // pick a model on the other backend.
+  // pick a model on the other backend. Model process profiles that fail to
+  // load are the user's to fix, like a model the thread cannot take.
+  // App rule: model-menu-settings
   private requestedModelChange(
     thread: ThreadRecord,
     params: Record<string, unknown>,
   ): string | null {
     const rawModel = modelFromParams(params, null)
     if (!rawModel || rawModel === thread.model) return null
-    const model = normalizeSelectableModelId(rawModel, thread.model)
+    const model = invalidRequestIfThrows(() => normalizeSelectableModelId(rawModel, thread.model))
     return model === thread.model ? null : model
   }
 
@@ -9134,7 +9221,8 @@ export class CodexClaudeAppServer {
   // skill it picks and the context the App attached to it. Helper turns and
   // the adapter's own prompts get none of it, and leave the injected items to
   // the next message. So does a steer: the App injects items only while no
-  // turn runs, for the turn it starts next.
+  // turn runs, for the turn it starts next. A message that runs a Claude
+  // Code command gets all of it before its text, in blocks of its own.
   // App rule: skill-injection
   // App rule: additional-context
   // App rule: injected-context
@@ -9143,13 +9231,14 @@ export class CodexClaudeAppServer {
     prompt: string,
     params: Record<string, unknown>,
     options: { steer?: boolean } = {},
-  ): string {
-    if (params.outputSchema != null || typeof params._hiddenPrompt === 'string') return prompt
+  ): TurnPrompt {
+    if (params.outputSchema != null || typeof params._hiddenPrompt === 'string')
+      return { prompt, context: [] }
     const skillDirs = [
       ...claudeSkillDirs(thread.cwd),
       ...this.appSkillsFor(thread.id).appSkills.map((skill) => dirname(skill.path)),
     ]
-    return withTurnContext(
+    return turnPrompt(
       prompt,
       [skillInstructions(prompt, skillDirs), additionalContextBlocks(params.additionalContext)],
       options.steer ? null : injectedItemsContext(this.store.takeInjectedItems(thread.id)),
@@ -10099,11 +10188,20 @@ export class CodexClaudeAppServer {
     return true
   }
 
-  // What a failed turn's error leaves out: that the computer slept during
-  // the turn, which is the likely reason a model request broke off, and the
-  // notices Claude reported along the way, whose rows the App does not keep.
+  // What a failed turn's error leaves out: that the computer slept since
+  // Claude last made progress in the turn, which is the likely reason a model
+  // request broke off, and the notices Claude reported along the way, whose
+  // rows the App does not keep. A sleep the turn went on from (it streamed,
+  // ran a tool) did not break it. A turn with no run of its own counts the
+  // sleep since it started.
   private explainTurnError(turn: TurnRecord, error: CodexTurnError): CodexTurnError {
-    const sleptMs = turn.startedAt == null ? 0 : this.sleepMonitor.sleptSince(turn.startedAt * 1000)
+    const sleptAtProgress = this.sleptAtTurnProgress.get(turn.id)
+    const sleptMs =
+      sleptAtProgress !== undefined
+        ? this.sleepMonitor.suspendedMs() - sleptAtProgress
+        : turn.startedAt == null
+          ? 0
+          : this.sleepMonitor.sleptSince(turn.startedAt * 1000)
     const explained = withSleepNotice(error, sleptMs, this.platform)
     if (explained !== error) {
       debugLog('turn.slept', { threadId: turn.threadId, turnId: turn.id, sleptMs })

@@ -7,12 +7,14 @@ import { codexHome } from './util.mjs'
 // keeps the settings in its own config file rather than in config.toml, so a
 // write is honest only where a Claude thread acts on it:
 //
-// - mcp_servers.<name>: the servers added under Settings > MCP servers. Claude
-//   threads run them (see appMcpServers), unless
-//   CLAUDE_CODEX_APP_MCP_SERVERS=0.
+// - mcp_servers.<name>: the servers added under Settings > MCP servers. With
+//   CLAUDE_CODEX_APP_MCP_SERVERS=1 Claude threads run them (see
+//   appMcpServers); otherwise a write that would change them is refused with
+//   a message saying so, and the servers already saved stay saved, unused.
 // - A setting Claude has no counterpart for fails when it sets a value, so the
 //   App shows the setting as not saved; clearing it succeeds. config/read
-//   reports what Claude threads actually do for it.
+//   reports what Claude threads actually do for it, but for the network
+//   access the App's permission presets need unset (see server.mts).
 // - Everything else is kept as written and reported back by config/read:
 //   settings the adapter applies itself (model, effort, approval policy,
 //   sandbox mode, web search, reasoning summaries, memories) and the App's own
@@ -29,9 +31,16 @@ export interface ConfigEdit {
 }
 
 // Whether the servers added in the App's MCP settings apply to Claude threads.
+// Off unless asked for: a server added there starts a program, or reaches a
+// URL, from every Claude thread, which is more than the settings page says.
 export function appMcpServersEnabled(): boolean {
-  return process.env.CLAUDE_CODEX_APP_MCP_SERVERS !== '0'
+  return process.env.CLAUDE_CODEX_APP_MCP_SERVERS === '1'
 }
+
+// What the App's MCP settings show when a save, switch or delete is refused
+// because the servers do not apply.
+export const APP_MCP_SERVERS_OFF =
+  "MCP servers added in the App are not used for Claude threads unless the adapter runs with CLAUDE_CODEX_APP_MCP_SERVERS=1. You can also add a server to Claude Code's own MCP config (claude mcp add, or a project's .mcp.json)."
 
 // App rule: desktop-mcp-servers
 // The servers the App's main process writes into the user config each time it
@@ -42,6 +51,15 @@ const DESKTOP_MCP_SERVERS = new Set(['node_repl', 'cua_repl'])
 
 // The App names a server it adds with these characters, as Codex requires.
 const SERVER_NAME = /^[A-Za-z0-9_-]+$/
+
+// A key the adapter cannot keep in a settings table: set on a plain object,
+// it replaces the object's prototype instead, so a write naming it would
+// succeed with nothing checked or kept.
+const PROTOTYPE_KEY = '__proto__'
+
+function validServerName(name: string): boolean {
+  return SERVER_NAME.test(name) && name !== PROTOTYPE_KEY
+}
 
 function invalid(message: string): RpcError {
   return new RpcError(message, undefined, INVALID_REQUEST)
@@ -81,7 +99,8 @@ function serverEntryProblem(name: string, entry: Table): string | null {
   const url = typeof entry.url === 'string' && entry.url.length > 0
   if (command === url) return `mcp_servers.${name} needs either a command or a url`
   for (const [field, value] of Object.entries(entry)) {
-    const check = FIELD_TYPES[field]
+    if (field === PROTOTYPE_KEY) return `mcp_servers.${name} has an invalid field: ${field}`
+    const check = Object.hasOwn(FIELD_TYPES, field) ? FIELD_TYPES[field] : undefined
     if (check && !check(value)) return `mcp_servers.${name}.${field} has the wrong type`
   }
   return null
@@ -119,29 +138,29 @@ export function editMcpServers(settings: Table, edit: ConfigEdit): void {
     servers = upsert ? { ...prior } : {}
     for (const [key, entry] of Object.entries(table ?? {})) {
       if (DESKTOP_MCP_SERVERS.has(key)) continue
+      // Checked before withPath, which would drop a __proto__ server unseen.
+      if (!validServerName(key)) throw invalid(`invalid MCP server name: ${key}`)
       servers = withPath(servers, [key], entry, upsert)
     }
   } else {
-    if (!SERVER_NAME.test(name)) throw invalid(`invalid MCP server name: ${name}`)
+    if (!validServerName(name)) throw invalid(`invalid MCP server name: ${name}`)
+    if (field.includes(PROTOTYPE_KEY))
+      throw invalid(`invalid MCP server field: mcp_servers.${name}.${field.join('.')}`)
     if (field.length > 0 && !asTable(prior[name]))
       throw invalid(`no MCP server named ${name} in the App's settings`)
     if (field.length === 0 && edit.value != null && !asTable(edit.value))
       throw invalid(`mcp_servers.${name} must be a table`)
     servers = withPath(prior, [name, ...field], edit.value, upsert)
   }
-  // A server the edit removes is a change too: with the switch off, what was
+  // A server the edit removes is a change too: with the servers off, what was
   // saved stays as it is.
   const changed = [...new Set([...Object.keys(prior), ...Object.keys(servers)])].filter(
     (key) => servers[key] !== prior[key],
   )
-  if (changed.length > 0 && !appMcpServersEnabled()) {
-    throw invalid(
-      'MCP servers from the App settings are turned off for Claude threads (CLAUDE_CODEX_APP_MCP_SERVERS=0)',
-    )
-  }
+  if (changed.length > 0 && !appMcpServersEnabled()) throw invalid(APP_MCP_SERVERS_OFF)
   for (const key of changed) {
     if (!Object.hasOwn(servers, key)) continue
-    if (!SERVER_NAME.test(key)) throw invalid(`invalid MCP server name: ${key}`)
+    if (!validServerName(key)) throw invalid(`invalid MCP server name: ${key}`)
     const entry = asTable(servers[key])
     if (!entry) throw invalid(`mcp_servers.${key} must be a table`)
     const problem = serverEntryProblem(key, entry)
@@ -151,8 +170,8 @@ export function editMcpServers(settings: Table, edit: ConfigEdit): void {
   else delete settings.mcp_servers
 }
 
-// The servers the App's settings hold, for config/read: what its MCP
-// settings list and edit.
+// The servers the App's settings hold: what its MCP settings list and edit
+// (config/read reports them only while they apply).
 export function appMcpServerTable(settings: Table): Table {
   const out: Table = {}
   for (const [name, entry] of Object.entries(asTable(settings.mcp_servers) ?? {})) {
@@ -163,10 +182,14 @@ export function appMcpServerTable(settings: Table): Table {
 
 // The App's MCP settings save to the file config/read names as the origin of
 // mcp_servers, and say they are unavailable without one; a server whose
-// origin is a user file can be edited there.
+// origin is a user file can be edited there. With the servers off the origin
+// is still reported, but no server: the page lists none, and a save shows
+// APP_MCP_SERVERS_OFF under the form rather than a page that only says the
+// settings are unavailable.
 // App rule: mcp-settings
 export function appMcpServerOrigins(settings: Table, origin: unknown): Table {
   const out: Table = { mcp_servers: origin }
+  if (!appMcpServersEnabled()) return out
   for (const name of Object.keys(appMcpServerTable(settings))) out[`mcp_servers.${name}`] = origin
   return out
 }
@@ -283,8 +306,9 @@ export function pruneLegacySettings(settings: Table): boolean {
   return pruned
 }
 
-// Codex's sandbox_workspace_write table as it holds for Claude threads.
-export function claudeSandboxWorkspaceWrite(): Table {
+// Codex's sandbox_workspace_write table as it holds for Claude threads: what
+// a write of it may set without failing. config/read reports none.
+function claudeSandboxWorkspaceWrite(): Table {
   return {
     writable_roots: [],
     network_access: true,

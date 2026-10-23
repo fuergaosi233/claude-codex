@@ -91,8 +91,9 @@ request on its own. With the default native backend, each retry shows in the
 turn as Codex shows a stream retry: a passing **Reconnecting 1/10** row that
 counts up and leaves once Claude answers, with the HTTP status and the wait
 under it. Like Codex, the adapter does not store these rows, so they are gone
-when the chat is reopened. A subagent's retries show the same way in the
-subagent's own thread while it runs, never in the parent chat.
+when the chat is reopened. A foreground subagent's retries show the same way
+in the subagent's own thread while it runs, never in the parent chat; Claude
+Code does not report a background agent's retries.
 
 A turn that fails tells the App why, with the error code Codex would send:
 the context window is full, the server is busy (HTTP 529), a rate limit, a bad
@@ -119,17 +120,23 @@ adapter's environment takes its place.
 
 Most failed connections on a laptop come from the computer going to sleep
 during a turn, which breaks Claude's connection to the model. When a turn
-fails after the computer slept for a minute or more during it, its error says
-so: roughly how long the computer slept, and that a message, or **Continue**,
-picks up where Claude left off. On macOS it also points to the App's
+fails after the computer slept for a minute or more since Claude last made
+progress in it, its error says so: roughly how long the computer slept, and
+that a message, or **Continue**, picks up where Claude left off. A sleep the
+turn went on from (Claude wrote or ran something after waking) is not blamed,
+and neither is an API that answered, for example as overloaded or over a
+limit. On macOS it also points to the App's
 **Settings > General > Prevent sleep while running**, which does not stop
 sleep with the lid closed (the App does not offer it on Windows). The error keeps its code and details.
 
 To have the adapter keep a Mac awake itself while Claude works, start it with
 `CLAUDE_CODEX_PREVENT_IDLE_SLEEP=1`: it then holds `caffeinate -i` while any
 turn, background agent or other background work runs, and lets go once nothing
-does. Closing the lid still sleeps. It is off by default and does nothing on
-other platforms.
+does. A command Claude runs in the background with Bash counts as background
+work, so a dev server or file watcher keeps the Mac awake until its Claude
+session closes, `CLAUDE_CODEX_BACKGROUND_IDLE_MS` (default 2 hours) after the
+session's last message. Closing the lid still sleeps. It is off by default and
+does nothing on other platforms.
 
 A turn waiting on a subagent or workflow does not fail because the computer
 slept, or while it waits on you for an approval, an answer, an MCP form or an
@@ -345,19 +352,43 @@ The `/` popup also lists the commands Claude Code finds for a folder beyond
 its own: your and the project's `.claude/commands`, the commands and skills of
 your Claude Code plugins (`plugin:name`) and the prompts of MCP servers. They
 show as "Local file" skills and run as slash commands, with the rest of your
-message as their arguments. Claude Code reports them when a chat's turn
-starts, so a folder no Claude chat has worked in yet lists them after its
-first turn, and a command added later appears once the next turn starts in
-that folder. A Claude CLI started with its setting sources turned off (see
-`CLAUDE_CODEX_CLAUDE_CONFIG_DIR` in
+message as their arguments. A command's "Local file" is a short page the
+adapter writes for that folder with the description Claude Code reported
+there, so two projects with a `/deploy` of their own each show theirs; it is
+removed when the folder stops reporting the command. Claude Code reports
+them when a chat's turn starts, so a folder no Claude chat has worked in yet
+lists them after its first turn, and a command added later appears once the
+next turn starts in that folder. A Claude CLI started with its setting
+sources turned off (see `CLAUDE_CODEX_CLAUDE_CONFIG_DIR` in
 [Configuration](/guide/configuration#reference-table)) finds no user,
 project or plugin commands, so none are listed. Commands named like one of
-the App's own (`/init`, `/compact`, …) are left out, and Claude Code's plain
+the App's own are left out: `/init`, `/compact`, `/review-mode` and the rest,
+including the ones the App offers only in some windows or chats (`/pin`,
+`/archive`, `/read-aloud`, `/hotkey-window-new`, …). Claude Code's plain
 built-ins such as `/cost` are not listed.
 
+A message that starts with a command, typed or picked, runs it with the rest
+of the message as its arguments, a file you mention included (as `@path`).
+That includes a command named with a dot, such as `/release.notes` from a
+file `release.notes.md`. Images, a skill you pick with it, a side chat's instructions and context the
+App sends along reach Claude with the command, ahead of it, and stay out of
+its arguments. A command you send while Claude is still working is not
+folded into the running answer the way other messages are: Claude Code runs
+it once that answer ends, and the turn ends after it.
+
+That is on the default Agent SDK backend. The `claude-p`, `agent-http` and
+`agentapi` backends (see [Backends](/guide/backends)) get a message as one
+flat text, with that context ahead of the command, so a command sent with any
+of it does not run there: Claude reads the whole text as a plain message.
+Only a message with no such context goes as typed. The context cannot follow
+the command instead, as it would become the command's arguments. Codex chats
+on the `codex-proxy` route get the same flat text, and have no Claude Code
+commands to run.
+
 Context the App attaches to a message without showing it, such as the follow-up
-after you connect a suggested plugin, reaches Claude after the message, marked
-as data rather than instructions when the App does not vouch for it.
+after you connect a suggested plugin, reaches Claude after the message (before
+it for a command), marked as data rather than instructions when the App does
+not vouch for it.
 
 The App's instructions to the model describe tools only Codex chats have:
 starting and messaging other threads, worktrees, automations and the sidebar.
@@ -541,7 +572,17 @@ stops says it was stopped by the user, one an interrupt of the parent ends
 says it was interrupted, and one still running when the parent turn fails says
 it ended because the parent turn failed, and why; none of these count as
 failed subagents. Each of these endings is also the subagent thread's last
-message. The App draws a turn's error only when the turn failed, and does not
+message.
+
+A workflow agent that fails, such as one that stalled on every attempt or hit
+an API error, fails the same way as soon as the workflow records it, with the
+reason the workflow reported for it, and counts as a failed subagent. If the
+workflow gives no reason within two seconds, or none by the time it ends, the
+agent's turn says only that it failed. An attempt the workflow ran again after
+a stall ends as failed too, as soon as the next attempt starts, saying the
+workflow ran the agent again. Claude Code's progress report replaces that
+attempt's error with the next attempt's start, so its own reason does not come
+through. The App draws a turn's error only when the turn failed, and does not
 draw the agent's state on the parent's wait card; both are there for clients
 that read them.
 
@@ -609,23 +650,36 @@ rather than delete Claude Code's notes.
 
 ## MCP servers and other settings
 
-**Settings > MCP servers** works for Claude chats. A server you add, edit or
-switch off there is saved by the adapter (in its own config, not in
-`config.toml`) and used by Claude chats from their next turn; Claude can call
-its tools, and the App lists the server with its tools. A server without a
-command or URL is refused with an error. The App's own desktop servers, which
-it writes there for its Codex chats each time it starts, are not kept.
-`CLAUDE_CODEX_APP_MCP_SERVERS=0` leaves these servers out, and the App then
-says its MCP settings are unavailable. Servers from the Codex and Claude Code
+**Settings > MCP servers** works for Claude chats only when the adapter runs
+with `CLAUDE_CODEX_APP_MCP_SERVERS=1`. Without it (the default) the page lists
+no server you added, and saving, switching or deleting one shows this under
+the form instead:
+
+> MCP servers added in the App are not used for Claude threads unless the
+> adapter runs with CLAUDE_CODEX_APP_MCP_SERVERS=1. You can also add a server
+> to Claude Code's own MCP config (claude mcp add, or a project's .mcp.json).
+
+With the switch, a server you add, edit or switch off there is saved by the
+adapter (in its own config, not in `config.toml`) and used by Claude chats from
+their next turn; Claude can call its tools, and the App lists the server with
+its tools. A server without a command or URL is refused with an error. The
+App's own desktop servers, which it writes there for its Codex chats each time
+it starts, are never kept, with or without the switch. Servers from the Codex and Claude Code
 configs and from `CLAUDE_CODEX_MCP_SERVERS` are listed apart from the ones you
 added; see [MCP, tools & directories](/guide/configuration#mcp-tools-directories).
 
-**Settings > Configuration** shows what Claude chats do. Network access shows
-on, as Claude chats have no network sandbox, and turning it off, or picking a
-verbosity, says "Couldn't update this setting", since Claude models have
-neither setting. Web search off takes Claude's WebSearch tool away; the other
-search modes keep it. The approval policy and sandbox mode are saved and apply
-to the chats you start. The full list is under
+**Settings > Configuration** shows what Claude chats do, but for one row:
+Network access shows off, although Claude chats always have network access, as
+they have no network sandbox. The adapter leaves that setting unset, as Codex
+does without a `[sandbox_workspace_write]` table, because the App takes the
+default permissions for its Default permissions preset only then; reported on,
+new chats would preselect Custom (config.toml). Turning it on changes nothing.
+Turning it off, or picking a verbosity, says "Couldn't update this setting",
+since Claude chats have neither setting. Web search off takes Claude's
+WebSearch tool away; the other search modes keep it. It shows off, and Claude
+has no WebSearch, also when the adapter runs with `CLAUDE_CODEX_WEBSEARCH=0`
+and no mode was picked there. The approval policy and sandbox mode are saved
+and apply to the chats you start. The full list is under
 [App settings](/guide/configuration#app-settings).
 
 ## App tools
@@ -672,7 +726,7 @@ need the default native Claude Agent SDK backend:
 | `thread_list` | The chats this one started, each `working`, `blocked` (waiting on you), `done-unread` (finished a turn the leader has not read) or `idle`. `scope: "all"` adds your other recent chats. |
 | `thread_wait` | Waits until `any` (default) or `all` of the given chats finish their turn or get blocked, then returns each one's status and last agent message, truncated. |
 | `thread_prompt` | Sends a chat a message, as you would: into its running turn while it works (the App's default for follow-ups), otherwise as a new turn. `wait: true` also waits for that turn. |
-| `thread_read` | A chat's transcript as structured items in pages of bounded size, with a cursor for reading only what is new. |
+| `thread_read` | A chat's transcript as structured items in pages of bounded size, with a cursor for reading only what is new. A forked chat's transcript starts with the turns it was forked with, as the App shows it. |
 
 When Claude's reply repeats the `::created-thread{threadId="…"}` line, the
 Codex App shows a card for the new chat in the reply, as it does for chats Codex

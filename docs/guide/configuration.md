@@ -187,7 +187,12 @@ regular file owned by that user with mode `0600`, not a symbolic link; the
 adapter opens it without following links and rejects it if it changes while
 being read. A profiles file that breaks these rules, or that cannot be parsed,
 fails the requests that need it with the reason rather than falling back to
-another Claude Code.
+another Claude Code. The reason is one line of at most 300 characters that
+names the file (or `CLAUDE_CODEX_MODEL_PROFILES`) and says what is wrong, such
+as the JSON error and where it is, without quoting the file's text, so a
+credential pasted into it does not end up on screen or in the logs. A model
+change it fails is an invalid request (`-32600`), so the model menu's toast
+shows the reason.
 
 ### Fingerprints
 
@@ -263,9 +268,9 @@ export CLAUDE_CODEX_ALLOWED_TOOLS="Read,Glob,Grep"
 export CLAUDE_CODEX_ADD_DIRS="/repo/shared,/repo/docs"
 export CLAUDE_CODEX_ENABLE_FILE_CHECKPOINTING=1
 
-# Leave out the servers added under the App's Settings > MCP servers (on by
-# default).
-export CLAUDE_CODEX_APP_MCP_SERVERS=0
+# Use the servers added under the App's Settings > MCP servers in Claude
+# threads (off by default).
+export CLAUDE_CODEX_APP_MCP_SERVERS=1
 ```
 
 A Claude thread's own turns start these MCP servers, each source winning a
@@ -273,10 +278,12 @@ name from the ones before it:
 
 1. the Codex config's `[mcp_servers]`, with `CLAUDE_CODEX_CODEX_MCP_SERVERS=1`;
 2. the Claude Code config's servers, with `CLAUDE_CODEX_CLAUDE_MCP_SERVERS=1`;
-3. the servers added under the App's **Settings > MCP servers**;
+3. the servers added under the App's **Settings > MCP servers**, with
+   `CLAUDE_CODEX_APP_MCP_SERVERS=1`;
 4. `CLAUDE_CODEX_MCP_SERVERS`.
 
-The App's MCP settings add, edit, switch off and delete servers through the
+With `CLAUDE_CODEX_APP_MCP_SERVERS=1` the App's MCP settings add, edit, switch
+off and delete servers through the
 adapter, which keeps them in its own `config.json` under `CLAUDE_CODEX_HOME`
 (not in `CODEX_HOME/config.toml`) and reads them as Codex reads an
 `[mcp_servers.<name>]` entry: a `command` with `args`, `env`, `env_vars` and
@@ -287,9 +294,17 @@ field of the wrong type, fails and the App shows the error. The servers the App
 itself writes at startup for its Codex threads (`node_repl`, `cua_repl`) are
 never kept. `mcpServerStatus/list` and `config/mcpServer/reload` include the
 App's servers, and title, summary and other internal turns start none of them.
-With `CLAUDE_CODEX_APP_MCP_SERVERS=0` Claude threads leave them out and the
-App's MCP settings say they are unavailable; what was saved stays for when the
-switch is removed.
+Without the switch (the default) the page lists none of them, and saving,
+switching or deleting a server there fails with this message under the form:
+
+> MCP servers added in the App are not used for Claude threads unless the
+> adapter runs with CLAUDE_CODEX_APP_MCP_SERVERS=1. You can also add a server
+> to Claude Code's own MCP config (claude mcp add, or a project's .mcp.json).
+
+Servers saved while the switch was on stay saved, unused, until it is set
+again. The switch is off by default because such a server starts a program,
+or reaches a URL with the headers and environment it names, from every Claude
+thread's turns.
 
 ## App settings
 
@@ -303,9 +318,9 @@ no counterpart for: a write that sets one of those fails, and the App shows
 | --- | --- | --- |
 | `model`, `model_reasoning_effort` | the App | the model and effort of new threads |
 | `approval_policy`, `sandbox_mode` | Settings > Configuration | kept and read back; the App sends them with each new thread, where they set how Claude asks for permission |
-| `web_search` | Settings > Configuration | `disabled` takes Claude's WebSearch tool away; `cached`, `indexed` and `live` keep it, as Claude has the one kind of search |
+| `web_search` | Settings > Configuration | `disabled` takes Claude's WebSearch tool away; `cached`, `indexed` and `live` keep it, as Claude has the one kind of search. Unset, it is `disabled` with `CLAUDE_CODEX_WEBSEARCH=0` and `live` otherwise |
 | `model_reasoning_summary` | Settings > Configuration | `none` hides Claude's thinking |
-| `sandbox_workspace_write.network_access` | Settings > Configuration | always on: Claude threads have no network sandbox, so turning it off fails |
+| `sandbox_workspace_write.network_access` | Settings > Configuration | always on: Claude threads have no network sandbox, so turning it off fails. `config/read` still reports `sandbox_workspace_write` unset, as Codex does without the table, so Settings shows network access off: with it on, the App would take the default permissions for Custom (config.toml) instead of its Default permissions preset |
 | other `sandbox_workspace_write` fields | none | fixed: Claude threads have no filesystem sandbox, so other values fail |
 | `model_verbosity` | Settings > Configuration | fails: Claude models have no verbosity setting; read back as unset |
 | `service_tier`, `profiles.<name>.service_tier` | the speed menu | `default` succeeds and is not kept; any other tier fails, as Claude models list none |
@@ -508,7 +523,7 @@ the profile's `env` or env file.
 | `CLAUDE_CODEX_CODEX_NOTIFY` | `1` runs the Codex config's `notify` program when a Claude thread's turn completes; off otherwise, since the Codex App sets `notify` to its own turn-ended program. See [Inherited configuration](https://github.com/fuergaosi233/claude-codex#inherited-configuration). |
 | `CLAUDE_CODEX_CODEX_AUTO_COMPACT` | `1` takes `model_auto_compact_token_limit` from the Codex config files (user `config.toml` and trusted project `.codex/config.toml`) as the auto-compact window of Claude threads; off otherwise, since users set it there for Codex models and it would replace their Claude Code window. See [Context compaction](#context-compaction). |
 | `CLAUDE_CODEX_APP_PLUGIN_MCP` | `1` runs the MCP server of the Codex App's bundled `code-review` plugin for the App's Pull Requests panel calls, from the plugin's folder with a short environment allowlist; a comma-separated list names other plugins instead (`codex-app-tools` and `browser-use` never run). Off otherwise; Claude threads never get these servers. The plugin uses the host's GitHub credentials, such as an existing `gh` login; the adapter passes it no token. See [Pull Requests panel](/guide/gui#pull-requests-panel). |
-| `CLAUDE_CODEX_APP_MCP_SERVERS` | `0` leaves the servers added under the App's Settings > MCP servers out of Claude threads, and the App's MCP settings then say they are unavailable. On otherwise: the App can add, edit, switch off and delete servers, which the adapter keeps in its own config and starts in Claude threads' own turns, below `CLAUDE_CODEX_MCP_SERVERS`. See [MCP, tools & directories](#mcp-tools-directories). |
+| `CLAUDE_CODEX_APP_MCP_SERVERS` | `1` lets the App's Settings > MCP servers add, edit, switch off and delete servers, which the adapter keeps in its own config and starts in Claude threads' own turns, below `CLAUDE_CODEX_MCP_SERVERS`. Off otherwise (the default): the page lists no server and every save, switch or delete there fails with a message naming this switch and Claude Code's own MCP config; servers saved earlier stay saved, unused. See [MCP, tools & directories](#mcp-tools-directories). |
 | `CLAUDE_CODEX_ALLOWED_TOOLS` | Pre-approved tools. |
 | `CLAUDE_CODEX_ADD_DIRS` | Extra directories exposed to Claude. |
 | `CLAUDE_CODEX_CLAUDE_CONFIG_DIR` | Claude Code config folder (such as `~/.claude`) whose `CLAUDE.md`, rules and skills the adapter passes to Claude itself, together with the project's `CLAUDE.md` files, rules and skills. For a Claude CLI started with its setting sources turned off. `AGENTS.md` files reach Claude either way. Its MCP servers, subagents, permission rules and command hooks come along only with the switches below. |
@@ -520,13 +535,13 @@ the profile's `env` or env file.
 | `CLAUDE_CODEX_ENABLE_FILE_CHECKPOINTING` | Enable SDK file checkpointing. |
 | `CLAUDE_CODEX_AUTO_WORKTREE` / `_WORKTREE_ROOT` | Per-thread worktree isolation. |
 | `CLAUDE_CODEX_IDLE_EXIT_MS` | Daemon idle shutdown. |
-| `CLAUDE_CODEX_PREVENT_IDLE_SLEEP` | `1` keeps a Mac from idle-sleeping while Claude works: the adapter holds `/usr/bin/caffeinate -i -w <adapter pid>` while any turn, background agent or other background work runs, and stops it once nothing does. A computer that sleeps during a turn breaks Claude's connection to the model and fails the turn. Closing the lid still sleeps, and the `caffeinate` process ends with the adapter. A `caffeinate` that cannot start or ends on its own is tried at most three times, and never fails a turn. Off by default; does nothing on other platforms. See [Retries and errors](/guide/gui#retries-and-errors). |
+| `CLAUDE_CODEX_PREVENT_IDLE_SLEEP` | `1` keeps a Mac from idle-sleeping while Claude works: the adapter holds `/usr/bin/caffeinate -i -w <adapter pid>` while any turn, background agent or other background work runs, and stops it once nothing does. Background work includes a command Claude runs in the background with Bash: a dev server or file watcher keeps the Mac awake until its Claude session closes, which happens `CLAUDE_CODEX_BACKGROUND_IDLE_MS` (default 2 hours) after the session's last message. A computer that sleeps during a turn breaks Claude's connection to the model and fails the turn. Closing the lid still sleeps, and the `caffeinate` process ends with the adapter. A `caffeinate` that cannot start or ends on its own is started again while work runs, and never fails a turn; the adapter stops trying until it restarts only after three in a row end within a minute of starting. Off by default; does nothing on other platforms. See [Retries and errors](/guide/gui#retries-and-errors). |
 | `CLAUDE_CODEX_WS_AUTH` | `capability-token` requires a token on the `ws://` listener; `none` (the default on loopback) does not. See [WebSocket listener](#websocket-listener). |
 | `CLAUDE_CODEX_WS_TOKEN` / `_TOKEN_FILE` / `_TOKEN_SHA256` | The `ws://` listener token, from the variable, a 0600 file (absolute path), or as its SHA-256 digest. Default: `ws-token` in the adapter home, created on first use. |
 | `CLAUDE_CODEX_WS_ALLOWED_ORIGINS` | Comma-separated origins allowed to open a `ws://` connection; requests with any other `Origin` are refused. |
 | `CLAUDE_CODEX_WS_ALLOW_UNAUTHENTICATED` | `1` (or `--ws-allow-unauthenticated`) lets a `ws://` listener on a non-loopback address start without a token, which it otherwise refuses. Not recommended: anyone who can reach the address can run the agent. |
 | `CLAUDE_CODEX_SOCKET_PATH` | Unix socket that `app-server --listen unix://` listens on and `app-server proxy` connects to when neither names one (`app-server proxy --sock <path>` still wins). Default `app-server-control/app-server-control.sock` under `CODEX_HOME`, or a short path in the temp directory when that is too long for a socket. Both commands read it, so set it where both run, as an absolute path (a relative one resolves against each command's working directory) within the socket path limit (about 104 bytes on macOS, 108 on Linux). The daemon creates the socket's folder if needed and makes it private to the user (mode 700), with a `.pid` file next to the socket, so give the socket a folder of its own. |
-| `CLAUDE_CODEX_BACKGROUND_IDLE_MS` | How long a Claude session keeps background agents alive without any message (default 2 hours). Every message, a background agent's progress included, starts the wait over. |
+| `CLAUDE_CODEX_BACKGROUND_IDLE_MS` | How long a Claude session keeps background agents and background Bash commands alive without any message (default 2 hours). Every message, a background agent's progress included, starts the wait over. |
 | `CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS` | How long a turn waits on a subagent or workflow that shows no sign of life before it fails the turn (default `1800000`, 30 minutes; `0` never gives up; at least `100`). Any progress (the agent's output or tool heartbeats, task progress, a workflow agent starting or finishing) starts the wait over. The wait is paused while the turn waits on you (an approval, a question, an MCP elicitation or an App tool call), and time the computer spends asleep does not count: after either, the wait starts over. On expiry the turn is stopped as an interrupt would stop it, which keeps background work earlier turns left running; while background agents the turn itself handed off still run, only its own stuck agents and workflows stop and those agents keep going. |
 | `CLAUDE_CODEX_SUBAGENT_ITEMS` | `0` keeps a subagent's thread to its prompt and its answer. By default (Agent SDK backend) the thread also shows the subagent's own work as it goes: its messages, thinking, and tool calls with their results, as the items the chat shows for its own calls, stored with the thread; the parent chat looks the same either way. See [Subagents](/guide/gui#subagents). |
 | `CLAUDE_CODEX_QUIET_BACKGROUND_TURNS` | `0` marks every finished turn unread in the Codex App again. By default a turn that ends while its background agents or workflows still run leaves the chat read and sends no notification (background Bash shells do not count, since one can run for hours); see [Background work and the unread dot](/guide/gui#background-work-and-the-unread-dot). |
@@ -543,7 +558,7 @@ the profile's `env` or env file.
 | `CLAUDE_CODEX_LEADER_TOOLS` | `1` gives Claude in chats you start the leader tools (the `codex_leader` MCP server), to start and drive other chats; off by default. See [Leader chats](/guide/gui#leader-chats). |
 | `CLAUDE_CODEX_LEADER_MAX_RUNNING` | How many chats one leader may have working at once (default `4`). |
 | `CLAUDE_CODEX_REASONING_VISIBLE` | `0` keeps Claude's thinking out of the Codex App: the CLI is not passed `--thinking-display summarized`, and what thinking arrives stays raw reasoning content, which the App does not show. The App's Reasoning summary setting set to None (`model_reasoning_summary = "none"`) does the same. Use it too with a Claude CLI pinned through `CLAUDE_CODEX_CLI` that predates the flag. See [Thinking and reasoning summaries](/guide/gui#thinking-and-reasoning-summaries). |
-| `CLAUDE_CODEX_WEBSEARCH` | `0` tells the Codex App that Claude threads do not search the web: `modelProvider/capabilities/read` reports no web search and `config/read` reports `web_search = "disabled"`. Otherwise both report live search, the way Claude's WebSearch tool works. Claude Code's WebSearch tool itself stays available; turn web search off in the App's Settings > Configuration (`web_search = "disabled"`), or deny it in Claude Code's permission rules, to take it away. |
+| `CLAUDE_CODEX_WEBSEARCH` | `0` turns web search off for Claude threads while the App's Settings > Configuration saved no Web search mode: Claude's turns run without Claude Code's WebSearch tool, `config/read` reports `web_search = "disabled"` and `modelProvider/capabilities/read` reports no web search. A mode saved there wins, so `cached`, `indexed` or `live` gives Claude the tool back. Otherwise Claude has the tool and both report live search, the way it works. Claude Code's permission rules can also deny it. |
 | `CLAUDE_CODEX_REAP_ORPHANED_CLI` | `0` stops the adapter from ending Claude CLI processes a previous adapter left running (on by default; never on Windows). |
 | `CLAUDE_CODEX_MOCK` | Run the protocol without Claude credentials. |
 | `CLAUDE_CODEX_STATE_DB_TIMEOUT_MS` | How long a state-database write waits for another connection's lock before it fails (default `5000`). |

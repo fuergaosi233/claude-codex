@@ -287,7 +287,8 @@ export class LeaderThreads {
     if (!thread || thread.ephemeral) throw new Error(`unknown thread: ${input.threadId}`)
     const tracked = store.leaderOf(thread.id) === leaderId
     const status = this.status(thread, this.seenTurns(leaderId))
-    const turns = store.listTurns(thread.id)
+    // A fork reads with the turns it was forked with, as the App shows it.
+    const turns = store.historyTurns(thread.id)
     let first = 0
     let firstItem = 0
     let cursorReset = false
@@ -325,6 +326,8 @@ export class LeaderThreads {
       else if (turn.status === 'inProgress') cursor = `${turn.id}:${start}`
       else cursor = `${turn.id}:${turn.items.length}`
     }
+    // Only a turn of the chat's own counts as read: markSeen passes over an
+    // inherited one.
     const last = turns.at(-1)
     if (tracked && !hasMore && last && last.status !== 'inProgress')
       this.markSeen(thread.id, last.id)
@@ -472,13 +475,15 @@ export class LeaderThreads {
     if (status === 'blocked') entry.blockedOn = blockedOn(thread)
     entry.cwd = thread.cwd
     entry.model = thread.model
-    const last = this.host.store.lastTurnRef(thread.id)
+    // A fork that has no turn of its own yet shows the last one it inherited.
+    // Unread completions (status) count only its own turns.
+    const last = this.host.store.lastHistoryTurnRef(thread.id)
     if (last) {
       entry.turnId = last.id
       entry.turnStatus = last.status
     }
     if (withMessage && last) {
-      const turn = this.host.store.getTurn(last.id)
+      const turn = this.host.store.historyTurn(thread.id, last.id)
       if (turn) {
         Object.assign(entry, lastAgentMessage(turn), turnError(turn))
       }

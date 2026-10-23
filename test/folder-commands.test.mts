@@ -2,13 +2,14 @@ import assert from 'node:assert/strict'
 import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import test from 'node:test'
 import { listClaudeSkills } from '../src/claude-capabilities.mjs'
 import {
   claudeCommandManifest,
   listClaudeCommands,
   listFolderCommands,
+  noteClaudeCommands,
   noteFolderCommands,
   onClaudeCommandsChanged,
   type ReportedCommand,
@@ -96,14 +97,20 @@ test('noteFolderCommands keeps the commands a folder reports beyond Claude Code 
       noteFolderCommands(folder, REPORT)
       assert.equal(changes, 1, 'an unchanged report is not announced again')
 
-      // A plugin command's manifest folder maps back to its name.
-      const manifest = claudeCommandManifest('acme:ship')
-      assert.equal(manifest, join(home, 'adapter', 'claude-commands', 'acme+ship', 'SKILL.md'))
+      // A plugin command's manifest folder maps back to its name, kept with
+      // the folder's other commands.
+      const manifest = claudeCommandManifest('acme:ship', folder)
+      assert.equal(basename(dirname(manifest)), 'acme+ship')
+      assert.equal(
+        dirname(dirname(dirname(manifest))),
+        join(home, 'adapter', 'claude-commands', '+folders'),
+      )
+      assert.equal(claudeCommandManifest('acme:ship', `${folder}/`), manifest)
       const text = await readFile(manifest, 'utf8')
       assert.match(text, /^---\nname: acme:ship\ndescription: "Ship a release with Acme."/)
       assert.match(text, /Claude Code command from your Claude Code settings/)
       assert.match(text, /runs `\/acme:ship \[version\]` in Claude Code/)
-      assert.equal(existsSync(claudeCommandManifest('mcp__docs__search')), true)
+      assert.equal(existsSync(claudeCommandManifest('mcp__docs__search', folder)), true)
 
       // Saved per folder, and read back by a later adapter.
       const saved = JSON.parse(
@@ -132,9 +139,12 @@ test('noteFolderCommands keeps the commands a folder reports beyond Claude Code 
         ['deploy'],
       )
       assert.equal(changes, 2)
+      assert.equal(existsSync(manifest), false, 'a dropped command loses its manifest')
+      assert.equal(existsSync(claudeCommandManifest('deploy', folder)), true)
       noteFolderCommands(folder, [REPORT[0] as ReportedCommand])
       assert.deepEqual(listFolderCommands(folder), [])
       assert.equal(changes, 3)
+      assert.equal(existsSync(dirname(dirname(manifest))), false)
       const cleared = JSON.parse(
         await readFile(join(home, 'adapter', 'claude-commands.json'), 'utf8'),
       )
@@ -142,6 +152,121 @@ test('noteFolderCommands keeps the commands a folder reports beyond Claude Code 
     } finally {
       off()
     }
+  })
+})
+
+test('commands named like one of the App\'s own "/" commands are left out', async () => {
+  await withEnv({}, async (home) => {
+    const folder = join(home, 'project')
+    // Every command the App registers in its "/" popup, by id.
+    const app = [
+      'archive',
+      'autoreview',
+      'chat',
+      'chatgpt-lockdown',
+      'chatgpt-model',
+      'cloud',
+      'cloud-environment',
+      'compact',
+      'custom-gpt',
+      'delete',
+      'dictate',
+      'feedback',
+      'fork',
+      'goal',
+      'hotkey-window-new',
+      'hotkey-window-resume',
+      'ide-context',
+      'init',
+      'local',
+      'local-project-to-chat',
+      'mcp',
+      'memories',
+      'model',
+      'new',
+      'pet',
+      'pin',
+      'plan-mode',
+      'project',
+      'projectless',
+      'read-aloud',
+      'reasoning',
+      'rename',
+      'review-mode',
+      'share',
+      'side',
+      'sketch',
+      'status',
+      'usage',
+      'worktree',
+      'worktree-prompt',
+    ]
+    noteFolderCommands(folder, [
+      { name: 'simplify', description: '', argumentHint: '', builtin: true },
+      ...app.map((name) => ({ name, description: 'Mine.', argumentHint: '' })),
+      { name: 'deploy', description: 'Deploy.', argumentHint: '' },
+      // A plugin's command only shares the part after its namespace.
+      { name: 'acme:pin', description: 'Pin with Acme.', argumentHint: '' },
+    ])
+    assert.deepEqual(
+      listFolderCommands(folder).map((command) => command.name),
+      ['acme:pin', 'deploy'],
+    )
+    // Claude Code's own skills are filtered the same way.
+    noteClaudeCommands(
+      [
+        { name: 'pet', description: '', argumentHint: '', builtin: true },
+        { name: 'review', description: 'Review.', argumentHint: '', builtin: true },
+      ],
+      ['pet', 'review'],
+    )
+    assert.deepEqual(
+      listClaudeCommands().map((command) => command.name),
+      ['review'],
+    )
+  })
+})
+
+test('each folder keeps the manifests of its own commands, and only those', async () => {
+  await withEnv({}, async (home) => {
+    const report = (description: string): ReportedCommand[] => [
+      REPORT[0] as ReportedCommand,
+      { name: 'deploy', description, argumentHint: '' },
+      { name: 'standup', description: 'Write my standup notes.', argumentHint: '' },
+    ]
+    const app = join(home, 'app')
+    const site = join(home, 'site')
+    noteFolderCommands(app, report('Deploy the app.'))
+    noteFolderCommands(site, report('Deploy the site.'))
+    const appDeploy = claudeCommandManifest('deploy', app)
+    const siteDeploy = claudeCommandManifest('deploy', site)
+    assert.notEqual(appDeploy, siteDeploy)
+    assert.match(await readFile(appDeploy, 'utf8'), /description: "Deploy the app."/)
+    assert.match(await readFile(siteDeploy, 'utf8'), /description: "Deploy the site."/)
+    const [appEntry, siteEntry] = listClaudeSkills({ cwds: [app, site] })
+    assert.equal(appEntry?.skills.find((skill) => skill.name === 'deploy')?.path, appDeploy)
+    assert.equal(siteEntry?.skills.find((skill) => skill.name === 'deploy')?.path, siteDeploy)
+
+    // Dropping a command in one folder leaves the other folder's.
+    noteFolderCommands(app, [REPORT[0] as ReportedCommand, REPORT[3] as ReportedCommand])
+    assert.equal(existsSync(appDeploy), false)
+    assert.equal(existsSync(claudeCommandManifest('standup', app)), true)
+    assert.match(await readFile(siteDeploy, 'utf8'), /description: "Deploy the site."/)
+
+    // A manifest removed by another adapter sharing the home is written again
+    // when the folder is listed.
+    await rm(siteDeploy)
+    listFolderCommands(site)
+    assert.equal(existsSync(siteDeploy), true)
+
+    // A folder no longer kept loses its manifests.
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    for (let index = 0; index < 64; index += 1)
+      noteFolderCommands(join(home, 'more', String(index)), report('Deploy.'))
+    assert.deepEqual(listFolderCommands(app), [])
+    assert.equal(existsSync(claudeCommandManifest('standup', app)), false)
+    assert.equal(existsSync(siteDeploy), false)
+    assert.equal(existsSync(claudeCommandManifest('deploy', join(home, 'more', '63'))), true)
   })
 })
 
@@ -161,6 +286,13 @@ test('a picked command runs as a slash command, plugin and MCP names included', 
     assert.equal(
       skillLinksToCommand(`[$deploy?label=Deploy](<${claudeCommandManifest('deploy')}>) staging`),
       '/deploy staging',
+    )
+    // A folder's own command, as skills/list offers it.
+    assert.equal(
+      skillLinksToCommand(
+        `[$acme:ship](${claudeCommandManifest('acme:ship', join(tmpdir(), 'ws'))}) 1.2.0`,
+      ),
+      '/acme:ship 1.2.0',
     )
     // A link into another folder is no command.
     const elsewhere = join(tmpdir(), 'acme+ship', 'SKILL.md')
@@ -211,7 +343,7 @@ test('skills/list offers a folder its own commands next to its skills, once per 
         name: 'acme:ship',
         description: 'Ship a release with Acme.',
         shortDescription: 'Ship a release with Acme.',
-        path: claudeCommandManifest('acme:ship'),
+        path: claudeCommandManifest('acme:ship', workspace),
         scope: 'user',
         enabled: true,
       })

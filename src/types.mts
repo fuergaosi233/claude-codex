@@ -579,6 +579,11 @@ export interface RuntimeTurnContext {
   // encoded; image (URL) is passed through as-is. Sidecar reshapes the
   // Claude SDK query into a multimodal user message when this is non-empty.
   imageInputs: ImageInput[]
+  // Text Claude reads before `prompt`, in text blocks of the same message,
+  // for a prompt that runs a Claude Code command (see turnPrompt in
+  // src/turn-context.mts). A runtime that sends no content blocks puts it
+  // in front of the prompt.
+  promptContext?: string[]
   // Attach to a turn Claude already started on its own (a background task
   // reported back) instead of sending `prompt`. Only meaningful after the
   // runtime called RuntimeBackgroundListener.onAutonomousTurn for the thread.
@@ -841,8 +846,8 @@ export type RuntimeEvent =
   // A model request failed and Claude will send it again after `delayMs`.
   // `status` is the API's HTTP status (null when nothing answered) and
   // `category` the SDK's error category ('overloaded', ...). `toolUseId` is
-  // the Agent call of the subagent whose request it was; without it the
-  // request was the main loop's.
+  // the Agent call of the subagent whose request it was, and `agentId` that
+  // subagent's task id; without either the request was the main loop's.
   | {
       type: 'retrying'
       attempt: number
@@ -851,6 +856,7 @@ export type RuntimeEvent =
       category: string | null
       delayMs: number | null
       toolUseId?: string
+      agentId?: string
     }
   | {
       type: 'completed'
@@ -1063,6 +1069,8 @@ export interface RuntimeBackgroundListener {
 
 export interface RuntimeSteerOptions {
   imageInputs?: ImageInput[]
+  // As RuntimeTurnContext.promptContext.
+  promptContext?: string[]
   // Fires once the backend starts consuming the message (Claude Code folds a
   // steer in at the next tool-round boundary, or runs it as its own turn).
   onAccepted?: () => void

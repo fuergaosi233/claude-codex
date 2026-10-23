@@ -185,6 +185,51 @@ export function withTurnContext(
   return [injected ?? '', prompt, ...parts].filter((part) => part.trim()).join('\n\n')
 }
 
+// A message that runs a Claude Code command: `/name`, then its arguments.
+// Claude Code runs any command it has under that name, such as
+// `release.notes` from a file release.notes.md, and only then checks an
+// unknown name's characters to tell it from a path. So a name here takes
+// every character a command name can have (see claude-commands.mts), dots
+// included; a path such as `/tmp/x` has a second `/` and is no command. Text
+// like `/notes.md says` gets a command's layout, and Claude Code reads it as
+// the plain message it is.
+const COMMAND_PROMPT = /^\/[A-Za-z0-9_][\w.:-]*(?:\s|$)/
+
+export function isCommandPrompt(prompt: string): boolean {
+  return COMMAND_PROMPT.test(prompt)
+}
+
+// What Claude reads for a message: its text, and the context that goes
+// before it in text blocks of their own.
+export interface TurnPrompt {
+  prompt: string
+  context: string[]
+}
+
+// Claude Code runs a message as a command only when the last text block of
+// the message starts with `/name`, and passes the rest of that block on as
+// the command's arguments. Blocks before it reach Claude with the command
+// and stay out of its arguments. So a message that runs a command keeps its
+// text as typed and gets its context as blocks before it, in the order
+// withTurnContext puts it around any other message.
+export function turnPrompt(
+  prompt: string,
+  context: ReadonlyArray<string | null>,
+  injected: string | null = null,
+): TurnPrompt {
+  if (!isCommandPrompt(prompt))
+    return { prompt: withTurnContext(prompt, context, injected), context: [] }
+  const blocks = [injected, ...context].filter((part): part is string => !!part?.trim())
+  return { prompt, context: blocks }
+}
+
+// The prompt as one text, for a runtime that sends no content blocks. With
+// any context, a command message no longer starts with `/name` there, so it
+// does not run: the context cannot follow it without becoming its arguments.
+export function flatPrompt(prompt: string, context: readonly string[] | undefined): string {
+  return context && context.length > 0 ? [...context, prompt].join('\n\n') : prompt
+}
+
 // The App's instructions describe its own tools (threads, worktrees,
 // automations, the sidebar), which Codex threads get from the App. A Claude
 // thread has none of them, so its prompt says which of the named ones it
