@@ -75,7 +75,9 @@ versioning or publishing metadata.
 - A turn keeps a `contextCompaction` item only once the compaction completes,
   in the place it started, like Codex. A compaction an interrupt cuts short no
   longer reads as "Context compacted" after a reload, and one Claude Code could
-  not do leaves no marker; its notice says what happened.
+  not do leaves no marker; its notice says what happened. That includes a
+  `/compact` (`thread/compact/start`) Claude Code could not do: its turn keeps
+  only the summary written instead, and no `thread/compacted` is sent.
 - Requests the user can correct fail with JSON-RPC `-32600` (invalid request),
   the code Codex uses, instead of `-32000`, with the same messages: an unknown
   thread, turn, section, queued message or process; a bad cursor or parameter;

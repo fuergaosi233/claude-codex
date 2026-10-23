@@ -4676,8 +4676,9 @@ test('thread/compact/start writes a summary when Claude cannot compact, and keep
       proc,
       3,
       threadId,
-      (message) => message.method === 'thread/compacted',
+      (message) => message.method === 'turn/completed',
     )
+    seen.push(...(await readQuiet(reader, 300)))
     const warning = seen.find((message) => message.method === 'warning')
     assert.equal(
       warning?.params.message,
@@ -4690,7 +4691,24 @@ test('thread/compact/start writes a summary when Claude cannot compact, and keep
       .join('')
     assert.match(text, /MOCK_COMPACT_SUMMARY/)
     assert.doesNotMatch(text, /Context compacted for thread/)
-    assert.equal(compactionItemEvents(seen, 'item/completed').length, 1)
+    // Nothing claims the session was compacted: the item closes as an empty
+    // reasoning item, and no thread/compacted follows.
+    const [started] = compactionItemEvents(seen, 'item/started')
+    assert.equal(compactionItemEvents(seen, 'item/completed').length, 0)
+    assert.deepEqual(
+      seen
+        .filter(
+          (message) =>
+            message.method === 'item/completed' &&
+            message.params.item.id === started.params.item.id,
+        )
+        .map((message) => message.params.item),
+      [{ type: 'reasoning', id: started.params.item.id, summary: [], content: [] }],
+    )
+    assert.equal(
+      seen.some((message) => message.method === 'thread/compacted'),
+      false,
+    )
     assert.equal(
       seen.some(
         (message) =>

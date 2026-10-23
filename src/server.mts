@@ -3475,7 +3475,12 @@ export class CodexClaudeAppServer {
   // Compacts the thread like Codex's /compact: Claude compacts the thread's
   // own session, so the next turn goes on from its summary. A thread with no
   // Claude session yet, or whose compaction fails, gets a summary written in
-  // a session of its own instead, and keeps its session as it was.
+  // a session of its own instead, and keeps its session as it was. When
+  // Claude could not compact the session, nothing claims it did: the item
+  // ends as an empty reasoning item, which the App does not draw and the
+  // turn does not keep, and no thread/compacted follows; the notice row says
+  // why and the summary still lands.
+  // App rule: item-completed-replaces
   private async compactThread(
     peer: RpcPeer,
     thread: ThreadRecord,
@@ -3498,6 +3503,17 @@ export class CodexClaudeAppServer {
         params: { threadId, turnId, item: compactItem, completedAtMs: nowMillis() },
       })
     }
+    const dropCompactItem = (): void => {
+      if (!compactOpen) return
+      compactOpen = false
+      const item: ThreadItem = { type: 'reasoning', id: compactItem.id, summary: [], content: [] }
+      this.notify(peer, {
+        method: 'item/completed',
+        params: { threadId, turnId, item, completedAtMs: nowMillis() },
+      })
+    }
+    // Set once Claude was asked to compact the session and did not.
+    let sessionFailed = false
     let agentItem: ThreadItem | null = null
     const completeAgentItem = (): void => {
       if (!agentItem) return
@@ -3542,7 +3558,10 @@ export class CodexClaudeAppServer {
           })
           return false
         })
+        sessionFailed = !compacted
       }
+      // The summary written next is not the session's compaction.
+      if (sessionFailed && active()) dropCompactItem()
       if (compacted || !active()) return
       const item: ThreadItem = {
         type: 'agentMessage',
@@ -3588,7 +3607,8 @@ export class CodexClaudeAppServer {
             method: 'turn/completed',
             params: { threadId, turn: this.toLifecycleTurn(completed) },
           })
-          this.notify(peer, { method: 'thread/compacted', params: { threadId, turnId } })
+          if (!sessionFailed)
+            this.notify(peer, { method: 'thread/compacted', params: { threadId, turnId } })
         }
       }
     }
