@@ -677,8 +677,12 @@ export type RuntimeEvent =
   // where a rewind back to that turn resumes.
   | { type: 'checkpoint'; claudeSessionId: string; messageUuid: string }
   // A new top-level model response is beginning, not a streamed content block.
-  | { type: 'message_boundary' }
-  | { type: 'text_delta'; delta: string }
+  // `failedRequest` marks this boundary, and the text and usage that follow
+  // it, of the message Claude Code writes for a model request that failed for
+  // good (its text names the error): they show, but are no sign Claude got on
+  // with the turn.
+  | { type: 'message_boundary'; failedRequest?: boolean }
+  | { type: 'text_delta'; delta: string; failedRequest?: boolean }
   | { type: 'reasoning_delta'; delta: string }
   | {
       type: 'tool_use'
@@ -786,12 +790,20 @@ export type RuntimeEvent =
     }
   // One API call of the main loop, before the turn's result settles its
   // usage. A message can be reported again with a larger count.
-  | { type: 'usage_progress'; messageId: string; usage: Record<string, unknown> }
+  | {
+      type: 'usage_progress'
+      messageId: string
+      usage: Record<string, unknown>
+      failedRequest?: boolean
+    }
   // A subagent or workflow the turn waits on is still working: its own
   // output, a task progress frame or a tool_progress heartbeat, which a
   // backend that filters nested events would otherwise keep to itself.
-  // `toolUseId` is the call that started it.
-  | { type: 'subagent_progress'; toolUseId: string }
+  // `toolUseId` is the call that started it. `failedRequest` marks a frame
+  // that tells of a request of the agent's that failed (a retry, or the
+  // message naming the error): it keeps the turn alive, but is no sign the
+  // agent got on with its work.
+  | { type: 'subagent_progress'; toolUseId: string; failedRequest?: boolean }
   | {
       type: 'metrics'
       durationMs: number | null
