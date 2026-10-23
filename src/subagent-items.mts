@@ -141,8 +141,9 @@ export class SubagentItems {
     else this.completeTool(peer, state, output)
   }
 
-  // A message reaches the running subagent: what it was saying ends there,
-  // so what it says next goes after the message.
+  // Something lands in the running subagent's turn from outside its own
+  // output (a message sent to it, the cards of an agent it launched): what it
+  // was saying ends there, so what it says next goes after that.
   interject(peer: RpcPeer, turnId: string): void {
     const state = this.turns.get(turnId)
     if (state) this.closeMessage(peer, state, 'commentary', null)

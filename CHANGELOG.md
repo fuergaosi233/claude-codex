@@ -741,7 +741,9 @@ versioning or publishing metadata.
   calls make, with its todo list as the thread's plan. With the Agent SDK
   backend the adapter asks Claude Code for the subagent's text and thinking
   (`forwardSubagentText`) and routes each frame by its agent id, so a nested
-  agent's work lands in its own thread. The items are stored with the child
+  agent's work lands in its own thread, and its cards land in the launching
+  agent's thread after what that agent said before the call, which its
+  answer then follows once. The items are stored with the child
   turn (`thread/read`, `thread/turns/list`, `thread/items/list`, resume,
   followers), keep the parent's output caps (other long text of a call is
   cut the same way, a diff at a line within 30,000 bytes), stop at 256 per

@@ -599,6 +599,68 @@ test("a nested agent's work goes to its own thread, by the task id the CLI names
   })
 })
 
+test('an agent that launches one of its own ends what it was saying there; its answer shows once, after the cards', async () => {
+  const script: Script = async (context, handlers, tools) => {
+    await startAgent(context, handlers, tools, 'agent-outer', 'task-outer', 'outer work')
+    // One frame: a sentence, then the Agent call. Nothing else comes between
+    // the helper's result and the answer: no thinking, no other call.
+    await handlers.onEvent(
+      out('agent-outer', { type: 'text', text: 'I will ask a helper.' }, 'task-outer'),
+    )
+    await startAgent(context, handlers, tools, 'agent-inner', 'task-inner', 'inner work', {
+      agentId: 'task-outer',
+    })
+    await handlers.onEvent({ type: 'tool_result', toolUseId: 'agent-inner', content: 'inner done' })
+    await handlers.onEvent(out('agent-outer', { type: 'text', text: 'outer done' }, 'task-outer'))
+    await handlers.onEvent({ type: 'tool_result', toolUseId: 'agent-outer', content: 'outer done' })
+    await handlers.onEvent({ type: 'completed', success: true, result: 'done' })
+  }
+  await withServer(script, async ({ startThread, runTurn, request }) => {
+    const threadId = await startThread()
+    const live = await runTurn(threadId, 'nest two agents')
+    const outer = spawnedChild(live, 'outer work')
+    const card = (item: any): unknown[] =>
+      item.type === 'collabAgentToolCall' ? ['collab', item.tool, item.status] : shape(item)
+    assert.deepEqual((await threadItems(request, outer)).map(card), [
+      ['user', 'outer work'],
+      ['message', 'commentary', 'I will ask a helper.'],
+      ['collab', 'spawnAgent', 'completed'],
+      ['collab', 'wait', 'completed'],
+      ['message', null, 'outer done'],
+    ])
+    // Live, the message completes before the cards start, and the answer is
+    // a message of its own.
+    const lifecycle = live
+      .filter(
+        (message) =>
+          (message.method === 'item/started' || message.method === 'item/completed') &&
+          message.params.threadId === outer &&
+          message.params.item.type !== 'subAgentActivity',
+      )
+      .map((message) => [message.method.slice('item/'.length), ...card(message.params.item)])
+    assert.deepEqual(lifecycle, [
+      ['started', 'user', 'outer work'],
+      ['completed', 'user', 'outer work'],
+      ['started', 'message', null, ''],
+      ['completed', 'message', 'commentary', 'I will ask a helper.'],
+      ['started', 'collab', 'spawnAgent', 'inProgress'],
+      ['completed', 'collab', 'spawnAgent', 'completed'],
+      ['started', 'collab', 'wait', 'inProgress'],
+      ['completed', 'collab', 'wait', 'completed'],
+      ['started', 'message', null, ''],
+      ['completed', 'message', null, 'outer done'],
+    ])
+    assert.equal(
+      completedIn(live, outer).filter(
+        (item) => item.type === 'agentMessage' && item.text.includes('outer done'),
+      ).length,
+      1,
+      'the answer shows once',
+    )
+    assert.deepEqual(leftOpen(live, outer), [])
+  })
+})
+
 test('a subagent stopped mid-call closes the call as failed; what it sends later shows nowhere', async () => {
   const script: Script = async (context, handlers, tools) => {
     await startAgent(context, handlers, tools, 'agent-slow', 'slow-task', 'run the suite')

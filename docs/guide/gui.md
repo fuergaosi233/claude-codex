@@ -508,10 +508,12 @@ A subagent's thread shows its work as it goes: what it says and thinks, and
 each tool call with its result, drawn as the chat draws its own calls
 (commands and file reads, searches, edits, MCP tool calls, web searches,
 images), with its todo list as the thread's plan. An agent another agent
-launches shows its work in its own thread. The work is stored with the thread,
-so it is still there when the thread is reopened, after an adapter restart
-too, and every window following the chat sees it live. None of it shows in the
-parent chat, which keeps its agent cards and the subagent's answer. Claude Code
+launches shows its work in its own thread, and its agent cards show in the
+launching agent's thread after what that agent said before launching it. The
+work is stored with the thread, so it is still there when the thread is
+reopened, after an adapter restart too, and every window following the chat
+sees it live. None of it shows in the parent chat, which keeps its agent cards
+and the subagent's answer. Claude Code
 hands a subagent's output over a block at a time, so its messages appear whole
 rather than word by word. Outputs are cut as the chat's own are, and so is any
 other long text of a call (a command, its arguments); an edit's diff keeps its

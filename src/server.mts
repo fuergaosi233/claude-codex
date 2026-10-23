@@ -5205,6 +5205,9 @@ export class CodexClaudeAppServer {
               reasoningEffort: collabEffort,
               agentsStates: {},
             }
+            // What the host agent was saying ends at its Agent call: what it
+            // says next goes after the cards.
+            if (host) this.subagentItems.interject(peer, hostTurnId)
             this.store.appendItem(hostTurnId, spawnBegin)
             this.notify(peer, {
               method: 'item/started',
