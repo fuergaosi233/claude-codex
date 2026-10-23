@@ -207,6 +207,9 @@ interface PendingTurn {
   // still working (see noteSubagentProgress), on the monotonic clock: a wall
   // clock set back must not hold the reports back for as long.
   progressReportedAtMs: number
+  // The calls whose agent last told of a request that failed (see
+  // noteSubagentProgress): such a call's result tells of the failure.
+  failedSubagentCalls: Set<string>
   // The API error behind the main loop's latest response or retry, null
   // once a response arrives without one.
   apiError: { category: string | null; status: number | null } | null
@@ -1644,6 +1647,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       workflowFailure: null,
       model: null,
       progressReportedAtMs: Number.NEGATIVE_INFINITY,
+      failedSubagentCalls: new Set(),
       apiError: null,
       notificationKeys: new Set(),
     }
@@ -2500,13 +2504,16 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   ): Promise<void> {
     const toolUseId = this.progressToolUseId(pending, type, message)
     if (!toolUseId) return
+    const failedRequest = tellsFailedRequest(type, message)
+    if (failedRequest) pending.failedSubagentCalls.add(toolUseId)
+    else pending.failedSubagentCalls.delete(toolUseId)
     const now = performance.now()
     if (now - pending.progressReportedAtMs < SUBAGENT_PROGRESS_INTERVAL_MS) return
     pending.progressReportedAtMs = now
     await pending.handlers.onEvent({
       type: 'subagent_progress',
       toolUseId,
-      ...(tellsFailedRequest(type, message) ? { failedRequest: true } : {}),
+      ...(failedRequest ? { failedRequest } : {}),
     })
   }
 
@@ -3170,12 +3177,15 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       // server's subagent state machine closes the collabAgentToolCall.
       const isError = Boolean(block.is_error)
       const bodyContent = block.content
+      // An agent whose request failed for good ends its call with the error.
+      const failedRequest = pending.failedSubagentCalls.delete(toolUseId)
       await pending.handlers.onEvent({
         type: 'tool_result',
         toolUseId,
         content: bodyContent,
         isError,
         ...(structured ? { structured } : {}),
+        ...(failedRequest ? { failedRequest } : {}),
       })
       // After the result, which replaces what the command's item showed.
       if (!message.parent_tool_use_id && pending.session)

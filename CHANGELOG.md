@@ -44,8 +44,9 @@ versioning or publishing metadata.
   message (or Continue) picks up where it left off; on macOS it also points to
   the App's **Prevent sleep while running** setting. A sleep the turn went on
   from is not blamed (API retries, a subagent's included, notices, hooks, the
-  message Claude Code writes to name the failed request and the failing result
-  do not count as going on). The error code and details are unchanged, and
+  message Claude Code writes to name the failed request, the result of a
+  subagent that ended on one and the failing result do not count as going
+  on). The error code and details are unchanged, and
   refusals such as usage limits, an overloaded API or a Claude Code start that
   a retry cannot fix are left alone.
 - The subagent watchdog (`CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS`) no longer fails a

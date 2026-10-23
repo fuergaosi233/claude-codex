@@ -712,6 +712,9 @@ export type RuntimeEvent =
       // agent ran), not because the agent finished: the agent ends with the
       // turn, for the turn's reason.
       endedWithTurn?: boolean
+      // The agent's last word was a request of its that failed for good: the
+      // result tells of that failure, and is no sign the turn got on.
+      failedRequest?: boolean
     }
   | {
       type: 'permission_request'

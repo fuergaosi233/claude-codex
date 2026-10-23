@@ -443,8 +443,9 @@ const MAX_QUEUED_ACTIVITY = 64
 // it will send again, a notice (a model fallback, a compaction that failed),
 // an error, a hook run (a StopFailure hook runs after a request failed), and
 // the usage, figures and end of the result that closes it. After a sleep
-// broke its connection, a turn hears only these, and the events of the
-// message naming the error (failedRequest), until it fails. Usage also comes
+// broke its connection, a turn hears only these, and the events marked
+// failedRequest (the message naming the error; an agent's failed requests,
+// and the result of its call when it ended on one), until it fails. Usage also comes
 // with each message, after the message itself.
 const NO_PROGRESS_EVENTS: ReadonlySet<RuntimeEvent['type']> = new Set([
   'retrying',

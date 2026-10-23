@@ -1443,10 +1443,42 @@ test("an agent's failed requests keep the turn alive, marked as no progress of i
       parent_tool_use_id: null,
       message: { content: [{ type: 'tool_result', tool_use_id: 'agent-1', content: 'built' }] },
     },
+    assistant('m2', [
+      { type: 'tool_use', id: 'agent-2', name: 'Agent', input: { prompt: 'run the tests' } },
+    ]),
+  )
+  // An agent that ended on a request that failed for good: its call's
+  // result tells of the failure, and is no progress either.
+  await send(
+    {
+      type: 'assistant',
+      parent_tool_use_id: 'agent-2',
+      error: 'unknown',
+      message: { id: 'sub-error-2', model: '<synthetic>', content: [text('API Error')] },
+    },
+    5,
+  )
+  query.push(
+    {
+      type: 'user',
+      parent_tool_use_id: null,
+      message: {
+        content: [{ type: 'tool_result', tool_use_id: 'agent-2', content: 'API Error' }],
+      },
+    },
     { type: 'result', subtype: 'success', result: 'Built.' },
   )
   await turn
-  assert.deepEqual(progress(), [true, true, true, false])
+  assert.deepEqual(progress(), [true, true, true, false, true])
+  assert.deepEqual(
+    events.flatMap((event) =>
+      event.type === 'tool_result' ? [[event.toolUseId, event.failedRequest === true]] : [],
+    ),
+    [
+      ['agent-1', false],
+      ['agent-2', true],
+    ],
+  )
   await runtime.stop()
 })
 
