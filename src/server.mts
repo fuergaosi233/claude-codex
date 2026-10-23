@@ -225,6 +225,7 @@ import {
   TurnNoticeLog,
   withTurnNotices,
 } from './turn-notices.mjs'
+import { TurnWatchdog } from './turn-watchdog.mjs'
 import type {
   ClaudeResumePoint,
   ClaudeRuntime,
@@ -658,7 +659,7 @@ export class CodexClaudeAppServer {
   private readonly stopCommandsListener: () => void
   private readonly store: SessionStore
   private readonly runtime: ClaudeRuntime
-  // Notices that the computer slept, for failed turns.
+  // Notices that the computer slept, for the turn watchdog and failed turns.
   private readonly sleepMonitor: SleepMonitor
   private readonly platform: NodeJS.Platform
   // The CLI notices each recent turn has shown (see turn-notices.mts).
@@ -4723,53 +4724,31 @@ export class CodexClaudeAppServer {
       mcpServers: Object.keys((context.mcpServers ?? {}) as Record<string, unknown>),
     }
     let acceptRuntimeEvents = true
-    let watchdogTimer: NodeJS.Timeout | null = null
     let resolveWatchdog: (() => void) | null = null
-    // When the turn last heard from the subagents or workflow it waits on.
-    // A busy child reports many times a second, so progress only moves this
-    // mark; a timer that comes due early waits out the rest of the window.
-    // It is read off the monotonic clock the timer runs on, so a jump of the
-    // wall clock (a laptop waking from sleep) neither fails nor stretches it.
-    let lastProgressAtMs = 0
+    // Fails the turn after a whole window without a sign of life from the
+    // subagents or workflow it waits on. Waiting on the user pauses it, and
+    // a sleep of the computer starts the window over (turn-watchdog.mts).
     const watchdogTimeoutMs = subagentWatchdogTimeoutMs()
-    const watchdogPromise =
-      watchdogTimeoutMs > 0
-        ? new Promise<void>((resolve) => {
-            resolveWatchdog = resolve
-          })
-        : null
-    const disarmWatchdog = (): void => {
-      if (watchdogTimer) clearTimeout(watchdogTimer)
-      watchdogTimer = null
-    }
-    const noteProgress = (): void => {
-      lastProgressAtMs = performance.now()
-    }
-    const scheduleWatchdog = (delayMs: number): void => {
-      watchdogTimer = setTimeout(() => {
-        watchdogTimer = null
-        const idleMs = performance.now() - lastProgressAtMs
-        if (idleMs < watchdogTimeoutMs) {
-          scheduleWatchdog(watchdogTimeoutMs - idleMs)
-          return
-        }
+    const watchdog = new TurnWatchdog({
+      timeoutMs: watchdogTimeoutMs,
+      suspendedMs: () => this.sleepMonitor.suspendedMs(),
+      onExpire: () => {
         // Flip this before resolving the race so an already-buffered SDK event
         // cannot create a fresh child after the watchdog has decided to fail.
         acceptRuntimeEvents = false
         resolveWatchdog?.()
-      }, delayMs)
-      watchdogTimer.unref()
-    }
+      },
+    })
+    const watchdogPromise = watchdog.enabled
+      ? new Promise<void>((resolve) => {
+          resolveWatchdog = resolve
+        })
+      : null
+    const disarmWatchdog = (): void => watchdog.disarm()
+    const noteProgress = (): void => watchdog.noteProgress()
     const armWatchdog = (): void => {
-      if (
-        !watchdogPromise ||
-        watchdogTimer ||
-        !acceptRuntimeEvents ||
-        (activeSubagents.size === 0 && !workflowInFlight)
-      )
-        return
-      noteProgress()
-      scheduleWatchdog(watchdogTimeoutMs)
+      if (!acceptRuntimeEvents || (activeSubagents.size === 0 && !workflowInFlight)) return
+      watchdog.arm()
     }
     this.subagentStateByTurn.set(turn.id, {
       thread,
@@ -5763,13 +5742,15 @@ export class CodexClaudeAppServer {
               })
             }
           }
-          const decision = await this.requestApproval(
-            peer,
-            thread.id,
-            turn.id,
-            itemId,
-            event,
-            imageReadFallbacks.get(itemId),
+          const decision = await watchdog.whilePaused(
+            this.requestApproval(
+              peer,
+              thread.id,
+              turn.id,
+              itemId,
+              event,
+              imageReadFallbacks.get(itemId),
+            ),
           )
           if (!turnIsActive()) return { decision: 'cancel' }
           if (decision.decision === 'decline' || decision.decision === 'cancel')
@@ -5812,12 +5793,8 @@ export class CodexClaudeAppServer {
             type: 'active',
             activeFlags: ['waitingOnUserInput'],
           })
-          const answers = await this.requestUserInput(
-            peer,
-            thread.id,
-            turn.id,
-            item.id,
-            event.questions,
+          const answers = await watchdog.whilePaused(
+            this.requestUserInput(peer, thread.id, turn.id, item.id, event.questions),
           )
           if (!turnIsActive()) return { answers: {} }
           const contentItems = userInputAnswersAsContent(event.questions, answers)
@@ -5844,7 +5821,9 @@ export class CodexClaudeAppServer {
         onElicitationRequest: async (request, signal) => {
           if (!turnIsActive()) return { action: 'cancel' }
           completeMessage()
-          return this.requestElicitation(peer, thread.id, turn.id, request, signal)
+          return watchdog.whilePaused(
+            this.requestElicitation(peer, thread.id, turn.id, request, signal),
+          )
         },
         // Claude called one of the client's dynamic tools: a dynamicToolCall
         // item around the item/tool/call request, as Codex records it.
@@ -5872,12 +5851,14 @@ export class CodexClaudeAppServer {
           })
           const abort = new AbortController()
           dynamicToolCalls.set(item.id, abort)
-          const response = await this.requestDynamicTool(
-            peer,
-            thread.id,
-            turn.id,
-            request,
-            AbortSignal.any([signal, abort.signal]),
+          const response = await watchdog.whilePaused(
+            this.requestDynamicTool(
+              peer,
+              thread.id,
+              turn.id,
+              request,
+              AbortSignal.any([signal, abort.signal]),
+            ),
           )
           dynamicToolCalls.delete(item.id)
           // An interrupt or the end of the turn closed the item already.
