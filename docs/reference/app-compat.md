@@ -42,6 +42,7 @@ line a rule touches.
 | `agent-states` | shows `interrupted` as done and `errored` as failed | a stopped subagent shows as done |
 | `subagent-read` | reads a child with `includeTurns: false` and shows one without turns as loading | a finished subagent opens with its prompt and reply |
 | `child-prompt` | creates the child conversation from `thread/started` with an empty turn | a running subagent shows its prompt |
+| `subagent-titles` | titles a subagent thread with the `name` its `thread/started` carries, and otherwise generates one from the parent's `spawnAgent` prompt with a model turn of its own | a subagent's and a workflow agent's threads show the description or label at once, with no title turn for them |
 | `nested-subagent` | finds a child through the `spawnAgent` item of the conversation its `parentThreadId` names | a subagent's own subagent opens from the outer subagent's conversation, at depth 2 |
 | `rate-limit-banner` | shows a banner for every `account/rateLimits/updated` | no banner after an ordinary reply |
 | `projects` | holds project writes until `project/list` answers, and matches the `project not found` and deleted-key error texts | a project and a chat moved into it survive an App restart |

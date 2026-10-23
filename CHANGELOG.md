@@ -619,6 +619,13 @@ versioning or publishing metadata.
   stale copy without the turns taken on another. A copy that is identical,
   newer or longer stays as it is; a new copy keeps the source's file mode
   and is a clone where the file system supports it.
+- Subagent threads are named when they start, after the Agent call's
+  `description` or a workflow agent's label, else the agent's type and the
+  first line of its prompt, and keep the name in `thread/read`,
+  `thread/list` and after a restart. The Codex App used to run a title turn
+  for every subagent, which named workflow agents after the workflow's
+  relayed user request; a workflow agent's prompt is now the task the
+  workflow computed for it.
 
 ### Rust-first protocol groundwork
 

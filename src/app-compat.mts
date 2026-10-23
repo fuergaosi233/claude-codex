@@ -196,6 +196,14 @@ export const APP_RULES: readonly AppRule[] = [
     verify: 'Open a running subagent before it answers: its prompt shows.',
   },
   {
+    id: 'subagent-titles',
+    app: "Titles a subagent thread from its thread/started announcement: it shows the thread's name if it has one; otherwise it generates a title from the spawnAgent prompt of the parent (or the thread's preview) with a model turn of its own and saves it with thread/name/set. The agent's row in the parent is named by agentNickname, not by the title.",
+    adapter:
+      "Names every subagent thread when it announces it, and keeps the name: the Agent tool's description, a workflow agent's label (or the first line of its task, not the harness header in front of it), else the agent's type and the first line of its prompt, with whitespace collapsed and at most 120 characters.",
+    verify:
+      'Run a subagent and a workflow: their threads show the description or label at once, and the App sends no title turn for them.',
+  },
+  {
     id: 'nested-subagent',
     app: "Finds a child through the spawnAgent item of the conversation the child names as its parent (parentThreadId), and nests the child under that conversation's subagents.",
     adapter:

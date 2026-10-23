@@ -192,6 +192,7 @@ import {
   wrapMcpToolResult,
 } from './server-helpers.mjs'
 import { PINNED_SECTION_ID, type SessionStore, settledTurn } from './store.mjs'
+import { subagentThreadName } from './subagent-presentation.mjs'
 import {
   findOccurrences,
   forkTurns,
@@ -4886,6 +4887,16 @@ export class CodexClaudeAppServer {
             const agentPath = `${host?.agentPath ?? '/root'}/${agentNickname}`
             const agentRole = subType ?? 'general-purpose'
             const childStartedAt = nowSeconds()
+            // The child is named when it is announced: what the parent called
+            // the agent, else its type and the first line of its prompt. The
+            // App shows a subagent thread's name as its title and generates
+            // one only for a child announced without a name.
+            // App rule: subagent-titles
+            const childName = subagentThreadName({
+              description: event.input.description,
+              subType,
+              prompt: promptText,
+            })
             const childThread: ThreadRecord = {
               id: childThreadId,
               sessionId: thread.sessionId,
@@ -4895,7 +4906,7 @@ export class CodexClaudeAppServer {
               sectionEnteredAt: null,
               sectionPosition: null,
               preview: promptText.slice(0, 200),
-              name: null,
+              name: childName,
               archived: false,
               cwd: thread.cwd,
               // The subagent runs inside the parent's model process profile,
