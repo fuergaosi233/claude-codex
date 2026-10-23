@@ -425,10 +425,18 @@ export const APP_RULES: readonly AppRule[] = [
       'Run /compact in a chat whose conversation Claude Code refuses to compact: a row under the turn says why, and the turn completes.',
   },
   {
+    id: 'compaction-marker',
+    app: 'Draws a contextCompaction item as "Context compacted" once item/completed arrives or when it is stored in a turn, and an open one as compacting while its turn is in progress and as "Compaction interrupted" once the turn has ended.',
+    adapter:
+      'Stores a contextCompaction only when the compaction completes, in the place it started, as Codex keeps only finished compactions. A compaction an interrupt or a failed turn cuts short stays open, so it shows as interrupted until the chat is reopened, where it is gone.',
+    verify:
+      'Interrupt a long /compact: the item shows as interrupted, not compacted; let one finish: it shows as compacted, also after the chat is reopened.',
+  },
+  {
     id: 'item-completed-replaces',
     app: 'Replaces the item with the same id on item/completed, whatever type it started as.',
     adapter:
-      'Completes an image Read that fails or is stopped as its failed Read command in place of the imageView it started as.',
+      'Completes an image Read that fails or is stopped as its failed Read command in place of the imageView it started as, and a compaction Claude could not do while the turn went on as an empty reasoning item, which the App does not draw, in place of the contextCompaction it started as.',
     verify:
       'Ask Claude to read an image file that does not exist: the turn shows the failed Read, not an empty image.',
   },

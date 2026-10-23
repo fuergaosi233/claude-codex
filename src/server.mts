@@ -3388,7 +3388,8 @@ export class CodexClaudeAppServer {
       startedAt: nowSeconds(),
       completedAt: null,
       durationMs: null,
-      items: [compactItem],
+      // The compaction item joins the turn once it completes (compactThread).
+      items: [],
       diff: '',
       error: null,
     }
@@ -3439,9 +3440,14 @@ export class CodexClaudeAppServer {
     const threadId = thread.id
     const turnId = turn.id
     let compactOpen = true
+    // The turn keeps the item, first in it, only once it completes: the App
+    // draws a stored contextCompaction as compacted, and Codex keeps only
+    // the compactions that finished.
+    // App rule: compaction-marker
     const completeCompactItem = (): void => {
       if (!compactOpen) return
       compactOpen = false
+      this.store.insertItemAfter(turnId, null, compactItem)
       this.notify(peer, {
         method: 'item/completed',
         params: { threadId, turnId, item: compactItem, completedAtMs: nowMillis() },
@@ -4542,24 +4548,41 @@ export class CodexClaudeAppServer {
       openToolItems.clear()
     }
     // Claude compacting the conversation within the turn, on its own when
-    // the context fills up, shows as Codex's contextCompaction item. Like
-    // Codex's, a compaction an interrupt or a failed turn cuts short stays
-    // open, which the App shows as interrupted.
-    let compactionItemId: string | null = null
+    // the context fills up, shows as Codex's contextCompaction item. The turn
+    // keeps the item only once the compaction is done, in the place it
+    // started: the App draws a stored contextCompaction as compacted
+    // whatever became of it. Like Codex's, a compaction an interrupt or a
+    // failed turn cuts short stays open, which the App shows as interrupted.
+    // One that failed while the turn went on becomes an empty reasoning item,
+    // which the App does not draw, so nothing claims the context was
+    // compacted; the notice that it failed says what happened.
+    // App rule: compaction-marker
+    // App rule: item-completed-replaces
+    let compaction: { id: string; afterItemId: string | null } | null = null
     const startCompactionItem = (): void => {
-      if (compactionItemId) return
-      compactionItemId = newId()
-      const item: ThreadItem = { type: 'contextCompaction', id: compactionItemId }
-      this.store.appendItem(turn.id, item)
+      if (compaction) return
+      const items = this.store.getTurn(turn.id)?.items ?? []
+      compaction = { id: newId(), afterItemId: items.at(-1)?.id ?? null }
+      const item: ThreadItem = { type: 'contextCompaction', id: compaction.id }
       this.notify(peer, {
         method: 'item/started',
         params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: nowMillis() },
       })
     }
     const completeCompactionItem = (): void => {
-      if (!compactionItemId) return
-      const item: ThreadItem = { type: 'contextCompaction', id: compactionItemId }
-      compactionItemId = null
+      if (!compaction) return
+      const item: ThreadItem = { type: 'contextCompaction', id: compaction.id }
+      this.store.insertItemAfter(turn.id, compaction.afterItemId, item)
+      compaction = null
+      this.notify(peer, {
+        method: 'item/completed',
+        params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
+      })
+    }
+    const dropCompactionItem = (): void => {
+      if (!compaction) return
+      const item: ThreadItem = { type: 'reasoning', id: compaction.id, summary: [], content: [] }
+      compaction = null
       this.notify(peer, {
         method: 'item/completed',
         params: { threadId: thread.id, turnId: turn.id, item, completedAtMs: nowMillis() },
@@ -5533,6 +5556,7 @@ export class CodexClaudeAppServer {
               turnId: turn.id,
               message: event.message,
             })
+            dropCompactionItem()
             publishNotice(event.message)
             return
           }
@@ -5951,9 +5975,9 @@ export class CodexClaudeAppServer {
     }
     if (this.store.getTurn(turn.id)?.status === 'inProgress') {
       completeOpenToolItems('Claude finished the turn without a result for this tool.')
-      // A compaction that failed never reached its boundary; the turn
-      // went on without it and completes.
-      completeCompactionItem()
+      // A compaction that never reached its boundary failed; the turn went
+      // on without it, and the context was not compacted.
+      dropCompactionItem()
       this.finalizeOrphanedSubagents(peer, thread, turn, subagentContexts, activeSubagents)
     }
     this.subagentStateByTurn.delete(turn.id)
