@@ -4773,7 +4773,7 @@ export class CodexClaudeAppServer {
     const turnIsActive = (): boolean =>
       !this.stopped &&
       acceptRuntimeEvents &&
-      this.store.getTurn(turn.id)?.status === 'inProgress' &&
+      this.store.turnStatus(turn.id) === 'inProgress' &&
       this.activeTurnByThread.get(thread.id) === turn.id
     let resumedAtCheckpoint = false
     const runtimeTurn = this.runtime.runTurn(
@@ -6653,7 +6653,7 @@ export class CodexClaudeAppServer {
       if (event.agentId && callTaskKnown) return null
       agent = foreground ?? entry?.context ?? null
     }
-    if (!agent || this.store.getTurn(agent.childTurnId)?.status !== 'inProgress') return null
+    if (!agent || this.store.turnStatus(agent.childTurnId) !== 'inProgress') return null
     return agent
   }
 

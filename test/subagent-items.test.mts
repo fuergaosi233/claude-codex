@@ -923,6 +923,68 @@ test("every follower of the parent gets the subagent's work live, also one that 
   })
 })
 
+test("a subagent's block is written once, and no turn is read whole just for its status", async () => {
+  // Many agents may work at once, and every block of theirs is stored.
+  const blocks: SubagentOutput[] = [
+    { type: 'reasoning', text: 'Look first.' },
+    { type: 'text', text: 'Reading.' },
+    { type: 'tool_use', toolUseId: 'read-1', toolName: 'Read', input: { file_path: 'a.txt' } },
+    { type: 'tool_result', toolUseId: 'read-1', content: 'a', isError: false },
+  ]
+  const signal = () => {
+    let resolve: () => void = () => {}
+    const promise = new Promise<void>((done) => {
+      resolve = done
+    })
+    return { promise, resolve }
+  }
+  const send = signal()
+  const sent = signal()
+  const finish = signal()
+  const script: Script = async (context, handlers, tools) => {
+    await startAgent(context, handlers, tools, 'agent-1', 'task-1', 'survey the repo')
+    await send.promise
+    for (const output of blocks) await handlers.onEvent(out('agent-1', output, 'task-1'))
+    sent.resolve()
+    await finish.promise
+    await handlers.onEvent({ type: 'tool_result', toolUseId: 'agent-1', content: ANSWER })
+    await handlers.onEvent({ type: 'completed', success: true, result: 'done' })
+  }
+  await withServer(script, async ({ startThread, startTurn, waitFor }) => {
+    const threadId = await startThread()
+    await startTurn(threadId, 'survey the repo with an agent')
+    await waitFor(
+      (message) => message.method === 'turn/started' && message.params.threadId !== threadId,
+      'the child turn',
+    )
+    const calls = { getTurn: 0, upsertTurn: 0 }
+    const { getTurn, upsertTurn } = SessionStore.prototype
+    SessionStore.prototype.getTurn = function (this: SessionStore, id: string) {
+      calls.getTurn += 1
+      return getTurn.call(this, id)
+    }
+    SessionStore.prototype.upsertTurn = function (this: SessionStore, turn) {
+      calls.upsertTurn += 1
+      return upsertTurn.call(this, turn)
+    }
+    try {
+      send.resolve()
+      await sent.promise
+    } finally {
+      SessionStore.prototype.getTurn = getTurn
+      SessionStore.prototype.upsertTurn = upsertTurn
+      finish.resolve()
+    }
+    // One write per block, and one more for the message the call closes;
+    // each write reads the turn it changes, and nothing else does.
+    assert.deepEqual(calls, { getTurn: blocks.length + 1, upsertTurn: blocks.length + 1 })
+    await waitFor(
+      (message) => message.method === 'turn/completed' && message.params.threadId === threadId,
+      'the parent turn',
+    )
+  })
+})
+
 test('a child turn shows a bounded amount of work; its answer still shows', async () => {
   const extra = 5
   const long = 'x'.repeat(45_000)

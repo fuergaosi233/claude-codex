@@ -167,8 +167,15 @@ export class SubagentItems {
     })
   }
 
-  private startItem(peer: RpcPeer, state: ChildTurnState, item: ThreadItem): void {
-    this.host.store.appendItem(state.target.turnId, item)
+  // `stored` is the item as the deltas that follow leave it, so that a
+  // block that arrives whole is written once.
+  private startItem(
+    peer: RpcPeer,
+    state: ChildTurnState,
+    item: ThreadItem,
+    stored: ThreadItem = item,
+  ): void {
+    this.host.store.appendItem(state.target.turnId, stored)
     this.emit(peer, state, 'item/started', { item, startedAtMs: nowMillis() })
   }
 
@@ -205,16 +212,14 @@ export class SubagentItems {
     if (!this.reserve(state)) return
     const kept = capOutput(text, SUBAGENT_TEXT_LIMIT)
     const id = newId()
-    this.startItem(peer, state, {
+    const item: ThreadItem = {
       type: 'agentMessage',
       id,
       text: '',
       phase: null,
       memoryCitation: null,
-    })
-    this.updateItem(state, id, (item) =>
-      item.type === 'agentMessage' ? { ...item, text: kept } : item,
-    )
+    }
+    this.startItem(peer, state, item, { ...item, text: kept })
     this.emit(peer, state, 'item/agentMessage/delta', { itemId: id, delta: kept })
     state.message = {
       id,
@@ -251,19 +256,20 @@ export class SubagentItems {
     // App rule: reasoning-summary
     const visible = this.host.reasoningVisible()
     const id = newId()
-    this.startItem(peer, state, {
+    const item: ThreadItem = {
       type: 'reasoning',
       id,
-      summary: visible ? [''] : [],
-      content: visible ? [] : [''],
-    })
+      summary: visible ? [kept] : [],
+      content: visible ? [] : [kept],
+    }
+    this.startItem(
+      peer,
+      state,
+      { ...item, summary: visible ? [''] : [], content: visible ? [] : [''] },
+      item,
+    )
     if (visible)
       this.emit(peer, state, 'item/reasoning/summaryPartAdded', { itemId: id, summaryIndex: 0 })
-    const item = this.updateItem(state, id, (current) =>
-      current.type === 'reasoning'
-        ? { ...current, summary: visible ? [kept] : [], content: visible ? [] : [kept] }
-        : current,
-    )
     this.emit(
       peer,
       state,
