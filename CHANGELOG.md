@@ -861,10 +861,10 @@ versioning or publishing metadata.
   followers), keep the parent's output caps (other long text of a call is
   cut the same way, a diff at a line within 30,000 bytes), stop at 256 per
   child turn or once a child turn's items come to 2 MiB (the answer is
-  always kept whole), and a call still open when the child turn ends shows as failed, whichever way
-  it ends: the subagent stops or fails, either thread is interrupted (also
-  when the agent's task cannot be stopped), or the adapter stops or
-  restarts. An image being read when the adapter dies is the exception: it
+  always kept whole), and a call still open when the child turn ends shows
+  as failed, whichever way it ends: the subagent stops or fails, either
+  thread is interrupted (also when the agent's task cannot be stopped), or
+  the adapter stops or restarts. An image being read when the adapter dies is the exception: it
   shows as the image, as it does in the parent's own turns. The parent
   thread is unchanged.
   `CLAUDE_CODEX_SUBAGENT_ITEMS=0` keeps the previous prompt-and-answer view.
