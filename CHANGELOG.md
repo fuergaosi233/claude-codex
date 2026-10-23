@@ -753,7 +753,9 @@ versioning or publishing metadata.
   always kept whole), and a call still open when the child turn ends shows as failed, whichever way
   it ends: the subagent stops or fails, either thread is interrupted (also
   when the agent's task cannot be stopped), or the adapter stops or
-  restarts. The parent thread is unchanged.
+  restarts. An image being read when the adapter dies is the exception: it
+  shows as the image, as it does in the parent's own turns. The parent
+  thread is unchanged.
   `CLAUDE_CODEX_SUBAGENT_ITEMS=0` keeps the previous prompt-and-answer view.
 - Deleting a subagent's thread while the agent runs no longer fails the
   parent's turn with "FOREIGN KEY constraint failed" when the agent ends, or

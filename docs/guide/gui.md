@@ -523,7 +523,8 @@ lines are left out. One run of a subagent shows at most 256 pieces of work,
 and starts none once what it shows comes to 2 MiB; its answer always shows,
 whole and once. A call still running when the subagent's turn ends (stopped, interrupted from
 either thread, failed, or the adapter stopped or restarted) shows as failed,
-also after a reload. Deleting a subagent's thread while it runs drops its work
+also after a reload; an image being read when the adapter died shows as the
+image, as it does in the chat's own turns. Deleting a subagent's thread while it runs drops its work
 and leaves the parent's turn alone. Workflow agents, and subagents on backends
 other than the Agent SDK, show their prompt and answer only. Set
 `CLAUDE_CODEX_SUBAGENT_ITEMS=0` for the adapter to keep every subagent's
