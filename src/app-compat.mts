@@ -184,6 +184,14 @@ export const APP_RULES: readonly AppRule[] = [
     verify: 'Stop a running subagent; it shows as done, not failed.',
   },
   {
+    id: 'subagent-failure-reason',
+    app: "Shows a failed turn's error.message as an error row at the end of that turn, unless the turn holds an `error` item that will not be retried; it shows nothing for an interrupted turn's error. A spawnAgent or sendInput row adds the agent's agentsStates message after its status; a wait is never drawn and a closeAgent row shows no state.",
+    adapter:
+      "Ends a child that failed, was stopped or was ended with its parent with a turn error saying why: the CLI's error text without its tags, usage trailer or stack frames, a JSON error body told by its message, or what ended it. A workflow agent fails once the workflow's journal records it failed, with the error the workflow's progress reports for it, and an attempt the workflow ran again fails once the next attempt starts, saying the workflow ran the agent again. The same reason is the agent's agentsStates message on its wait and closeAgent items. A parent turn that fails after agents of its own failed adds how many and the first one's reason to its error.",
+    verify:
+      "Have a subagent fail (a workflow agent that stalls, or one whose tool call errors): its thread ends with an error row naming the cause, without stack frames, and the parent's failed turn says a subagent failed and why.",
+  },
+  {
     id: 'subagent-read',
     app: 'Reads a child for the subagent panel with thread/read includeTurns:false, and shows a child without turns as still loading.',
     adapter: 'Returns the turns of a subagent thread even when they are not asked for.',
@@ -194,6 +202,14 @@ export const APP_RULES: readonly AppRule[] = [
     app: 'Creates the child conversation from thread/started with an empty turn and takes its history as loaded while the child runs.',
     adapter: "Replays the child's prompt as an item lifecycle.",
     verify: 'Open a running subagent before it answers: its prompt shows.',
+  },
+  {
+    id: 'subagent-titles',
+    app: "Titles a subagent thread from its thread/started announcement: it shows the thread's name if it has one; otherwise it generates a title from the spawnAgent prompt of the parent (or the thread's preview) with a model turn of its own and saves it with thread/name/set. The agent's row in the parent is named by agentNickname, not by the title.",
+    adapter:
+      "Names every subagent thread when it announces it, and keeps the name: the Agent tool's description, a workflow agent's label (or the first line of its task, not the harness header in front of it), else the agent's type and the first line of its prompt, with whitespace collapsed and at most 120 characters.",
+    verify:
+      'Run a subagent and a workflow: their threads show the description or label at once, and the App sends no title turn for them.',
   },
   {
     id: 'nested-subagent',
@@ -266,11 +282,11 @@ export const APP_RULES: readonly AppRule[] = [
   },
   {
     id: 'model-menu-settings',
-    app: 'Applies a model picked from the menu of an open chat it has resumed with thread/settings/update (model, effort and multiAgentMode); in a new chat the pick only rides on the first turn/start. When the request fails it shows a “Couldn’t update model settings” toast, adding the error message only for code -32600, and puts the menu back. Only code -32601, or a message saying method not found, or unknown method or unknown variant next to the method name, counts as the server lacking the method.',
+    app: 'Applies a model picked from the menu of an open chat it has resumed with thread/settings/update (model, effort and multiAgentMode); in a new chat the pick only rides on the first turn/start. When the request fails it shows a “Couldn’t update model settings” toast and puts the menu back; only for code -32600 the toast adds “Check your config.toml.” with the error message and an Open config.toml button. Only code -32601, or a message saying method not found, or unknown method or unknown variant next to the method name, counts as the server lacking the method.',
     adapter:
-      "Refuses a model on the other backend from the chat's (a Codex model in a Claude chat, or a Claude model in a Codex chat unless the Codex proxy carries every thread) once the chat has a conversation, with a plain error raised before anything changes, so the menu goes back and the chat keeps its model. With model process profiles configured, a Claude chat with a conversation refuses another profile the same way, and a chat its profile can no longer run (the profile changed or went away, or the chat predates profiles) refuses any model. The chat's current model sent along with other settings is no change.",
+      "Refuses a model on the other backend from the chat's (a Codex model in a Claude chat, or a Claude model in a Codex chat unless the Codex proxy carries every thread) once the chat has a conversation, with an invalid-request error (-32600) raised before anything changes, so the toast gives the reason, the menu goes back and the chat keeps its model. With model process profiles configured, a Claude chat with a conversation refuses another profile the same way, and a chat its profile can no longer run (the profile changed or went away, or the chat predates profiles) refuses any model. Model process profiles that fail to load refuse a model change the same way, with a one-line reason that names the file or variable and quotes none of it. The chat's current model sent along with other settings is no change.",
     verify:
-      'With Codex models in the menu, pick one in a Claude chat that has a reply: a toast says the model settings could not be updated and the menu shows the Claude model again; another Claude model still applies.',
+      'With Codex models in the menu, pick one in a Claude chat that has a reply: a toast says the model settings could not be updated, with the reason, and the menu shows the Claude model again; another Claude model still applies.',
   },
   {
     id: 'reasoning-summary',
@@ -282,11 +298,11 @@ export const APP_RULES: readonly AppRule[] = [
   },
   {
     id: 'reconnecting-errors',
-    app: 'Shows an `error` notification with willRetry as a passing stream-error row in the turn that replaces the one before it, and reads the attempt count only from a message of the form "Reconnecting... n/m"; any other message shows as it is.',
+    app: 'Shows an `error` notification with willRetry as a passing stream-error row in the turn, and reads the attempt count only from a message of the form "Reconnecting... n/m"; such a row replaces a Reconnecting row right before it, and any other message shows as it is, in a row of its own (see turn-notices).',
     adapter:
-      'Turns each retry the Claude CLI reports for a chat\'s main loop (system/api_retry) into an `error` with willRetry, the message "Reconnecting... n/m" and the HTTP status and wait in additionalDetails, and does not store it, as Codex does not. Retries inside a subagent or a structured-output helper turn show nothing.',
+      "Turns each retry the Claude CLI reports for a chat's main loop (system/api_retry) into an `error` with willRetry, the message \"Reconnecting... n/m\" and the HTTP status and wait in additionalDetails, and does not store it, as Codex does not. A foreground subagent's retry, which the CLI reports as its Agent call's tool_progress with subagent_retry, shows the same way in that subagent's thread while its turn runs, and never in the parent (the CLI reports none for a background agent); retries in a structured-output helper turn show nothing.",
     verify:
-      'Point the adapter at an API that answers 529 for a while: the turn shows "Reconnecting 1/10", counting up, and then the reply.',
+      'Point the adapter at an API that answers 529 for a while: the turn shows "Reconnecting 1/10", counting up, and then the reply; a foreground subagent running then shows its own retries in its thread.',
   },
   {
     id: 'error-codes',
@@ -417,10 +433,26 @@ export const APP_RULES: readonly AppRule[] = [
       'With approvals on, have Claude run `cat README.md && touch x`: the card shows the whole command.',
   },
   {
+    id: 'turn-notices',
+    app: 'Shows an `error` notification with willRetry as a dim row of its own under the turn it names, with its message as written, whether that turn still runs or has ended, without failing or ending the turn; only a "Reconnecting... n/m" message replaces the row before it. It does not keep the row when the chat is reopened, and it ignores `warning` notifications.',
+    adapter:
+      "Sends what Claude Code reports beside a turn (a compaction it could not do, a model it switched to, an urgent CLI notification, a call it denied or an MCP request it declined while no turn was running) as a `warning`, as Codex does, and as such an `error` with no code: each message once per turn, the first 5 as rows. A notice between turns goes under the thread's running or last turn. A turn that then fails repeats its notices in the error's additionalDetails, stored with the turn, which the App shows only in a diagnostics view it does not always offer. A structured-output helper turn sends warnings only, and CLAUDE_CODEX_NOTICE_ROWS=0 turns the rows off.",
+    verify:
+      'Have a background task call a tool that needs approval after the turn ended: a row under the last turn says the call was denied and how to run it again, and the turn stays completed.',
+  },
+  {
+    id: 'compaction-marker',
+    app: 'Draws a contextCompaction item as "Context compacted" once item/completed arrives or when it is stored in a turn, and an open one as compacting while its turn is in progress and as "Compaction interrupted" once the turn has ended.',
+    adapter:
+      'Stores a contextCompaction only when the compaction completes, in the place it started, as Codex keeps only finished compactions. A compaction an interrupt or a failed turn cuts short stays open, so it shows as interrupted until the chat is reopened, where it is gone. A /compact Claude Code could not do is neither stored nor completed as a contextCompaction (see item-completed-replaces), and sends no thread/compacted.',
+    verify:
+      'Interrupt a long /compact: the item shows as interrupted, not compacted; let one finish: it shows as compacted, also after the chat is reopened; one Claude Code refuses shows its notice row and the summary, and no "Context compacted".',
+  },
+  {
     id: 'item-completed-replaces',
     app: 'Replaces the item with the same id on item/completed, whatever type it started as.',
     adapter:
-      'Completes an image Read that fails or is stopped as its failed Read command in place of the imageView it started as.',
+      'Completes an image Read that fails or is stopped as its failed Read command in place of the imageView it started as, and a compaction Claude could not do, while the turn went on or for a /compact, as an empty reasoning item, which the App does not draw, in place of the contextCompaction it started as.',
     verify:
       'Ask Claude to read an image file that does not exist: the turn shows the failed Read, not an empty image.',
   },

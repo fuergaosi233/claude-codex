@@ -99,14 +99,66 @@ const DEFAULT_INHERITED_ENV = [
   'FORCE_COLOR',
 ]
 
+// The longest message a profiles configuration that fails to load fails with.
+const LOAD_ERROR_MAX_LENGTH = 300
+const SOURCE_PATH_MAX_LENGTH = 80
+
+// A configuration that fails to load fails every request that needs it, and
+// the App shows the message: a model change answers it as an invalid request,
+// whose message the model menu's toast quotes. So it names the source and
+// says what is wrong in one short line, and never quotes the configuration,
+// which sits next to provider credentials.
 export function loadClaudeModelProfiles(env: Environment = process.env): ClaudeModelProfile[] {
+  try {
+    return parseClaudeModelProfiles(env)
+  } catch (error) {
+    throw new Error(modelProfilesLoadError(env, error))
+  }
+}
+
+function modelProfilesLoadError(env: Environment, error: unknown): string {
+  const fileValue = oneLine(env.CLAUDE_CODEX_MODEL_PROFILES_FILE ?? '')
+  const inlineValue = (env.CLAUDE_CODEX_MODEL_PROFILES ?? '').trim()
+  // Both set is the error itself, which names them.
+  const source =
+    fileValue && inlineValue
+      ? ''
+      : fileValue
+        ? ` from ${clipStart(fileValue, SOURCE_PATH_MAX_LENGTH)} (CLAUDE_CODEX_MODEL_PROFILES_FILE)`
+        : ' from CLAUDE_CODEX_MODEL_PROFILES'
+  const message = `cannot load Claude model profiles${source}: ${loadFailureReason(error)}`
+  return clipEnd(message, LOAD_ERROR_MAX_LENGTH)
+}
+
+// A file system error's own message ends with the path, which the message
+// already names.
+function loadFailureReason(error: unknown): string {
+  const code = (error as { code?: unknown } | null)?.code
+  if (typeof code !== 'string') return oneLine(errorMessage(error))
+  if (code === 'ENOENT') return 'the file does not exist'
+  if (code === 'EACCES' || code === 'EPERM') return 'permission denied'
+  if (code === 'ENOTDIR') return 'part of the path is not a folder'
+  return `cannot read the file (${code})`
+}
+
+// JSON.parse quotes the text around a syntax error (`Unexpected token 'x',
+// ..."ls": [x, "y"]"... is not valid JSON`): keep what comes before the
+// quote. Its other messages give a position and quote nothing.
+function jsonSyntaxReason(error: unknown): string {
+  const message = oneLine(errorMessage(error))
+  const quote = message.indexOf('"')
+  const reason = (quote < 0 ? message : message.slice(0, quote)).replace(/[\s,.]+$/, '')
+  return reason || 'not valid JSON'
+}
+
+function parseClaudeModelProfiles(env: Environment): ClaudeModelProfile[] {
   const source = modelProfilesSource(env)
   if (!source) return []
   let parsed: unknown
   try {
     parsed = JSON.parse(source.text)
   } catch (error) {
-    throw new Error(`invalid Claude model profiles JSON: ${errorMessage(error)}`)
+    throw new Error(`invalid Claude model profiles JSON: ${jsonSyntaxReason(error)}`)
   }
   const root = asRecord(parsed)
   const entries = Array.isArray(parsed) ? parsed : root?.models
@@ -119,8 +171,11 @@ export function loadClaudeModelProfiles(env: Environment = process.env): ClaudeM
     const record = asRecord(entry)
     if (!record) throw new Error(`Claude model profile at index ${index} must be an object`)
     const id = requiredString(record.id, `Claude model profile at index ${index} requires id`)
+    // Not quoted: whatever was put there is no id.
     if (!MODEL_PROFILE_ID.test(id)) {
-      throw new Error(`invalid Claude model profile id: ${id}`)
+      throw new Error(
+        `invalid Claude model profile id at index ${index}: use letters, digits, '.', '_' and '-', at most 128 characters`,
+      )
     }
     if (seen.has(id)) throw new Error(`duplicate Claude model profile id: ${id}`)
     seen.add(id)
@@ -155,7 +210,8 @@ export function loadClaudeModelProfiles(env: Environment = process.env): ClaudeM
     }
   })
   if (defaultModel && !seen.has(defaultModel)) {
-    throw new Error(`Claude model profiles defaultModel is unknown: ${defaultModel}`)
+    const named = MODEL_PROFILE_ID.test(defaultModel) ? `: ${defaultModel}` : ''
+    throw new Error(`Claude model profiles defaultModel is unknown${named}`)
   }
   if (!profiles.some((profile) => profile.isDefault)) {
     const first = profiles[0]
@@ -421,17 +477,18 @@ function assertPrivateEnvMetadata(stat: Stats, path: string): void {
   }
 }
 
+// The load error names the file.
 function assertControlledConfigFile(path: string): void {
   const stat = lstatSync(path)
   if (stat.isSymbolicLink()) {
-    throw new Error(`model profiles config must not be a symbolic link: ${path}`)
+    throw new Error('model profiles config must not be a symbolic link')
   }
-  if (!stat.isFile()) throw new Error(`model profiles config must be a regular file: ${path}`)
+  if (!stat.isFile()) throw new Error('model profiles config must be a regular file')
   if ((stat.mode & 0o022) !== 0) {
-    throw new Error(`model profiles config must not be group or world writable: ${path}`)
+    throw new Error('model profiles config must not be group or world writable')
   }
   if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
-    throw new Error(`model profiles config must be owned by the current user: ${path}`)
+    throw new Error('model profiles config must be owned by the current user')
   }
 }
 
@@ -553,4 +610,16 @@ function optionalString(value: unknown): string {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+function oneLine(text: string): string {
+  return text.replace(/\s+/g, ' ').trim()
+}
+
+function clipStart(text: string, max: number): string {
+  return text.length > max ? `…${text.slice(text.length - max + 1)}` : text
+}
+
+function clipEnd(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text
 }

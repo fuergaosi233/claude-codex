@@ -2,6 +2,14 @@ import { constants } from 'node:fs'
 import { lstat, open, realpath } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, isAbsolute, join, normalize, resolve, sep } from 'node:path'
+import {
+  clipText,
+  collapseWhitespace,
+  firstPromptLine,
+  isRelayedUserRequest,
+  SUBAGENT_NAME_MAX_CHARS,
+  workflowAgentPrompt,
+} from './subagent-presentation.mjs'
 import { isPathInside } from './util.mjs'
 
 export interface WorkflowLaunchInfo {
@@ -31,17 +39,39 @@ interface WorkflowJournalMonitorOptions {
   onStarted: (agent: WorkflowJournalAgentStart) => Promise<void>
   onResult: (agent: WorkflowJournalAgentResult) => Promise<void>
   onError?: (error: Error) => Promise<void> | void
+  // Why an agent failed, once the workflow has said so. The journal only
+  // records that it failed.
+  failureReason?: (agentId: string) => string | null | undefined
+  // How long an agent that failed waits for that reason before it ends
+  // without one.
+  failureReasonWaitMs?: number
 }
 
 interface WorkflowJournalEntry {
-  type: 'started' | 'result'
+  type: 'started' | 'result' | 'failed'
   agentId: string
+  // The script call the agent runs for. Each attempt at it (a retry after a
+  // stall, say) starts a new agent under the same key.
+  key?: string
   result?: unknown
+  // The name the workflow script gave the agent (its `label`), which the CLI
+  // writes on the agent's started line: the script's own label, else one it
+  // makes from the prompt.
+  label?: string
 }
+
+// Why a workflow agent ended without a result, when the workflow gave no
+// reason.
+export const WORKFLOW_AGENT_FAILED = 'The workflow agent failed without saying why.'
+export const WORKFLOW_AGENT_RETRIED =
+  'This attempt ended without a result; the workflow ran the agent again.'
 
 const MAX_WORKFLOW_JOURNAL_BYTES = 8 * 1024 * 1024
 const MAX_WORKFLOW_AGENT_TRANSCRIPT_BYTES = 4 * 1024 * 1024
 const WORKFLOW_DRAIN_SETTLE_MS = 500
+// The CLI journals a failure and reports its reason separately, in the
+// workflow's progress; either can arrive first.
+const WORKFLOW_FAILURE_REASON_WAIT_MS = 2_000
 
 export function defaultWorkflowTranscriptRoots(
   env: NodeJS.ProcessEnv = process.env,
@@ -99,8 +129,14 @@ export class WorkflowJournalMonitor {
   private readonly onStarted: WorkflowJournalMonitorOptions['onStarted']
   private readonly onResult: WorkflowJournalMonitorOptions['onResult']
   private readonly onError: WorkflowJournalMonitorOptions['onError']
+  private readonly failureReason: WorkflowJournalMonitorOptions['failureReason']
+  private readonly failureReasonWaitMs: number
   private readonly startedAgentIds = new Set<string>()
   private readonly completedAgentIds = new Set<string>()
+  // Agents that ended without a result, by when that was first seen.
+  private readonly endedWithoutResult = new Map<string, number>()
+  // The workflow is over: what it has not said by now, it will not say.
+  private settling = false
   private timer: NodeJS.Timeout | null = null
   private pollPromise: Promise<void> | null = null
   private verifiedTranscriptDir: string | null = null
@@ -114,6 +150,11 @@ export class WorkflowJournalMonitor {
     this.onStarted = options.onStarted
     this.onResult = options.onResult
     this.onError = options.onError
+    this.failureReason = options.failureReason
+    this.failureReasonWaitMs = Math.max(
+      0,
+      options.failureReasonWaitMs ?? WORKFLOW_FAILURE_REASON_WAIT_MS,
+    )
   }
 
   start(): void {
@@ -149,6 +190,7 @@ export class WorkflowJournalMonitor {
   }
 
   async drain(timeoutMs = 500): Promise<void> {
+    this.settling = true
     const deadline = Date.now() + Math.max(0, timeoutMs)
     let stableSince = Date.now()
     let lastStarted = this.startedAgentIds.size
@@ -197,13 +239,48 @@ export class WorkflowJournalMonitor {
     if (!transcriptDir || !this.isCurrent(generation)) return
     const entries = await readJournalEntries(join(transcriptDir, 'journal.jsonl'), transcriptDir)
     if (!this.isCurrent(generation)) return
+    const labels = new Map<string, string>()
+    // The latest attempt at each script call, and the agents the journal
+    // says ended.
+    const latestAttempts = new Map<string, string>()
+    const ended = new Set<string>()
+    for (const entry of entries) {
+      if (entry.type !== 'started') {
+        ended.add(entry.agentId)
+        continue
+      }
+      if (entry.label && !labels.has(entry.agentId)) labels.set(entry.agentId, entry.label)
+      if (entry.key) latestAttempts.set(entry.key, entry.agentId)
+    }
     for (const entry of entries) {
       if (!this.isCurrent(generation)) return
-      const started = await this.ensureStarted(transcriptDir, entry.agentId, generation)
+      const started = await this.ensureStarted(
+        transcriptDir,
+        entry.agentId,
+        generation,
+        labels.get(entry.agentId),
+      )
       if (!this.isCurrent(generation)) return
-      if (!started) continue
-      if (entry.type !== 'result' || this.completedAgentIds.has(entry.agentId)) continue
-      const result = await workflowAgentResult(transcriptDir, entry.agentId, entry.result)
+      if (!started || this.completedAgentIds.has(entry.agentId)) continue
+      let result: WorkflowJournalAgentResult | null
+      if (entry.type === 'result') {
+        result = await workflowAgentResult(transcriptDir, entry.agentId, entry.result)
+      } else if (entry.type === 'failed') {
+        result = this.failedResult(entry.agentId, WORKFLOW_AGENT_FAILED)
+      } else if (
+        entry.key &&
+        latestAttempts.get(entry.key) !== entry.agentId &&
+        !ended.has(entry.agentId)
+      ) {
+        // A later attempt at the same call started: this one is over, and
+        // nothing else will say so. Its reason does not come either: Claude
+        // Code reports the stalled attempt's error and the next attempt's
+        // start together and keeps only the latest state of each call, so
+        // there is nothing to wait for.
+        result = this.failedResult(entry.agentId, WORKFLOW_AGENT_RETRIED, false)
+      } else {
+        continue
+      }
       if (!result || !this.isCurrent(generation)) continue
       await this.onResult(result)
       if (!this.isCurrent(generation)) return
@@ -211,10 +288,30 @@ export class WorkflowJournalMonitor {
     }
   }
 
+  // The failed result of an agent that ended without one, with the reason the
+  // workflow gave. Null while that reason may still come, unless `wait` is
+  // false.
+  private failedResult(
+    agentId: string,
+    fallback: string,
+    wait = true,
+  ): WorkflowJournalAgentResult | null {
+    const reason = collapseWhitespace(this.failureReason?.(agentId) ?? '')
+    if (!reason && wait && !this.settling) {
+      const now = Date.now()
+      const since = this.endedWithoutResult.get(agentId) ?? now
+      this.endedWithoutResult.set(agentId, since)
+      if (now - since < this.failureReasonWaitMs) return null
+    }
+    this.endedWithoutResult.delete(agentId)
+    return { agentId, content: `${reason || fallback}\nagentId: ${agentId}`, isError: true }
+  }
+
   private async ensureStarted(
     transcriptDir: string,
     agentId: string,
     generation: number,
+    label: string | undefined,
   ): Promise<boolean> {
     if (this.startedAgentIds.has(agentId)) return true
     const prompt = await readAgentPrompt(transcriptDir, agentId)
@@ -222,7 +319,7 @@ export class WorkflowJournalMonitor {
     await this.onStarted({
       agentId,
       prompt,
-      description: workflowAgentDescription(prompt, agentId),
+      description: workflowAgentDescription(prompt, agentId, label),
     })
     if (!this.isCurrent(generation)) return false
     this.startedAgentIds.add(agentId)
@@ -262,6 +359,49 @@ export class WorkflowJournalMonitor {
 
   private isCurrent(generation: number): boolean {
     return !this.stopped && !this.failure && this.generation === generation
+  }
+}
+
+// Why a workflow's agents failed, from the workflow's progress reports
+// (task_progress.workflow_progress): each entry is the latest state of one
+// script call (its index), and an error state says why the attempt failed.
+// The attempt's agentId comes with it, except for an error the call threw
+// once its attempts were over (stalled on every one, say); that error is the
+// call's own, and so its last attempt's. The error of an attempt the call
+// runs again never shows: the next attempt's start comes in the same report
+// and replaces it.
+export class WorkflowAgentFailures {
+  private readonly agentErrors = new Map<string, string>()
+  private readonly callErrors = new Map<number, string>()
+  // The last attempt seen at each call, and the call of each attempt.
+  private readonly lastAttempts = new Map<number, string>()
+  private readonly agentCalls = new Map<string, number>()
+
+  note(progress: unknown): void {
+    if (!Array.isArray(progress)) return
+    for (const value of progress) {
+      const entry = recordOrNull(value)
+      if (entry?.type !== 'workflow_agent') continue
+      const agentId = stringValue(entry.agentId)
+      const index = Number.isSafeInteger(entry.index) ? (entry.index as number) : null
+      const error = entry.state === 'error' ? collapseWhitespace(stringValue(entry.error)) : ''
+      if (agentId && error) this.agentErrors.set(agentId, error)
+      if (index === null) continue
+      if (agentId) {
+        this.lastAttempts.set(index, agentId)
+        this.agentCalls.set(agentId, index)
+      }
+      if (error) this.callErrors.set(index, error)
+      else this.callErrors.delete(index)
+    }
+  }
+
+  reason(agentId: string): string | null {
+    const own = this.agentErrors.get(agentId)
+    if (own) return own
+    const index = this.agentCalls.get(agentId)
+    if (index === undefined || this.lastAttempts.get(index) !== agentId) return null
+    return this.callErrors.get(index) ?? null
   }
 }
 
@@ -306,11 +446,17 @@ async function readJournalEntries(
     if (!entry) continue
     const type = String(entry.type ?? '')
     const agentId = stringValue(entry.agentId)
-    if ((type !== 'started' && type !== 'result') || !isWorkflowAgentId(agentId)) continue
+    if (type !== 'started' && type !== 'result' && type !== 'failed') continue
+    // A call that failed before its agent started has no agent to end.
+    if (!isWorkflowAgentId(agentId)) continue
+    const key = stringValue(entry.key)
+    const label = type === 'started' ? collapseWhitespace(stringValue(entry.label)) : ''
     entries.push({
       type,
       agentId,
+      ...(key ? { key } : {}),
       ...(type === 'result' ? { result: entry.result } : {}),
+      ...(label ? { label } : {}),
     })
   }
   return entries
@@ -324,6 +470,9 @@ async function readAgentPrompt(transcriptDir: string, agentId: string): Promise<
   )
   if (text === null) return null
 
+  // The messages the agent was started with come before its first reply.
+  const userMessages: string[] = []
+  let replied = false
   for (const line of text.split('\n')) {
     if (!line.trim()) continue
     let parsed: unknown
@@ -334,11 +483,19 @@ async function readAgentPrompt(transcriptDir: string, agentId: string): Promise<
     }
     const record = recordOrNull(parsed)
     const message = recordOrNull(record?.message)
+    if (message?.role === 'assistant') {
+      replied = true
+      break
+    }
     if (message?.role !== 'user') continue
     const prompt = messageText(message.content)
-    if (prompt) return prompt
+    if (prompt) userMessages.push(prompt)
   }
-  return null
+  // The relayed user request comes first, the computed task right after it.
+  // Until the task is there too (and the agent has not answered), wait for it
+  // rather than show the relay as the agent's prompt.
+  if (!replied && userMessages.length > 0 && userMessages.every(isRelayedUserRequest)) return null
+  return workflowAgentPrompt(userMessages)
 }
 
 async function readRegularTextFile(
@@ -443,12 +600,15 @@ async function readAgentResult(transcriptDir: string, agentId: string): Promise<
   return finalText || null
 }
 
-function workflowAgentDescription(prompt: string, agentId: string): string {
-  const firstLine = prompt
-    .split('\n')
-    .map((line) => line.trim())
-    .find(Boolean)
-  return (firstLine || `Workflow agent ${agentId}`).slice(0, 120)
+// What the agent is called in the App: the workflow's label for it, else the
+// first line of its task.
+export function workflowAgentDescription(
+  prompt: string,
+  agentId: string,
+  label?: string | null,
+): string {
+  const name = collapseWhitespace(label ?? '') || firstPromptLine(prompt)
+  return clipText(name || `Workflow agent ${agentId}`, SUBAGENT_NAME_MAX_CHARS)
 }
 
 function resultText(value: unknown): string {

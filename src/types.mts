@@ -672,8 +672,12 @@ export type RuntimeEvent =
   // where a rewind back to that turn resumes.
   | { type: 'checkpoint'; claudeSessionId: string; messageUuid: string }
   // A new top-level model response is beginning, not a streamed content block.
-  | { type: 'message_boundary' }
-  | { type: 'text_delta'; delta: string }
+  // `failedRequest` marks this boundary, and the text and usage that follow
+  // it, of the message Claude Code writes for a model request that failed for
+  // good (its text names the error): they show, but are no sign Claude got on
+  // with the turn.
+  | { type: 'message_boundary'; failedRequest?: boolean }
+  | { type: 'text_delta'; delta: string; failedRequest?: boolean }
   | { type: 'reasoning_delta'; delta: string }
   | {
       type: 'tool_use'
@@ -703,6 +707,14 @@ export type RuntimeEvent =
       // Claude Code's structured tool result (e.g. Agent `async_launched`,
       // SendMessage `resumedAgentId`) when the backend exposes it.
       structured?: Record<string, unknown> | null
+      // The runtime closed this agent's call because the turn is ending (it
+      // failed, was interrupted or stopped, or its session closed while the
+      // agent ran), not because the agent finished: the agent ends with the
+      // turn, for the turn's reason.
+      endedWithTurn?: boolean
+      // The agent's last word was a request of its that failed for good: the
+      // result tells of that failure, and is no sign the turn got on.
+      failedRequest?: boolean
     }
   | {
       type: 'permission_request'
@@ -760,6 +772,9 @@ export type RuntimeEvent =
       preTokens: number | null
       postTokens: number | null
     }
+  // Claude could not compact the conversation; `message` says so and why.
+  // The history stays as it was.
+  | { type: 'compaction_failed'; message: string }
   // A plan-mode turn's finished plan: the text Claude handed to ExitPlanMode.
   // The App shows it as the turn's plan card and offers to implement it.
   | { type: 'proposed_plan'; toolUseId: string; text: string }
@@ -773,12 +788,24 @@ export type RuntimeEvent =
     }
   // One API call of the main loop, before the turn's result settles its
   // usage. A message can be reported again with a larger count.
-  | { type: 'usage_progress'; messageId: string; usage: Record<string, unknown> }
+  | {
+      type: 'usage_progress'
+      messageId: string
+      usage: Record<string, unknown>
+      failedRequest?: boolean
+    }
   // A subagent or workflow the turn waits on is still working: its own
   // output, a task progress frame or a tool_progress heartbeat, which a
   // backend that filters nested events would otherwise keep to itself.
-  // `toolUseId` is the call that started it.
-  | { type: 'subagent_progress'; toolUseId: string }
+  // `toolUseId` is the call that started it. `idle` marks a frame that keeps
+  // the turn alive but tells of none of the agent's work: a request of its
+  // that failed, the CLI's timer tick for a call that still runs, and the
+  // like (see the native runtime's subagentFrame).
+  | {
+      type: 'subagent_progress'
+      toolUseId: string
+      idle?: boolean
+    }
   | {
       type: 'metrics'
       durationMs: number | null
@@ -806,9 +833,11 @@ export type RuntimeEvent =
     }
   // Claude's auto-memory recalled these memories for the prompt.
   | { type: 'memory_recall'; memories: RecalledMemory[] }
-  // A model request of the main loop failed and Claude will send it again
-  // after `delayMs`. `status` is the API's HTTP status (null when nothing
-  // answered) and `category` the SDK's error category ('overloaded', ...).
+  // A model request failed and Claude will send it again after `delayMs`.
+  // `status` is the API's HTTP status (null when nothing answered) and
+  // `category` the SDK's error category ('overloaded', ...). `toolUseId` is
+  // the Agent call of the subagent whose request it was, and `agentId` that
+  // subagent's task id; without either the request was the main loop's.
   | {
       type: 'retrying'
       attempt: number
@@ -816,6 +845,8 @@ export type RuntimeEvent =
       status: number | null
       category: string | null
       delayMs: number | null
+      toolUseId?: string
+      agentId?: string
     }
   | {
       type: 'completed'
@@ -1018,6 +1049,9 @@ export interface RuntimeBackgroundListener {
   // The thread's live session ended. `liveTaskIds` are the background tasks
   // it still tracked as running; nothing will report on them any more.
   onSessionReleased(threadId: string, liveTaskIds: string[]): void
+  // Something the user should hear about that happened while no turn of the
+  // thread was running, such as a tool call refused for want of one.
+  onNotice?(threadId: string, message: string): void
 }
 
 export interface RuntimeSteerOptions {
@@ -1101,7 +1135,8 @@ export interface ClaudeRuntime {
   // turn starts a new one: the thread's history was rewound or deleted.
   resetSession?(threadId: string): void
   // True when a turn whose prompt is `/compact` compacts the Claude session
-  // it resumes, reporting it with compaction_started / compaction_completed.
+  // it resumes, reporting it with compaction_started / compaction_completed
+  // (compaction_failed when Claude could not).
   compactsSessions?(): boolean
   // The MCP config was reloaded. Sessions still open retry their MCP servers
   // that failed or wait for a sign-in; a session opened later reads the

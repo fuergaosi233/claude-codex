@@ -1357,6 +1357,19 @@ export class SessionStore {
     return turn
   }
 
+  // Puts the item right after afterItemId: first when that is null, last when
+  // the turn has no such item.
+  insertItemAfter(turnId: string, afterItemId: string | null, item: ThreadItem): TurnRecord | null {
+    const turn = this.getTurn(turnId)
+    if (!turn) return null
+    const index =
+      afterItemId === null ? 0 : turn.items.findIndex((entry) => entry.id === afterItemId) + 1
+    if (afterItemId !== null && index === 0) turn.items.push(jsonClone(item))
+    else turn.items.splice(index, 0, jsonClone(item))
+    this.upsertTurn(turn)
+    return turn
+  }
+
   updateItem(
     turnId: string,
     itemId: string,

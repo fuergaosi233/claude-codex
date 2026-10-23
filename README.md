@@ -383,14 +383,17 @@ Subagent threads. While a local workflow runs, the adapter tails its journal and
 inner agent through Codex's native `subAgentActivity` lifecycle (with `completed` sent only to
 clients that advertise it) plus `spawnAgent`/`wait` tool state; runtimes without journal metadata
 fall back to one aggregate workflow agent when the workflow reaches a terminal state.
+Each inner agent's thread is named by its workflow label (else the first line of its task).
 A bare `/workflows` lists workflow runs
 recorded in the current Codex thread.
 
 A turn waiting on a subagent or workflow gives up only after it has heard nothing from it for
 `CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS` (default 30 minutes; `0` never gives up). Any sign of life
 (the agent's output or tool heartbeats, task progress, a workflow agent starting or finishing)
-starts that wait over, so a long but healthy workflow runs to the end. When it does give up, the
-turn fails and its stuck agents stop; background agents it handed off keep running. See the
+starts that wait over, so a long but healthy workflow runs to the end. The wait is paused while
+the turn waits on the user, and time the computer spends asleep does not count. When it does
+give up, the turn fails and its stuck agents stop; background agents it handed off keep
+running. See the
 [configuration reference](https://fuergaosi233.github.io/claude-codex/guide/configuration#reference-table).
 
 This compatibility layer is specific to the native Claude Agent SDK backend. Alternate HTTP,

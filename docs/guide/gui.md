@@ -91,7 +91,9 @@ request on its own. With the default native backend, each retry shows in the
 turn as Codex shows a stream retry: a passing **Reconnecting 1/10** row that
 counts up and leaves once Claude answers, with the HTTP status and the wait
 under it. Like Codex, the adapter does not store these rows, so they are gone
-when the chat is reopened. Retries inside a subagent do not show.
+when the chat is reopened. A foreground subagent's retries show the same way
+in the subagent's own thread while it runs, never in the parent chat; Claude
+Code does not report a background agent's retries.
 
 A turn that fails tells the App why, with the error code Codex would send:
 the context window is full, the server is busy (HTTP 529), a rate limit, a bad
@@ -114,10 +116,75 @@ credentials. The adapter asks the CLI to report every startup failure this
 way by setting `CLAUDE_CODE_STARTUP_FAILURE_RESULTS=1`; a value in the
 adapter's environment takes its place.
 
-Notices the Claude CLI would show an interactive user at once, such as a
-failed compaction, go out as `warning` notifications, each once a turn. The
-Codex App opts out of `warning` notifications in `initialize`, as it does with
-Codex, so it does not show them; other clients do get them.
+### Sleep
+
+Most failed connections on a laptop come from the computer going to sleep
+during a turn, which breaks Claude's connection to the model. When a turn
+fails after the computer slept for a minute or more since Claude last made
+progress in it, its error says so: roughly how long the computer slept, and
+that a message, or **Continue**, picks up where Claude left off. A sleep the
+turn went on from (Claude, or a subagent, wrote or ran something after waking;
+retries, heartbeats and an agent that failed on its own request do not count)
+is not blamed, and neither is an API that answered, for example as overloaded
+or over a limit. On macOS it also points to the App's
+**Settings > General > Prevent sleep while running**, which does not stop
+sleep with the lid closed (the App does not offer it on Windows). The error
+keeps its code and details.
+
+To have the adapter keep a Mac awake itself while Claude works, start it with
+`CLAUDE_CODEX_PREVENT_IDLE_SLEEP=1`: it then holds `caffeinate -i` while any
+turn, background agent or other background work runs, and lets go once nothing
+does. A command Claude runs in the background with Bash counts as background
+work, so a dev server or file watcher keeps the Mac awake until its Claude
+session closes, `CLAUDE_CODEX_BACKGROUND_IDLE_MS` (default 2 hours) after the
+session's last message. Closing the lid still sleeps. It is off by default and
+does nothing on other platforms.
+
+A turn waiting on a subagent or workflow does not fail because the computer
+slept, or while it waits on you for an approval, an answer, an MCP form or an
+App tool call: the `CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS` wait starts over after
+either.
+
+### Notices
+
+Notices the Claude CLI would show an interactive user at once show as a dim
+row under the turn, which goes on: a compaction Claude Code could not do, a
+switch to a fallback model, an urgent CLI notification, or a call refused
+while no turn was running. Each message shows once a turn, and a turn shows
+at most five. The App does not keep these rows when the chat is reopened. A
+turn that then fails repeats its notices in its error's details, which are
+stored with the turn and returned by `thread/read`, but the App shows those
+details only in an error diagnostics view it does not always offer.
+
+The adapter sends each notice as an `error` notification with `willRetry` and
+no error code, which the App draws as such a row without failing the turn,
+and also as a `warning`, as Codex does, for other clients (the App opts out of
+`warning` notifications in `initialize`). `CLAUDE_CODEX_NOTICE_ROWS=0` sends
+the warning alone. Title and other helper turns send warnings only.
+
+### Calls between turns
+
+A background agent, a workflow or a cron job can call a tool that needs your
+approval, ask for your input through an MCP server, or call an App tool after
+your turn has ended. With no turn running there is nowhere to ask, so the
+request is turned down, as before, but not silently. A tool call or an App
+tool call is refused, and Claude is told no user turn was active and that you
+can run it again in a turn. An MCP server's request for your input is
+declined: the server gets only a plain decline, so what Claude hears of it is
+up to that server. In every case a notice row under the chat's running or
+last turn says what was turned down. Nothing is queued; ask Claude to run it
+again in a new message.
+
+### Request errors
+
+A request you can put right, such as a model the chat cannot take, an unknown
+chat or a bad parameter, fails with the JSON-RPC code `-32600` (invalid
+request), as Codex answers an unknown chat, and its message says why. Picking
+a Codex model in a Claude chat that has a reply, for example, shows the
+**Couldn't update model settings** toast with the reason (below the App's own
+"Check your config.toml." line, which the App adds to every such error), and
+the menu goes back to the Claude model.
+A failure inside the adapter stays a server error (`-32000`).
 
 ## The context gauge
 
@@ -232,7 +299,7 @@ for, or for a call that only you may answer.
 **Decline** refuses the call: its card shows as declined, and Claude is told and
 goes on. **Cancel** refuses it and stops the turn, as the Stop button does. A
 call Claude refuses on its own (a deny rule, its permission mode) also shows as
-declined, with a warning saying why.
+declined, with a [notice](#notices) row saying why.
 
 ### Auto-review
 
@@ -400,6 +467,42 @@ The App's own `codex-app-tools` and `browser-use` plugins, and the `codex_app`
 server, are never run. The servers are only for the App's calls: Claude
 threads do not get them, and the App's MCP panel lists them next to the
 thread's own servers.
+
+## Subagents
+
+Each subagent Claude launches gets its own thread under the chat. The adapter
+names the thread when the subagent starts: with the Agent call's
+`description` or a workflow agent's label, else with the agent's type and the
+first line of its prompt, as one line of at most 120 characters without
+control characters or terminal escapes. The App then runs no title turn for
+it, and the name stays the same in the thread's history and after the
+adapter restarts. A workflow agent's prompt is the task the workflow
+computed for it, not the user request the workflow relays to every agent.
+
+A subagent that fails says why. Its thread's turn fails with the reason Claude
+Code gave, such as an API error or the error its run ended with, without the
+CLI's tags and usage trailer, and the agent's state on the parent's agent
+calls carries the same reason. A background subagent's reason is the one
+Claude Code reports when it ends, such as a stall, rather than the last thing
+it said. When the parent turn fails after some of its subagents failed, its
+error also says how many did and why the first one did. A subagent the user
+stops says it was stopped by the user, one an interrupt of the parent ends
+says it was interrupted, and one still running when the parent turn fails says
+it ended because the parent turn failed, and why; none of these count as
+failed subagents. Each of these endings is also the subagent thread's last
+message.
+
+A workflow agent that fails, such as one that stalled on every attempt or hit
+an API error, fails the same way as soon as the workflow records it, with the
+reason the workflow reported for it, and counts as a failed subagent. If the
+workflow gives no reason within two seconds, or none by the time it ends, the
+agent's turn says only that it failed. An attempt the workflow ran again after
+a stall ends as failed too, as soon as the next attempt starts, saying the
+workflow ran the agent again. Claude Code's progress report replaces that
+attempt's error with the next attempt's start, so its own reason does not come
+through. The App draws a turn's error only when the turn failed, and does not
+draw the agent's state on the parent's wait card; both are there for clients
+that read them.
 
 ## Background work and the unread dot
 

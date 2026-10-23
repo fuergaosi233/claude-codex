@@ -4,6 +4,7 @@ import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
+import { INVALID_REQUEST } from '../src/host-methods.mjs'
 import {
   assertModelProfileTransition,
   loadClaudeModelProfiles,
@@ -323,6 +324,89 @@ test('model profile config must be owner-controlled and cannot be a symbolic lin
   }
 })
 
+test('profiles that fail to load say where and why in one short line, quoting none of them', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'claude-codex-model-profiles-'))
+  const configFile = join(root, 'models.json')
+  const failure = (env: Record<string, string>): string => {
+    try {
+      loadClaudeModelProfiles({ HOME: root, ...env })
+    } catch (error) {
+      const message = (error as Error).message
+      assert.ok(message.length <= 300, message)
+      assert.doesNotMatch(message, /\n/)
+      return message
+    }
+    assert.fail('the profiles loaded')
+  }
+  const inline = (value: unknown) =>
+    failure({
+      CLAUDE_CODEX_MODEL_PROFILES: typeof value === 'string' ? value : JSON.stringify(value),
+    })
+  try {
+    // A credential pasted without quotes: JSON.parse quotes the text around it.
+    const pasted = inline(
+      '[{"id": "main-model", "env": {"ANTHROPIC_AUTH_TOKEN": sk-pasted-credential}}]',
+    )
+    assert.match(
+      pasted,
+      /^cannot load Claude model profiles from CLAUDE_CODEX_MODEL_PROFILES: invalid Claude model profiles JSON: Unexpected token 's'$/,
+    )
+
+    const fromFile = { CLAUDE_CODEX_MODEL_PROFILES_FILE: configFile }
+    const fileSource = `cannot load Claude model profiles from ${configFile} (CLAUDE_CODEX_MODEL_PROFILES_FILE): `
+    await writeFile(
+      configFile,
+      '{\n  "models": [\n    { "id": "main-model",\n      "env": { "API_KEY": sk-file-credential } }\n  ]\n}\n',
+      { mode: 0o600 },
+    )
+    const quoted = failure(fromFile)
+    assert.ok(quoted.startsWith(`${fileSource}invalid Claude model profiles JSON: `), quoted)
+    assert.doesNotMatch(quoted, /file-credential|API_KEY|"/)
+    // A message that quotes nothing stays whole, with where the error is.
+    await writeFile(configFile, '{\n  "models": [{ "id": "main-model" }],\n}\n', { mode: 0o600 })
+    assert.match(
+      failure(fromFile),
+      /: invalid Claude model profiles JSON: Expected double-quoted property name in JSON at position \d+ \(line 3 column 1\)$/,
+    )
+    assert.equal(
+      failure({ CLAUDE_CODEX_MODEL_PROFILES_FILE: join(root, 'missing.json') }),
+      `cannot load Claude model profiles from ${join(root, 'missing.json')} (CLAUDE_CODEX_MODEL_PROFILES_FILE): the file does not exist`,
+    )
+    // A long path keeps its end, where the file name is.
+    const deep = join(root, 'a'.repeat(100), 'b'.repeat(100))
+    await mkdir(deep, { recursive: true })
+    await writeFile(join(deep, 'models.json'), '{', { mode: 0o600 })
+    assert.match(
+      failure({ CLAUDE_CODEX_MODEL_PROFILES_FILE: join(deep, 'models.json') }),
+      /^cannot load Claude model profiles from …b{67}\/models\.json \(CLAUDE_CODEX_MODEL_PROFILES_FILE\): invalid Claude model profiles JSON: Expected property name or '}' in JSON at position 1 \(line 1 column 2\)$/,
+    )
+    assert.equal(
+      failure({ CLAUDE_CODEX_MODEL_PROFILES: '[{"id":"a"}]', ...fromFile }),
+      'cannot load Claude model profiles: set only one of CLAUDE_CODEX_MODEL_PROFILES_FILE or CLAUDE_CODEX_MODEL_PROFILES',
+    )
+
+    // What was put where an id belongs is no id, so it is not quoted.
+    assert.equal(
+      inline([{ id: 'main-model' }, { id: 'sk-pasted credential' }]),
+      "cannot load Claude model profiles from CLAUDE_CODEX_MODEL_PROFILES: invalid Claude model profile id at index 1: use letters, digits, '.', '_' and '-', at most 128 characters",
+    )
+    assert.equal(
+      inline({ defaultModel: 'sk-pasted credential', models: [{ id: 'main-model' }] }),
+      'cannot load Claude model profiles from CLAUDE_CODEX_MODEL_PROFILES: Claude model profiles defaultModel is unknown',
+    )
+    assert.match(
+      inline({ defaultModel: 'other-model', models: [{ id: 'main-model' }] }),
+      /: Claude model profiles defaultModel is unknown: other-model$/,
+    )
+    // A longer reason is cut short.
+    const clipped = inline([{ id: 'a', env: { [`PROVIDER_TOKEN_${'X'.repeat(400)}`]: 'literal' } }])
+    assert.equal(clipped.length, 300)
+    assert.match(clipped, /must reference a parent environment variable: PROVIDER_TOKEN_X+…$/)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('model profile env files must be private regular files', async () => {
   const root = await mkdtemp(join(tmpdir(), 'claude-codex-model-profiles-'))
   const envFile = join(root, 'provider.env')
@@ -512,9 +596,73 @@ test('a running profile turn switches model only within its profile', async () =
     // Another profile is another process: launcher, provider and config dir.
     const across = await update({ model: 'second-model' })
     assert.match(across.error?.message ?? '', /cannot change model process profile/)
+    assert.equal(across.error?.code, INVALID_REQUEST)
     const same = await update({ model: 'main-model', effort: 'high' })
     assert.deepEqual(same.result, { status: 'applied' })
     assert.deepEqual(updates, [{ model: 'vendor/main-1', effort: 'high' }])
+  } finally {
+    release()
+    await harness.close()
+  }
+})
+
+test('a model change refuses profiles that fail to load as an invalid request, quoting none of them', async () => {
+  let release = () => {}
+  const released = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  let running = false
+  const harness = await profileServer(
+    TWO_PROFILES,
+    {},
+    {
+      runTurn: async (_context, handlers) => {
+        running = true
+        await released
+        await handlers.onEvent({ type: 'completed', success: true, result: 'done' })
+      },
+      updateTurnSettings: async () => true,
+    },
+  )
+  const { call } = harness
+  try {
+    const { result: held } = await call('thread/start', { cwd: harness.root, model: 'main-model' })
+    const { result: fresh } = await call('thread/start', { cwd: harness.root, model: 'main-model' })
+    const { result: turn } = await call('turn/start', {
+      threadId: held.thread.id,
+      input: [{ type: 'text', text: 'Hold this turn.' }],
+    })
+    for (let waited = 0; !running; waited += 10) {
+      assert.ok(waited < 5_000, 'turn did not start')
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+
+    // A credential pasted without quotes: JSON.parse quotes the text around it.
+    await writeFile(
+      harness.configFile,
+      '{"models": [{"id": "main-model", "env": {"API_KEY": sk-pasted-credential}}]}',
+      { mode: 0o600 },
+    )
+    const reason = `cannot load Claude model profiles from ${harness.configFile} (CLAUDE_CODEX_MODEL_PROFILES_FILE): invalid Claude model profiles JSON: Unexpected token 's'`
+    // The model menu, a running turn's settings, and a turn on another model.
+    // App rule: model-menu-settings
+    const refusals = [
+      await call('thread/settings/update', { threadId: fresh.thread.id, model: 'second-model' }),
+      await call('turn/settings/update', {
+        threadId: held.thread.id,
+        turnId: turn.turn.id,
+        model: 'second-model',
+      }),
+      await call('turn/start', {
+        threadId: fresh.thread.id,
+        model: 'second-model',
+        input: [{ type: 'text', text: 'Switch.' }],
+      }),
+    ]
+    for (const refused of refusals) {
+      assert.deepEqual(refused.error, { code: INVALID_REQUEST, message: reason })
+    }
+    assert.equal(harness.store.getThread(fresh.thread.id)?.model, 'main-model')
   } finally {
     release()
     await harness.close()
@@ -552,14 +700,18 @@ test('a chat keeps its profile once it has a conversation; a new chat takes any'
     // App rule: model-menu-settings
     const menu = await call('thread/settings/update', { threadId, model: 'main-model' })
     assert.match(menu.error?.message ?? '', /cannot change model process profile/)
+    // The code the App's model menu shows the reason for.
+    assert.equal(menu.error?.code, INVALID_REQUEST)
     const metadata = await call('thread/metadata/update', { threadId, model: 'main-model' })
     assert.match(metadata.error?.message ?? '', /cannot change model process profile/)
+    assert.equal(metadata.error?.code, INVALID_REQUEST)
     const turn = await call('turn/start', {
       threadId,
       model: 'main-model',
       input: [{ type: 'text', text: 'Switch.' }],
     })
     assert.match(turn.error?.message ?? '', /cannot change model process profile/)
+    assert.equal(turn.error?.code, INVALID_REQUEST)
     assert.equal(harness.store.getThread(threadId)?.model, 'second-model')
 
     // A resume ignores the picker rather than failing.
@@ -629,6 +781,7 @@ test('a chat whose profile changed or went away still opens, but nothing starts 
       model: 'claude-sonnet-4-5',
     })
     assert.match(picked.error?.message ?? '', /model process profiles are no longer configured/)
+    assert.equal(picked.error?.code, INVALID_REQUEST)
     assert.equal(harness.store.getThread(unsent.thread.id)?.model, 'main-model')
   } finally {
     await harness.close()
@@ -1244,6 +1397,9 @@ async function assertOpensButStartsNothing(
   assert.match(fork.error?.message ?? '', refusal)
   const moved = await call('thread/metadata/update', { threadId, model: 'second-model' })
   assert.match(moved.error?.message ?? '', refusal)
+  // The user puts it right by starting a new chat: an invalid request.
+  for (const refused of [turn, review, compact, fork, moved])
+    assert.equal(refused.error?.code, INVALID_REQUEST)
 
   // Turns the adapter starts by itself say why they did not, in words the App
   // shows as they are.
