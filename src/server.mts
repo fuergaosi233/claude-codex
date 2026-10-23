@@ -3719,6 +3719,16 @@ export class CodexClaudeAppServer {
       onUserInputRequest: async (event) => ({
         answers: Object.fromEntries(event.questions.map((q) => [q.id, { answers: [] }])),
       }),
+    }).catch((error: unknown) => {
+      // Once Claude has compacted the session, a run that goes wrong after
+      // it does not undo that: the thread has compacted, and no summary is
+      // written in its place.
+      if (!compacted) throw error
+      debugLog('thread.compact.failed_after_compaction', {
+        threadId: thread.id,
+        turnId,
+        error: error instanceof Error ? error.message : String(error),
+      })
     })
     if (!compacted)
       debugLog('thread.compact.session_incomplete', {

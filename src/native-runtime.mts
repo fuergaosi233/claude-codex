@@ -3058,7 +3058,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       if (usage && messageId)
         await pending.handlers.onEvent({ type: 'usage_progress', messageId, usage, ...failed })
     }
-    const content = (inner.content as Array<Record<string, unknown>>) || []
+    const content = contentBlocks(inner)
     for (const block of content) {
       const blockType = String(block.type ?? '')
       if (blockType === 'text') {
@@ -3151,7 +3151,9 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     let workflowLaunchAttached = false
     const inner = message.message as Record<string, unknown> | undefined
     if (!inner) return
-    const content = (inner.content as Array<Record<string, unknown>>) || []
+    // What /compact streams (its summary, the command's output) is plain
+    // text, with no blocks.
+    const content = contentBlocks(inner)
     const toolResultCount = content.filter((block) => String(block.type) === 'tool_result').length
     // The structured result describes the message's only tool result (e.g.
     // an Agent call's `async_launched` when Claude backgrounded it).
@@ -3597,6 +3599,16 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       return
     }
   }
+}
+
+// A message's content blocks; a message whose content is plain text has none.
+function contentBlocks(inner: Record<string, unknown>): Array<Record<string, unknown>> {
+  return Array.isArray(inner.content)
+    ? inner.content.flatMap((block) => {
+        const record = recordOrNull(block)
+        return record ? [record] : []
+      })
+    : []
 }
 
 // The frame tells of a model request that failed: a retry (the main loop's

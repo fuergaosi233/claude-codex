@@ -88,6 +88,12 @@ versioning or publishing metadata.
   not do leaves no marker; its notice says what happened. That includes a
   `/compact` (`thread/compact/start`) Claude Code could not do: its turn keeps
   only the summary written instead, and no `thread/compacted` is sent.
+- A `/compact` Claude Code did now ends as compacted, with
+  `thread/compacted`. The adapter failed on the plain-text messages the
+  command streams once it has compacted (its summary and output), so the
+  turn also got a summary written in a session of its own, which cost a
+  second model call, and sent no `thread/compacted`. A run that goes wrong
+  after Claude compacted the session no longer undoes that either.
 - Requests the user can correct fail with JSON-RPC `-32600` (invalid request),
   as Codex answers an unknown thread or turn and a bad cursor, instead of
   `-32000`, with the same messages: an unknown thread, turn, section, queued
