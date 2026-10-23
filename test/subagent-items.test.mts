@@ -6,7 +6,11 @@ import test from 'node:test'
 import { MockRuntime } from '../src/mock-runtime.mjs'
 import { CodexClaudeAppServer } from '../src/server.mjs'
 import { SessionStore } from '../src/store.mjs'
-import { MAX_SUBAGENT_ITEMS, SubagentItems } from '../src/subagent-items.mjs'
+import {
+  MAX_SUBAGENT_ITEMS,
+  MAX_SUBAGENT_TURN_BYTES,
+  SubagentItems,
+} from '../src/subagent-items.mjs'
 import type {
   ClaudeRuntime,
   RpcPeer,
@@ -1419,6 +1423,225 @@ test('a child turn shows a bounded amount of work; its answer still shows', asyn
     assert.ok(noisy.aggregatedOutput.length <= 20_100, 'command output is cut as the App cuts it')
     assert.deepEqual(leftOpen(live, child), [])
   })
+})
+
+const DIFF_LEFT_OUT = / … (\d+) more lines not shown\n$/
+
+// The +/- lines of a diff, without its header and what says what is left out.
+const diffBody = (diff: string): string[] =>
+  diff
+    .split('\n')
+    .slice(3)
+    .filter((line) => line !== '' && !DIFF_LEFT_OUT.test(`${line}\n`))
+
+test("a subagent's big edits, commands and call arguments are cut in its items, live and stored", async () => {
+  // Three bytes a character: a diff is cut by its bytes.
+  const lines = Array.from({ length: 4_000 }, (_, index) => `€€€€ line ${index}`)
+  const edits = Array.from({ length: 50 }, () => ({
+    old_string: 'o'.repeat(1_000),
+    new_string: 'n'.repeat(1_000),
+  }))
+  const command = `echo ${'a'.repeat(50_000)} | wc -c`
+  const calls: SubagentOutput[] = [
+    {
+      type: 'tool_use',
+      toolUseId: 'write',
+      toolName: 'Write',
+      input: { file_path: 'big.txt', content: lines.join('\n') },
+    },
+    { type: 'tool_result', toolUseId: 'write', content: 'Wrote big.txt.', isError: false },
+    {
+      type: 'tool_use',
+      toolUseId: 'edits',
+      toolName: 'MultiEdit',
+      input: { file_path: 'many.txt', edits },
+    },
+    { type: 'tool_result', toolUseId: 'edits', content: 'Edited many.txt.', isError: false },
+    { type: 'tool_use', toolUseId: 'count', toolName: 'Bash', input: { command } },
+    { type: 'tool_result', toolUseId: 'count', content: '50001', isError: false },
+    {
+      type: 'tool_use',
+      toolUseId: 'search',
+      toolName: 'mcp__github__search',
+      input: { q: 'q'.repeat(50_000) },
+    },
+    { type: 'tool_result', toolUseId: 'search', content: 'found 0', isError: false },
+    { type: 'text', text: 'Changed a lot.' },
+  ]
+  const script: Script = async (context, handlers, tools) => {
+    await startAgent(context, handlers, tools, 'agent-big', 'big-task', 'change a lot')
+    for (const output of calls) await handlers.onEvent(out('agent-big', output))
+    await handlers.onEvent({
+      type: 'tool_result',
+      toolUseId: 'agent-big',
+      content: 'Changed a lot.',
+    })
+    await handlers.onEvent({ type: 'completed', success: true, result: 'done' })
+  }
+  await withServer(script, async ({ startThread, runTurn, request }) => {
+    const threadId = await startThread()
+    const live = await runTurn(threadId, 'big changes')
+    const child = spawnedChild(live, 'change a lot')
+    const stored = await threadItems(request, child)
+    assert.deepEqual(
+      stored.slice(1, 3).map((item) => [item.type, item.status, item.changes[0].path]),
+      [
+        ['fileChange', 'completed', 'big.txt'],
+        ['fileChange', 'completed', 'many.txt'],
+      ],
+    )
+    const [, write, multi, bash, mcp, answer] = stored
+
+    // The written file's diff keeps its header and the lines that fit.
+    const [change] = write.changes
+    assert.equal(write.changes.length, 1)
+    assert.ok(change.diff.startsWith('--- a/big.txt\n+++ b/big.txt\n@@\n+€€€€ line 0\n'))
+    assert.ok(Buffer.byteLength(change.diff) <= 30_100, 'a diff is cut by its bytes')
+    const kept = diffBody(change.diff)
+    assert.deepEqual(
+      kept,
+      lines.slice(0, kept.length).map((line) => `+${line}`),
+    )
+    assert.equal(Number(DIFF_LEFT_OUT.exec(change.diff)?.[1]), lines.length - kept.length)
+    assert.equal(
+      change.diff.split('\n').some((line: string) => line.startsWith('\\')),
+      false,
+      'nothing reads as "no newline at end of file"',
+    )
+
+    // Edits past the cap are dropped, and counted in the last one kept.
+    assert.ok(multi.changes.length < edits.length)
+    const last = multi.changes.at(-1)
+    const shown = multi.changes.flatMap((entry: any) => diffBody(entry.diff)).length
+    assert.equal(Number(DIFF_LEFT_OUT.exec(last.diff)?.[1]), 2 * edits.length - shown)
+    assert.ok(Buffer.byteLength(JSON.stringify(multi.changes)) <= 32_000)
+    assert.ok(multi.changes.slice(0, -1).every((entry: any) => !DIFF_LEFT_OUT.test(entry.diff)))
+
+    // A command is cut as an exploration's output is, its actions too.
+    assert.equal(bash.type, 'commandExecution')
+    assert.ok(bash.command.startsWith('echo aaa'))
+    assert.match(bash.command, /\n… \d+ more characters not shown$/)
+    assert.ok(JSON.stringify(bash.commandActions).length <= 31_000)
+    assert.equal(bash.aggregatedOutput, '50001')
+
+    // Arguments too big to keep are their JSON text, cut.
+    assert.equal(mcp.type, 'mcpToolCall')
+    assert.equal(typeof mcp.arguments, 'string')
+    assert.ok(mcp.arguments.startsWith('{"q":"qqq'))
+    assert.match(mcp.arguments, /\n… \d+ more characters not shown$/)
+    assert.deepEqual(shape(answer), ['message', null, 'Changed a lot.'])
+
+    // What the App was sent is what was kept.
+    const sent = (method: string, itemId: string) =>
+      live.find(
+        (message) =>
+          message.method === method &&
+          message.params.threadId === child &&
+          (message.params.item?.id ?? message.params.itemId) === itemId,
+      )?.params
+    for (const item of [write, multi])
+      for (const method of ['item/started', 'item/completed'])
+        assert.deepEqual(sent(method, item.id).item.changes, item.changes)
+    for (const item of [write, multi])
+      assert.deepEqual(sent('item/fileChange/patchUpdated', item.id).changes, item.changes)
+    for (const method of ['item/started', 'item/completed']) {
+      assert.equal(sent(method, bash.id).item.command, bash.command)
+      assert.deepEqual(sent(method, bash.id).item.commandActions, bash.commandActions)
+      assert.equal(sent(method, mcp.id).item.arguments, mcp.arguments)
+    }
+    assert.deepEqual(leftOpen(live, child), [])
+  })
+})
+
+test("a child turn's work stops at a byte budget; its answer still shows, whole", async () => {
+  const reads = 40
+  // An exploration's output is capped at 30,000 characters, here 90,000
+  // bytes: about two dozen of them fill the budget.
+  const content = '€'.repeat(40_000)
+  const answer = `Read them all. ${'€'.repeat(50_000)}`
+  const script: Script = async (context, handlers, tools) => {
+    await startAgent(context, handlers, tools, 'agent-reader', 'reader-task', 'read it all')
+    for (let index = 0; index < reads; index += 1) {
+      const toolUseId = `read-${index}`
+      await handlers.onEvent(
+        out('agent-reader', {
+          type: 'tool_use',
+          toolUseId,
+          toolName: 'Read',
+          input: { file_path: `f${index}.txt` },
+        }),
+      )
+      await handlers.onEvent(
+        out('agent-reader', { type: 'tool_result', toolUseId, content, isError: false }),
+      )
+    }
+    await handlers.onEvent(out('agent-reader', { type: 'text', text: answer }))
+    await handlers.onEvent({ type: 'tool_result', toolUseId: 'agent-reader', content: answer })
+    await handlers.onEvent({ type: 'completed', success: true, result: 'done' })
+  }
+  await withServer(script, async ({ startThread, runTurn, request }) => {
+    const threadId = await startThread()
+    const live = await runTurn(threadId, 'a reader')
+    const child = spawnedChild(live, 'read it all')
+    const items = await threadItems(request, child)
+    const work = items.slice(1, -1)
+    assert.ok(work.length > 0 && work.length < reads, `${work.length} reads shown`)
+    assert.deepEqual(
+      work.map((item) => item.command),
+      Array.from({ length: work.length }, (_, index) => `Read f${index}.txt`),
+    )
+    const bytes = work.map((item) => Buffer.byteLength(JSON.stringify(item)))
+    const total = bytes.reduce((sum, size) => sum + size, 0)
+    // It stops at the first read that starts once the budget is reached.
+    assert.ok(total >= MAX_SUBAGENT_TURN_BYTES, `${total} bytes shown`)
+    assert.ok(total - (bytes.at(-1) ?? 0) < MAX_SUBAGENT_TURN_BYTES)
+    assert.deepEqual(shape(items.at(-1)), ['message', null, answer])
+    assert.deepEqual(completedIn(live, child).slice(1, -1).map(shape), work.map(shape))
+    assert.deepEqual(leftOpen(live, child), [])
+  })
+})
+
+test('a call a subagent leaves open fails with its reason cut to the cap', () => {
+  const stored: ThreadItem[] = []
+  const projector = new SubagentItems({
+    store: {
+      appendItem: (_turnId, item) => {
+        stored.push(item)
+        return null
+      },
+      updateItem: (_turnId, itemId, updater) => {
+        const index = stored.findIndex((item) => item.id === itemId)
+        stored[index] = updater(stored[index] as ThreadItem)
+        return { items: stored } as unknown as TurnRecord
+      },
+      turnStatus: () => 'inProgress',
+    },
+    notify: () => {},
+    toolItem: (event) => ({
+      type: 'mcpToolCall',
+      id: event.toolUseId,
+      server: 'docs',
+      tool: 'fetch',
+      status: 'inProgress',
+      arguments: event.input,
+      result: null,
+      error: null,
+      durationMs: null,
+    }),
+    reasoningVisible: () => true,
+  })
+  const peer: RpcPeer = { id: 'projector-test', send: () => {}, close: () => {} }
+  projector.add(
+    peer,
+    { threadId: 'child', turnId: 'turn', cwd: '/' },
+    { type: 'tool_use', toolUseId: 'fetch', toolName: 'mcp__docs__fetch', input: { page: 'x' } },
+  )
+  projector.finish(peer, 'turn', '', `It broke: ${'e'.repeat(50_000)}`)
+  const call = stored[0] as Extract<ThreadItem, { type: 'mcpToolCall' }>
+  assert.equal(call.type, 'mcpToolCall')
+  assert.equal(call.status, 'failed')
+  assert.match(String(call.error?.message), /^It broke: e+\n… \d+ more characters not shown$/)
+  assert.ok(String(call.error?.message).length < 31_000)
 })
 
 test('a capped last message is still the answer, kept whole and not shown twice', async () => {

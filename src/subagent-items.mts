@@ -6,8 +6,9 @@
 //
 // Claude Code forwards a subagent's output as complete blocks, never as
 // streamed deltas, so each piece shows at once. Output is kept bounded: a
-// result keeps the caps the parent's items have, and a child turn shows at
-// most MAX_SUBAGENT_ITEMS items of work.
+// result keeps the caps the parent's items have, any other text of an item is
+// cut the same way and a diff at a line, and a child turn shows at most
+// MAX_SUBAGENT_ITEMS items of work and MAX_SUBAGENT_TURN_BYTES of them.
 import { appendCommandOutput } from './command-output.mjs'
 import {
   parseExitCodeFromResult,
@@ -18,7 +19,13 @@ import {
 } from './server-helpers.mjs'
 import type { SessionStore } from './store.mjs'
 import { capOutput, EXPLORE_OUTPUT_LIMIT, isExploreTool } from './tool-items.mjs'
-import type { RpcPeer, RuntimeEvent, SubagentOutput, ThreadItem } from './types.mjs'
+import type {
+  FileUpdateChange,
+  RpcPeer,
+  RuntimeEvent,
+  SubagentOutput,
+  ThreadItem,
+} from './types.mjs'
 import { debugLog, newId, nowMillis } from './util.mjs'
 import { markVisualizeLines } from './visualize-lines.mjs'
 
@@ -26,8 +33,16 @@ import { markVisualizeLines } from './visualize-lines.mjs'
 // left out (its answer still shows).
 export const MAX_SUBAGENT_ITEMS = 256
 
-// A subagent's message, or its MCP tool result, is cut to this many
-// characters, the cap of an exploration command's output.
+// Bytes of stored items one child turn shows: work that starts once its items
+// come to this much is left out too, as past MAX_SUBAGENT_ITEMS. Every piece
+// of work the child stores rewrites its turn, which costs more the bigger the
+// turn is. A piece already started still gets its (capped) result.
+export const MAX_SUBAGENT_TURN_BYTES = 2 * 1024 * 1024
+
+// A subagent's message, its MCP tool result, or any other text of an item
+// (a command, a path, a call's arguments as JSON) is cut to this many
+// characters, the cap of an exploration command's output. A diff is cut at a
+// line within this many bytes.
 const SUBAGENT_TEXT_LIMIT = EXPLORE_OUTPUT_LIMIT
 
 // What an open tool item of the child says when the child ends without its
@@ -83,6 +98,9 @@ interface ChildTurnState {
   calls: Set<string>
   items: number
   omitted: number
+  // What its items take as stored, in all and by item.
+  bytes: number
+  sizes: Map<string, number>
 }
 
 export class SubagentItems {
@@ -109,6 +127,8 @@ export class SubagentItems {
         calls: new Set(),
         items: 0,
         omitted: 0,
+        bytes: 0,
+        sizes: new Map(),
       }
       this.turns.set(target.turnId, state)
     } else {
@@ -142,6 +162,8 @@ export class SubagentItems {
         threadId: state.target.threadId,
         turnId,
         omitted: state.omitted,
+        items: state.items,
+        bytes: state.bytes,
       })
     const message = state.message
     if (!message) return false
@@ -174,14 +196,22 @@ export class SubagentItems {
         this.finish(peer, turnId, '', SUBAGENT_CALL_UNFINISHED)
   }
 
-  // Counts an item against the turn's limit; false when it is left out.
+  // Counts an item against the turn's limits; false when it is left out.
   private reserve(state: ChildTurnState): boolean {
-    if (state.items >= MAX_SUBAGENT_ITEMS) {
+    if (state.items >= MAX_SUBAGENT_ITEMS || state.bytes >= MAX_SUBAGENT_TURN_BYTES) {
       state.omitted += 1
       return false
     }
     state.items += 1
     return true
+  }
+
+  // Keeps count of what the turn's items take as stored.
+  private measure(state: ChildTurnState, item: ThreadItem | null): void {
+    if (!item) return
+    const size = Buffer.byteLength(JSON.stringify(item))
+    state.bytes += size - (state.sizes.get(item.id) ?? 0)
+    state.sizes.set(item.id, size)
   }
 
   private emit(
@@ -205,6 +235,7 @@ export class SubagentItems {
     stored: ThreadItem = item,
   ): void {
     this.host.store.appendItem(state.target.turnId, stored)
+    this.measure(state, stored)
     this.emit(peer, state, 'item/started', { item, startedAtMs: nowMillis() })
   }
 
@@ -214,7 +245,9 @@ export class SubagentItems {
     updater: (item: ThreadItem) => ThreadItem,
   ): ThreadItem | null {
     const turn = this.host.store.updateItem(state.target.turnId, itemId, updater)
-    return turn?.items.find((item) => item.id === itemId) ?? null
+    const item = turn?.items.find((entry) => entry.id === itemId) ?? null
+    this.measure(state, item)
+    return item
   }
 
   private completeItem(peer: RpcPeer, state: ChildTurnState, item: ThreadItem | null): void {
@@ -330,10 +363,13 @@ export class SubagentItems {
     }
     if (!this.reserve(state)) return
     const options = { mcpServers: state.target.mcpServers ?? [] }
-    const item = this.host.toolItem(event, state.target.cwd, options)
+    const item = capToolItem(this.host.toolItem(event, state.target.cwd, options))
     const imageFallback =
       item.type === 'imageView'
-        ? { ...this.host.toolItem(event, state.target.cwd, { imageView: false }), id: item.id }
+        ? capToolItem({
+            ...this.host.toolItem(event, state.target.cwd, { imageView: false }),
+            id: item.id,
+          })
         : null
     state.tools.set(output.toolUseId, {
       itemId: item.id,
@@ -401,7 +437,9 @@ export class SubagentItems {
     this.completeItem(peer, state, item)
   }
 
-  private failTool(peer: RpcPeer, state: ChildTurnState, tool: OpenTool, failure: string): void {
+  private failTool(peer: RpcPeer, state: ChildTurnState, tool: OpenTool, reason: string): void {
+    // How the child ended may be all it said.
+    const failure = capOutput(reason, SUBAGENT_TEXT_LIMIT)
     const durationMs = Math.max(0, nowMillis() - tool.startedAtMs)
     const item = this.updateItem(state, tool.itemId, (current) => {
       if (current.type === 'commandExecution') return { ...current, status: 'failed', durationMs }
@@ -444,6 +482,104 @@ function cappedMcpResult(
 
 function cappedMcpError(content: unknown): { message: string } {
   return { message: capOutput(wrapMcpToolError(content).message, SUBAGENT_TEXT_LIMIT) }
+}
+
+// A tool item of the child as it is kept: a diff cut at a line, a call's
+// arguments too big to keep as their JSON text capped (as an MCP result too
+// big to keep is), and any other text capped. Actions parsed from a command
+// too long to keep show as the command itself.
+function capToolItem(item: ThreadItem): ThreadItem {
+  if (item.type === 'fileChange')
+    return {
+      ...item,
+      changes: capChanges(
+        item.changes.map((change) => ({
+          ...change,
+          path: capOutput(change.path, SUBAGENT_TEXT_LIMIT),
+        })),
+      ),
+    }
+  if (item.type === 'mcpToolCall') {
+    const { arguments: input, ...rest } = item
+    return { ...capStrings(rest), arguments: cappedArguments(input) }
+  }
+  if (item.type === 'commandExecution' && jsonLength(item.commandActions) > SUBAGENT_TEXT_LIMIT)
+    return capStrings<ThreadItem>({
+      ...item,
+      commandActions: [{ type: 'unknown', command: item.command }],
+    })
+  return capStrings(item)
+}
+
+function jsonLength(value: unknown): number {
+  return JSON.stringify(value ?? null).length
+}
+
+function cappedArguments(input: unknown): unknown {
+  if (jsonLength(input) <= SUBAGENT_TEXT_LIMIT) return input
+  return capOutput(JSON.stringify(input), SUBAGENT_TEXT_LIMIT)
+}
+
+// `value` with every string longer than the cap cut to it.
+function capStrings<T>(value: T): T {
+  if (typeof value === 'string') return capOutput(value, SUBAGENT_TEXT_LIMIT) as T
+  if (Array.isArray(value)) return value.map((entry) => capStrings(entry)) as T
+  if (value && typeof value === 'object')
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [key, capStrings(entry)]),
+    ) as T
+  return value
+}
+
+// A file change's diffs, in all at most `limit` bytes: the diff that passes
+// it is cut after its last whole line that fits (its header always shows),
+// and a line of context says how many changed lines are left out, there and
+// in the changes after it, which are dropped. The marker is not a `\` line,
+// which a diff reads as "no newline at end of file".
+function capChanges(
+  changes: FileUpdateChange[],
+  limit: number = SUBAGENT_TEXT_LIMIT,
+): FileUpdateChange[] {
+  let room = limit
+  const kept: FileUpdateChange[] = []
+  for (const [index, change] of changes.entries()) {
+    const bytes = Buffer.from(change.diff, 'utf8')
+    if (bytes.length <= room) {
+      kept.push(change)
+      room -= bytes.length
+      continue
+    }
+    const fits = room > 0 ? bytes.lastIndexOf(0x0a, room - 1) + 1 : 0
+    const cut = Math.max(bytes.subarray(0, fits).toString('utf8').length, headerLength(change.diff))
+    const left =
+      changedLines(change.diff.slice(cut)) +
+      changes
+        .slice(index + 1)
+        .reduce((sum, next) => sum + changedLines(next.diff.slice(headerLength(next.diff))), 0)
+    const head = change.diff.slice(0, cut)
+    kept.push({
+      ...change,
+      diff: `${head}${head.endsWith('\n') || head === '' ? '' : '\n'} … ${left} more lines not shown\n`,
+    })
+    break
+  }
+  return kept
+}
+
+// The `--- a/…`, `+++ b/…` and `@@` lines a diff starts with (none when it
+// has fewer lines).
+function headerLength(diff: string): number {
+  let end = 0
+  for (let line = 0; line < 3; line += 1) {
+    const newline = diff.indexOf('\n', end)
+    if (newline < 0) return 0
+    end = newline + 1
+  }
+  return end
+}
+
+function changedLines(body: string): number {
+  return body.split('\n').filter((line) => line !== '').length
 }
 
 const flat = (text: string): string => text.replace(/\s+/g, ' ').trim()

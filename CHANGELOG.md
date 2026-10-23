@@ -743,8 +743,10 @@ versioning or publishing metadata.
   (`forwardSubagentText`) and routes each frame by its agent id, so a nested
   agent's work lands in its own thread. The items are stored with the child
   turn (`thread/read`, `thread/turns/list`, `thread/items/list`, resume,
-  followers), keep the parent's output caps, stop at 256 per child turn, and
-  a call still open when the child turn ends shows as failed, whichever way
+  followers), keep the parent's output caps (other long text of a call is
+  cut the same way, a diff at a line within 30,000 bytes), stop at 256 per
+  child turn or once a child turn's items come to 2 MiB (the answer is
+  always kept whole), and a call still open when the child turn ends shows as failed, whichever way
   it ends: the subagent stops or fails, either thread is interrupted (also
   when the agent's task cannot be stopped), or the adapter stops or
   restarts. The parent thread is unchanged.
