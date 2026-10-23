@@ -521,6 +521,52 @@ test('the workflow agents a native turn closes as it ends are marked as ended wi
   )
 })
 
+test('a parent turn the subagent watchdog ends says how many of its subagents failed', async () => {
+  const previousTimeout = process.env.CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS
+  process.env.CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS = '150'
+  const script: Script = async (_context, handlers, tools) => {
+    const interrupted = tools.interrupted()
+    await handlers.onEvent({
+      type: 'tool_use',
+      toolUseId: 'agent-broken',
+      toolName: 'Agent',
+      input: { description: 'Broken', prompt: 'break' },
+    })
+    await handlers.onEvent({
+      type: 'tool_result',
+      toolUseId: 'agent-broken',
+      content: '<tool_use_error>Disk full</tool_use_error>',
+      isError: true,
+    })
+    await handlers.onEvent({
+      type: 'tool_use',
+      toolUseId: 'agent-stuck',
+      toolName: 'Agent',
+      input: { description: 'Stuck', prompt: 'hang' },
+    })
+    // The agent never reports again; the watchdog gives up on the turn.
+    await interrupted
+  }
+  try {
+    await withScriptedServer(script, async ({ startThread, runTurn }) => {
+      const threadId = await startThread()
+      const live = await runTurn(threadId, 'stall an agent')
+      const timeout = 'Subagent did not publish a terminal result within 1 second.'
+      assert.deepEqual(
+        turnCompleted(live, spawnedChild(live, 'hang')).params.turn.error,
+        turnError(timeout),
+      )
+      assert.equal(
+        turnCompleted(live, threadId).params.turn.error.message,
+        `${timeout} A subagent failed: Disk full`,
+      )
+    })
+  } finally {
+    if (previousTimeout == null) delete process.env.CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS
+    else process.env.CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS = previousTimeout
+  }
+})
+
 test('a subagent the user stops says so in its turn and its state, and does not count as failed', async () => {
   const script: Script = async (context, handlers, tools) => {
     await handlers.onEvent({

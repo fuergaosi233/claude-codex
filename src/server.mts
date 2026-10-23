@@ -5986,7 +5986,8 @@ export class CodexClaudeAppServer {
         // terminalize the parent turn immediately and late events are guarded.
         void this.releaseStalledTurn(thread.id, turn.id).catch(() => {})
       }
-      throw new Error(message)
+      // App rule: subagent-failure-reason
+      throw withSubagentFailures(new Error(message), selfFailedSubagents)
     }
     if (outcome.kind === 'rejected') {
       if (this.store.getTurn(turn.id)?.status === 'inProgress') {
