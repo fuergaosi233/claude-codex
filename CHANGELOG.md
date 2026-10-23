@@ -36,6 +36,52 @@ versioning or publishing metadata.
 - A refused listener or another bad listener option ends the adapter with
   exit code 1 and the message alone, without a stack trace.
 
+### Failures you can see and act on
+
+- A turn that fails after the computer slept for a minute or more during it
+  says so in its error: roughly how long the computer slept, that this broke
+  Claude's connection to the model, and that a message (or Continue) picks up
+  where it left off; on macOS and Windows it also points to the App's
+  **Prevent sleep while running** setting. The error code and details are
+  unchanged, and refusals such as usage limits or startup failures are left
+  alone.
+- The subagent watchdog (`CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS`) no longer fails a
+  turn over quiet that is not a stall. The wait is paused while the turn waits
+  on the user (an approval, a question, an MCP elicitation or a client dynamic
+  tool call), and time the computer spent asleep does not count; after either,
+  the wait starts over.
+- Opt-in `CLAUDE_CODEX_PREVENT_IDLE_SLEEP=1` keeps a Mac from idle-sleeping
+  while Claude works: the adapter holds `caffeinate -i -w <adapter pid>` while
+  any turn, background agent or other background work runs, and stops it once
+  nothing does. Closing the lid still sleeps. Off by default, and it does
+  nothing on other platforms.
+- What Claude Code reports beside a turn (a compaction it could not do, a
+  switch to a fallback model, an urgent CLI notification, a call it refused)
+  now shows in the Codex App as a dim row under the turn, which goes on. Each
+  notice also goes out as an `error` notification with `willRetry: true` and
+  no error code, which the App draws that way; the `warning` is still sent.
+  Each message shows once a turn and at most five rows a turn, and a turn that
+  then fails repeats its notices in the error's `additionalDetails`, which the
+  App keeps. `CLAUDE_CODEX_NOTICE_ROWS=0` sends the warnings alone.
+- A tool call, MCP elicitation or client dynamic tool call that background work
+  (a background agent, a workflow, a cron job) makes while no turn runs is
+  still refused, but no longer silently: Claude is told no user turn was active
+  and that the user can run it again in a turn, and the user sees a notice row
+  under the thread's running or last turn. Nothing is queued.
+- A turn keeps a `contextCompaction` item only once the compaction completes,
+  in the place it started, like Codex. A compaction an interrupt cuts short no
+  longer reads as "Context compacted" after a reload, and one Claude Code could
+  not do leaves no marker; its notice says what happened.
+- Requests the user can correct fail with JSON-RPC `-32600` (invalid request),
+  the code Codex uses, instead of `-32000`, with the same messages: an unknown
+  thread, turn, section, queued message or process; a bad cursor or parameter;
+  a model the chat cannot take; a rewind or queued start while a turn runs.
+  The model menu's "Couldn't update model settings" toast now gives the
+  reason. Failures inside the adapter stay `-32000`.
+- The goal tools (`codex_goal`) and leader tools (`codex_leader`) load with the
+  session instead of behind Claude Code's tool search, so Claude knows they are
+  there in a session with many tools.
+
 ### App-server and protocol compatibility
 
 - Opt-in Memories: with `CLAUDE_CODEX_MEMORIES=1`, the App's Memories

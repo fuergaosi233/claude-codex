@@ -114,10 +114,61 @@ credentials. The adapter asks the CLI to report every startup failure this
 way by setting `CLAUDE_CODE_STARTUP_FAILURE_RESULTS=1`; a value in the
 adapter's environment takes its place.
 
-Notices the Claude CLI would show an interactive user at once, such as a
-failed compaction, go out as `warning` notifications, each once a turn. The
-Codex App opts out of `warning` notifications in `initialize`, as it does with
-Codex, so it does not show them; other clients do get them.
+### Sleep
+
+Most failed connections on a laptop come from the computer going to sleep
+during a turn, which breaks Claude's connection to the model. When a turn
+fails after the computer slept for a minute or more during it, its error says
+so: roughly how long the computer slept, and that a message, or **Continue**,
+picks up where Claude left off. On macOS and Windows it also points to the
+App's **Settings > General > Prevent sleep while running**, which does not
+stop sleep with the lid closed. The error keeps its code and details.
+
+To have the adapter keep a Mac awake itself while Claude works, start it with
+`CLAUDE_CODEX_PREVENT_IDLE_SLEEP=1`: it then holds `caffeinate -i` while any
+turn, background agent or other background work runs, and lets go once nothing
+does. Closing the lid still sleeps. It is off by default and does nothing on
+other platforms.
+
+A turn waiting on a subagent or workflow does not fail because the computer
+slept, or while it waits on you for an approval, an answer, an MCP form or an
+App tool call: the `CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS` wait starts over after
+either.
+
+### Notices
+
+Notices the Claude CLI would show an interactive user at once show as a dim
+row under the turn, which goes on: a compaction Claude Code could not do, a
+switch to a fallback model, an urgent CLI notification, or a call refused
+while no turn was running. Each message shows once a turn, and a turn shows
+at most five. The App does not keep these rows when the chat is reopened, so a
+turn that then fails repeats its notices in the error's details, which it does
+keep.
+
+The adapter sends each notice as an `error` notification with `willRetry` and
+no error code, which the App draws as such a row without failing the turn,
+and also as a `warning`, as Codex does, for other clients (the App opts out of
+`warning` notifications in `initialize`). `CLAUDE_CODEX_NOTICE_ROWS=0` sends
+the warning alone. Title and other helper turns send warnings only.
+
+### Calls between turns
+
+A background agent, a workflow or a cron job can call a tool that needs your
+approval, ask for your input through an MCP server, or call an App tool after
+your turn has ended. With no turn running there is nowhere to ask, so the
+call is refused, as before, but not silently: Claude is told no user turn was
+active and that you can run it again in a turn, and a notice row under the
+chat's running or last turn says what was refused. Nothing is queued; ask
+Claude to run it again in a new message.
+
+### Request errors
+
+A request you can put right, such as a model the chat cannot take, an unknown
+chat or a bad parameter, fails with the JSON-RPC code Codex uses for it,
+`-32600` (invalid request), and its message says why. Picking a Codex model in
+a Claude chat that has a reply, for example, shows the **Couldn't update model
+settings** toast with the reason, and the menu goes back to the Claude model.
+A failure inside the adapter stays a server error (`-32000`).
 
 ## The context gauge
 
@@ -232,7 +283,7 @@ for, or for a call that only you may answer.
 **Decline** refuses the call: its card shows as declined, and Claude is told and
 goes on. **Cancel** refuses it and stops the turn, as the Stop button does. A
 call Claude refuses on its own (a deny rule, its permission mode) also shows as
-declined, with a warning saying why.
+declined, with a [notice](#notices) row saying why.
 
 ### Auto-review
 

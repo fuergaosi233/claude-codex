@@ -39,7 +39,12 @@ Implemented as real remote/runtime behavior:
   command actions, image views, web searches and page opens, MCP tool calls by
   server and tool, hook runs, model reroutes, aggregated git diff updates, and
   `error` notifications for API retries (`willRetry`) and failed turns, with
-  Codex error codes.
+  Codex error codes; Claude Code's notices as `warning` notifications and as
+  `error` notifications with `willRetry` and no code, which the App shows as
+  rows under the turn.
+- **Request errors** — `-32600` (invalid request) for requests the user can
+  put right, `-32000` for failures inside the adapter, `-32601` for unknown
+  methods.
 - **Remote utilities** — file read/write/list/metadata/copy/remove/watch,
   command exec with stdin/terminate, process spawn/stdin/kill, fuzzy file
   search, direct MCP stdio/HTTP tool and resource calls.
