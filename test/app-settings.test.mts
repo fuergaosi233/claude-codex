@@ -436,6 +436,60 @@ test('a write the App MCP settings cannot hold fails and changes nothing', async
   }
 })
 
+test('an MCP server or field named __proto__ is refused instead of dropped unseen', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'app-mcp-proto-'))
+  // Built as params arrive over the wire: JSON.parse makes __proto__ an own
+  // key, where an object literal would set the prototype.
+  const wire = (text: string) => JSON.parse(text) as Record<string, unknown>
+  try {
+    await withServer(root, appServersOn, async ({ request, send }) => {
+      await request('config/batchWrite', saveServer(root, 'kept', { command: '/bin/kept' }))
+      const failures: Array<[string, string, RegExp]> = [
+        [
+          'config/value/write',
+          '{"keyPath":"mcp_servers.__proto__","value":{"command":42},"mergeStrategy":"replace"}',
+          /invalid MCP server name: __proto__/,
+        ],
+        [
+          'config/batchWrite',
+          '{"edits":[{"keyPath":"mcp_servers.__proto__","value":{"command":"/bin/x"},"mergeStrategy":"replace"}],"filePath":null}',
+          /invalid MCP server name: __proto__/,
+        ],
+        [
+          'config/batchWrite',
+          '{"edits":[{"keyPath":"mcp_servers","value":{"__proto__":{"command":42}},"mergeStrategy":"upsert"}],"filePath":null}',
+          /invalid MCP server name: __proto__/,
+        ],
+        [
+          'config/batchWrite',
+          '{"edits":[{"keyPath":"mcp_servers","value":{"__proto__":{"command":"/bin/x"}},"mergeStrategy":"replace"}],"filePath":null}',
+          /invalid MCP server name: __proto__/,
+        ],
+        [
+          'config/value/write',
+          '{"keyPath":"mcp_servers.kept.__proto__","value":{"enabled":"yes"},"mergeStrategy":"upsert"}',
+          /invalid MCP server field: mcp_servers\.kept\.__proto__/,
+        ],
+        [
+          'config/batchWrite',
+          '{"edits":[{"keyPath":"mcp_servers.kept","value":{"command":"/bin/x","__proto__":{"command":42}},"mergeStrategy":"replace"}],"filePath":null}',
+          /mcp_servers\.kept has an invalid field: __proto__/,
+        ],
+      ]
+      for (const [method, params, message] of failures) {
+        const response = await send(method, wire(params))
+        assert.equal(response.error?.code, INVALID_REQUEST, params)
+        assert.match(response.error?.message ?? '', message)
+      }
+      assert.deepEqual((await request('config/read', {})).config.mcp_servers, {
+        kept: { command: '/bin/kept' },
+      })
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('the App MCP settings are off unless CLAUDE_CODEX_APP_MCP_SERVERS=1', async () => {
   const root = await mkdtemp(join(tmpdir(), 'app-mcp-off-'))
   const userFile = join(root, 'codex', 'config.toml')

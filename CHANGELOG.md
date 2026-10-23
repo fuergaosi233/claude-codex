@@ -573,7 +573,9 @@ versioning or publishing metadata.
   lists them after a restart. One of them wins a name over a server the
   Codex or Claude Code config brings, and `CLAUDE_CODEX_MCP_SERVERS` wins
   over it; the App's own desktop servers (`node_repl`, `cua_repl`) are
-  accepted and not kept.
+  accepted and not kept. A server or field named `__proto__` is refused
+  with `INVALID_REQUEST`, where it would have reported success and been
+  dropped unchecked.
   The switch is off by default, since such a server runs a program or reaches
   a URL from every Claude thread. Without it the page lists no server, and a
   save, switch or delete there fails with a message the App shows under the

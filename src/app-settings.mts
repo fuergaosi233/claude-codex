@@ -52,6 +52,15 @@ const DESKTOP_MCP_SERVERS = new Set(['node_repl', 'cua_repl'])
 // The App names a server it adds with these characters, as Codex requires.
 const SERVER_NAME = /^[A-Za-z0-9_-]+$/
 
+// A key the adapter cannot keep in a settings table: set on a plain object,
+// it replaces the object's prototype instead, so a write naming it would
+// succeed with nothing checked or kept.
+const PROTOTYPE_KEY = '__proto__'
+
+function validServerName(name: string): boolean {
+  return SERVER_NAME.test(name) && name !== PROTOTYPE_KEY
+}
+
 function invalid(message: string): RpcError {
   return new RpcError(message, undefined, INVALID_REQUEST)
 }
@@ -90,7 +99,8 @@ function serverEntryProblem(name: string, entry: Table): string | null {
   const url = typeof entry.url === 'string' && entry.url.length > 0
   if (command === url) return `mcp_servers.${name} needs either a command or a url`
   for (const [field, value] of Object.entries(entry)) {
-    const check = FIELD_TYPES[field]
+    if (field === PROTOTYPE_KEY) return `mcp_servers.${name} has an invalid field: ${field}`
+    const check = Object.hasOwn(FIELD_TYPES, field) ? FIELD_TYPES[field] : undefined
     if (check && !check(value)) return `mcp_servers.${name}.${field} has the wrong type`
   }
   return null
@@ -128,10 +138,14 @@ export function editMcpServers(settings: Table, edit: ConfigEdit): void {
     servers = upsert ? { ...prior } : {}
     for (const [key, entry] of Object.entries(table ?? {})) {
       if (DESKTOP_MCP_SERVERS.has(key)) continue
+      // Checked before withPath, which would drop a __proto__ server unseen.
+      if (!validServerName(key)) throw invalid(`invalid MCP server name: ${key}`)
       servers = withPath(servers, [key], entry, upsert)
     }
   } else {
-    if (!SERVER_NAME.test(name)) throw invalid(`invalid MCP server name: ${name}`)
+    if (!validServerName(name)) throw invalid(`invalid MCP server name: ${name}`)
+    if (field.includes(PROTOTYPE_KEY))
+      throw invalid(`invalid MCP server field: mcp_servers.${name}.${field.join('.')}`)
     if (field.length > 0 && !asTable(prior[name]))
       throw invalid(`no MCP server named ${name} in the App's settings`)
     if (field.length === 0 && edit.value != null && !asTable(edit.value))
@@ -146,7 +160,7 @@ export function editMcpServers(settings: Table, edit: ConfigEdit): void {
   if (changed.length > 0 && !appMcpServersEnabled()) throw invalid(APP_MCP_SERVERS_OFF)
   for (const key of changed) {
     if (!Object.hasOwn(servers, key)) continue
-    if (!SERVER_NAME.test(key)) throw invalid(`invalid MCP server name: ${key}`)
+    if (!validServerName(key)) throw invalid(`invalid MCP server name: ${key}`)
     const entry = asTable(servers[key])
     if (!entry) throw invalid(`mcp_servers.${key} must be a table`)
     const problem = serverEntryProblem(key, entry)
