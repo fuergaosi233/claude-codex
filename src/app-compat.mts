@@ -187,7 +187,7 @@ export const APP_RULES: readonly AppRule[] = [
     id: 'subagent-failure-reason',
     app: "Shows a failed turn's error.message as an error row at the end of that turn, unless the turn holds an `error` item that will not be retried; it shows nothing for an interrupted turn's error. A spawnAgent or sendInput row adds the agent's agentsStates message after its status; a wait is never drawn and a closeAgent row shows no state.",
     adapter:
-      "Ends a child that failed, was stopped or was ended with its parent with a turn error saying why: the CLI's error text without its tags, usage trailer or stack frames, a JSON error body told by its message, or what ended it. The same reason is the agent's agentsStates message on its wait and closeAgent items. A parent turn that fails after agents of its own failed adds how many and the first one's reason to its error.",
+      "Ends a child that failed, was stopped or was ended with its parent with a turn error saying why: the CLI's error text without its tags, usage trailer or stack frames, a JSON error body told by its message, or what ended it. A workflow agent fails once the workflow's journal records it failed or ran it again, with the error the workflow's progress reports for it. The same reason is the agent's agentsStates message on its wait and closeAgent items. A parent turn that fails after agents of its own failed adds how many and the first one's reason to its error.",
     verify:
       "Have a subagent fail (a workflow agent that stalls, or one whose tool call errors): its thread ends with an error row naming the cause, without stack frames, and the parent's failed turn says a subagent failed and why.",
   },

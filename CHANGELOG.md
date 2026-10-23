@@ -81,6 +81,12 @@ versioning or publishing metadata.
   The model menu's "Couldn't update model settings" toast now gives the
   reason, after the App's own "Check your config.toml." line. Failures inside
   the adapter stay `-32000`.
+- A workflow agent that fails (one that stalled on every attempt, or hit an
+  API error) ends its thread's turn as failed, with the reason the workflow
+  reported, and counts as a failed subagent of its parent. It used to show as
+  running until the workflow ended and then as completed. An attempt the
+  workflow ran again after a stall ends the same way, with its own reason,
+  instead of staying open.
 - The goal tools (`codex_goal`) and leader tools (`codex_leader`) load with the
   session instead of behind Claude Code's tool search, so Claude knows they are
   there in a session with many tools.

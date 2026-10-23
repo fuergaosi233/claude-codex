@@ -117,6 +117,7 @@ import { parseWorkflowCommand, workflowRuntimePrompt } from './workflow-command.
 import {
   defaultWorkflowTranscriptRoots,
   parseWorkflowLaunchInfo,
+  WorkflowAgentFailures,
   WorkflowJournalMonitor,
   type WorkflowLaunchInfo,
 } from './workflow-subagents.mjs'
@@ -229,6 +230,8 @@ interface WorkflowTaskState {
   aggregateStarted: boolean
   terminal: boolean
   monitorFailed?: boolean
+  // Why its agents failed, from its progress reports.
+  agentFailures?: WorkflowAgentFailures
 }
 
 interface PendingPermission {
@@ -2735,6 +2738,17 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       this.attachDeferredWorkflowJournal(pending, state, sourceToolUseId)
       return
     }
+    if (subtype === 'task_progress') {
+      // A workflow's progress says why its agents failed; its journal does
+      // not.
+      // App rule: subagent-failure-reason
+      const state = pending.workflowTasks?.get(String(message.task_id ?? ''))
+      if (state && Array.isArray(message.workflow_progress)) {
+        state.agentFailures ??= new WorkflowAgentFailures()
+        state.agentFailures.note(message.workflow_progress)
+      }
+      return
+    }
     if (subtype === 'task_notification') {
       const taskId = String(message.task_id ?? '')
       if (!taskId) return
@@ -3232,6 +3246,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   ): WorkflowJournalMonitor {
     return new WorkflowJournalMonitor({
       launch,
+      failureReason: (agentId) => state.agentFailures?.reason(agentId),
       onStarted: async (agent) => {
         if (state.terminal) return
         const toolUseId = workflowAgentToolUseId(state.taskId, agent.agentId)

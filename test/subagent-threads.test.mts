@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { appendFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -519,6 +519,131 @@ test('the workflow agents a native turn closes as it ends are marked as ended wi
       ['tool_result', 'workflow-task:wf-task', true, true],
     ],
   )
+})
+
+test('a workflow agent that fails ends its child turn with the reason the workflow gave, and counts as failed', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'claude-codex-failed-workflow-agent-'))
+  const runId = 'wf_failed_agent_run'
+  const transcriptDir = join(root, 'projects', 'project', 'subagents', 'workflows', runId)
+  const failed = 'c000000000000001'
+  const done = 'c000000000000002'
+  const key = (n: number) => `v1:${String(n).repeat(64)}`
+  const journal = (...entries: unknown[]) =>
+    appendFile(
+      join(transcriptDir, 'journal.jsonl'),
+      entries.map((entry) => `${JSON.stringify(entry)}\n`).join(''),
+    )
+  await mkdir(transcriptDir, { recursive: true })
+  for (const agentId of [failed, done]) {
+    await writeFile(
+      join(transcriptDir, `agent-${agentId}.jsonl`),
+      `${JSON.stringify({ message: { role: 'user', content: `step ${agentId}` } })}\n`,
+    )
+  }
+  // The native runtime projects the workflow's journal into the turn.
+  const script: Script = async (_context, handlers) => {
+    const runtime = new NativeClaudeRuntime()
+    const pending = {
+      activeSubagents: new Set<string>(),
+      completedWorkflowTasks: new Set<string>(),
+      workflowToolUseIds: new Set(['wf-launch']),
+      workflowTranscriptRoots: [root],
+      handlers,
+    }
+    const handleSystem = Reflect.get(runtime, 'handleSystem')
+    try {
+      await handleSystem.call(runtime, pending, {
+        subtype: 'task_started',
+        task_id: 'wf-task',
+        tool_use_id: 'wf-launch',
+        task_type: 'local_workflow',
+        workflow_name: 'review',
+      })
+      await Reflect.get(runtime, 'handleUser').call(runtime, pending, {
+        type: 'user',
+        tool_use_result: {
+          status: 'async_launched',
+          taskId: 'wf-task',
+          taskType: 'local_workflow',
+          workflowName: 'review',
+          runId,
+          transcriptDir,
+        },
+        message: {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 'wf-launch', content: 'Launched.' }],
+        },
+      })
+      await journal(
+        { type: 'started', key: key(1), agentId: failed },
+        { type: 'started', key: key(2), agentId: done },
+      )
+      // The workflow reports why the agent failed; the journal only that it
+      // did.
+      await handleSystem.call(runtime, pending, {
+        subtype: 'task_progress',
+        task_id: 'wf-task',
+        workflow_progress: [
+          {
+            type: 'workflow_agent',
+            index: 1,
+            agentId: failed,
+            state: 'error',
+            error: `stalled \x1b[2m—\x1b[0m no progress\nfor ${'9'.repeat(500)}ms`,
+          },
+        ],
+      })
+      await journal(
+        { type: 'failed', key: key(1), agentId: failed },
+        { type: 'result', key: key(2), agentId: done, result: 'All checks pass' },
+      )
+      // The workflow itself completes.
+      await handleSystem.call(runtime, pending, {
+        subtype: 'task_notification',
+        task_id: 'wf-task',
+        status: 'completed',
+        summary: 'Review completed',
+      })
+    } finally {
+      await Reflect.get(runtime, 'stopWorkflowTasks').call(runtime, pending)
+    }
+    await handlers.onEvent({
+      type: 'completed',
+      success: false,
+      result: 'API Error: 529 Overloaded',
+      failure: { terminalReason: 'api_error', category: 'overloaded', status: 529 },
+    })
+  }
+  try {
+    await withScriptedServer(script, async ({ startThread, runTurn }) => {
+      const threadId = await startThread()
+      const live = await runTurn(threadId, 'run a workflow')
+      // Cleaned and clipped like any subagent's reason.
+      const told = 'stalled — no progress for '
+      const reason = `${told}${'9'.repeat(399 - told.length)}…`
+      const failedChild = spawnedChild(live, `step ${failed}`)
+      const doneChild = spawnedChild(live, `step ${done}`)
+      const failedTurn = turnCompleted(live, failedChild).params.turn
+      assert.equal(failedTurn.status, 'failed')
+      assert.deepEqual(failedTurn.error, turnError(reason))
+      const doneTurn = turnCompleted(live, doneChild).params.turn
+      assert.equal(doneTurn.status, 'completed')
+      assert.equal(doneTurn.error, null)
+      assert.deepEqual(
+        collabItems(live, 'wait').map((item) => item.agentsStates),
+        [
+          { [failedChild]: { status: 'errored', message: reason } },
+          { [doneChild]: { status: 'completed', message: null } },
+        ],
+      )
+      assert.equal(
+        turnCompleted(live, threadId).params.turn.error.message,
+        `API Error: 529 Overloaded. A subagent failed: ${Array.from(reason).slice(0, 199).join('')}…`,
+      )
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
 })
 
 test('a parent turn the subagent watchdog ends says how many of its subagents failed', async () => {

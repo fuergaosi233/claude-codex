@@ -478,7 +478,14 @@ stops says it was stopped by the user, one an interrupt of the parent ends
 says it was interrupted, and one still running when the parent turn fails says
 it ended because the parent turn failed, and why; none of these count as
 failed subagents. Each of these endings is also the subagent thread's last
-message. The App draws a turn's error only when the turn failed, and does not
+message.
+
+A workflow agent that fails, such as one that stalled on every attempt or hit
+an API error, fails the same way as soon as the workflow records it, with the
+reason the workflow reported for it, and counts as a failed subagent. An
+attempt the workflow ran again after a stall ends as failed too, with its own
+reason. If the workflow gives no reason within two seconds, or none by the
+time it ends, the agent's turn says only that it failed. The App draws a turn's error only when the turn failed, and does not
 draw the agent's state on the parent's wait card; both are there for clients
 that read them.
 
