@@ -824,9 +824,9 @@ export type RuntimeEvent =
   | { type: 'subagent_progress'; toolUseId: string; failedRequest?: boolean }
   // A subagent's own work: its text, thinking, tool calls and their results.
   // `toolUseId` is the Agent call the frame came under and `agentId` the task
-  // id of the agent that wrote it, when the CLI reports it (a nested agent's
-  // frames may come under its host's call, naming the nested agent). The
-  // server shows it in that agent's own thread.
+  // id of the agent that wrote it, when the CLI reports it (Claude Code sends
+  // a nested agent's frames under the nested agent's own call). The server
+  // shows it in that agent's own thread.
   | SubagentOutputEvent
   | {
       type: 'metrics'

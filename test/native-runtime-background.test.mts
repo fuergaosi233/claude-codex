@@ -1942,9 +1942,9 @@ async function runNestedWork(): Promise<{
   const events: RuntimeEvent[] = []
   const turn = runtime.runTurn(context, handlers(events))
   const query = await waitFor(() => queries[0], 'session')
-  const nested = (block: Record<string, unknown>, agentId = 'task-1') => ({
+  const nested = (block: Record<string, unknown>, agentId = 'task-1', parent = 'agent-1') => ({
     type: 'assistant',
-    parent_tool_use_id: 'agent-1',
+    parent_tool_use_id: parent,
     agent_id: agentId,
     message: { id: `sub-${agentId}`, content: [block] },
   })
@@ -1964,7 +1964,8 @@ async function runNestedWork(): Promise<{
     result('grep-1', 'hit', 'agent-1'),
     nested({ type: 'tool_use', id: 'answer-1', name: 'StructuredOutput', input: { ok: true } }),
     nested({ type: 'tool_use', id: 'agent-2', name: 'Agent', input: { prompt: 'deeper' } }),
-    nested(text('Deeper.'), 'task-2'),
+    // Claude Code sends the nested agent's frames under its own call.
+    nested(text('Deeper.'), 'task-2', 'agent-2'),
     result('agent-2', 'deep report', 'agent-1'),
     result('agent-1', 'report', null),
     assistant('m2', [text('done')]),
@@ -1994,7 +1995,7 @@ test("a subagent's own work reaches the turn as its output; its Agent calls stay
     ],
     // Its Agent call only ends what it was saying.
     ['agent-1', 'task-1', { type: 'agent_call', toolUseId: 'agent-2' }],
-    ['agent-1', 'task-2', { type: 'text', text: 'Deeper.' }],
+    ['agent-2', 'task-2', { type: 'text', text: 'Deeper.' }],
   ])
   const tree = (events: RuntimeEvent[]) =>
     events.flatMap((event) =>

@@ -6871,9 +6871,10 @@ export class CodexClaudeAppServer {
 
   // The agent that wrote a subagent's frame: the one the frame names by task
   // id (agent_id), else the one its Agent call (parent_tool_use_id) started.
-  // A frame naming an agent this thread does not know is not the call's
-  // agent's: a CLI that forwards a nested agent's frames under its host's
-  // call names the nested agent. Null too once the agent's child turn ended.
+  // Claude Code sends a nested agent's frames under the nested agent's own
+  // call; one that came under its host's call, naming the nested agent, would
+  // still reach it. A frame naming an agent this thread does not know is not
+  // the call's agent's. Null too once the agent's child turn ended.
   private subagentOutputAgent(
     threadId: string,
     contexts: Map<string, SubagentContext>,

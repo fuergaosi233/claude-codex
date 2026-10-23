@@ -537,21 +537,22 @@ test("a nested agent's work goes to its own thread, by the task id the CLI names
     await startAgent(context, handlers, tools, 'agent-inner', 'task-inner', 'inner work', {
       agentId: 'task-outer',
     })
-    // A CLI forwards the nested agent's frames under its host's call, naming
-    // the nested agent, or under the nested agent's own call.
+    // Claude Code sends the nested agent's frames under its own call, naming
+    // it.
     const bash = { type: 'tool_use', toolUseId: 'inner-bash', toolName: 'Bash' } as const
     await handlers.onEvent(
-      out('agent-outer', { ...bash, input: { command: 'ls src' } }, 'task-inner'),
+      out('agent-inner', { ...bash, input: { command: 'ls src' } }, 'task-inner'),
     )
+    // Should one come under its host's call, naming it, it still reaches it.
     await handlers.onEvent(
       out(
-        'agent-inner',
+        'agent-outer',
         { type: 'tool_result', toolUseId: 'inner-bash', content: 'a.ts', isError: false },
         'task-inner',
       ),
     )
-    // A frame naming an agent nobody knows, under a call whose agent is
-    // known, is not that agent's.
+    // Should a frame name an agent nobody knows under a call whose agent is
+    // known, it is not that agent's.
     await handlers.onEvent(out('agent-outer', { type: 'text', text: 'Not mine.' }, 'task-unknown'))
     // An older CLI names no agent: the call says whose it is.
     await handlers.onEvent(out('agent-outer', { type: 'reasoning', text: 'The helper is done.' }))
