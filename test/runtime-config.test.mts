@@ -17,7 +17,7 @@ import {
   writeFile,
 } from 'node:fs/promises'
 import http from 'node:http'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import test from 'node:test'
 import * as z from 'zod'
@@ -35,6 +35,7 @@ import {
 import { TurnInput } from '../src/native-turn-input.mjs'
 import { resolveRuntimeConfig } from '../src/runtime-config.mjs'
 import { buildSystemPromptAddendum } from '../src/server-helpers.mjs'
+import { sessionChangesHint } from '../src/session-changes.mjs'
 import type { DynamicToolServer, RuntimeTurnContext } from '../src/types.mjs'
 import { parseWorkflowCommand, workflowRuntimePrompt } from '../src/workflow-command.mjs'
 import {
@@ -693,6 +694,73 @@ test('native SDK runtime serves the leader tools, and only the looking ones in p
     thread_wait: 'allow',
     thread_read: 'allow',
   })
+})
+
+test('native SDK runtime serves the chat changes, and outside git tells Claude of them', async () => {
+  const runtime = new NativeClaudeRuntime()
+  Reflect.set(runtime, 'zod', z)
+  const sdk = {
+    tool: (...args: unknown[]) => args,
+    createSdkMcpServer: (config: Record<string, unknown>) => ({ type: 'sdk', ...config }),
+  }
+  const calls: Array<{ input: unknown; session: { cwd: string; configRoots: string[] } }> = []
+  const sessionChanges = {
+    changes: async (input: unknown, session: { cwd: string; configRoots: string[] }) => {
+      calls.push({ input, session })
+      return 'the diff'
+    },
+  }
+  const buildOptions = Reflect.get(runtime, 'buildOptions')
+  const build = (overrides: Partial<RuntimeTurnContext>) =>
+    buildOptions.call(runtime, sdk, nativeTurnContext(overrides), new AbortController(), () => null)
+  const cwd = await realpath(await mkdtemp(join(tmpdir(), 'claude-codex-session-tool-')))
+  try {
+    assert.equal(build({ cwd }).mcpServers, undefined)
+    const options = build({
+      cwd,
+      sessionChanges,
+      systemPromptAddendum: 'Be brief.',
+      approvalPolicy: 'on-request',
+      sandboxMode: 'workspace-write',
+    })
+    const server = options.mcpServers.codex_session
+    assert.equal(server.alwaysLoad, true)
+    const [tool] = server.tools
+    assert.equal(tool[0], 'changes')
+    assert.deepEqual(tool[4], { annotations: { readOnlyHint: true } })
+    assert.deepEqual(await tool[3]({ stat: true }), {
+      content: [{ type: 'text', text: 'the diff' }],
+    })
+    // The handler reads the transcripts of the turn's cwd, in the config dirs
+    // sessions may have run from.
+    assert.deepEqual(calls[0]?.input, { stat: true })
+    assert.equal(calls[0]?.session.cwd, cwd)
+    assert.ok(calls[0]?.session.configRoots.includes(join(homedir(), '.claude')))
+    sessionChanges.changes = async () => {
+      throw new Error('Cannot tell when those turns started.')
+    }
+    assert.deepEqual(await tool[3]({ turns: 1 }), {
+      content: [{ type: 'text', text: 'Cannot tell when those turns started.' }],
+      isError: true,
+    })
+
+    // Outside git the system prompt says where the changes are, after the
+    // App's own instructions; inside, git has them.
+    const hint = sessionChangesHint(cwd)
+    if (hint !== null) assert.match(hint, /mcp__codex_session__changes/)
+    assert.equal(options.systemPrompt.append, ['Be brief.', hint].filter(Boolean).join('\n\n'))
+    await mkdir(join(cwd, '.git'))
+    assert.equal(build({ cwd, sessionChanges }).systemPrompt.append, undefined)
+
+    // Allowed without asking, in plan mode too: it only reads.
+    const signal = new AbortController().signal
+    for (const built of [options, build({ cwd, sessionChanges, planMode: true })])
+      assert.deepEqual(await built.canUseTool('mcp__codex_session__changes', {}, { signal }), {
+        behavior: 'allow',
+      })
+  } finally {
+    await rm(cwd, { recursive: true, force: true })
+  }
 })
 
 test('explicit native SDK bypass includes the required dangerous opt-in flag', () => {

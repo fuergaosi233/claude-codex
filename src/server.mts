@@ -206,6 +206,7 @@ import {
   wrapMcpToolError,
   wrapMcpToolResult,
 } from './server-helpers.mjs'
+import { sessionChanges, sessionChangesEnabled } from './session-changes.mjs'
 import { type SleepMonitor, SleepTracker, withSleepNotice } from './sleep-notice.mjs'
 import { PINNED_SECTION_ID, type SessionStore, settledTurn } from './store.mjs'
 import {
@@ -280,6 +281,7 @@ import type {
   RuntimeTaskUsage,
   RuntimeTurnContext,
   RuntimeTurnSettings,
+  SessionChangesHandler,
   SubagentOutputEvent,
   ThreadAttachmentRecord,
   ThreadGoal,
@@ -2635,6 +2637,43 @@ export class CodexClaudeAppServer {
     )
   }
 
+  // The codex_session tool: the changes the thread's Claude sessions made to
+  // files. Which changes count follows the thread's history: each session it
+  // went through counts up to the last checkpoint the history keeps in it, so
+  // a fork leaves out what its parent did later and a rollback what it
+  // dropped, and the session the thread runs in now counts to the end. The
+  // diff still shows each file as it is on disk now. `turns` keeps the last
+  // few turns' changes, the running one included: those after the turn
+  // before them ended.
+  private sessionChangesFor(threadId: string): SessionChangesHandler {
+    return {
+      changes: async (input, session) => {
+        const thread = this.store.getThread(threadId)
+        if (!thread) throw new Error('This chat no longer exists.')
+        const marks = this.store.turnCheckpoints(threadId)
+        const sessions = new Map<string, string | null>()
+        for (const { checkpoint } of marks)
+          if (checkpoint) sessions.set(checkpoint.sessionId, checkpoint.messageUuid)
+        if (thread.claudeSessionId) sessions.set(thread.claudeSessionId, null)
+        const first = input.turns && input.turns < marks.length ? marks.length - input.turns : null
+        const startedAt = first === null ? null : marks[first]?.startedAt
+        return sessionChanges({
+          ...session,
+          sessions,
+          turns:
+            first === null
+              ? null
+              : {
+                  after: marks[first - 1]?.checkpoint ?? null,
+                  startedAt: startedAt == null ? null : startedAt * 1000,
+                },
+          paths: input.paths,
+          stat: input.stat,
+        })
+      },
+    }
+  }
+
   // Goal tools the model calls through the codex_goal MCP server. They read
   // the thread's goal at call time, so one set of handlers serves the
   // thread's whole session.
@@ -4535,6 +4574,10 @@ export class CodexClaudeAppServer {
       leaderTools:
         turnPurpose === 'normal' && !isCodexThread && this.leaderThreads.allowed(thread)
           ? this.leaderThreads.handlersFor(thread.id)
+          : null,
+      sessionChanges:
+        turnPurpose === 'normal' && !isCodexThread && sessionChangesEnabled()
+          ? this.sessionChangesFor(thread.id)
           : null,
       // Without the memories mapping the runtime leaves auto-memory to
       // Claude Code's own settings.

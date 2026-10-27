@@ -762,6 +762,15 @@ versioning or publishing metadata.
   while new chats run on the Codex proxy, and in plan mode only lists, waits
   and reads. Which chat leads which survives restarts. Without the switch
   nothing changes.
+- Opt-in session changes: with `CLAUDE_CODEX_SESSION_CHANGES=1`, Claude in a
+  chat gets a read-only `codex_session` MCP tool, `changes`, that gives the
+  files the chat changed with Edit, Write and NotebookEdit, its subagents'
+  included, as a unified diff read from its Claude Code transcripts, so
+  `/simplify`, `/review` and other reviews work outside a git repository.
+  Outside one the system prompt says to call it. It follows the thread's
+  history, so a rolled-back turn no longer counts, and narrows to `paths`,
+  the last `turns` or a `stat` list. Changes made by shell commands are not
+  shown. Without the switch nothing changes.
 - Deleting a thread ends its running background agents first, so each child
   turn completes as interrupted; stopping a turn no longer wakes the thread to
   acknowledge the background agents Claude Code stopped with it; and
