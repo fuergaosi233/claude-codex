@@ -12,7 +12,6 @@ import {
   subagentFailureReason,
   subagentFailureSummary,
   subagentThreadName,
-  subagentTurnError,
   taskEndReason,
   withSubagentFailures,
   workflowAgentPrompt,
@@ -190,11 +189,6 @@ test('a subagent failure reason drops the trailer, error tags and stack frames',
   assert.ok(long.endsWith('…'))
   // A line that only mentions "at" mid-text is kept.
   assert.equal(subagentFailureReason('Failed at step 3'), 'Failed at step 3')
-  assert.deepEqual(subagentTurnError('Why'), {
-    message: 'Why',
-    codexErrorInfo: null,
-    additionalDetails: null,
-  })
 })
 
 test('a background task tells why it ended from its summary unless that is its description', () => {

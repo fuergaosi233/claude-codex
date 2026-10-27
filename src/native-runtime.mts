@@ -119,6 +119,7 @@ import {
 } from './util.mjs'
 import { parseWorkflowCommand, workflowRuntimePrompt } from './workflow-command.mjs'
 import {
+  agentResultContent,
   defaultWorkflowTranscriptRoots,
   parseWorkflowLaunchInfo,
   WorkflowAgentFailures,
@@ -311,6 +312,9 @@ interface LiveSession {
   endedWhileIdle: string[]
   // Live output of the Bash commands the main loop runs.
   commandOutputs: CommandOutputs
+  // How many commands_changed messages the session has sent: a newer list
+  // than the one its supportedCommands() answer may still bring.
+  commandPushes: number
   // The Claude Code version the CLI reported in its initialize reply or its
   // system/init, null until it did.
   cliVersion: string | null
@@ -392,9 +396,6 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
   private turns = new Map<string, PendingTurn>()
   private permissions = new Map<string, PendingPermission>()
   private sessions = new Map<string, LiveSession>()
-  // How many commands_changed messages each session has sent: a newer list
-  // than the one its supportedCommands() answer may still bring.
-  private commandPushes = new WeakMap<LiveSession, number>()
   // Session cron jobs per thread. They outlive a closed process: the next
   // resume of the same Claude session schedules them again.
   private cronJobs = new Map<string, CronJobs>()
@@ -1399,6 +1400,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         endedWhileIdle: [],
         // startCli replaces it once the CLI's query exists.
         commandOutputs: new CommandOutputs(null),
+        commandPushes: 0,
         cliVersion: null,
         sink: null,
         settleTimer: null,
@@ -2362,7 +2364,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     // session (skills in a subfolder Claude works in, a reloaded plugin).
     // App rule: skills-popup
     if (subtype === 'commands_changed') {
-      this.commandPushes.set(session, (this.commandPushes.get(session) ?? 0) + 1)
+      session.commandPushes += 1
       if (Array.isArray(message.commands) && this.isReusable(session.lastContext))
         noteFolderCommands(session.lastContext.cwd, message.commands as ReportedCommand[])
       return
@@ -2687,15 +2689,14 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       const skills = Array.isArray(message.skills) ? message.skills.map(String) : null
       const folder = this.isReusable(pending.context) ? pending.context.cwd : null
       const session = pending.session
-      const pushes = this.commandPushes.get(session) ?? 0
+      const pushes = session.commandPushes
       if (skills || folder)
         void Promise.resolve()
           .then(() => query?.supportedCommands())
           .then((commands) => {
             if (!Array.isArray(commands)) return
             if (skills) noteClaudeCommands(commands, skills)
-            if (folder && (this.commandPushes.get(session) ?? 0) === pushes)
-              noteFolderCommands(folder, commands)
+            if (folder && session.commandPushes === pushes) noteFolderCommands(folder, commands)
           })
           .catch(() => {})
       // Which efforts each model takes, for model/list. An older SDK has no
@@ -3227,16 +3228,10 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
           pending.structuredInput = JSON.stringify(input)
           continue
         }
-        if (name === 'AskUserQuestion') {
-          // The canUseTool bridge below renders this as a Codex-native
-          // dynamicToolCall via onUserInputRequest. Skip the generic
-          // tool_use event so the App doesn't also draw an mcpToolCall card
-          // for the same question.
-          continue
-        }
-        // The server draws a dynamic tool call as a dynamicToolCall item
-        // when it runs (onDynamicToolCall).
-        if (dynamicToolNames(pending.context).has(name)) continue
+        // The question card (onUserInputRequest) and a dynamic tool call
+        // (onDynamicToolCall) draw the call when it runs; a generic tool_use
+        // would draw it twice.
+        if (drawnElsewhere(name, pending.context)) continue
         await pending.handlers.onEvent({
           type: 'tool_use',
           toolUseId: id,
@@ -3509,7 +3504,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       await pending.handlers.onEvent({
         type: 'tool_result',
         toolUseId,
-        content: `${message}\nagentId: ${agentId}`,
+        content: agentResultContent(message, agentId),
         isError,
         ...(endedWithTurn ? { endedWithTurn } : {}),
       })
@@ -3950,14 +3945,11 @@ function subagentOutputEvents(
   if (!toolUseId || (type !== 'assistant' && type !== 'user')) return []
   const agentId = stringOrNull(message.agent_id)
   const inner = recordOrNull(message.message)
-  const content: unknown[] = Array.isArray(inner?.content) ? inner.content : []
   const events: SubagentOutputEvent[] = []
   const push = (output: SubagentOutputEvent['output']): void => {
     events.push({ type: 'subagent_output', toolUseId, ...(agentId ? { agentId } : {}), output })
   }
-  for (const entry of content) {
-    const block = recordOrNull(entry)
-    if (!block) continue
+  for (const block of inner ? contentBlocks(inner) : []) {
     const blockType = String(block.type ?? '')
     if (type === 'assistant' && blockType === 'text') {
       push({ type: 'text', text: String(block.text ?? '') })

@@ -4,7 +4,7 @@
 // split into its server and tool.
 import { basename, extname, isAbsolute, join, relative, sep } from 'node:path'
 import { mcpToolName } from './inherited-config.mjs'
-import type { CommandAction } from './types.mjs'
+import type { CommandAction, ThreadItem } from './types.mjs'
 
 // Claude Code tools that only read, search or list files.
 const EXPLORE_TOOLS = new Set(['Read', 'Grep', 'Glob', 'LS'])
@@ -75,6 +75,18 @@ export function imageReadPath(
   if (!raw || !IMAGE_EXTENSIONS.has(extname(raw).toLowerCase())) return null
   const path = absolutePath(raw, cwd)
   return isAbsolute(path) ? path : null
+}
+
+// An image Read shows as an imageView. If Claude cannot read the image, the
+// item becomes its fallback, a Read command, failed with what the tool said.
+export function failedImageRead(
+  fallback: ThreadItem | null | undefined,
+  output: string | null,
+  exitCode: number | null,
+  durationMs: number | null,
+): ThreadItem | null {
+  if (fallback?.type !== 'commandExecution') return null
+  return { ...fallback, status: 'failed', aggregatedOutput: output, exitCode, durationMs }
 }
 
 // Splits Claude's name for an MCP tool, mcp__<server>__<tool>, into the

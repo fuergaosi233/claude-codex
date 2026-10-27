@@ -18,7 +18,7 @@ import {
   wrapMcpToolResult,
 } from './server-helpers.mjs'
 import type { SessionStore } from './store.mjs'
-import { capOutput, EXPLORE_OUTPUT_LIMIT, isExploreTool } from './tool-items.mjs'
+import { capOutput, EXPLORE_OUTPUT_LIMIT, failedImageRead, isExploreTool } from './tool-items.mjs'
 import type {
   FileUpdateChange,
   RpcPeer,
@@ -422,7 +422,7 @@ export class SubagentItems {
           durationMs,
         }
       if (current.type === 'imageView' && isError)
-        return failedImageRead(tool, commandOutput, exitCode, durationMs) ?? current
+        return failedImageRead(tool.imageFallback, commandOutput, exitCode, durationMs) ?? current
       if (current.type === 'fileChange')
         return { ...current, status: isError ? 'failed' : 'completed' }
       if (current.type === 'mcpToolCall')
@@ -451,7 +451,7 @@ export class SubagentItems {
     const item = this.updateItem(state, tool.itemId, (current) => {
       if (current.type === 'commandExecution') return { ...current, status: 'failed', durationMs }
       if (current.type === 'imageView')
-        return failedImageRead(tool, null, null, durationMs) ?? current
+        return failedImageRead(tool.imageFallback, null, null, durationMs) ?? current
       if (current.type === 'fileChange') return { ...current, status: 'failed' }
       if (current.type === 'mcpToolCall')
         return { ...current, status: 'failed', error: { message: failure }, durationMs }
@@ -459,17 +459,6 @@ export class SubagentItems {
     })
     this.completeItem(peer, state, item)
   }
-}
-
-function failedImageRead(
-  tool: OpenTool,
-  output: string | null,
-  exitCode: number | null,
-  durationMs: number,
-): ThreadItem | null {
-  const fallback = tool.imageFallback
-  if (fallback?.type !== 'commandExecution') return null
-  return { ...fallback, status: 'failed', aggregatedOutput: output, exitCode, durationMs }
 }
 
 // An MCP result as the parent's items carry it, unless it is too big to keep
@@ -538,16 +527,13 @@ function capStrings<T>(value: T): T {
   return value
 }
 
-// A file change's diffs, in all at most `limit` bytes: the diff that passes
-// it is cut after its last whole line that fits (its header always shows),
-// and a line of context says how many changed lines are left out, there and
-// in the changes after it, which are dropped. The marker is not a `\` line,
-// which a diff reads as "no newline at end of file".
-function capChanges(
-  changes: FileUpdateChange[],
-  limit: number = SUBAGENT_TEXT_LIMIT,
-): FileUpdateChange[] {
-  let room = limit
+// A file change's diffs, in all at most SUBAGENT_TEXT_LIMIT bytes: the diff
+// that passes it is cut after its last whole line that fits (its header
+// always shows), and a line of context says how many changed lines are left
+// out, there and in the changes after it, which are dropped. The marker is
+// not a `\` line, which a diff reads as "no newline at end of file".
+function capChanges(changes: FileUpdateChange[]): FileUpdateChange[] {
+  let room = SUBAGENT_TEXT_LIMIT
   const kept: FileUpdateChange[] = []
   for (const [index, change] of changes.entries()) {
     const bytes = Buffer.from(change.diff, 'utf8')

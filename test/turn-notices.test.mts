@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { plainTurnError } from '../src/server-helpers.mjs'
 import {
   MAX_VISIBLE_NOTICES_PER_TURN,
-  noticeTurnError,
   TurnNoticeLog,
   withTurnNotices,
 } from '../src/turn-notices.mjs'
@@ -28,8 +28,6 @@ test('a turn records each notice once, and shows only the first few as rows', ()
     ...Array.from({ length: MAX_VISIBLE_NOTICES_PER_TURN - 1 }, (_, i) => `notice ${i + 2}`),
     'one more',
   ])
-  log.forget('turn-1')
-  assert.deepEqual(log.messages('turn-1'), [])
 })
 
 test("a failed turn's details repeat its notices", () => {
@@ -53,7 +51,7 @@ test("a failed turn's details repeat its notices", () => {
   const details = withTurnNotices(failed, many).additionalDetails ?? ''
   assert.match(details, /- notice 10\n- and 3 more$/)
   assert.doesNotMatch(details, /notice 11/)
-  assert.deepEqual(noticeTurnError('hello'), {
+  assert.deepEqual(plainTurnError('hello'), {
     message: 'hello',
     codexErrorInfo: null,
     additionalDetails: null,

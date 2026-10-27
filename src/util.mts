@@ -387,6 +387,12 @@ export function stableHash(value: string): string {
   return createHash('sha256').update(value).digest('hex')
 }
 
+// `base` ended as a sentence, then `sentence` after it.
+export function appendSentence(base: string, sentence: string): string {
+  if (!base) return sentence
+  return `${/[.!?。！？]$/.test(base) ? base : `${base}.`} ${sentence}`
+}
+
 export function modelDisplayName(model: string): string {
   if (model === 'default') return 'Claude Default'
   if (model === 'sonnet') return 'Claude Sonnet'

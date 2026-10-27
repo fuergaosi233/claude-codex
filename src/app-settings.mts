@@ -1,5 +1,5 @@
 import { asTable, codexMcpServer, type InheritedMcpServer, mergeTables } from './codex-config.mjs'
-import { INVALID_REQUEST, RpcError } from './host-methods.mjs'
+import { invalidRequest, type RpcError } from './host-methods.mjs'
 import { codexHome } from './util.mjs'
 
 // What the Codex App's settings write with config/value/write and
@@ -39,7 +39,7 @@ export function appMcpServersEnabled(): boolean {
 
 // What the App's MCP settings show when a save, switch or delete is refused
 // because the servers do not apply.
-export const APP_MCP_SERVERS_OFF =
+const APP_MCP_SERVERS_OFF =
   "MCP servers added in the App are not used for Claude threads unless the adapter runs with CLAUDE_CODEX_APP_MCP_SERVERS=1. You can also add a server to Claude Code's own MCP config (claude mcp add, or a project's .mcp.json)."
 
 // App rule: desktop-mcp-servers
@@ -59,10 +59,6 @@ const PROTOTYPE_KEY = '__proto__'
 
 function validServerName(name: string): boolean {
   return SERVER_NAME.test(name) && name !== PROTOTYPE_KEY
-}
-
-function invalid(message: string): RpcError {
-  return new RpcError(message, undefined, INVALID_REQUEST)
 }
 
 // The fields of a Codex [mcp_servers.<name>] entry the App's form writes, with
@@ -134,22 +130,22 @@ export function editMcpServers(settings: Table, edit: ConfigEdit): void {
   let servers: Table
   if (name === undefined) {
     const table = asTable(edit.value)
-    if (edit.value != null && !table) throw invalid('mcp_servers must be a table of servers')
+    if (edit.value != null && !table) throw invalidRequest('mcp_servers must be a table of servers')
     servers = upsert ? { ...prior } : {}
     for (const [key, entry] of Object.entries(table ?? {})) {
       if (DESKTOP_MCP_SERVERS.has(key)) continue
       // Checked before withPath, which would drop a __proto__ server unseen.
-      if (!validServerName(key)) throw invalid(`invalid MCP server name: ${key}`)
+      if (!validServerName(key)) throw invalidRequest(`invalid MCP server name: ${key}`)
       servers = withPath(servers, [key], entry, upsert)
     }
   } else {
-    if (!validServerName(name)) throw invalid(`invalid MCP server name: ${name}`)
+    if (!validServerName(name)) throw invalidRequest(`invalid MCP server name: ${name}`)
     if (field.includes(PROTOTYPE_KEY))
-      throw invalid(`invalid MCP server field: mcp_servers.${name}.${field.join('.')}`)
+      throw invalidRequest(`invalid MCP server field: mcp_servers.${name}.${field.join('.')}`)
     if (field.length > 0 && !asTable(prior[name]))
-      throw invalid(`no MCP server named ${name} in the App's settings`)
+      throw invalidRequest(`no MCP server named ${name} in the App's settings`)
     if (field.length === 0 && edit.value != null && !asTable(edit.value))
-      throw invalid(`mcp_servers.${name} must be a table`)
+      throw invalidRequest(`mcp_servers.${name} must be a table`)
     servers = withPath(prior, [name, ...field], edit.value, upsert)
   }
   // A server the edit removes is a change too: with the servers off, what was
@@ -157,14 +153,14 @@ export function editMcpServers(settings: Table, edit: ConfigEdit): void {
   const changed = [...new Set([...Object.keys(prior), ...Object.keys(servers)])].filter(
     (key) => servers[key] !== prior[key],
   )
-  if (changed.length > 0 && !appMcpServersEnabled()) throw invalid(APP_MCP_SERVERS_OFF)
+  if (changed.length > 0 && !appMcpServersEnabled()) throw invalidRequest(APP_MCP_SERVERS_OFF)
   for (const key of changed) {
     if (!Object.hasOwn(servers, key)) continue
-    if (!validServerName(key)) throw invalid(`invalid MCP server name: ${key}`)
+    if (!validServerName(key)) throw invalidRequest(`invalid MCP server name: ${key}`)
     const entry = asTable(servers[key])
-    if (!entry) throw invalid(`mcp_servers.${key} must be a table`)
+    if (!entry) throw invalidRequest(`mcp_servers.${key} must be a table`)
     const problem = serverEntryProblem(key, entry)
-    if (problem) throw invalid(problem)
+    if (problem) throw invalidRequest(problem)
   }
   if (Object.keys(servers).length > 0) settings.mcp_servers = servers
   else delete settings.mcp_servers
@@ -278,7 +274,9 @@ export function unsupportedSettingWrite(edit: ConfigEdit): RpcError | 'drop' | n
   const unsupported = unsupportedFor(edit.keyPath)
   if (!unsupported) return null
   if (edit.value == null || unsupported.accepts?.(edit.value)) return 'drop'
-  return invalid(`${edit.keyPath} is not supported for Claude threads: ${unsupported.reason}`)
+  return invalidRequest(
+    `${edit.keyPath} is not supported for Claude threads: ${unsupported.reason}`,
+  )
 }
 
 // What the adapter kept of the App's settings before it handled the keys
