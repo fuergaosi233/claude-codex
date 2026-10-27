@@ -271,6 +271,10 @@ export CLAUDE_CODEX_ENABLE_FILE_CHECKPOINTING=1
 # Use the servers added under the App's Settings > MCP servers in Claude
 # threads (off by default).
 export CLAUDE_CODEX_APP_MCP_SERVERS=1
+
+# Give Claude a tool with the files the chat changed, as a diff, for reviews
+# outside git (off by default; see below).
+export CLAUDE_CODEX_SESSION_CHANGES=1
 ```
 
 A Claude thread's own turns start these MCP servers, each source winning a
@@ -304,6 +308,28 @@ switching or deleting a server there fails with this message under the form:
 Servers saved while the switch was on stay saved, unused, until it is set
 again. The switch is off by default because such a server starts a program,
 or reaches a URL with the headers and environment it names, from every Claude
+thread's turns.
+
+With `CLAUDE_CODEX_SESSION_CHANGES=1` a Claude thread's turns get the
+`codex_session` server's read-only `changes` tool
+(`mcp__codex_session__changes`), which Claude calls without asking. It reads
+the chat's Claude Code transcripts, its subagents' included, and shows each
+file the chat changed with Edit, Write or NotebookEdit as it is now against
+the file before the chat's first change to it, as a unified diff: what
+`/simplify`, `/review` and other reviews would read from `git diff`. It
+follows the thread's history, so a turn rolled back from the thread no longer
+counts. Its arguments narrow it:
+
+- `paths`: only these files or directories, relative to the working directory
+  or absolute (files outside it are only listed otherwise);
+- `turns`: only the changes of the last N turns, the current one included;
+- `stat`: the changed files with their line counts, without the diff.
+
+Outside a git work tree the system prompt tells Claude to call it where a
+command reads its changes from git. What shell commands changed is not in the
+transcripts and not shown, and a subagent's change to a file whose earlier
+text cannot be worked out is shown on its own. The switch is off by default
+because it adds a tool and, outside git, a system prompt line to every Claude
 thread's turns.
 
 ## App settings

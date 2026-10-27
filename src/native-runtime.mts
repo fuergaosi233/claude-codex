@@ -81,6 +81,12 @@ import { resolveClaudeModelProcess } from './model-profiles.mjs'
 import { echoedUuids, TurnInput, type TurnInputMessage } from './native-turn-input.mjs'
 import { appliedPermissionUpdates, permissionSuggestions } from './permission-suggestions.mjs'
 import { sdkHooks } from './sdk-hooks.mjs'
+import {
+  SESSION_CHANGES_DESCRIPTION,
+  SESSION_CHANGES_TOOL,
+  SESSION_MCP_SERVER,
+  sessionChangesHint,
+} from './session-changes.mjs'
 import { subagentItemsEnabled } from './subagent-items.mjs'
 import { readTaskResult } from './task-output.mjs'
 import { ToolInputPreviews } from './tool-input-preview.mjs'
@@ -106,6 +112,7 @@ import type {
   RuntimeTaskUsage,
   RuntimeTurnContext,
   RuntimeTurnSettings,
+  SessionChangesHandler,
   SubagentOutputEvent,
   UserInputAnswers,
   UserInputQuestion,
@@ -116,6 +123,7 @@ import {
   debugLog,
   isPathInside,
   newId,
+  projectSlugs,
 } from './util.mjs'
 import { parseWorkflowCommand, workflowRuntimePrompt } from './workflow-command.mjs'
 import {
@@ -897,10 +905,13 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       opts.model = context.model
     }
     if (context.effort) opts.effort = context.effort
+    const profileRoot = modelProcess
+      ? defaultWorkflowTranscriptRoots(modelProcess.env, context.cwd)[0]
+      : undefined
     const resume = sdkResumeSessionId(
       context.claudeSessionId,
       context.cwd,
-      modelProcess ? defaultWorkflowTranscriptRoots(modelProcess.env, context.cwd)[0] : undefined,
+      profileRoot,
       context.model,
     )
     if (resume) opts.resume = resume
@@ -995,6 +1006,19 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
         [LEADER_MCP_SERVER]: leaderToolServer(sdk, this.zod, context.leaderTools),
       }
     }
+    // Outside git, Claude also learns where the chat's changes are.
+    let sessionHint: string | null = null
+    if (context.sessionChanges && this.zod && typeof sdk.createSdkMcpServer === 'function') {
+      opts.mcpServers = {
+        ...((opts.mcpServers as Record<string, unknown> | undefined) ?? {}),
+        [SESSION_MCP_SERVER]: sessionChangesServer(sdk, this.zod, context.sessionChanges, {
+          cwd: context.cwd,
+          profileRoot,
+          model: context.model,
+        }),
+      }
+      sessionHint = sessionChangesHint(context.cwd)
+    }
     if (context.outputFormat) opts.outputFormat = context.outputFormat
 
     // Codex App's pinned policies map onto Claude SDK's permissionMode. plan
@@ -1035,13 +1059,12 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     // prompt append, preserving Claude Code's built-in preset.
     // Re-render on resume so settings changes (including clearing an append)
     // take effect on the next turn instead of waiting for SDK compaction.
+    const append = [context.systemPromptAddendum?.trim(), sessionHint].filter(Boolean).join('\n\n')
     opts.systemPrompt = {
       type: 'preset',
       preset: 'claude_code',
       snapshot: false,
-      ...(context.systemPromptAddendum?.trim()
-        ? { append: context.systemPromptAddendum.trim() }
-        : {}),
+      ...(append ? { append } : {}),
     }
 
     // CLI binary override (for users pinning a specific claude-code build).
@@ -1072,7 +1095,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       | { behavior: 'allow'; updatedInput?: unknown; updatedPermissions?: unknown[] }
       | { behavior: 'deny'; message: string; interrupt?: boolean }
     > => {
-      if (GOAL_TOOL_NAMES.has(toolName)) return { behavior: 'allow' }
+      if (GOAL_TOOL_NAMES.has(toolName) || toolName === SESSION_CHANGES_TOOL)
+        return { behavior: 'allow' }
       const toolUseId = options.toolUseID || `tool-${newId()}`
       // Claude Code says the user has to answer this ask themselves (the card
       // is the tool's own interface, or its disclosure only shows locally): no
@@ -4077,15 +4101,17 @@ function betweenTurnsMessage(tool: string, outcome: 'denied' | 'not run'): strin
   return `${tool} was ${outcome} because ${why}; the user can re-run it in a turn.`
 }
 
-function goalToolServer(sdk: ClaudeSdk, z: Zod, goal: GoalToolHandlers) {
-  const run = async (call: () => Promise<string>) => {
-    try {
-      return { content: [{ type: 'text' as const, text: await call() }] }
-    } catch (error) {
-      const text = error instanceof Error ? error.message : String(error)
-      return { content: [{ type: 'text' as const, text }], isError: true }
-    }
+// An MCP tool's result: the call's text, or its error's.
+async function toolText(call: () => Promise<string>) {
+  try {
+    return { content: [{ type: 'text' as const, text: await call() }] }
+  } catch (error) {
+    const text = error instanceof Error ? error.message : String(error)
+    return { content: [{ type: 'text' as const, text }], isError: true }
   }
+}
+
+function goalToolServer(sdk: ClaudeSdk, z: Zod, goal: GoalToolHandlers) {
   return sdk.createSdkMcpServer({
     name: GOAL_MCP_SERVER,
     version: '1.0.0',
@@ -4094,7 +4120,7 @@ function goalToolServer(sdk: ClaudeSdk, z: Zod, goal: GoalToolHandlers) {
     // looking for them.
     alwaysLoad: true,
     tools: [
-      sdk.tool('get_goal', GET_GOAL_DESCRIPTION, {}, () => run(() => goal.getGoal())),
+      sdk.tool('get_goal', GET_GOAL_DESCRIPTION, {}, () => toolText(() => goal.getGoal())),
       sdk.tool(
         'create_goal',
         CREATE_GOAL_DESCRIPTION,
@@ -4111,7 +4137,7 @@ function goalToolServer(sdk: ClaudeSdk, z: Zod, goal: GoalToolHandlers) {
             .optional()
             .describe('Positive token budget for the new goal. Omit unless explicitly requested.'),
         },
-        (args) => run(() => goal.createGoal(args.objective, args.token_budget ?? null)),
+        (args) => toolText(() => goal.createGoal(args.objective, args.token_budget ?? null)),
       ),
       sdk.tool(
         'update_goal',
@@ -4123,7 +4149,60 @@ function goalToolServer(sdk: ClaudeSdk, z: Zod, goal: GoalToolHandlers) {
               'Required. `paused` requires an explicit user request. Set to `complete` only when the objective is achieved and no required work remains. Set to `blocked` only after the same blocking condition has recurred for at least three consecutive goal turns and the agent is at an impasse.',
             ),
         },
-        (args) => run(() => goal.updateGoal(args.status)),
+        (args) => toolText(() => goal.updateGoal(args.status)),
+      ),
+    ],
+  })
+}
+
+// The codex_session server: one read-only tool, so plan mode may use it too.
+// The session's transcripts are in the model profile's config dir or wherever
+// the CLI keeps them (see sdkResumeSessionId); the roots are listed at each
+// call, so one made since the session started is searched too.
+function sessionChangesServer(
+  sdk: ClaudeSdk,
+  z: Zod,
+  handler: SessionChangesHandler,
+  session: { cwd: string; profileRoot: string | undefined; model: string | null | undefined },
+) {
+  const { cwd, profileRoot, model } = session
+  const configRoots = () => [
+    ...(profileRoot ? [profileRoot] : []),
+    nativeConfigRoot(model),
+    ...knownConfigRoots(),
+  ]
+  return sdk.createSdkMcpServer({
+    name: SESSION_MCP_SERVER,
+    version: '1.0.0',
+    // Up front: a review that finds no git diff should see it without
+    // searching for it.
+    alwaysLoad: true,
+    tools: [
+      sdk.tool(
+        'changes',
+        SESSION_CHANGES_DESCRIPTION,
+        {
+          paths: z
+            .array(z.string())
+            .optional()
+            .describe(
+              'Only these files or directories, absolute or relative to the working directory.',
+            ),
+          stat: z
+            .boolean()
+            .optional()
+            .describe('List the changed files with their line counts, without the diff.'),
+          turns: z
+            .number()
+            .int()
+            .positive()
+            .optional()
+            .describe(
+              "Only the changes of the chat's last N turns, this one included: 1 is this turn, 2 adds the one before. Omit for all of the chat's changes.",
+            ),
+        },
+        (args) => toolText(() => handler.changes(args, { cwd, configRoots: configRoots() })),
+        { annotations: { readOnlyHint: true } },
       ),
     ],
   })
@@ -4136,6 +4215,7 @@ function registeredDynamicServers(context: RuntimeTurnContext): DynamicToolServe
   const taken = new Set([
     GOAL_MCP_SERVER,
     LEADER_MCP_SERVER,
+    SESSION_MCP_SERVER,
     ...Object.keys(recordOrNull(context.mcpServers) ?? {}),
   ])
   return context.dynamicTools.filter((server) => !taken.has(server.server))
@@ -4157,14 +4237,6 @@ function toolSignal(extra: unknown): AbortSignal | undefined {
 }
 
 function leaderToolServer(sdk: ClaudeSdk, z: Zod, leader: LeaderToolHandlers) {
-  const run = async (call: () => Promise<string>) => {
-    try {
-      return { content: [{ type: 'text' as const, text: await call() }] }
-    } catch (error) {
-      const text = error instanceof Error ? error.message : String(error)
-      return { content: [{ type: 'text' as const, text }], isError: true }
-    }
-  }
   const readOnly = { annotations: { readOnlyHint: true } }
   const threadId = z.string().describe('The threadId thread_start or thread_list returned.')
   const timeoutSec = z
@@ -4188,7 +4260,7 @@ function leaderToolServer(sdk: ClaudeSdk, z: Zod, leader: LeaderToolHandlers) {
             .optional()
             .describe('"children" (default): the chats you started. "all": recent chats too.'),
         },
-        (args) => run(() => leader.list(args)),
+        (args) => toolText(() => leader.list(args)),
         readOnly,
       ),
       sdk.tool(
@@ -4208,7 +4280,7 @@ function leaderToolServer(sdk: ClaudeSdk, z: Zod, leader: LeaderToolHandlers) {
             .describe("Absolute working directory. Defaults to this chat's."),
           model: z.string().optional().describe("Claude model id. Defaults to this chat's."),
         },
-        (args) => run(() => leader.start(args)),
+        (args) => toolText(() => leader.start(args)),
       ),
       sdk.tool(
         'thread_prompt',
@@ -4222,7 +4294,7 @@ function leaderToolServer(sdk: ClaudeSdk, z: Zod, leader: LeaderToolHandlers) {
             .describe('Wait for the turn that takes the message to finish and return its result.'),
           timeoutSec,
         },
-        (args, extra) => run(() => leader.prompt(args, toolSignal(extra))),
+        (args, extra) => toolText(() => leader.prompt(args, toolSignal(extra))),
       ),
       sdk.tool(
         'thread_wait',
@@ -4235,7 +4307,7 @@ function leaderToolServer(sdk: ClaudeSdk, z: Zod, leader: LeaderToolHandlers) {
             .describe('"any" (default): return when one is done or blocked. "all": when all are.'),
           timeoutSec,
         },
-        (args, extra) => run(() => leader.wait(args, toolSignal(extra))),
+        (args, extra) => toolText(() => leader.wait(args, toolSignal(extra))),
         readOnly,
       ),
       sdk.tool(
@@ -4248,7 +4320,7 @@ function leaderToolServer(sdk: ClaudeSdk, z: Zod, leader: LeaderToolHandlers) {
             .optional()
             .describe('The cursor a previous thread_read returned, to read only what came after.'),
         },
-        (args) => run(() => leader.read(args)),
+        (args) => toolText(() => leader.read(args)),
         readOnly,
       ),
     ],
@@ -4362,6 +4434,7 @@ export function sessionSignature(context: RuntimeTurnContext): string {
     context.goalTools ? GOAL_MCP_SERVER : null,
     context.dynamicTools ?? null,
     context.leaderTools ? LEADER_MCP_SERVER : null,
+    context.sessionChanges ? SESSION_MCP_SERVER : null,
     context.addDirs ?? [],
     context.allowedTools ?? [],
     inheritedAllowedTools(context),
@@ -4425,13 +4498,8 @@ function sessionTranscriptFile(
   env: NodeJS.ProcessEnv,
 ): string | null {
   const root = env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')
-  const dirs = [cwd]
-  try {
-    const real = realpathSync(cwd)
-    if (real !== cwd) dirs.push(real)
-  } catch {}
-  for (const dir of dirs) {
-    const file = join(root, 'projects', dir.replace(/[^a-zA-Z0-9-]/g, '-'), `${sessionId}.jsonl`)
+  for (const slug of projectSlugs(cwd)) {
+    const file = join(root, 'projects', slug, `${sessionId}.jsonl`)
     if (existsSync(file)) return file
   }
   return null
@@ -4473,11 +4541,7 @@ export function sdkResumeSessionId(
   if (!value) return null
   if (/^(agent-http|agentapi|claude-p):/.test(value)) return null
   if (!cwd) return value
-  const slugs = [projectSlug(cwd)]
-  try {
-    const real = realpathSync(cwd)
-    if (real !== cwd) slugs.push(projectSlug(real))
-  } catch {}
+  const slugs = projectSlugs(cwd)
   const runRoot = configRoot ?? nativeConfigRoot(model)
   const roots = configRoot ? [configRoot] : [runRoot, ...knownConfigRoots()]
   let source: TranscriptCopy | null = null
@@ -4500,10 +4564,6 @@ export function sdkResumeSessionId(
 interface TranscriptCopy {
   file: string
   stat: Stats
-}
-
-function projectSlug(dir: string): string {
-  return dir.replace(/[^a-zA-Z0-9-]/g, '-')
 }
 
 // The config dir a turn without a model process profile runs from. The CLI

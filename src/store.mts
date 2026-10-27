@@ -1524,10 +1524,24 @@ export class SessionStore {
     return index + 1
   }
 
-  private historyCheckpoints(threadId: string): Array<{ checkpoint: ClaudeCheckpoint | null }> {
-    return this.historyRows(threadId, 'claude_session_id, claude_message_uuid').map((row) => ({
-      checkpoint: checkpointFrom(row.claude_session_id, row.claude_message_uuid),
-    }))
+  // The Claude checkpoint and start (unix seconds) of each turn of a thread's
+  // history, its inherited turns first.
+  turnCheckpoints(
+    threadId: string,
+  ): Array<{ checkpoint: ClaudeCheckpoint | null; startedAt: number | null }> {
+    this.ensureInheritedHistory(threadId)
+    return this.historyCheckpoints(threadId)
+  }
+
+  private historyCheckpoints(
+    threadId: string,
+  ): Array<{ checkpoint: ClaudeCheckpoint | null; startedAt: number | null }> {
+    return this.historyRows(threadId, 'claude_session_id, claude_message_uuid, started_at').map(
+      (row) => ({
+        checkpoint: checkpointFrom(row.claude_session_id, row.claude_message_uuid),
+        startedAt: row.started_at == null ? null : Number(row.started_at),
+      }),
+    )
   }
 
   // The given columns of the first `limit` turns of a thread's history (all

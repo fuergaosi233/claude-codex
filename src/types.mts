@@ -609,6 +609,10 @@ export interface RuntimeTurnContext {
   // prompt, wait on and read separate chats. Off unless the adapter enables
   // them; backends without in-process tools ignore it.
   leaderTools?: LeaderToolHandlers | null
+  // Let Claude read the changes the thread made to files (the codex_session
+  // `changes` tool), for reviews where git has none. Off unless the adapter
+  // enables it; backends without in-process tools ignore it.
+  sessionChanges?: SessionChangesHandler | null
   // Ask Claude to return its thinking as readable summaries (the CLI's
   // --thinking-display). Unset keeps the CLI's default, which recent models
   // answer with redacted thinking. Backends without the flag ignore it.
@@ -649,6 +653,19 @@ export interface LeaderToolHandlers {
     signal?: AbortSignal,
   ): Promise<string>
   read(input: { threadId: string; sinceCursor?: string | undefined }): Promise<string>
+}
+
+// Same contract as GoalToolHandlers. The runtime says where the session runs:
+// its cwd, and the config dirs its transcripts may be in.
+export interface SessionChangesHandler {
+  changes(
+    input: {
+      paths?: string[] | undefined
+      stat?: boolean | undefined
+      turns?: number | undefined
+    },
+    session: { cwd: string; configRoots: string[] },
+  ): Promise<string>
 }
 
 export interface ImageInput {

@@ -1,5 +1,6 @@
 import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { SESSION_CHANGES_TOOL } from './session-changes.mjs'
 import { subagentItemsEnabled } from './subagent-items.mjs'
 import type {
   ClaudePermissionUpdate,
@@ -15,6 +16,7 @@ import type {
   SubagentOutput,
 } from './types.mjs'
 import { sleep } from './util.mjs'
+import { defaultWorkflowTranscriptRoots } from './workflow-subagents.mjs'
 
 const MOCK_BACKGROUND_AGENT_ID = 'a0b1c2d3e4f5a6b7'
 const MOCK_FOREGROUND_AGENT_ID = 'deadbeefcafef00d'
@@ -376,26 +378,43 @@ export class MockRuntime implements ClaudeRuntime {
       for (const [, tool = '', json = '{}'] of context.prompt.matchAll(
         /^leader (thread_\w+) (.*)$/gm,
       )) {
-        const toolUseId = `leader-${context.turnId}-${(call += 1)}`
         const input = JSON.parse(json)
-        await handlers.onEvent({
-          type: 'tool_use',
-          toolUseId,
-          toolName: `mcp__codex_leader__${tool}`,
+        const { content, isError } = await mockToolCall(
+          handlers,
+          `leader-${context.turnId}-${(call += 1)}`,
+          `mcp__codex_leader__${tool}`,
           input,
-        })
-        let content: string
-        let isError = false
-        try {
-          content = await callLeaderTool(context, tool, input)
-        } catch (error) {
-          content = error instanceof Error ? error.message : String(error)
-          isError = true
-        }
-        await handlers.onEvent({ type: 'tool_result', toolUseId, content, isError })
+          () => callLeaderTool(context, tool, input),
+        )
         lines.push(`${tool} => ${isError ? 'error: ' : ''}${content}`)
       }
       const text = lines.join('\n')
+      await handlers.onEvent({ type: 'text_delta', delta: text })
+      await handlers.onEvent({ type: 'completed', success: true, result: text })
+      return
+    }
+
+    // Session changes: every `session changes <json input>` line calls the
+    // codex_session tool, with the transcripts in the Claude config dir.
+    if (/^session changes /m.test(context.prompt)) {
+      const configRoots = defaultWorkflowTranscriptRoots(process.env, context.cwd)
+      const lines: string[] = []
+      let call = 0
+      for (const [, json = '{}'] of context.prompt.matchAll(/^session changes (.*)$/gm)) {
+        const input = JSON.parse(json)
+        const { content, isError } = await mockToolCall(
+          handlers,
+          `session-${context.turnId}-${(call += 1)}`,
+          SESSION_CHANGES_TOOL,
+          input,
+          async () => {
+            if (!context.sessionChanges) throw new Error('session changes are off')
+            return context.sessionChanges.changes(input, { cwd: context.cwd, configRoots })
+          },
+        )
+        lines.push(isError ? `error: ${content}` : content)
+      }
+      const text = lines.join('\n\n')
       await handlers.onEvent({ type: 'text_delta', delta: text })
       await handlers.onEvent({ type: 'completed', success: true, result: text })
       return
@@ -2022,6 +2041,28 @@ function callLeaderTool(
     default:
       throw new Error(`unknown leader tool: ${tool}`)
   }
+}
+
+// One in-process tool call as the native runtime reports it: the call, then
+// its result or its error.
+async function mockToolCall(
+  handlers: RuntimeHandlers,
+  toolUseId: string,
+  toolName: string,
+  input: Record<string, unknown>,
+  run: () => Promise<string>,
+): Promise<{ content: string; isError: boolean }> {
+  await handlers.onEvent({ type: 'tool_use', toolUseId, toolName, input })
+  let content: string
+  let isError = false
+  try {
+    content = await run()
+  } catch (error) {
+    content = error instanceof Error ? error.message : String(error)
+    isError = true
+  }
+  await handlers.onEvent({ type: 'tool_result', toolUseId, content, isError })
+  return { content, isError }
 }
 
 // The permission changes Claude Code offers with a tool's approval when the

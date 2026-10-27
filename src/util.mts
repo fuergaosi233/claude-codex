@@ -5,6 +5,7 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   statSync,
   unlinkSync,
@@ -81,6 +82,18 @@ export function defaultSocketPath(): string {
   const preferred = join(codexHome(), 'app-server-control', 'app-server-control.sock')
   if (preferred.length <= socketPathLimit()) return preferred
   return join(tmpdir(), `ccx-${stableHash(preferred).slice(0, 16)}.sock`)
+}
+
+// The folders a cwd's sessions may be in under a Claude Code config dir's
+// projects: named after the cwd, and after its real path when that differs.
+export function projectSlugs(cwd: string): string[] {
+  const slug = (dir: string) => dir.replace(/[^a-zA-Z0-9-]/g, '-')
+  const slugs = [slug(cwd)]
+  try {
+    const real = realpathSync(cwd)
+    if (real !== cwd) slugs.push(slug(real))
+  } catch {}
+  return slugs
 }
 
 // `path` lies strictly below `root`; both are compared lexically.
