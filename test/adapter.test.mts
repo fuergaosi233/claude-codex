@@ -2266,18 +2266,25 @@ test('unix daemon keeps active turns alive across peer reconnect', async () => {
     )
     await reader2.nextResponse(3)
 
+    // How much of the reply streamed while no peer was connected depends on
+    // timing, so the deltas only show the stream went on; the finished item
+    // carries the whole reply.
+    let streamed = ''
     let text = ''
     let completed = false
     for (let i = 0; i < 1000; i += 1) {
       const message = await reader2.next()
-      if (message.method === 'item/agentMessage/delta') text += message.params.delta
+      if (message.method === 'item/agentMessage/delta') streamed += message.params.delta
+      if (message.method === 'item/completed' && message.params.item.type === 'agentMessage')
+        text = message.params.item.text
       if (message.method === 'turn/completed') {
         completed = true
         break
       }
     }
     assert.equal(completed, true)
-    assert.match(text, /reconnect check/)
+    assert.match(streamed, /x{20}/)
+    assert.match(text, /active reconnect check/)
 
     ws2.close()
     await once(ws2, 'close')
