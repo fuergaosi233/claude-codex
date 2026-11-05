@@ -919,9 +919,11 @@ versioning or publishing metadata.
 
 ### Validation and release gates
 
-- Default CI runs Biome checks, TypeScript typechecking, the Node test suite,
-  Rust workspace tests, and the pinned Rust protocol fixture drift gate.
-- Documentation changes should run `npm run docs:build`.
+- Default CI runs Biome checks, TypeScript typechecking, the VitePress docs
+  build, the Node test suite, Rust workspace tests, and the pinned Rust protocol
+  fixture drift gate.
+- The docs build no longer ignores dead links, so a link to a page that does not
+  exist fails CI.
 - Credentialed smoke and acceptance checks remain opt-in and must use
   credentials already owned by the local user or organization on the host.
 - `npm run check:app-upgrade -- --app <bundle>` checks a new Codex App build

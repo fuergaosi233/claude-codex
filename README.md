@@ -427,10 +427,11 @@ Full Access turn. Operators can still opt into native SDK bypass explicitly with
 - **Unsupported:** personal subscription pooling, browser cookie or session-token
   reuse, credential sharing, private endpoint use, provider bypass behavior, and
   claims of unavailable entitlements.
-- **Release checks:** CI runs `npm run check`, `npm run typecheck`, `npm test`,
-  `cargo test --workspace`, and the pinned Rust fixture drift check. Docs changes
-  should run `npm run docs:build`; credentialed smoke and acceptance checks stay
-  opt-in with user- or organization-owned credentials.
+- **Release checks:** CI runs `npm run check`, `npm run typecheck`,
+  `npm run docs:build` (which fails on dead links), `npm test`,
+  `cargo test --workspace`, and the pinned Rust fixture drift check; credentialed
+  smoke and acceptance checks stay opt-in with user- or organization-owned
+  credentials.
 
 See the
 **[release readiness reference](https://fuergaosi233.github.io/claude-codex/reference/release-readiness)**
