@@ -31,6 +31,10 @@ replace the TypeScript runtime, transport, store, or provider execution path.
 | `npm run smoke:real` | Opt-in | Real Claude turn using host-owned Anthropic, Bedrock, or Vertex credentials. |
 | `npm run acceptance:local-remote` | Opt-in | Local shim, daemon, proxy, and real Claude file-edit flow. |
 | `npm run acceptance:gui-ssh-localhost` | Opt-in | Closest automated check to Codex App GUI Remote over SSH localhost. |
+| `npm run acceptance:ssh-runtime-matrix` | Opt-in | Switching between runtime modes on a remote host, with a real turn after each mode switch in each of two workspaces. |
+| `npm run probe:capabilities` | Opt-in | Mock app-server advertises the expected Codex compat version and answers core thread, turn, process, compact, and review requests. |
+| `npm run probe:codex-cli-remote` | Opt-in | How the installed `codex --remote` CLI behaves against the adapter in mock WebSocket mode. |
+| `npm run check:app-upgrade` | Opt-in | A new Codex App build against the verified App baseline; see [App compatibility](/reference/app-compat). |
 
 Default CI uses fake or mockable credentials. Credentialed smoke and acceptance
 checks require credentials already owned by the local user or organization on
