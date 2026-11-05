@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { parseProcessRows } from './cli-orphans.mjs'
+import { parseProcessRows, psEnv } from './cli-orphans.mjs'
 
 // Several servers can share one state dir: the App's own, a second window, a
 // one-shot `codex app-server` probe. Each turn records the server that wrote
@@ -41,9 +41,9 @@ function signalable(pid: number): boolean {
   }
 }
 
-// Start times by pid, or null when ps could not run. The C locale and UTC
-// make every server print the same start time for a process, whatever
-// locale or time zone it was started with.
+// Start times by pid, or null when ps could not run. psEnv makes every
+// server print the same start time for a process, whatever locale or time
+// zone it was started with.
 function startTimes(pids: number[]): Map<number, string> | null {
   if (process.platform === 'win32') return null
   let output: string
@@ -56,7 +56,7 @@ function startTimes(pids: number[]): Map<number, string> | null {
         timeout: 5000,
         maxBuffer: 1024 * 1024,
         stdio: ['ignore', 'pipe', 'ignore'],
-        env: { ...process.env, LC_ALL: 'C', TZ: 'UTC' },
+        env: psEnv(),
       },
     )
   } catch (error) {

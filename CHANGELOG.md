@@ -210,7 +210,10 @@ versioning or publishing metadata.
   in progress in the App.
 - The adapter stops Claude CLI processes a previous adapter on the same state
   dir left running, matching pid, start time and command line before
-  signalling (`CLAUDE_CODEX_REAP_ORPHANED_CLI=0` turns it off).
+  signalling (`CLAUDE_CODEX_REAP_ORPHANED_CLI=0` turns it off). Start times
+  are read in UTC and the C locale, so two adapters with a different `TZ`
+  (an App launch and a shell) no longer drop a live sibling's record or miss
+  a killed adapter's Claude CLI.
 - A second adapter started on the same state dir (a startup probe, another
   window) no longer fails the turns a running adapter is still working on.
   Each turn records the process that wrote it, by pid and start time, and

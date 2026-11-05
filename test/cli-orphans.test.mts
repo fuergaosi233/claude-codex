@@ -29,7 +29,10 @@ async function waitFor(check: () => boolean, ms: number): Promise<boolean> {
 
 // A stand-in adapter: it spawns a CLI look-alike (which itself runs a tool
 // process), records it, and prints both pids.
-function startOwner(dir: string): Promise<{ owner: ChildProcess; cli: number; tool: number }> {
+function startOwner(
+  dir: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<{ owner: ChildProcess; cli: number; tool: number }> {
   const script = `
     import { spawn } from 'node:child_process'
     import { recordCliChildren } from ${JSON.stringify(modulePath)}
@@ -43,6 +46,7 @@ function startOwner(dir: string): Promise<{ owner: ChildProcess; cli: number; to
   `
   const owner = spawn(process.execPath, ['--input-type=module', '-e', script], {
     stdio: ['ignore', 'pipe', 'inherit'],
+    env,
   })
   return new Promise((resolvePids, reject) => {
     owner.stdout.setEncoding('utf8')
@@ -77,6 +81,34 @@ test('reapOrphanedCliChildren stops the CLI tree of a killed adapter only', {
     // Nothing left to reap the second time.
     assert.deepEqual(await reapOrphanedCliChildren(dir, 200), [])
   } finally {
+    for (const pid of [owner.pid, cli, tool])
+      try {
+        if (pid) process.kill(pid, 'SIGKILL')
+      } catch {}
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('reapOrphanedCliChildren matches an adapter that runs in another time zone', {
+  skip: process.platform === 'win32',
+}, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'claude-codex-cli-children-'))
+  const { owner, cli, tool } = await startOwner(dir, { ...process.env, TZ: 'Asia/Tokyo' })
+  const savedTz = process.env.TZ
+  process.env.TZ = 'America/New_York'
+  try {
+    // The owner is alive: its record survives a reap from another time zone.
+    assert.deepEqual(await reapOrphanedCliChildren(dir, 200), [])
+    assert.deepEqual(await readdir(dir), [`${owner.pid}.json`])
+    assert.equal(alive(cli), true)
+
+    owner.kill('SIGKILL')
+    await once(owner, 'exit')
+    assert.deepEqual(await reapOrphanedCliChildren(dir, 200), [cli])
+    assert.equal(await waitFor(() => !alive(cli) && !alive(tool), 5000), true)
+  } finally {
+    if (savedTz === undefined) delete process.env.TZ
+    else process.env.TZ = savedTz
     for (const pid of [owner.pid, cli, tool])
       try {
         if (pid) process.kill(pid, 'SIGKILL')
