@@ -1,10 +1,10 @@
 #!/usr/bin/env node
-import { chmodSync, existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { APP_PLUGIN_SERVER_ENV, setAppPluginConfigOverrides } from './app-plugin-mcp.mjs'
 import { sweepCliMcpConfigs } from './cli-mcp-config.mjs'
 import { reapOrphanedCliChildren } from './cli-orphans.mjs'
-import { daemonProbe, startupConfigProbe } from './cli-probes.mjs'
+import { daemonProbe, listening, startupConfigProbe } from './cli-probes.mjs'
 import { inheritedHooksWarning } from './inherited-config.mjs'
 import { createRuntime } from './runtime-factory.mjs'
 import { CodexClaudeAppServer } from './server.mjs'
@@ -129,7 +129,7 @@ async function main(): Promise<void> {
   const isUnixDaemon = listen.startsWith('unix://')
   let pidFile: string | null = null
   if (isUnixDaemon) {
-    pidFile = ensureSingleUnixDaemon(listen)
+    pidFile = await ensureSingleUnixDaemon(listen)
   }
 
   const store = new SessionStore()
@@ -311,19 +311,23 @@ function configArgs(args: string[]): string[] {
   return values
 }
 
-function ensureSingleUnixDaemon(listen: string): string {
+// How long after writing its pid file a starting daemon may take to listen.
+// A younger pid file whose process is alive counts as a daemon on its way up.
+const DAEMON_STARTUP_GRACE_MS = 10_000
+
+async function ensureSingleUnixDaemon(listen: string): Promise<string> {
   const socketPath = listen === 'unix://' ? defaultSocketPath() : listen.slice('unix://'.length)
   const pidFile = `${socketPath}.pid`
   ensureParent(socketPath)
-  if (existsSync(pidFile)) {
-    const pid = Number(readFileSync(pidFile, 'utf8'))
-    if (Number.isFinite(pid) && processIsAlive(pid)) {
-      process.stderr.write(
-        `[claude-codex-adapter] app-server already running at ${socketPath} (pid ${pid})\n`,
-      )
-      process.exit(0)
-    }
+  const pid = readDaemonPid(pidFile)
+  if (pid !== null && (await daemonIsRunning(pid, socketPath, pidFile))) {
+    process.stderr.write(
+      `[claude-codex-adapter] app-server already running at ${socketPath} (pid ${pid})\n`,
+    )
+    process.exit(0)
   }
+  // Anything else is a stale file: empty or truncated by a crash, or a pid
+  // the system has since handed to another process. This daemon replaces it.
   try {
     if (existsSync(socketPath)) unlinkSync(socketPath)
   } catch {}
@@ -332,6 +336,39 @@ function ensureSingleUnixDaemon(listen: string): string {
     chmodSync(dirname(socketPath), 0o700)
   } catch {}
   return pidFile
+}
+
+// The pid in the file, or null when it is missing or could not name another
+// daemon. Number('') is 0, and kill(0) or kill(-n) signals a process group,
+// so only a plain positive pid other than init and this process counts.
+function readDaemonPid(pidFile: string): number | null {
+  let text: string
+  try {
+    text = readFileSync(pidFile, 'utf8').trim()
+  } catch {
+    return null
+  }
+  if (!/^\d+$/.test(text)) return null
+  const pid = Number(text)
+  return Number.isSafeInteger(pid) && pid > 1 && pid !== process.pid ? pid : null
+}
+
+// A live pid alone may be a recycled one, so the socket has to accept a
+// connection too. A daemon that wrote its pid file moments ago may still be
+// starting; give it until the grace window ends to begin listening.
+async function daemonIsRunning(pid: number, socketPath: string, pidFile: string): Promise<boolean> {
+  let writtenAt: number
+  try {
+    writtenAt = statSync(pidFile).mtimeMs
+  } catch {
+    return false
+  }
+  for (;;) {
+    if (!processIsAlive(pid)) return false
+    if (await listening(socketPath)) return true
+    if (Date.now() - writtenAt >= DAEMON_STARTUP_GRACE_MS) return false
+    await sleep(200)
+  }
 }
 
 function processIsAlive(pid: number): boolean {
