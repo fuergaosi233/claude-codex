@@ -38,6 +38,11 @@ versioning or publishing metadata.
 
 ### Failures you can see and act on
 
+- A turn in a GPT chat (the `codex-proxy` route) now hands its prompt to
+  `codex exec` on stdin instead of as the last argument. A message that
+  starts with `-` or `--` no longer fails as an unknown `codex` flag, and a
+  prompt over 128 KiB (a pasted log, a large injected context) no longer fails
+  with `spawn E2BIG` on Linux.
 - A turn that fails after the computer slept for a minute or more since
   Claude last made progress in it says so in its error: roughly how long the
   computer slept, that this broke Claude's connection to the model, and that a
