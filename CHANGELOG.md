@@ -131,6 +131,10 @@ versioning or publishing metadata.
 
 ### App-server and protocol compatibility
 
+- An HTTP MCP server that answers with an event stream and keeps the stream
+  open after its reply no longer makes every request wait out the MCP
+  timeout and fail: the adapter stops reading at the event that answers the
+  request, as Codex's MCP client does.
 - Opt-in Memories: with `CLAUDE_CODEX_MEMORIES=1`, the App's Memories
   settings (Settings > Personalization) and `/memories` decide whether Claude
   threads run with Claude Code's auto-memory, and while Memories is off in the

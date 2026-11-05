@@ -603,7 +603,13 @@ async function connectHttp(config: Record<string, unknown>): Promise<McpConnecti
   let nextId = 1
   const request = async (method: string, params: unknown): Promise<unknown> => {
     const id = nextId++
-    const reply = await postJsonRpc(url, headers, { jsonrpc: '2.0', id, method, params }, signal)
+    const reply = await postJsonRpc(
+      url,
+      headers,
+      { jsonrpc: '2.0', id, method, params },
+      signal,
+      id,
+    )
     if (method === 'initialize' && reply.sessionId) headers['mcp-session-id'] = reply.sessionId
     const record = asRecord(jsonRpcReply(reply, id))
     if (record.error) throw new Error(JSON.stringify(record.error))
@@ -625,17 +631,23 @@ async function connectHttp(config: Record<string, unknown>): Promise<McpConnecti
 
 // One JSON-RPC message posted to an HTTP server, and what came back. Errors
 // leave out what fetch says, which can repeat the url or a header value.
+// A request's event stream is read up to the event that answers `id`: the
+// server may keep the stream open after it.
 async function postJsonRpc(
   url: string,
   headers: Record<string, string>,
   message: Record<string, unknown>,
   signal: AbortSignal,
+  id?: number,
 ): Promise<{ text: string; stream: boolean; sessionId: string | null }> {
   let response: Response
   let text: string
   try {
     response = await fetch(url, { method: 'POST', headers, body: JSON.stringify(message), signal })
-    text = await response.text()
+    text =
+      id !== undefined && response.ok && isEventStream(response)
+        ? await readEventsUntilReply(response, id)
+        : await response.text()
   } catch (error) {
     if (signal.aborted) throw new Error('MCP request timed out')
     const cause = error instanceof Error ? error.cause : undefined
@@ -650,9 +662,57 @@ async function postJsonRpc(
   if (!response.ok) throw new Error(`HTTP MCP request failed ${response.status}: ${detail}`)
   return {
     text,
-    stream: (response.headers.get('content-type') ?? '').includes('text/event-stream'),
+    stream: isEventStream(response),
     sessionId: response.headers.get('mcp-session-id'),
   }
+}
+
+function isEventStream(response: Response): boolean {
+  return (response.headers.get('content-type') ?? '').includes('text/event-stream')
+}
+
+// The events of a stream, through the first whole one whose data answers id,
+// or all of them when the stream ends first. The rest of the stream is let go.
+async function readEventsUntilReply(response: Response, id: number): Promise<string> {
+  if (!response.body) return ''
+  const reader = response.body.pipeThrough(new TextDecoderStream()).getReader()
+  let text = ''
+  let scanned = 0
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) return text
+      text += value
+      // Only whole events, which end at a blank line, are looked at.
+      const boundary = /\r?\n\r?\n/g
+      boundary.lastIndex = scanned
+      for (let end = boundary.exec(text); end; end = boundary.exec(text)) {
+        const event = text.slice(scanned, end.index)
+        scanned = end.index + end[0].length
+        if (eventAnswers(event, id)) return text.slice(0, scanned)
+      }
+    }
+  } finally {
+    reader.cancel().catch(() => undefined)
+  }
+}
+
+function eventAnswers(event: string, id: number): boolean {
+  const data = eventData(event)
+  if (!data) return false
+  try {
+    return String(asRecord(JSON.parse(data)).id) === String(id)
+  } catch {
+    return false
+  }
+}
+
+function eventData(event: string): string {
+  return event
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith('data:'))
+    .map((line) => line.slice('data:'.length).trim())
+    .join('\n')
 }
 
 // The reply to request id: the JSON body, or, from an event stream, the
@@ -662,11 +722,7 @@ function jsonRpcReply(reply: { text: string; stream: boolean }, id: number): unk
   if (!reply.stream && !/^(event|data|id):/.test(trimmed)) return JSON.parse(trimmed)
   let last: unknown = null
   for (const event of trimmed.split(/\r?\n\r?\n/)) {
-    const data = event
-      .split(/\r?\n/)
-      .filter((line) => line.startsWith('data:'))
-      .map((line) => line.slice('data:'.length).trim())
-      .join('\n')
+    const data = eventData(event)
     if (!data) continue
     const message = asRecord(JSON.parse(data))
     if (String(message.id) === String(id)) return message
