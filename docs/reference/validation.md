@@ -47,9 +47,8 @@ CI runs `npm run check`, `npm run typecheck`, `npm test`,
   credentials.
 
 - **`acceptance:ssh-runtime-matrix`** copies itself with `scp` to `/tmp` on
-  `<ssh-host>` (or `CLAUDE_CODEX_MATRIX_SSH_HOST`) and runs there after
-  sourcing `~/.claude-codex/runtime.env`, which must set `CODEX_REAL` and
-  `CLAUDE_CODEX_ADAPTER`. For every `from->to` pair of runtime modes (default
+  `<ssh-host>` and runs there after sourcing `~/.claude-codex/runtime.env`,
+  which must set `CODEX_REAL` and `CLAUDE_CODEX_ADAPTER`. For every `from->to` pair of runtime modes (default
   `codex`, `agent-sdk-sidecar`, `agent-http`, `agentapi`, `claude-p`; override
   with comma-separated `MODE_MATRIX_MODES`) it switches modes with
   `claude-codex-mode set`, writes a token file into `<cwd-a>` and `<cwd-b>`, and
