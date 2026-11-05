@@ -829,8 +829,15 @@ export class CodexClaudeAppServer {
         this.subscribersByThread.delete(threadId)
     }
     for (const pending of this.pendingServerRequests.values()) pending.targets.delete(peer.id)
-    for (const child of [...this.commandProcesses.values(), ...this.processHandles.values()])
-      if (this.peerOfResource.get(child) === peer.id) terminateChild(child)
+    // Dropped at once, as Codex drops the connection's sessions: a process that
+    // ignores SIGTERM must not keep its id taken.
+    for (const processes of [this.commandProcesses, this.processHandles]) {
+      for (const [id, child] of processes) {
+        if (this.peerOfResource.get(child) !== peer.id) continue
+        processes.delete(id)
+        terminateChild(child)
+      }
+    }
     for (const [watchId, watcher] of this.fsWatchers) {
       if (this.peerOfResource.get(watcher) !== peer.id) continue
       watcher.close()
@@ -8921,13 +8928,13 @@ export class CodexClaudeAppServer {
           code: (error as NodeJS.ErrnoException).code,
         })
         if (timeout) clearTimeout(timeout)
-        this.commandProcesses.delete(processId)
+        if (this.commandProcesses.get(processId) === child) this.commandProcesses.delete(processId)
         reject(error)
       })
       child.once('close', (code, signal) => {
         debugLog('command.exec.close', { processId, code, signal, stdoutBytes, stderrBytes })
         if (timeout) clearTimeout(timeout)
-        this.commandProcesses.delete(processId)
+        if (this.commandProcesses.get(processId) === child) this.commandProcesses.delete(processId)
         resolve({
           exitCode: code ?? 1,
           stdout: streamOutput ? '' : Buffer.concat(stdout).toString('utf8'),
@@ -9004,6 +9011,8 @@ export class CodexClaudeAppServer {
         stdio: ['pipe', 'pipe', 'inherit'],
       })
       ;(child as any).__isPtyBridge = true
+      // A bridge that has just exited fails the kill or input written to it.
+      child.stdin?.on('error', () => {})
     } else {
       child = spawn(command[0] as string, command.slice(1), {
         cwd,
@@ -9096,7 +9105,8 @@ export class CodexClaudeAppServer {
       if (exited) return
       exited = true
       if (timeout) clearTimeout(timeout)
-      this.processHandles.delete(processHandle)
+      if (this.processHandles.get(processHandle) === child)
+        this.processHandles.delete(processHandle)
       setImmediate(() =>
         this.notify(peer, {
           method: 'process/exited',
@@ -9125,7 +9135,8 @@ export class CodexClaudeAppServer {
         stderrCapReached,
       })
       if (timeout) clearTimeout(timeout)
-      this.processHandles.delete(processHandle)
+      if (this.processHandles.get(processHandle) === child)
+        this.processHandles.delete(processHandle)
       this.notify(peer, {
         method: 'process/exited',
         params: {

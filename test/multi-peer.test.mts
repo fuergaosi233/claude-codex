@@ -360,6 +360,12 @@ test('a client that disconnects takes its terminals and command/exec processes w
       disableTimeout: true,
     }).catch(() => {})
     const aExec = await pidOf(a, 'command/exec/outputDelta', 'processId', 'a-exec')
+    // One that ignores SIGTERM still frees its handle.
+    await a.request('process/spawn', {
+      ...terminal('a-stubborn'),
+      command: ['sh', '-c', 'trap "" TERM; echo $$; while :; do sleep 0.1; done'],
+    })
+    const aStubborn = await pidOf(a, 'process/outputDelta', 'processHandle', 'a-stubborn')
     await b.request('process/spawn', terminal('b-terminal'))
     const bTerminal = await pidOf(b, 'process/outputDelta', 'processHandle', 'b-terminal')
     try {
@@ -367,13 +373,20 @@ test('a client that disconnects takes its terminals and command/exec processes w
       for (const pid of [aTerminal, aExec])
         assert.ok(await exits(pid, 5_000), `process ${pid} of the closed client still runs`)
       assert.equal(isAlive(bTerminal), true, 'the other client keeps its terminal')
+      await b.request('process/spawn', terminal('a-stubborn'))
+      const reused = await pidOf(b, 'process/outputDelta', 'processHandle', 'a-stubborn')
+      process.kill(aStubborn, 'SIGKILL')
+      // The old process's exit leaves the new one with the handle.
+      await exits(aStubborn, 5_000)
+      await b.request('process/kill', { processHandle: 'a-stubborn' })
+      assert.ok(await exits(reused, 5_000), 'the reused handle names the new process')
       await b.request('process/kill', { processHandle: 'b-terminal' })
       await b.until(
         (message) =>
           message.method === 'process/exited' && message.params.processHandle === 'b-terminal',
       )
     } finally {
-      for (const pid of [aTerminal, aExec, bTerminal])
+      for (const pid of [aTerminal, aExec, aStubborn, bTerminal])
         if (isAlive(pid)) process.kill(pid, 'SIGKILL')
     }
   })
