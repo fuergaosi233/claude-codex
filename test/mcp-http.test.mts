@@ -6,7 +6,8 @@ import { callMcpTool, readMcpResource } from '../src/mcp.mjs'
 
 // A streamable HTTP MCP server that answers each request as an event stream:
 // a log notification, then the reply, written in two pieces. With `keepOpen`
-// it leaves the stream open after the reply, as the transport allows.
+// it leaves the stream open after the reply, as the transport allows, and
+// answers notifications with a stream it never ends.
 async function withStreamingServer(
   keepOpen: boolean,
   body: (call: () => Promise<Record<string, unknown>>) => Promise<void>,
@@ -25,7 +26,13 @@ async function withStreamingServer(
       }
       const message = JSON.parse(text)
       if (message.id == null) {
-        res.writeHead(202).end()
+        // A notification has no reply; this server opens a stream for it anyway.
+        if (keepOpen) {
+          res.writeHead(200, { 'content-type': 'text/event-stream' }).flushHeaders()
+          open.add(res)
+        } else {
+          res.writeHead(202).end()
+        }
         return
       }
       const result =

@@ -631,8 +631,8 @@ async function connectHttp(config: Record<string, unknown>): Promise<McpConnecti
 
 // One JSON-RPC message posted to an HTTP server, and what came back. Errors
 // leave out what fetch says, which can repeat the url or a header value.
-// A request's event stream is read up to the event that answers `id`: the
-// server may keep the stream open after it.
+// An event stream is read up to the event that answers `id`, not to its end:
+// the server may keep it open.
 async function postJsonRpc(
   url: string,
   headers: Record<string, string>,
@@ -645,7 +645,7 @@ async function postJsonRpc(
   try {
     response = await fetch(url, { method: 'POST', headers, body: JSON.stringify(message), signal })
     text =
-      id !== undefined && response.ok && isEventStream(response)
+      response.ok && isEventStream(response)
         ? await readEventsUntilReply(response, id)
         : await response.text()
   } catch (error) {
@@ -673,8 +673,13 @@ function isEventStream(response: Response): boolean {
 
 // The events of a stream, through the first whole one whose data answers id,
 // or all of them when the stream ends first. The rest of the stream is let go.
-async function readEventsUntilReply(response: Response, id: number): Promise<string> {
+// A notification (no id) waits for no reply.
+async function readEventsUntilReply(response: Response, id: number | undefined): Promise<string> {
   if (!response.body) return ''
+  if (id === undefined) {
+    await response.body.cancel().catch(() => undefined)
+    return ''
+  }
   const reader = response.body.pipeThrough(new TextDecoderStream()).getReader()
   let text = ''
   let scanned = 0
