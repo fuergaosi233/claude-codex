@@ -338,14 +338,13 @@ prune_bridge_pool() {
   done < <(pool_dirs)
 }
 
+# Prints the pooled bridge log of <mode> written to most recently, or nothing.
 latest_bridge_log() {
   local mode="$1"
-  local dir newest=""
+  local dir
   while IFS= read -r dir; do
-    [ -f "$dir/log" ] || continue
-    newest="$dir/log"
-  done < <(for dir in $(pool_dirs "$mode"); do [ -d "$dir" ] && printf '%s\n' "$dir"; done | sort_by_mtime)
-  printf '%s\n' "$newest"
+    if [ -f "$dir/log" ]; then printf '%s\n' "$dir/log"; fi
+  done < <(pool_dirs "$mode") | sort_by_mtime | awk 'NR == 1'
 }
 
 sort_by_mtime() {
