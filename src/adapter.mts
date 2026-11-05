@@ -27,7 +27,7 @@ import { debugLog, defaultSocketPath, ensureParent, sleep } from './util.mjs'
 // the daemon — observed as pid churn (one daemon process per few minutes)
 // with no error trace in debug.jsonl. Logging here puts the cause on disk
 // AND keeps the daemon alive so the App's reconnect is a no-op.
-process.on('uncaughtException', (error: unknown) => {
+function onUncaughtException(error: unknown): void {
   const err = error as NodeJS.ErrnoException
   const code = err?.code ?? null
   const isExpected = code === 'EPIPE' || code === 'ECONNRESET' || code === 'EBADF'
@@ -39,13 +39,17 @@ process.on('uncaughtException', (error: unknown) => {
   })
   // EPIPE/ECONNRESET from peer disconnects are routine; swallow them so the
   // daemon keeps serving other peers. Anything else: re-throw on next tick to
-  // preserve normal error semantics (and we already logged it).
+  // preserve normal error semantics (and we already logged it). The listener
+  // comes off first: a throw it is still listening for comes straight back
+  // here, and the process would log and re-throw forever instead of exiting.
   if (!isExpected) {
+    process.off('uncaughtException', onUncaughtException)
     setImmediate(() => {
       throw error
     })
   }
-})
+}
+process.on('uncaughtException', onUncaughtException)
 process.on('unhandledRejection', (reason: unknown) => {
   const err = reason as NodeJS.ErrnoException
   debugLog('adapter.unhandledRejection', {
