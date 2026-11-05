@@ -1,61 +1,34 @@
-import { type ChildProcess, execFile, spawn } from 'node:child_process'
-import { type FSWatcher, readFileSync, watch, writeFileSync } from 'node:fs'
-import { isAbsolute, join } from 'node:path'
+import { execFile } from 'node:child_process'
+import { isAbsolute } from 'node:path'
 import { promisify } from 'node:util'
 import type { ConfigEdit } from './app-settings.mjs'
 import type { AppSkill } from './claude-capabilities.mjs'
-import { callMcpTool, readMcpConfig, readMcpResource } from './mcp.mjs'
 import { stripQuietTurnHeartbeat } from './quiet-turns.mjs'
-import type { SessionStore } from './store.mjs'
 import { type AppToolNoteOptions, appToolAvailabilityNote } from './turn-context.mjs'
 import type {
   ApprovalsReviewer,
-  ClaudeRuntime,
   CollaborationModeKind,
   FileUpdateChange,
-  ImageInput,
-  JsonRpcId,
-  JsonRpcRequest,
-  JsonRpcResponse,
   PermissionDecision,
-  RpcPeer,
   RuntimeEvent,
   RuntimeFailure,
   ThreadItem,
   ThreadRecord,
-  ThreadTokenUsage,
   TokenUsageBreakdown,
   TurnRecord,
-  UserInput,
   UserInputAnswers,
   UserInputQuestion,
-  WireMessage,
 } from './types.mjs'
 import {
-  adapterHome,
   claudeModelOptions,
-  claudeOutputFormat,
-  codexCliVersion,
   codexHome,
   codexProxyModelOptions,
-  codexUserAgent,
   debugLog,
-  defaultAllowedTools,
-  ensureParent,
-  extractImageInputs,
-  isCodexOpenAiModel,
-  newId,
   normalizeCodexReasoningEffort,
-  nowMillis,
   nowSeconds,
-  platformFamily,
-  platformOs,
-  resolveClaudeEffort,
-  resolveClaudeModel,
   textFromInput,
   toolOutputInput,
 } from './util.mjs'
-import { maybeCreateThreadWorktree } from './worktree.mjs'
 
 const execFileAsync = promisify(execFile)
 

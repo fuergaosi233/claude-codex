@@ -128,7 +128,6 @@ import { recordRunEvent } from './run-registry.mjs'
 import { normalizeRuntimeType } from './runtime-config.mjs'
 import {
   acceptsAmendment,
-  addedFileDiff,
   addTokenBreakdowns,
   allSelectableModelOptions,
   approvalSessionKey,
@@ -137,14 +136,12 @@ import {
   autoReviewAction,
   buildSystemPromptAddendum,
   type CodexTurnError,
-  coerceStructuredValue,
   collaborationModeEnvelope,
   collaborationModeFromParams,
   collaborationModeSettings,
   commandArray,
   commandEnv,
   compactSummary,
-  conciseStructuredString,
   configEdits,
   configLayerMetadata,
   defaultSelectableModelId,
@@ -152,10 +149,7 @@ import {
   fallbackStructuredText,
   fileChangeFromTool,
   gitDiff,
-  gitUntrackedDiff,
   hasLegacyPermissionParams,
-  isGitWorkTree,
-  isNotAGitRepo,
   isSubagentToolName,
   listFiles,
   modelFromParams,
@@ -175,13 +169,11 @@ import {
   permissionProfileIdFromParams,
   permissionProfileList,
   permissionProfilePolicy,
-  personalityPromptCue,
   plainTurnError,
   projectMetadata,
   projectName,
   projectRoots,
   REVIEW_FALLBACK,
-  readConfigReasoningEffort,
   reasoningEffortFromParams,
   reasoningSummariesVisible,
   retryTurnError,
@@ -189,7 +181,6 @@ import {
   reviewPrompt,
   sandboxEnvelope,
   sandboxFromTurnParams,
-  simpleDiff,
   stringListFromEnv,
   stringOr,
   subagentEffortFromInput,
@@ -262,7 +253,6 @@ import type {
   DynamicToolCallResponse,
   ElicitationRequest,
   ElicitationResponse,
-  FileUpdateChange,
   GoalToolHandlers,
   ImageInput,
   JsonRpcId,
@@ -5521,7 +5511,7 @@ export class CodexClaudeAppServer {
             // thread/tokenUsage/updated notification on the CHILD thread
             // (App's status bar reads from this) and roll the totals into
             // the parent thread so subagent costs aren't invisible.
-            if (parsed.usage && parsed.usage.totalTokens) {
+            if (parsed.usage?.totalTokens) {
               const breakdown: TokenUsageBreakdown = {
                 totalTokens: parsed.usage.totalTokens,
                 inputTokens: 0,
@@ -9679,7 +9669,7 @@ export class CodexClaudeAppServer {
     while (ancestorId && !seen.has(ancestorId)) {
       seen.add(ancestorId)
       const ancestor = this.store.getThread(ancestorId)
-      if (!ancestor || ancestor.threadSource !== 'subagent') break
+      if (ancestor?.threadSource !== 'subagent') break
       depth += 1
       ancestorId = ancestor.forkedFromId
     }
@@ -10026,7 +10016,7 @@ export class CodexClaudeAppServer {
   private finalizeActiveSubagentsForShutdown(message: string): void {
     for (const [turnId, state] of this.subagentStateByTurn.entries()) {
       const turn = this.store.getTurn(turnId)
-      if (!turn || turn.status !== 'inProgress') {
+      if (turn?.status !== 'inProgress') {
         this.subagentStateByTurn.delete(turnId)
         continue
       }

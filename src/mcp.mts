@@ -532,7 +532,7 @@ async function connectStdio(
     while ((lineEnd = buffer.indexOf('\n')) >= 0) {
       const line = buffer.slice(0, lineEnd).trim()
       buffer = buffer.slice(lineEnd + 1)
-      if (!line || !line.startsWith('{')) continue
+      if (!line?.startsWith('{')) continue
       let message: Record<string, unknown>
       try {
         message = JSON.parse(line) as Record<string, unknown>
