@@ -131,6 +131,10 @@ versioning or publishing metadata.
 
 ### App-server and protocol compatibility
 
+- A Claude Code rule's `paths:` frontmatter is read as YAML reads it:
+  comments and blank lines no longer end the list or end up in a pattern,
+  and a rule file with CRLF line endings keeps its patterns. Such rules used
+  to lose patterns, or were put whole into every thread's prompt.
 - Opt-in Memories: with `CLAUDE_CODEX_MEMORIES=1`, the App's Memories
   settings (Settings > Personalization) and `/memories` decide whether Claude
   threads run with Claude Code's auto-memory, and while Memories is off in the

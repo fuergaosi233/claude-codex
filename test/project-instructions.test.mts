@@ -235,6 +235,44 @@ test('a bridged Claude Code folder brings CLAUDE.md files, rules, imports and sk
   }
 })
 
+test("a rule's paths: frontmatter reads YAML comments and blank lines as YAML does", async () => {
+  const root = await mkdtemp(join(tmpdir(), 'project-instructions-paths-'))
+  const claudeHome = join(root, 'claude-home')
+  const repo = join(root, 'repo')
+  const rules = join(repo, '.claude', 'rules')
+  const cases: Array<[string, string, string]> = [
+    ['comment', 'paths:\n  - "src/api/**"\n  # the library too\n  - lib/**', 'src/api/**, lib/**'],
+    ['blank', 'paths:\n  - src/**\n\n  - lib/**\ndescription: x', 'src/**, lib/**'],
+    ['leading', 'paths:\n  # API files\n  - src/api/**', 'src/api/**'],
+    ['inline', 'paths: src/**, lib/** # generated', 'src/**, lib/**'],
+    [
+      'trailing',
+      "paths:\n  - \"a/**\" # keep\n  - 'b #1/**'\n  - it's/** # x",
+      "a/**, b #1/**, it's/**",
+    ],
+    ['crlf', 'paths:\r\n  - src/**\r\n  - lib/**\r', 'src/**, lib/**'],
+    ['crlf-comment', 'paths:\r\n  - src/** # here\r\n\r\n  - lib/**\r', 'src/**, lib/**'],
+  ]
+  try {
+    await mkdir(join(repo, '.git'), { recursive: true })
+    for (const [name, frontmatter] of cases)
+      await write(join(rules, `${name}.md`), `---\n${frontmatter}\n---\n${name} rule.`)
+    const result = await withEnv(
+      { CODEX_HOME: join(root, 'empty-home'), CLAUDE_CODEX_CLAUDE_CONFIG_DIR: claudeHome },
+      async () => projectInstructions(repo),
+    )
+    const prompt = result.prompt ?? ''
+    const lines = prompt.split('\n').map((line) => line.trim())
+    for (const [name, , globs] of cases) {
+      assert.ok(lines.includes(`- ${join(rules, `${name}.md`)} (${globs})`), `${name}: ${prompt}`)
+      // Path-scoped: its text stays out of the prompt.
+      assert.equal(prompt.includes(`${name} rule.`), false, name)
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('Claude threads get the instructions in their prompt and report them as sources', async () => {
   const root = await mkdtemp(join(tmpdir(), 'project-instructions-server-'))
   const repo = join(root, 'repo')

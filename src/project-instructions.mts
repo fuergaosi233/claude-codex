@@ -334,10 +334,12 @@ function importsOf(text: string, base: string): string[] {
 }
 
 // A rule's `paths` patterns, from a YAML list or a comma-separated value.
+// Comments and blank lines are YAML's: they neither end the list nor make a
+// pattern.
 function ruleGlobs(text: string): string[] {
   const body = frontmatterBody(text)
   if (body == null) return []
-  const lines = body.split('\n')
+  const lines = body.split('\n').map(withoutYamlComment)
   const index = lines.findIndex((line) => /^paths\s*:/.test(line))
   if (index < 0) return []
   const unquote = (value: string) => value.trim().replace(/^["']|["']$/g, '')
@@ -350,11 +352,34 @@ function ruleGlobs(text: string): string[] {
       .filter(Boolean)
   const globs: string[] = []
   for (const line of lines.slice(index + 1)) {
+    if (!line.trim()) continue
     const item = /^\s*-\s*(.+)$/.exec(line)
     if (!item) break
     globs.push(unquote(item[1] ?? ''))
   }
   return globs.filter(Boolean)
+}
+
+// A YAML line without its comment: a `#` that starts the line or follows
+// whitespace, outside a quoted value. A quote only opens one where a value
+// starts, so `it's` is plain text.
+function withoutYamlComment(line: string): string {
+  let quote = ''
+  let valueStart = true
+  for (let index = 0; index < line.length; index++) {
+    const char = line[index] ?? ''
+    if (quote) {
+      if (char === quote) quote = ''
+      continue
+    }
+    if (/\s/.test(char)) continue
+    if (valueStart && (char === '"' || char === "'")) quote = char
+    else if (char === '#' && (index === 0 || /\s/.test(line[index - 1] ?? '')))
+      return line.slice(0, index).trimEnd()
+    valueStart = char === '-' || char === ':' || char === ',' || char === '['
+  }
+  // Lines of a CRLF file end in \r, which a list item's `.+$` won't match.
+  return line.trimEnd()
 }
 
 function frontmatterFields(text: string): { name?: string; description?: string } {
