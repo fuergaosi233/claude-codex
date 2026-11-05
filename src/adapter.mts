@@ -11,6 +11,7 @@ import { CodexClaudeAppServer } from './server.mjs'
 import { SessionStore } from './store.mjs'
 import {
   normalizeListenUrl,
+  parseListenUrl,
   parseProxySockArg,
   prepareWebSocketAuth,
   type RunningTransport,
@@ -98,7 +99,7 @@ async function main(): Promise<void> {
     return
   }
 
-  const listen = getArg(args, '--listen') ?? 'stdio://'
+  const listen = checkOptions(() => listenArg(args))
   if (listen === 'off') return
   const wsAuth = {
     auth: getArg(args, '--ws-auth'),
@@ -110,6 +111,8 @@ async function main(): Promise<void> {
   // Before anything else starts, so a listener that would be unprotected
   // fails without touching the store or other processes.
   const preparedWsAuth = checkOptions(() => {
+    const normalizedListen = normalizeListenUrl(listen)
+    if (normalizedListen !== 'stdio://') parseListenUrl(normalizedListen)
     if (
       !listen.startsWith('ws://') &&
       (allowUnauthenticated || Object.values(wsAuth).some((value) => value !== null))
@@ -276,6 +279,16 @@ function checkOptions<T>(check: () => T): T {
     )
     process.exit(1)
   }
+}
+
+// The --listen value, stdio:// when the flag is absent. `--listen` with no
+// value, or followed by another flag, is an error rather than a silent stdio://.
+function listenArg(args: string[]): string {
+  const value = getArg(args, '--listen')
+  if (args.includes('--listen') && (value === null || value.startsWith('-'))) {
+    throw new Error('--listen needs a value')
+  }
+  return value ?? 'stdio://'
 }
 
 function getArg(args: string[], name: string): string | null {

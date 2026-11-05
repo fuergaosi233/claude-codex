@@ -274,7 +274,9 @@ export function parseProxySockArg(args: string[]): string {
   return value
 }
 
-function parseListenUrl(
+// Throws `unsupported listen URL` for anything but unix:// and a valid ws://;
+// the adapter calls it before opening the store so a typo touches nothing.
+export function parseListenUrl(
   listenUrl: string,
 ): { kind: 'unix'; path: string } | { kind: 'ws'; host: string; port: number } {
   if (listenUrl === 'unix://') return { kind: 'unix', path: defaultSocketPath() }
@@ -283,7 +285,12 @@ function parseListenUrl(
     return { kind: 'unix', path: path.length > 0 ? path : defaultSocketPath() }
   }
   if (listenUrl.startsWith('ws://')) {
-    const url = new URL(listenUrl)
+    let url: URL
+    try {
+      url = new URL(listenUrl)
+    } catch {
+      throw new Error(`unsupported listen URL: ${listenUrl}`)
+    }
     return {
       kind: 'ws',
       host: url.hostname || '127.0.0.1',
