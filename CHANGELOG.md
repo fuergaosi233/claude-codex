@@ -131,6 +131,10 @@ versioning or publishing metadata.
 
 ### App-server and protocol compatibility
 
+- When a client disconnects from a `unix://` or `ws://` adapter, the
+  terminals (`process/spawn`) and `command/exec` processes it started are
+  ended and its `fs/watch` watchers closed, as `codex app-server` does. They
+  used to keep running after every App reconnect. Other clients keep theirs.
 - Opt-in Memories: with `CLAUDE_CODEX_MEMORIES=1`, the App's Memories
   settings (Settings > Personalization) and `/memories` decide whether Claude
   threads run with Claude Code's auto-memory, and while Memories is off in the

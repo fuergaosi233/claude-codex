@@ -619,6 +619,14 @@ function unknownThread(threadId: string): RpcError {
   return invalidRequest(`unknown thread: ${threadId}`)
 }
 
+// Ends a command/exec or process/spawn process. A PTY bridge is asked to kill
+// its shell first; the bridge itself goes on SIGTERM.
+function terminateChild(child: ChildProcess): void {
+  if ((child as any).__isPtyBridge && child.stdin?.writable)
+    child.stdin.write(JSON.stringify({ action: 'kill' }) + '\n')
+  child.kill('SIGTERM')
+}
+
 export interface ServerOptions {
   sleepMonitor?: SleepMonitor
   // Where the adapter runs, for advice that names an App setting.
@@ -673,6 +681,9 @@ export class CodexClaudeAppServer {
   private commandProcesses = new Map<string, ChildProcess>()
   private processHandles = new Map<string, ChildProcess>()
   private fsWatchers = new Map<string, FSWatcher>()
+  // The peer whose command/exec, process/spawn or fs/watch request started a
+  // process or watcher. Codex ends them when that connection closes.
+  private peerOfResource = new WeakMap<ChildProcess | FSWatcher, string>()
   // Goal state lives in the store. These track the hidden continuation turns
   // the adapter starts, how many of them in a row made no progress, and when
   // goal time was last accrued for a thread's running turn.
@@ -818,6 +829,13 @@ export class CodexClaudeAppServer {
         this.subscribersByThread.delete(threadId)
     }
     for (const pending of this.pendingServerRequests.values()) pending.targets.delete(peer.id)
+    for (const child of [...this.commandProcesses.values(), ...this.processHandles.values()])
+      if (this.peerOfResource.get(child) === peer.id) terminateChild(child)
+    for (const [watchId, watcher] of this.fsWatchers) {
+      if (this.peerOfResource.get(watcher) !== peer.id) continue
+      watcher.close()
+      this.fsWatchers.delete(watchId)
+    }
   }
 
   async stop(): Promise<void> {
@@ -8799,6 +8817,7 @@ export class CodexClaudeAppServer {
       this.notify(peer, { method: 'fs/changed', params: { watchId, changedPaths: [changedPath] } })
     })
     this.fsWatchers.set(watchId, watcher)
+    this.peerOfResource.set(watcher, peer.id)
     return { path }
   }
 
@@ -8837,6 +8856,7 @@ export class CodexClaudeAppServer {
       stdio: 'pipe',
     })
     this.commandProcesses.set(processId, child)
+    this.peerOfResource.set(child, peer.id)
 
     const stdout: Buffer[] = []
     const stderr: Buffer[] = []
@@ -8992,6 +9012,7 @@ export class CodexClaudeAppServer {
       })
     }
     this.processHandles.set(processHandle, child)
+    this.peerOfResource.set(child, peer.id)
 
     const capture = (target: Buffer[], chunk: Buffer, currentBytes: number): [number, boolean] => {
       if (currentBytes >= cap) return [currentBytes, true]
@@ -9151,10 +9172,7 @@ export class CodexClaudeAppServer {
     const processHandle = stringOr(params.processHandle, '')
     const child = this.processHandles.get(processHandle)
     if (!child) throw invalidRequest(`unknown process handle: ${processHandle}`)
-    if ((child as any).__isPtyBridge) {
-      child.stdin?.write(JSON.stringify({ action: 'kill' }) + '\n')
-    }
-    child.kill('SIGTERM')
+    terminateChild(child)
     return {}
   }
 

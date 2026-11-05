@@ -3,7 +3,7 @@ import { type ChildProcess, spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import { readFileSync } from 'node:fs'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import net from 'node:net'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -328,6 +328,92 @@ test('unsubscribing stops one follower only', { timeout: 20_000 }, async () => {
   })
 })
 
+test('a client that disconnects takes its terminals and command/exec processes with it', {
+  timeout: 30_000,
+}, async () => {
+  await withDaemon(async (connect) => {
+    const a = await connect()
+    const b = await connect()
+    const pidOf = async (peer: Client, method: string, key: string, id: string) => {
+      const delta = (
+        await peer.until((message) => message.method === method && message.params[key] === id)
+      ).at(-1)
+      return Number(Buffer.from(delta.params.deltaBase64, 'base64').toString('utf8').trim())
+    }
+    // A shell that prints its pid, then waits as an open terminal does.
+    const shell = ['sh', '-c', 'echo $$; exec sleep 60']
+    const terminal = (processHandle: string) => ({
+      processHandle,
+      command: shell,
+      cwd: process.cwd(),
+      streamStdoutStderr: true,
+      streamStdin: true,
+    })
+    await a.request('process/spawn', terminal('a-terminal'))
+    const aTerminal = await pidOf(a, 'process/outputDelta', 'processHandle', 'a-terminal')
+    // command/exec answers when its process ends, which a closed client never hears.
+    a.request('command/exec', {
+      processId: 'a-exec',
+      command: shell,
+      cwd: process.cwd(),
+      streamStdoutStderr: true,
+      disableTimeout: true,
+    }).catch(() => {})
+    const aExec = await pidOf(a, 'command/exec/outputDelta', 'processId', 'a-exec')
+    await b.request('process/spawn', terminal('b-terminal'))
+    const bTerminal = await pidOf(b, 'process/outputDelta', 'processHandle', 'b-terminal')
+    try {
+      a.close()
+      for (const pid of [aTerminal, aExec])
+        assert.ok(await exits(pid, 5_000), `process ${pid} of the closed client still runs`)
+      assert.equal(isAlive(bTerminal), true, 'the other client keeps its terminal')
+      await b.request('process/kill', { processHandle: 'b-terminal' })
+      await b.until(
+        (message) =>
+          message.method === 'process/exited' && message.params.processHandle === 'b-terminal',
+      )
+    } finally {
+      for (const pid of [aTerminal, aExec, bTerminal])
+        if (isAlive(pid)) process.kill(pid, 'SIGKILL')
+    }
+  })
+})
+
+test('a client that disconnects stops its fs watchers', { timeout: 20_000 }, async (t) => {
+  await withServer(async (connect, _debugLog, server) => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-codex-watch-'))
+    try {
+      const app = connect('app')
+      const watched = await app.request('fs/watch', { watchId: 'w1', path: dir }).catch((error) => {
+        // Some hosts run out of inotify instances; there is nothing to test then.
+        if (/EMFILE|ENOSPC/.test(String(error))) return null
+        throw error
+      })
+      if (!watched) {
+        t.skip('fs.watch is unavailable on this host')
+        return
+      }
+      // The other client watches the same folder, so a change is seen at all.
+      const other = connect('other')
+      await other.request('fs/watch', { watchId: 'w2', path: dir })
+      server.closePeer({ id: 'app', send: () => {}, close: () => {} })
+      const before = app.received.length
+      await writeFile(join(dir, 'changed.txt'), 'x')
+      await other.until(
+        (message) => message.method === 'fs/changed' && message.params.watchId === 'w2',
+      )
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 100))
+      assert.deepEqual(
+        app.received.slice(before).map((message) => message.method),
+        [],
+        'no fs/changed after the client closed',
+      )
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+})
+
 interface Client {
   readonly received: any[]
   receive(message: any): void
@@ -384,7 +470,11 @@ async function withDaemon(body: (connect: () => Promise<Client>) => Promise<void
 // The server in this process, for tests that pick the peer ids or read the
 // debug log.
 async function withServer(
-  body: (connect: (id: string) => Client, debugLog: string) => Promise<void>,
+  body: (
+    connect: (id: string) => Client,
+    debugLog: string,
+    server: CodexClaudeAppServer,
+  ) => Promise<void>,
 ): Promise<void> {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const debugLog = join(home, 'debug.jsonl')
@@ -408,19 +498,23 @@ async function withServer(
     new MockRuntime(),
   )
   try {
-    await body((id) => {
-      const peer: RpcPeer = {
-        id,
-        // As over the wire: a copy, which later changes to the item miss.
-        send: (message) => connection.receive(JSON.parse(JSON.stringify(message))),
-        close: () => {},
-      }
-      const connection = client(
-        (message) => server.handle(peer, message as WireMessage),
-        () => {},
-      )
-      return connection
-    }, debugLog)
+    await body(
+      (id) => {
+        const peer: RpcPeer = {
+          id,
+          // As over the wire: a copy, which later changes to the item miss.
+          send: (message) => connection.receive(JSON.parse(JSON.stringify(message))),
+          close: () => {},
+        }
+        const connection = client(
+          (message) => server.handle(peer, message as WireMessage),
+          () => {},
+        )
+        return connection
+      },
+      debugLog,
+      server,
+    )
   } finally {
     await server.stop()
     setEnv(saved)
@@ -539,4 +633,22 @@ async function waitForListening(proc: ChildProcess): Promise<void> {
     })
     proc.once('exit', () => reject(new Error(`daemon exited: ${output}`)))
   })
+}
+
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function exits(pid: number, timeoutMs: number): Promise<boolean> {
+  const end = Date.now() + timeoutMs
+  while (Date.now() < end) {
+    if (!isAlive(pid)) return true
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 50))
+  }
+  return !isAlive(pid)
 }
