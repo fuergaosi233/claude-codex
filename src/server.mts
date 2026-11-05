@@ -10337,22 +10337,7 @@ export class CodexClaudeAppServer {
   }
 
   private bindPeerToDescendants(peer: RpcPeer, rootThreadId: string): void {
-    const queue = [rootThreadId]
-    const seen = new Set<string>()
-    while (queue.length > 0) {
-      const parentId = queue.shift()
-      if (!parentId || seen.has(parentId)) continue
-      seen.add(parentId)
-      for (const child of this.store.listThreads({
-        includeEphemeral: true,
-        parentThreadId: parentId,
-        sortKey: 'created_at',
-        sortDirection: 'asc',
-      })) {
-        this.subscribe(child.id, peer)
-        queue.push(child.id)
-      }
-    }
+    for (const id of this.store.descendantThreadIds(rootThreadId)) this.subscribe(id, peer)
   }
 
   private loadPersistedConfig(): void {

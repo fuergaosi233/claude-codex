@@ -881,6 +881,12 @@ versioning or publishing metadata.
   parent's turn with "FOREIGN KEY constraint failed" when the agent ends, or
   stops the adapter's shutdown halfway; the agent's end leaves nothing in
   the deleted thread.
+- A client that resumes a thread now follows all of its subagents and their
+  subagents. It used to follow only the first 50 children of each thread,
+  so a workflow with more agents left the rest without live updates there.
+  Finding a thread's subagents and the newest-first thread list use indexes
+  instead of reading every thread: with 20,000 threads a list page takes
+  about 1 ms instead of 25 ms.
 
 ### Rust-first protocol groundwork
 
