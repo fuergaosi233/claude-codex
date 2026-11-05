@@ -278,6 +278,15 @@ export class SessionStore {
     // Model process profile identity a thread is pinned to (model-profiles.mts).
     this.ensureColumn('threads', 'model_profile_fingerprint', 'TEXT')
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_threads_project ON threads(project_id)')
+    // Without these the default thread/list page (newest created first) and
+    // every fork-tree lookup (forked_from_id = ?) scan and sort the whole
+    // table. archived does not lead: with no ANALYZE stats SQLite would then
+    // prefer it over the project and section indexes.
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_threads_created ON threads(created_at, id);
+      CREATE INDEX IF NOT EXISTS idx_threads_forked_from
+        ON threads(forked_from_id, archived, created_at, id);
+    `)
     // Codex's per-thread memory mode; set when the thread is created, then
     // only by setThreadMemoryMode.
     this.ensureColumn('threads', 'memory_mode', 'TEXT')
@@ -633,6 +642,25 @@ export class SessionStore {
       )
       .all(...queryArgs, limit)
     return rows.map((row: unknown) => this.rowToThread(row))
+  }
+
+  // Every unarchived thread below rootId, ephemeral ones included, without
+  // listThreads' page cap. An archived thread hides its own descendants too.
+  // CROSS JOIN keeps the walk going parent to child through
+  // idx_threads_forked_from; left to itself SQLite may scan threads instead.
+  descendantThreadIds(rootId: string): string[] {
+    const rows = this.db
+      .prepare(
+        `WITH RECURSIVE descendants(id) AS (
+           SELECT id FROM threads WHERE forked_from_id = ? AND archived = 0
+           UNION
+           SELECT child.id FROM descendants parent CROSS JOIN threads child
+             ON child.forked_from_id = parent.id WHERE child.archived = 0
+         )
+         SELECT id FROM descendants WHERE id <> ?`,
+      )
+      .all(rootId, rootId) as Array<{ id: unknown }>
+    return rows.map((row) => String(row.id))
   }
 
   listSections(limit = 100, cursor: string | null = null): ThreadSectionRecord[] {
