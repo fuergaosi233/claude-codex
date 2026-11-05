@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { appendFileSync, existsSync, readFileSync, statSync } from 'node:fs'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -6,6 +7,7 @@ import test from 'node:test'
 import {
   claudeCodeAtLeast,
   codexProxyModelOptions,
+  debugLog,
   defaultSocketPath,
   isPathInside,
   newThreadId,
@@ -137,4 +139,110 @@ test('codexProxyModelOptions reads the model catalog under CODEX_HOME', async ()
     }
     await rm(directory, { recursive: true, force: true })
   }
+})
+
+// Runs `body` with the debug-log env knobs set, restoring them afterwards.
+async function withDebugLogEnv(
+  env: Record<string, string>,
+  body: (dir: string) => void | Promise<void>,
+): Promise<void> {
+  const names = [
+    'CLAUDE_CODEX_DEBUG_LOG',
+    'CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES',
+    'CLAUDE_CODEX_DEBUG_LOG_KEEP',
+  ]
+  const previous = names.map((name) => process.env[name])
+  const dir = await mkdtemp(join(tmpdir(), 'ccx-debuglog-'))
+  for (const name of names) delete process.env[name]
+  for (const [name, value] of Object.entries(env)) process.env[name] = value.replace('<dir>', dir)
+  try {
+    await body(dir)
+  } finally {
+    names.forEach((name, i) => {
+      if (previous[i] === undefined) delete process.env[name]
+      else process.env[name] = previous[i]
+    })
+    await rm(dir, { recursive: true, force: true })
+  }
+}
+
+function logEvents(path: string): string[] {
+  if (!existsSync(path)) return []
+  return readFileSync(path, 'utf8')
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line).event)
+}
+
+test('debugLog rotates at the size limit and keeps only CLAUDE_CODEX_DEBUG_LOG_KEEP old logs', async () => {
+  await withDebugLogEnv(
+    {
+      CLAUDE_CODEX_DEBUG_LOG: '<dir>/logs/debug.jsonl',
+      CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES: '400',
+      CLAUDE_CODEX_DEBUG_LOG_KEEP: '2',
+    },
+    (dir) => {
+      const path = join(dir, 'logs', 'debug.jsonl')
+      for (let i = 0; i < 40; i += 1) debugLog(`event.${i}`, { i })
+      assert.ok(existsSync(`${path}.1`))
+      assert.ok(existsSync(`${path}.2`))
+      assert.equal(existsSync(`${path}.3`), false)
+      const lineBytes = (readFileSync(path, 'utf8').split('\n')[0]?.length ?? 0) + 1
+      for (const file of [path, `${path}.1`, `${path}.2`]) {
+        assert.ok(statSync(file).size < 400 + lineBytes, file)
+      }
+      // Nothing is lost or reordered across the files that are kept.
+      const kept = [...logEvents(`${path}.2`), ...logEvents(`${path}.1`), ...logEvents(path)]
+      assert.equal(kept.at(-1), 'event.39')
+      const first = Number(kept[0]?.split('.')[1])
+      assert.deepEqual(
+        kept,
+        Array.from({ length: 40 - first }, (_, i) => `event.${first + i}`),
+      )
+    },
+  )
+})
+
+test('debugLog writes nothing when CLAUDE_CODEX_DEBUG_LOG is 0 or false', async () => {
+  for (const off of ['0', 'false']) {
+    await withDebugLogEnv({ CLAUDE_CODEX_DEBUG_LOG: off }, (dir) => {
+      const home = process.env.CLAUDE_CODEX_HOME
+      process.env.CLAUDE_CODEX_HOME = dir
+      try {
+        debugLog('ignored')
+      } finally {
+        if (home === undefined) delete process.env.CLAUDE_CODEX_HOME
+        else process.env.CLAUDE_CODEX_HOME = home
+      }
+      assert.equal(existsSync(join(dir, 'debug.jsonl')), false)
+    })
+  }
+})
+
+test('debugLog recreates its folder when it is removed while running', async () => {
+  await withDebugLogEnv({ CLAUDE_CODEX_DEBUG_LOG: '<dir>/logs/debug.jsonl' }, async (dir) => {
+    const path = join(dir, 'logs', 'debug.jsonl')
+    debugLog('before')
+    await rm(join(dir, 'logs'), { recursive: true, force: true })
+    debugLog('after')
+    assert.deepEqual(logEvents(path), ['after'])
+  })
+})
+
+test('debugLog notices another writer growing the log and still rotates it', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1_000_000 })
+  await withDebugLogEnv(
+    { CLAUDE_CODEX_DEBUG_LOG: '<dir>/debug.jsonl', CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES: '1000' },
+    (dir) => {
+      const path = join(dir, 'debug.jsonl')
+      debugLog('mine.1')
+      // A second adapter process appends to the same file.
+      appendFileSync(path, `${JSON.stringify({ event: 'other', pad: 'x'.repeat(2000) })}\n`)
+      t.mock.timers.tick(1000)
+      debugLog('mine.2')
+      assert.deepEqual(logEvents(`${path}.1`), ['mine.1', 'other'])
+      assert.deepEqual(logEvents(path), ['mine.2'])
+    },
+  )
 })

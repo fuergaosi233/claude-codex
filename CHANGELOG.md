@@ -634,6 +634,12 @@ versioning or publishing metadata.
   user, password, path (where a per-user server URL keeps its secret), query
   and fragment are replaced. Other values, such as a server's `command`, are
   still logged.
+- Writing a debug log line no longer creates the log's folder and reads the
+  file's size each time; the adapter logs every streaming notification, so
+  this was a mkdir and two stats on every delta. The folder is made once (and
+  again if it is removed), and the size is re-read at most once a second, so
+  rotation at `CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES` still notices lines other
+  adapter processes append.
 - Settings a Claude thread cannot honor are refused with `INVALID_REQUEST`
   instead of being saved and ignored, so the App shows "Couldn't update this
   setting": `model_verbosity`, a service tier other than the default, network
