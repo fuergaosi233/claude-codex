@@ -39,6 +39,8 @@ const DEFAULT_BUSY_TIMEOUT_MS = 5_000
 // are written. The file is in rollback-journal mode with synchronous=FULL, so
 // every commit is an fsync; a turn streams thousands of deltas.
 const STREAM_FLUSH_MS = 50
+// When a timed write fails (the file is busy), how long until it is tried again.
+const STREAM_RETRY_MS = 250
 
 function busyTimeoutMs(): number {
   const raw = process.env.CLAUDE_CODEX_STATE_DB_TIMEOUT_MS?.trim()
@@ -1233,13 +1235,21 @@ export class SessionStore {
       )
   }
 
+  // A turn streamItem holds in memory is read from there, so the status checks
+  // the server runs before each streamed delta do not write it early. Only this
+  // process changes a turn it owns, and its other writes flush first, so the
+  // copy is never behind the file.
   getTurn(id: string): TurnRecord | null {
+    const pending = this.pendingTurns.get(id)
+    if (pending) return jsonClone(pending)
     const row = this.db.prepare('SELECT * FROM turns WHERE id = ?').get(id)
     return row ? this.rowToTurn(row) : null
   }
 
   // A turn's status, without decoding its items.
   turnStatus(id: string): TurnRecord['status'] | null {
+    const pending = this.pendingTurns.get(id)
+    if (pending) return pending.status
     const row = this.db.prepare('SELECT status FROM turns WHERE id = ?').get(id) as
       | { status?: unknown }
       | undefined
@@ -1718,11 +1728,14 @@ export class SessionStore {
     try {
       this.flushPendingTurns()
     } catch (error) {
-      // The turns stay pending: the next streamItem retries, and the next
-      // other store call retries and throws to its caller.
+      // The turns stay pending and the timer tries again; a store write or
+      // close before then retries too and throws to its caller.
       debugLog('store.stream_flush_failed', {
         error: error instanceof Error ? error.message : String(error),
       })
+      if (this.pendingTurns.size > 0) {
+        this.flushTimer ??= setTimeout(() => this.flushOnTimer(), STREAM_RETRY_MS)
+      }
     }
   }
 

@@ -7,6 +7,7 @@ import { DatabaseSync } from 'node:sqlite'
 import test from 'node:test'
 import { SessionStore } from '../src/store.mjs'
 import type { ThreadItem, ThreadRecord, TurnRecord } from '../src/types.mjs'
+import { scriptedRuntime, withInProcessApp } from './fixtures/in-process-app.mjs'
 
 const DELTAS = 500
 
@@ -228,11 +229,73 @@ test('a flush a reader blocks is retried, not lost', async () => {
         reader.close()
       }
       assert.equal(storedText(path, turnId), '')
+      // Reads see the deltas while the write waits, and the timer retries it.
       assert.equal(agentText(store.getTurn(turnId)), fullText)
+      await delay(400)
       assert.equal(storedText(path, turnId), fullText)
     })
   } finally {
     if (previous === undefined) delete process.env.CLAUDE_CODEX_STATE_DB_TIMEOUT_MS
     else process.env.CLAUDE_CODEX_STATE_DB_TIMEOUT_MS = previous
   }
+})
+
+// The server checks the turn's status before every streamed delta. That check
+// must not write the turn early, or each delta costs a commit again.
+test("the server's streaming path coalesces text, reasoning and command output deltas", async () => {
+  const PER_KIND = 100
+  let writes = 0
+  let countWrites = (): void => {}
+  const runtime = scriptedRuntime(async (_context, handlers) => {
+    await handlers.onEvent({
+      type: 'tool_use',
+      toolUseId: 'shell',
+      toolName: 'Bash',
+      input: { command: 'make' },
+    })
+    countWrites()
+    for (let i = 0; i < PER_KIND; i += 1) {
+      await handlers.onEvent({ type: 'tool_output_delta', toolUseId: 'shell', delta: 'o' })
+    }
+    const afterOutput = writes
+    await handlers.onEvent({
+      type: 'tool_result',
+      toolUseId: 'shell',
+      content: 'ok',
+      isError: false,
+    })
+    for (let i = 0; i < PER_KIND; i += 1) {
+      await handlers.onEvent({ type: 'reasoning_delta', delta: 'r' })
+    }
+    // Starting the agent message after the reasoning writes once; the deltas
+    // after it must not.
+    await handlers.onEvent({ type: 'text_delta', delta: 't' })
+    const beforeText = writes
+    for (let i = 1; i < PER_KIND; i += 1) {
+      await handlers.onEvent({ type: 'text_delta', delta: 't' })
+    }
+    assert.ok(afterOutput <= 1, `command output wrote ${afterOutput} times`)
+    assert.ok(writes - beforeText <= 1, `text wrote ${writes - beforeText} times`)
+    await handlers.onEvent({ type: 'completed', success: true, result: 'done' })
+  })
+  await withInProcessApp(runtime, async (app) => {
+    const store = app.store as unknown as { writeTurn: (turn: TurnRecord) => void }
+    const writeTurn = store.writeTurn.bind(store)
+    countWrites = () => {
+      writes = 0
+      store.writeTurn = (turn) => {
+        writes += 1
+        writeTurn(turn)
+      }
+    }
+    const threadId = await app.startThread()
+    const turnId = await app.startTurn(threadId, 'go')
+    const completed = await app.turnCompleted(turnId)
+    assert.equal(completed.status, 'completed')
+    // A few writes for item starts and the completion, never one per delta.
+    assert.ok(writes < 20, `the turn wrote ${writes} times for ${3 * PER_KIND} deltas`)
+    const stored = app.store.getTurn(turnId)
+    const agent = stored?.items.find((item) => item.type === 'agentMessage')
+    assert.equal(agent?.type === 'agentMessage' ? agent.text : null, 't'.repeat(PER_KIND))
+  })
 })
