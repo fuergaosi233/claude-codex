@@ -131,6 +131,11 @@ versioning or publishing metadata.
 
 ### App-server and protocol compatibility
 
+- With the `codex` shim on `PATH`, `codex app-server generate-ts` and
+  `generate-json-schema` (and so `npm run generate:schema`) go to the real
+  Codex CLI (`CODEX_REAL`). They used to start an adapter app-server on stdio
+  that never wrote the bindings; without a real codex the shim now exits 127
+  and says to set `CODEX_REAL`.
 - Opt-in Memories: with `CLAUDE_CODEX_MEMORIES=1`, the App's Memories
   settings (Settings > Personalization) and `/memories` decide whether Claude
   threads run with Claude Code's auto-memory, and while Memories is off in the

@@ -82,6 +82,20 @@ no_daemon_running() {
   echo "Error: no app-server daemon is running at $socket" >&2
 }
 
+# `app-server generate-ts` / `generate-json-schema` write the protocol
+# bindings and exit. The adapter has no such subcommands (it would start a
+# stdio server instead), so these always belong to the real codex.
+is_schema_generator() {
+  shift
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      generate-ts | generate-json-schema) return 0 ;;
+    esac
+  done
+  return 1
+}
+
 REAL_CODEX="$(resolve_real_codex || true)"
 
 case "${1:-}" in
@@ -98,6 +112,13 @@ case "${1:-}" in
         exec "$REAL_CODEX" "$@"
       fi
       echo "codex shim is in native Codex mode, but no real codex binary was found; set CODEX_REAL" >&2
+      exit 127
+    fi
+    if is_schema_generator "$@"; then
+      if [ -n "$REAL_CODEX" ]; then
+        exec "$REAL_CODEX" "$@"
+      fi
+      echo "codex app-server schema generation needs the real codex binary, but none was found; set CODEX_REAL" >&2
       exit 127
     fi
     # One-shot probes the shim can settle on its own. The adapter answers
