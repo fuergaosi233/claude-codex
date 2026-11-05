@@ -367,13 +367,25 @@ stop_pidfile() {
   pid="$(cat "$file" 2>/dev/null || true)"
   if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
     kill "$pid" 2>/dev/null || true
-    for _ in $(seq 1 30); do
-      kill -0 "$pid" 2>/dev/null || break
-      sleep 0.1
-    done
-    kill -TERM "$pid" 2>/dev/null || true
+    if ! wait_pid_exit "$pid" 30; then
+      # Still running after 3s: force it, so the port and pidfile are not
+      # left to a process nothing tracks any more.
+      kill -KILL "$pid" 2>/dev/null || true
+      wait_pid_exit "$pid" 20 || echo "pid $pid did not exit after SIGKILL" >&2
+    fi
   fi
   rm -f "$file"
+}
+
+# Waits up to <tries> x 0.1s for <pid> to exit; fails if it is still running.
+wait_pid_exit() {
+  local pid="$1"
+  local tries="$2"
+  for _ in $(seq 1 "$tries"); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.1
+  done
+  ! kill -0 "$pid" 2>/dev/null
 }
 
 stop_adapter() {
@@ -391,9 +403,10 @@ stop_adapter() {
       fi
       sleep 0.1
     done
+    # Anything left ignored SIGTERM for 3s: force it.
     while read -r pid; do
       [ -n "$pid" ] || continue
-      kill -TERM "$pid" 2>/dev/null || true
+      kill -KILL "$pid" 2>/dev/null || true
     done < <(app_server_pids)
     echo "app-server stopped; Codex App Remote will start the new route on reconnect."
   else
