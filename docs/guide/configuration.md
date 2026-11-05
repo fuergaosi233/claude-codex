@@ -441,6 +441,27 @@ export CLAUDE_CODEX_PREVENT_IDLE_SLEEP="1"
 export CLAUDE_CODEX_NODE="/absolute/path/to/node"
 ```
 
+## Debug log
+
+```bash
+# JSON Lines debug log (default <adapter home>/debug.jsonl, the adapter home
+# being $CODEX_HOME/claude-codex-adapter unless CLAUDE_CODEX_HOME is set).
+# Exactly "0" or "false" turns it off.
+export CLAUDE_CODEX_DEBUG_LOG="$HOME/.claude-codex/debug.jsonl"
+
+# Rotate once the log reaches this many bytes (default 52428800, 50 MiB;
+# 0 never rotates), keeping this many old files as debug.jsonl.1, .2, ...
+# (default 3, at least 1).
+export CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES="52428800"
+export CLAUDE_CODEX_DEBUG_LOG_KEEP="3"
+```
+
+Each line holds a timestamp, the process id, an event name and its data. Values
+under keys that look like credentials (`token`, `secret`, `password`, `api_key`,
+`authorization`, `cookie`) are written as `[redacted]`, and long strings are
+cut at 1200 characters. Writing is best-effort: a log that cannot be written
+never fails a turn.
+
 ## WebSocket listener
 
 `--listen ws://host:port` serves the protocol over TCP for clients such as
@@ -588,5 +609,8 @@ the profile's `env` or env file.
 | `CLAUDE_CODEX_REAP_ORPHANED_CLI` | `0` stops the adapter from ending Claude CLI processes a previous adapter left running (on by default; never on Windows). |
 | `CLAUDE_CODEX_MOCK` | Run the protocol without Claude credentials. |
 | `CLAUDE_CODEX_STATE_DB_TIMEOUT_MS` | How long a state-database write waits for another connection's lock before it fails (default `5000`). |
+| `CLAUDE_CODEX_DEBUG_LOG` | Debug log path (default `debug.jsonl` in the adapter home); `0` or `false` turns it off. See [Debug log](#debug-log). |
+| `CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES` / `_KEEP` | Size at which the debug log rotates (default 50 MiB; `0` never rotates) and how many rotated files stay (default `3`). |
+| `CLAUDE_CODEX_HTTP_*`, `CLAUDE_CODEX_CLAUDE_P_*` | Tuning for the `agent-http`, `agentapi` and `claude-p` backends. See [Backends](/guide/backends#agent-http-and-agentapi-settings). |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` | Claude auth / custom endpoint configuration. Keep real values out of git. |
 | `CLAUDE_CODE_FORK_SUBAGENT` | Claude Code's own switch, passed on from the adapter's environment: `0` keeps Claude from starting fork subagents (`subagent_type: "fork"`), which Claude Code 2.1.302 and later offer by default. With model process profiles, only a profile that inherits or sets it passes it on. See [Claude Code variables](#claude-code-variables). |
