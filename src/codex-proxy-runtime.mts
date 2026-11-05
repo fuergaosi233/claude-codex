@@ -131,7 +131,7 @@ export class CodexProxyRuntime implements ClaudeRuntime {
 
       pending.rl.on('line', (line: string) => {
         const trimmed = line.trim()
-        if (!trimmed || !trimmed.startsWith('{')) return // skip blank lines + stray TUI noise
+        if (!trimmed?.startsWith('{')) return // skip blank lines + stray TUI noise
         let event: Record<string, unknown>
         try {
           event = JSON.parse(trimmed)

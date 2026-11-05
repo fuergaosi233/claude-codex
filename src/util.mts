@@ -847,7 +847,7 @@ export function codexProxyModelOptions(): Array<{
   }
   const env = process.env.CLAUDE_CODEX_CODEX_MODELS
   let ids: string[] = []
-  if (env && env.trim()) {
+  if (env?.trim()) {
     ids = env
       .split(',')
       .map((s) => s.trim())
@@ -885,7 +885,7 @@ export function codexProxyModelOptions(): Array<{
 // our shim is also called `codex`). Returns null when nothing usable found.
 export function resolveCodexBinary(): string | null {
   const explicit = process.env.CODEX_REAL
-  if (explicit && explicit.trim()) return explicit.trim()
+  if (explicit?.trim()) return explicit.trim()
   const knownCandidates = [
     join(
       homedir(),

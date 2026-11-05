@@ -130,7 +130,7 @@ function numericEnv(value: string | undefined, fallback: number, min: number, ma
 }
 
 function stringList(value: string | undefined): string[] {
-  if (!value || !value.trim()) return []
+  if (!value?.trim()) return []
   const raw = value.trim()
   try {
     const parsed = JSON.parse(raw)
