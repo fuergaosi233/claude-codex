@@ -111,6 +111,12 @@ versioning or publishing metadata.
   not found, a name, roots or metadata it refuses), whose text the App
   matches; a bad project cursor or an empty `idempotencyKey` is an invalid
   request.
+- `thread/turns/list`, `thread/turns/items/list`, `thread/items/list`,
+  `thread/timeline/list`, `thread/name/set`, `thread/archive`,
+  `thread/goal/get` and `turn/interrupt` refuse an unknown thread with
+  `unknown thread: <id>` (`-32600`) too. They used to answer an empty page,
+  `{goal: null}` or `{}`; a rename or archive still sent its notification,
+  and an interrupt left the caller subscribed to a thread that did not exist.
 - Model process profiles that fail to load fail with one line of at most 300
   characters that names the file (or `CLAUDE_CODEX_MODEL_PROFILES`) and says
   what is wrong. The message used to carry the JSON parser's excerpt of the
