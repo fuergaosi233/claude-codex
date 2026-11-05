@@ -81,6 +81,40 @@ appears.
 claude-codex-mode set agentapi opus
 ```
 
+### agent-http and agentapi settings
+
+`claude-codex-mode set agent-http|agentapi` writes the ones it needs into
+`runtime.env`; set the others there or in the login shell.
+
+```bash
+# Bridge address (default http://127.0.0.1:3284). The first one set wins:
+# CLAUDE_CODEX_HTTP_BASE_URL, CLAUDE_CODEX_AGENT_HTTP_URL, CLAUDE_CODEX_AGENTAPI_URL.
+export CLAUDE_CODEX_HTTP_BASE_URL="http://127.0.0.1:3284"
+
+# Start a bridge per thread cwd and model through `claude-codex-mode
+# ensure-bridge` (45 s limit) and use the URL it prints; off by default, and
+# set to 1 by `claude-codex-mode set agent-http|agentapi`. Title and summary
+# turns still use the base URL. The helper command defaults to claude-codex-mode.
+export CLAUDE_CODEX_HTTP_MANAGE_BRIDGE="1"
+export CLAUDE_CODEX_MODE_COMMAND="claude-codex-mode"
+
+# agent-http also listens on GET /events (on by default; 0 polls only).
+# agentapi always polls.
+export CLAUDE_CODEX_HTTP_USE_SSE="1"
+
+# Poll interval in ms (default 500, kept within 100..60000) and how long a turn
+# may run before it fails (default 300000, 5 minutes, kept within 1 s..24 h).
+export CLAUDE_CODEX_HTTP_POLL_MS="500"
+export CLAUDE_CODEX_HTTP_TIMEOUT_MS="300000"
+
+# Also send Ctrl-C to the bridge as a raw message on interrupt (off by default).
+export CLAUDE_CODEX_HTTP_INTERRUPT_RAW="1"
+```
+
+Flags count as on for `1`, `true`, `yes` or `on`; any other non-empty value is
+off. A number that does not parse falls back to the default, one out of range
+is clamped.
+
 ## claude-p
 
 Runs `claude-p --output-format json --input-file ...` per turn and emits the
@@ -92,4 +126,20 @@ final assistant text. Not streaming, no `turn/steer`; defaults to one-shot turns
 export CLAUDE_CODEX_RUNTIME_TYPE="claude-p"
 export CLAUDE_CODEX_CLAUDE_P_COMMAND="claude-p"
 # export CLAUDE_CODEX_CLAUDE_P_RESUME=1   # only after verifying --resume + --input-file
+
+# Extra arguments placed before the adapter's own (a JSON array of strings, or
+# split on whitespace).
+# export CLAUDE_CODEX_CLAUDE_P_ARGS='["--flag","value"]'
+
+# Per-turn limit in ms (default 300000, kept within 1 s..24 h). The adapter
+# passes it on as --timeout in seconds and ends the process tree when it runs
+# out. A run that hits that limit, or prints nothing but a StopTimeout on
+# stderr, is retried this many times (default 1, kept within 0..5).
+export CLAUDE_CODEX_CLAUDE_P_TIMEOUT_MS="300000"
+export CLAUDE_CODEX_CLAUDE_P_STOP_TIMEOUT_RETRIES="1"
+
+# Always pass --dangerously-skip-permissions (off by default). Without it the
+# flag is passed only for turns with approval policy "never" or the
+# danger-full-access sandbox.
+# export CLAUDE_CODEX_CLAUDE_P_SKIP_PERMISSIONS=1
 ```
