@@ -11,7 +11,7 @@
 // the reason back to Claude (PostToolUse); `additionalContext` is non-blocking
 // guidance. Any error exits 0 so a buggy hook never wedges the session.
 
-import { readFileSync, statSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { extname, isAbsolute, relative } from 'node:path'
 
 // Soft cap: server.mts is the known outlier (~3.4k lines). Files past this get
