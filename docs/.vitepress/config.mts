@@ -1,6 +1,6 @@
 import { defineConfig } from 'vitepress'
 
-const repo = 'https://github.com/fuergaosi233/claude-codex'
+const repo = 'https://github.com/nwverse/claude-codex'
 
 export default defineConfig({
   title: 'Claude Codex Adapter',

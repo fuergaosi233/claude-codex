@@ -52,7 +52,7 @@ mkdir -p ~/.local/npm-global
 ~/.local/npm-global/bin/claude /login        # interactive: claude.ai OAuth
 
 # 3. Adapter checkout + build.
-git clone https://github.com/fuergaosi233/claude-codex ~/claude-codex && cd ~/claude-codex
+git clone https://github.com/nwverse/claude-codex ~/claude-codex && cd ~/claude-codex
 npm install && npm run build
 
 # 4. Persist PATH + adapter pointers for non-interactive SSH.
