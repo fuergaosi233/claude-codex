@@ -88,7 +88,8 @@ async function main(): Promise<void> {
 
   const proxyIndex = args.indexOf('proxy')
   if (proxyIndex >= 0) {
-    await runProxy(parseProxySockArg(args.slice(proxyIndex + 1)))
+    const socketPath = checkOptions(() => parseProxySockArg(args.slice(proxyIndex + 1)))
+    await runProxy(socketPath)
     return
   }
 
