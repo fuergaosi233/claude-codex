@@ -14,7 +14,7 @@ hero:
       link: /guide/configuration
     - theme: alt
       text: View on GitHub
-      link: https://github.com/fuergaosi233/claude-codex
+      link: https://github.com/nwverse/claude-codex
 
 features:
   - icon: 🔌
