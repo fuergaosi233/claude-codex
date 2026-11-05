@@ -1,4 +1,12 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { adapterHome, debugLog, stableHash } from './util.mjs'
 
@@ -116,7 +124,9 @@ const MAX_FOLDERS = 64
 // being evicted.
 const REFRESH_MS = 24 * 60 * 60 * 1000
 
-let cache: { readonly path: string; readonly catalog: Catalog } | null = null
+// The catalog as last read or saved, with the file's stamp then: another
+// adapter sharing the home may have saved it since.
+let cache: { readonly path: string; stamp: string; readonly catalog: Catalog } | null = null
 // Manifests this process has written, by path.
 const written = new Map<string, string>()
 const listeners = new Set<() => void>()
@@ -147,7 +157,8 @@ function folderManifestDir(folder: string): string {
 
 function catalog(): Catalog {
   const path = catalogPath()
-  if (cache?.path === path) return cache.catalog
+  const stamp = fileStamp(path)
+  if (cache?.path === path && cache.stamp === stamp) return cache.catalog
   let parsed: { commands?: unknown; folders?: unknown } = {}
   try {
     parsed = JSON.parse(readFileSync(path, 'utf8')) ?? {}
@@ -164,7 +175,7 @@ function catalog(): Catalog {
       value.folders[folder] = { commands: commandList(entry.commands), at }
     }
   }
-  cache = { path, catalog: value }
+  cache = { path, stamp, catalog: value }
   for (const command of value.commands) writeManifest(command)
   return value
 }
@@ -253,11 +264,23 @@ function announce(): void {
 }
 
 function save(value: Catalog): void {
+  const path = catalogPath()
   try {
     mkdirSync(adapterHome(), { recursive: true })
-    writeFileSync(catalogPath(), `${JSON.stringify(value, null, 2)}\n`)
+    writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`)
+    if (cache?.path === path) cache.stamp = fileStamp(path)
   } catch (error) {
     debugLog('claudeCommands.saveFailed', { message: (error as Error).message })
+  }
+}
+
+// What tells one save of the file from another; empty while there is none.
+function fileStamp(path: string): string {
+  try {
+    const stat = statSync(path)
+    return `${stat.mtimeMs}:${stat.size}`
+  } catch {
+    return ''
   }
 }
 

@@ -131,6 +131,10 @@ versioning or publishing metadata.
 
 ### App-server and protocol compatibility
 
+- Adapters that share a home (the App's stdio adapter next to a daemon, two
+  App windows) no longer drop each other's `/` popup commands: each reads
+  `claude-commands.json` again when another has saved it, before serving or
+  saving it.
 - Opt-in Memories: with `CLAUDE_CODEX_MEMORIES=1`, the App's Memories
   settings (Settings > Personalization) and `/memories` decide whether Claude
   threads run with Claude Code's auto-memory, and while Memories is off in the

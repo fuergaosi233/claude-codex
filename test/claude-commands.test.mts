@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
+import { createInterface } from 'node:readline'
 import test from 'node:test'
 import {
   claudeCommandManifest,
@@ -111,4 +113,54 @@ test('firstSentence stops at the first real sentence end', () => {
     'Run a prompt on an interval (e.g. /loop 5m /foo).',
   )
   assert.equal(firstSentence('No period here'), 'No period here')
+})
+
+test("adapters sharing a home keep and see each other's folder commands", async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-commands-shared-'))
+  const module = resolve('dist/src/claude-commands.mjs')
+  // One adapter process: it runs its steps when told to on stdin, and prints
+  // what each `list` step returns.
+  const adapter = () => {
+    const script = `
+      import { createInterface } from 'node:readline'
+      const { listFolderCommands, noteFolderCommands } = await import(${JSON.stringify(module)})
+      const builtin = { name: 'cost', description: '', argumentHint: '', builtin: true }
+      for await (const line of createInterface({ input: process.stdin })) {
+        const [step, folder, name] = line.split(' ')
+        if (step === 'note')
+          noteFolderCommands(folder, [builtin, { name, description: '', argumentHint: '' }])
+        const names = listFolderCommands(folder).map((command) => command.name)
+        process.stdout.write(JSON.stringify(names) + '\\n')
+      }
+    `
+    const child = spawn(process.execPath, ['--input-type=module', '-e', script], {
+      env: { ...process.env, CLAUDE_CODEX_HOME: home, CLAUDE_CODEX_DEBUG_LOG: '0' },
+      stdio: ['pipe', 'pipe', 'inherit'],
+    })
+    const lines = createInterface({ input: child.stdout })[Symbol.asyncIterator]()
+    return {
+      async run(line: string): Promise<string[]> {
+        child.stdin.write(`${line}\n`)
+        const next = await lines.next()
+        return JSON.parse(String(next.value))
+      },
+      stop: () => child.kill(),
+    }
+  }
+  const a = adapter()
+  const b = adapter()
+  try {
+    assert.deepEqual(await a.run('note /work/a ship'), ['ship'])
+    assert.deepEqual(await b.run('note /work/b deploy'), ['deploy'])
+    // A sees what B saved, and saving its own folder keeps B's.
+    assert.deepEqual(await a.run('list /work/b'), ['deploy'])
+    assert.deepEqual(await a.run('note /work/c lint'), ['lint'])
+    const saved = JSON.parse(await readFile(join(home, 'claude-commands.json'), 'utf8'))
+    assert.deepEqual(Object.keys(saved.folders).sort(), ['/work/a', '/work/b', '/work/c'])
+    assert.deepEqual(await b.run('list /work/c'), ['lint'])
+  } finally {
+    a.stop()
+    b.stop()
+    await rm(home, { recursive: true, force: true })
+  }
 })
