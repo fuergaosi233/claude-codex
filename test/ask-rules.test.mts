@@ -66,6 +66,49 @@ test('a Bash ask rule covers every command of a command line and what wrappers r
   assert.equal(covered('rm:*', 'find . -name "*.tmp" -exec rm {} \\;'), true)
 })
 
+test('a Bash ask rule covers what a shell runs with -c after its other options', () => {
+  const covered = (specifier: string, line: string) => bashRuleCovers(specifier, line)
+  for (const line of [
+    "bash -c -- 'rm -rf build'",
+    "sh -c - 'rm -rf build'",
+    "bash -c -e 'rm -rf build'",
+    "bash -e -c 'rm -rf build'",
+    "bash -c -o pipefail 'rm -rf build'",
+    "bash -c -O extglob -- 'rm -rf build'",
+    "bash -ceo pipefail 'rm -rf build'",
+    "bash --norc -c 'rm -rf build'",
+    "sudo bash -c -- 'rm -rf build'",
+  ])
+    assert.equal(covered('rm:*', line), true, line)
+  assert.equal(
+    askRuleCovers('Bash(rm:*)', 'Bash', { command: "bash -c -- 'rm -rf build'" }, '/'),
+    true,
+  )
+  // An option's argument is not the command.
+  assert.equal(covered('pipefail:*', "bash -c -o pipefail 'ls'"), false)
+  assert.equal(covered('rm:*', "bash -c -- 'ls'"), false)
+  // Without -c the shell runs a script; its arguments are not a command.
+  assert.equal(covered('rm:*', 'bash deploy.sh -c rm'), false)
+})
+
+test('a command name the shell expands is asked about under any Bash rule', () => {
+  const covered = (specifier: string, line: string) => bashRuleCovers(specifier, line)
+  for (const line of [
+    '{rm,-rf,build}',
+    '/bin/r? -rf build',
+    '/bin/r[m] -rf build',
+    '/bin/r* -rf build',
+    "bash -c '{rm,-rf,build}'",
+  ]) {
+    assert.equal(covered('rm:*', line), true, line)
+    assert.equal(covered('git push:*', line), true, line)
+  }
+  // `[` and `[[` are commands, and globs in arguments are only arguments.
+  assert.equal(covered('git push:*', '[ -f x ] && echo hi'), false)
+  assert.equal(covered('git push:*', '[[ -f x ]] && echo hi'), false)
+  assert.equal(covered('git push:*', 'ls *.txt src/{a,b}'), false)
+})
+
 test('file ask rules cover the tools that read or edit the file', async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'ask-rules-')))
   const cwd = join(root, 'repo')

@@ -171,6 +171,9 @@ export function commandCandidates(line: string, depth = 0): string[] | null {
     const rest = withoutPrefixes(words)
     if (rest.length === 0) continue
     if (rest[0]?.includes('$')) return null
+    // A command name the shell expands (`{rm,-rf,x}`, `/bin/r?`) could be
+    // any command. `[` and `[[` are commands of their own.
+    if (rest[0] !== '[' && rest[0] !== '[[' && /[{*?[]/.test(rest[0] ?? '')) return null
     const program = basename(rest[0] ?? '')
     out.push(rest.join(' '), [program, ...rest.slice(1)].join(' '))
     if (WRAPPERS.has(program))
@@ -184,15 +187,41 @@ export function commandCandidates(line: string, depth = 0): string[] | null {
       out.push(...inner)
     }
     if (SHELLS.has(program)) {
-      const flag = rest.findIndex((word, index) => index > 0 && /^-[A-Za-z]*c[A-Za-z]*$/.test(word))
-      if (flag > 0) {
-        const inner = commandCandidates(rest[flag + 1] ?? '', depth + 1)
+      const script = shellCommandString(rest)
+      if (script !== null) {
+        const inner = commandCandidates(script, depth + 1)
         if (inner === null) return null
         out.push(...inner)
       }
     }
   }
   return [...new Set(out)]
+}
+
+// The command string of a shell run with -c, read as the shell reads its
+// options: they end at the first word that is not one, or after `--` or
+// `-`, and each o or O in an option word takes the next word as its
+// argument (`bash -c -o pipefail -- 'cmd'`). Null without -c.
+function shellCommandString(words: string[]): string | null {
+  let command = false
+  let index = 1
+  for (; index < words.length; index += 1) {
+    const word = words[index] ?? ''
+    if (word === '--' || word === '-') {
+      index += 1
+      break
+    }
+    if (word.startsWith('--')) {
+      if (word === '--rcfile' || word === '--init-file') index += 1
+      continue
+    }
+    if (!/^[-+]./.test(word)) break
+    for (const letter of word.slice(1)) {
+      if (letter === 'c' && word.startsWith('-')) command = true
+      if (letter === 'o' || letter === 'O') index += 1
+    }
+  }
+  return command ? (words[index] ?? null) : null
 }
 
 // Leading variable assignments and shell keywords.
