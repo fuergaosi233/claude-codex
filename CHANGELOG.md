@@ -597,6 +597,13 @@ versioning or publishing metadata.
 
 ### Trustworthy history and settings
 
+- Streaming no longer stalls the adapter on every text, reasoning or command
+  output delta. Each delta used to read the whole turn, write it back and
+  fsync the state database before the delta reached the App, a few
+  milliseconds each on a long turn. The store now keeps a streaming turn in
+  memory and writes it about every 50 ms, and before any other read or write
+  of the state, so history, completion, a restart and other processes still
+  see every delta.
 - A forked chat shows the turns it was forked with on every read, as a Codex
   fork does: `thread/resume`, `thread/read`, `thread/turns/list`,
   `thread/items/list`, `thread/turns/items/list`, `thread/timeline/list` and
