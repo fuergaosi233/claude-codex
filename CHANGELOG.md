@@ -931,6 +931,18 @@ versioning or publishing metadata.
   behaviors the adapter relies on are App rules in `src/app-compat.mts`, tagged
   in the code and kept in sync by `test/app-compat.test.mts`; an App build not
   yet checked gets a config warning. See `docs/reference/app-compat.md`.
+- `npm run doctor` checks the runtime the shim will run: it reads the
+  `runtime.env` that `claude-codex-mode set` writes, accepts `codex-proxy`
+  (and checks for the real `codex` CLI), and reports an unknown runtime type
+  as a failed check instead of crashing. It finds the adapter, shim and
+  `node_modules` from its own checkout whatever the working directory, checks
+  that the built adapter answers a startup probe, and names spawn errors such
+  as `ENOENT` instead of `exited null`. It reads quoted values, trailing
+  comments and a leading `~` in `runtime.env` as the shell does, fails the
+  runtime type check when a line it cannot evaluate sets the runtime, lists
+  the other lines it skipped, and says whether the type came from the file,
+  the environment or the default. It looks for the real `codex` as the shim
+  does for the native route and as the adapter does for `codex-proxy`.
 
 ### Still experimental or not yet included
 
