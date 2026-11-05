@@ -210,7 +210,10 @@ versioning or publishing metadata.
   in progress in the App.
 - The adapter stops Claude CLI processes a previous adapter on the same state
   dir left running, matching pid, start time and command line before
-  signalling (`CLAUDE_CODEX_REAP_ORPHANED_CLI=0` turns it off).
+  signalling (`CLAUDE_CODEX_REAP_ORPHANED_CLI=0` turns it off). Start times
+  are read in UTC and the C locale, so two adapters with a different `TZ`
+  (an App launch and a shell) no longer drop a live sibling's record or miss
+  a killed adapter's Claude CLI.
 - A second adapter started on the same state dir (a startup probe, another
   window) no longer fails the turns a running adapter is still working on.
   Each turn records the process that wrote it, by pid and start time, and
@@ -230,6 +233,13 @@ versioning or publishing metadata.
   explicit `--listen unix://PATH` or `proxy --sock PATH` still wins. Both
   commands read it, so set it where both run. The daemon makes the socket's
   folder private to the user, so give the socket a folder of its own.
+- `app-server proxy` takes `--sock=PATH` as well as `--sock PATH`; a `--sock`
+  with no path is an error instead of quietly using the default socket. A
+  bad `--listen` (`tcp://...`, `ws://host:abc`, or `--listen` with no value)
+  now fails with one line before the state database opens, instead of a
+  stack trace after it, or a silent `stdio://`. The unix daemon no longer
+  refuses to start over a pid file that is empty, holds `0`, or names a
+  process that is not listening on the socket.
 - With `CLAUDE_CODEX_SDK_LAUNCH_GATE=1`, the native runtime starts Claude
   Code processes one at a time: a new session waits until the previous
   launch has sent its first SDK message, has ended, or has held the slot for

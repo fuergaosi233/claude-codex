@@ -44,13 +44,21 @@ export function registryDir(): string {
   return join(adapterHome(), 'cli-children')
 }
 
+// ps prints lstart in the caller's time zone, and BSD ps also in its locale.
+// Start times are compared as text across adapters that may run with another
+// TZ or LANG (App launch vs a shell), so every listing uses the C locale and
+// UTC.
+export function psEnv(): NodeJS.ProcessEnv {
+  return { ...process.env, LC_ALL: 'C', TZ: 'UTC' }
+}
+
 function listProcesses(): Promise<ProcessRow[]> {
   return new Promise((resolve) => {
     // POSIX -A (every process) reads the same in BSD ps and Linux procps.
     execFile(
       'ps',
       ['-A', '-ww', '-o', 'pid=,ppid=,lstart=,command='],
-      { encoding: 'utf8', timeout: 5000, maxBuffer: 32 * 1024 * 1024 },
+      { encoding: 'utf8', timeout: 5000, maxBuffer: 32 * 1024 * 1024, env: psEnv() },
       (error, stdout) => resolve(error ? [] : parseProcessRows(stdout)),
     )
   })

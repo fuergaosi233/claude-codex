@@ -98,7 +98,7 @@ export async function daemonProbe(args: readonly string[]): Promise<ProbeResult 
 
 // Whether a server accepts connections on the unix socket. The connection
 // closes before it sends anything, so the server sees no client.
-function listening(socketPath: string): Promise<boolean> {
+export function listening(socketPath: string): Promise<boolean> {
   return new Promise((resolve) => {
     const socket = connect(socketPath)
     const done = (result: boolean) => {

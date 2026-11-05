@@ -261,14 +261,22 @@ export function normalizeListenUrl(value: string | null | undefined): string {
   return value && value.length > 0 ? value : 'stdio://'
 }
 
+// The socket of `app-server proxy`: `--sock PATH` or `--sock=PATH`, like
+// codex's own CLI. A `--sock` without a path is an error rather than the
+// default socket, which could belong to another daemon.
 export function parseProxySockArg(args: string[]): string {
   const index = args.indexOf('--sock')
-  const next = args[index + 1]
-  if (index >= 0 && next) return next
-  return defaultSocketPath()
+  const inline = args.find((arg) => arg.startsWith('--sock='))
+  const value =
+    index >= 0 ? args[index + 1] : inline !== undefined ? inline.slice('--sock='.length) : null
+  if (value === null) return defaultSocketPath()
+  if (!value || value.startsWith('-')) throw new Error('--sock needs a socket path')
+  return value
 }
 
-function parseListenUrl(
+// Throws `unsupported listen URL` for anything but unix:// and a valid ws://;
+// the adapter calls it before opening the store so a typo touches nothing.
+export function parseListenUrl(
   listenUrl: string,
 ): { kind: 'unix'; path: string } | { kind: 'ws'; host: string; port: number } {
   if (listenUrl === 'unix://') return { kind: 'unix', path: defaultSocketPath() }
@@ -277,7 +285,12 @@ function parseListenUrl(
     return { kind: 'unix', path: path.length > 0 ? path : defaultSocketPath() }
   }
   if (listenUrl.startsWith('ws://')) {
-    const url = new URL(listenUrl)
+    let url: URL
+    try {
+      url = new URL(listenUrl)
+    } catch {
+      throw new Error(`unsupported listen URL: ${listenUrl}`)
+    }
     return {
       kind: 'ws',
       host: url.hostname || '127.0.0.1',
