@@ -118,6 +118,10 @@ versioning or publishing metadata.
   `defaultModel` value that was not valid. A model change from the menu or
   `turn/settings/update` that fails on them is now an invalid request
   (`-32600`) like one from `turn/start`, so the toast shows the reason.
+- `claude-codex-mode logs agent-http|agentapi` and `tail agent-http|agentapi`
+  show the pooled bridge log written to most recently. They used to show the
+  oldest one, so the log a failed bridge start pointed you to was usually
+  another bridge's.
 - A workflow agent that fails (one that stalled on every attempt, or hit an
   API error) ends its thread's turn as failed, with the reason the workflow
   reported, and counts as a failed subagent of its parent. It used to show as
