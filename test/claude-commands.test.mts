@@ -142,9 +142,13 @@ test("adapters sharing a home keep and see each other's folder commands", async 
       async run(line: string): Promise<string[]> {
         child.stdin.write(`${line}\n`)
         const next = await lines.next()
+        if (next.done) throw new Error(`the adapter process ended at: ${line}`)
         return JSON.parse(String(next.value))
       },
-      stop: () => child.kill(),
+      stop: () => {
+        child.stdin.end()
+        child.kill()
+      },
     }
   }
   const a = adapter()

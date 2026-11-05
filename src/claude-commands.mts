@@ -3,6 +3,7 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -126,7 +127,8 @@ const REFRESH_MS = 24 * 60 * 60 * 1000
 
 // The catalog as last read or saved, with the file's stamp then: another
 // adapter sharing the home may have saved it since.
-let cache: { readonly path: string; stamp: string; readonly catalog: Catalog } | null = null
+let cache: { readonly path: string; readonly stamp: string; readonly catalog: Catalog } | null =
+  null
 // Manifests this process has written, by path.
 const written = new Map<string, string>()
 const listeners = new Set<() => void>()
@@ -263,13 +265,20 @@ function announce(): void {
   for (const listener of listeners) listener()
 }
 
+// Written aside and renamed into place, so another adapter reading it never
+// sees half a file.
 function save(value: Catalog): void {
   const path = catalogPath()
+  const temporary = `${path}.${process.pid}.tmp`
   try {
     mkdirSync(adapterHome(), { recursive: true })
-    writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`)
-    if (cache?.path === path) cache.stamp = fileStamp(path)
+    writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`)
+    renameSync(temporary, path)
+    cache = { path, stamp: fileStamp(path), catalog: value }
   } catch (error) {
+    try {
+      rmSync(temporary, { force: true })
+    } catch {}
     debugLog('claudeCommands.saveFailed', { message: (error as Error).message })
   }
 }
