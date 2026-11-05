@@ -251,6 +251,7 @@ test("a rule's paths: frontmatter reads YAML comments and blank lines as YAML do
       "a/**, b #1/**, it's/**",
     ],
     ['crlf', 'paths:\r\n  - src/**\r\n  - lib/**\r', 'src/**, lib/**'],
+    ['empty-item', 'paths:\n  - # placeholder\n  -\n  - src/**', 'src/**'],
     ['crlf-comment', 'paths:\r\n  - src/** # here\r\n\r\n  - lib/**\r', 'src/**, lib/**'],
   ]
   try {

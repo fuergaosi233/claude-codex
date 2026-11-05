@@ -353,7 +353,8 @@ function ruleGlobs(text: string): string[] {
   const globs: string[] = []
   for (const line of lines.slice(index + 1)) {
     if (!line.trim()) continue
-    const item = /^\s*-\s*(.+)$/.exec(line)
+    // An item may be empty, as `- # later` is.
+    const item = /^\s*-\s*(.*)$/.exec(line)
     if (!item) break
     globs.push(unquote(item[1] ?? ''))
   }
