@@ -1,6 +1,16 @@
 #!/usr/bin/env node
 import { spawnSync } from 'node:child_process'
-import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from 'node:fs'
+import {
+  accessSync,
+  closeSync,
+  constants,
+  existsSync,
+  openSync,
+  readFileSync,
+  readSync,
+  realpathSync,
+  statSync,
+} from 'node:fs'
 import { homedir } from 'node:os'
 import { delimiter, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -9,21 +19,53 @@ import { fileURLToPath } from 'node:url'
 // whatever the working directory is.
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const shimPath = join(repoRoot, 'scripts', 'codex-shim')
+
+// Every variable resolveRuntimeType() reads.
+const RUNTIME_TYPE_KEYS = [
+  'CLAUDE_CODEX_ROUTE',
+  'CLAUDE_CODEX_RUNTIME_TYPE',
+  'CLAUDE_CODEX_MOCK',
+  'CLAUDE_CODEX_RUNTIME',
+  'CLAUDE_CODEX_BACKEND',
+]
+
 const runtimeEnvPath =
   process.env.CLAUDE_CODEX_RUNTIME_ENV || join(homedir(), '.claude-codex', 'runtime.env')
 // The shim sources the runtime env file over its own environment, so the
 // file's assignments win, as they do there.
-const env = { ...process.env, ...readRuntimeEnv(runtimeEnvPath) }
+const runtimeEnv = readRuntimeEnv(runtimeEnvPath)
+const env = { ...process.env, ...runtimeEnv.values }
 const adapterPath = env.CLAUDE_CODEX_ADAPTER || join(repoRoot, 'dist', 'src', 'adapter.mjs')
 
 const checks = []
 let runtimeType = null
 
 check('runtime type', () => {
-  runtimeType = resolveRuntimeType()
-  const source = existsSync(runtimeEnvPath) ? runtimeEnvPath : 'environment'
-  return `${runtimeType} (from ${source})`
+  // A line the doctor cannot evaluate may set the runtime differently in the
+  // shim, so a guess from the rest would be a false ok.
+  const unread = runtimeEnv.skipped.filter((item) =>
+    RUNTIME_TYPE_KEYS.some((key) => item.text.includes(key)),
+  )
+  if (unread.length > 0)
+    throw new Error(
+      `cannot read ${unread.map((item) => `${item.key} (line ${item.line})`).join(', ')} ` +
+        `in ${runtimeEnvPath}; write it as KEY="value"`,
+    )
+  const resolved = resolveRuntimeType()
+  runtimeType = resolved.type
+  const source = !resolved.key
+    ? 'default'
+    : `from ${resolved.key in runtimeEnv.values ? runtimeEnvPath : 'environment'}`
+  return `${runtimeType} (${source})`
 })
+
+if (runtimeEnv.skipped.length > 0)
+  check('runtime env file', () => {
+    // Not a failure: the shim may read them fine. The checks below use the
+    // environment's values for these keys instead.
+    const lines = runtimeEnv.skipped.map((item) => `${item.key} (line ${item.line})`)
+    return `skipped lines the doctor cannot evaluate: ${lines.join(', ')}`
+  })
 
 check('node >= 24 with stable node:sqlite', () => {
   // node:sqlite ships flag-gated on Node 22 and stable on Node 24+. The adapter
@@ -91,7 +133,9 @@ if (runtimeType === 'codex' || runtimeType === 'codex-proxy')
   check(
     runtimeType === 'codex' ? 'real Codex passthrough' : 'real Codex CLI for codex-proxy',
     () => {
-      const command = resolveRealCodex()
+      // The shim runs the real Codex in the native mode; the adapter runs
+      // it for codex-proxy, and the two look for it differently.
+      const command = runtimeType === 'codex' ? shimRealCodex() : adapterRealCodex()
       if (!command) throw new Error('no real codex CLI found; set CODEX_REAL=/abs/path/to/codex')
       return run(command, ['--version']).stdout.trim()
     },
@@ -144,52 +188,67 @@ function requireModule(name) {
   if (result.status !== 0) throw new Error(result.stderr || result.stdout)
 }
 
-// The `KEY=value` / `export KEY="value"` lines `claude-codex-mode set` writes.
-// This is not a shell: lines with any other syntax, and values that expand
-// `$` or a command, are skipped; for those the doctor may differ from the
+// The `KEY=value` / `export KEY="value"` lines `claude-codex-mode set` writes,
+// with an optional trailing `# comment`. This is not a shell: lines that
+// expand `$`, run a command or use any other syntax are not evaluated; they
+// are returned as `skipped`, because there the doctor may differ from the
 // shim, which sources the file.
 function readRuntimeEnv(path) {
   let text
   try {
     text = readFileSync(path, 'utf8')
   } catch {
-    return {}
+    return { values: {}, skipped: [] }
   }
   const values = {}
-  for (const line of text.split('\n')) {
+  const skipped = []
+  text.split('\n').forEach((line, index) => {
+    if (/^\s*(?:#.*)?$/.test(line)) return
     const match = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*?)\s*$/.exec(line)
-    if (!match) continue
+    if (!match) {
+      skipped.push({ key: line.trim().split(/[\s=]/)[0], line: index + 1, text: line })
+      return
+    }
     const value = shellWord(match[2])
-    if (value !== null) values[match[1]] = value
-  }
-  return values
+    if (value === null) skipped.push({ key: match[1], line: index + 1, text: line })
+    else values[match[1]] = value
+  })
+  return { values, skipped }
 }
 
-// One literal shell word, or null for anything that needs a shell.
+// One literal shell word, then an optional comment; null for anything that
+// needs a shell.
 function shellWord(raw) {
-  const single = /^'([^']*)'$/.exec(raw)
-  if (single) return single[1]
-  const double = /^"((?:[^"\\$`]|\\["\\$`])*)"$/.exec(raw)
-  if (double) return double[1].replace(/\\(["\\$`])/g, '$1')
-  if (/^[^\s"'\\$`;&|<>()#]*$/.test(raw)) return raw
-  return null
+  const word = /^('[^']*'|"(?:[^"\\$`]|\\["\\$`])*"|[^\s"'\\$`;&|<>()#]*)(?:\s+#.*)?$/.exec(raw)
+  if (!word) return null
+  const value = word[1]
+  if (value.startsWith("'")) return value.slice(1, -1)
+  if (value.startsWith('"')) return value.slice(1, -1).replace(/\\(["\\$`])/g, '$1')
+  // Unquoted, the shell expands a leading `~` or `~/` to HOME; `~user` and a
+  // `~` after `:` need a shell.
+  if (/^~(?:\/|$)/.test(value)) return homedir() + value.slice(1)
+  if (value.includes('~')) return null
+  return value
 }
 
 // Mirrors codex-shim, which runs the real Codex for the native modes of
 // CLAUDE_CODEX_ROUTE / CLAUDE_CODEX_RUNTIME_TYPE, and normalizeRuntimeType()
-// in src/runtime-config.mts for everything the adapter runs.
+// in src/runtime-config.mts for everything the adapter runs. Returns the type
+// and the variable that set it (none for the default).
 function resolveRuntimeType() {
-  const route = (env.CLAUDE_CODEX_ROUTE || env.CLAUDE_CODEX_RUNTIME_TYPE || '').trim()
-  if (['codex', 'native-codex', 'real-codex', 'native', 'real'].includes(route)) return 'codex'
-  if (env.CLAUDE_CODEX_MOCK === '1') return 'mock'
-  const raw = (
-    env.CLAUDE_CODEX_RUNTIME_TYPE ||
-    env.CLAUDE_CODEX_RUNTIME ||
-    env.CLAUDE_CODEX_BACKEND ||
-    ''
+  const routeKey = ['CLAUDE_CODEX_ROUTE', 'CLAUDE_CODEX_RUNTIME_TYPE'].find((key) => env[key])
+  const route = (routeKey ? env[routeKey] : '').trim()
+  if (['codex', 'native-codex', 'real-codex', 'native', 'real'].includes(route))
+    return { type: 'codex', key: routeKey }
+  if (env.CLAUDE_CODEX_MOCK === '1') return { type: 'mock', key: 'CLAUDE_CODEX_MOCK' }
+  const key = ['CLAUDE_CODEX_RUNTIME_TYPE', 'CLAUDE_CODEX_RUNTIME', 'CLAUDE_CODEX_BACKEND'].find(
+    (name) => env[name],
   )
-    .trim()
-    .toLowerCase()
+  const type = normalizeRuntimeType((key ? env[key] : '').trim().toLowerCase())
+  return { type, key }
+}
+
+function normalizeRuntimeType(raw) {
   if (!raw) return 'agent-sdk-sidecar'
   if (
     [
@@ -212,20 +271,68 @@ function resolveRuntimeType() {
   throw new Error(`unknown CLAUDE_CODEX_RUNTIME_TYPE: ${raw}`)
 }
 
-// CODEX_REAL, else the first `codex` on PATH that is not this adapter's shim,
-// as codex-shim and resolveCodexBinary() in src/util.mts look for it.
-function resolveRealCodex() {
+// As resolve_real_codex in codex-shim: CODEX_REAL if it is executable, else
+// the first executable `codex` on PATH that is not the shim. The doctor also
+// skips other copies of the shim, which it cannot tell from the one in use.
+function shimRealCodex() {
+  const explicit = env.CODEX_REAL
+  if (explicit && isExecutable(explicit)) return explicit
+  let self = shimPath
+  try {
+    self = realpathSync(shimPath)
+  } catch {}
+  return pathCodex((candidate) => {
+    if (!isExecutable(candidate)) return false
+    try {
+      return realpathSync(candidate) !== self
+    } catch {
+      return false
+    }
+  })
+}
+
+// As resolveCodexBinary() in src/util.mts: any non-empty CODEX_REAL, then the
+// npm-installed binary, then the first file named `codex` on PATH.
+function adapterRealCodex() {
   if (env.CODEX_REAL?.trim()) return env.CODEX_REAL.trim()
+  const known = join(
+    homedir(),
+    '.local/node/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex.real',
+  )
+  if (existsSync(known)) return known
+  return pathCodex((candidate) => {
+    try {
+      return statSync(candidate).isFile()
+    } catch {
+      return false
+    }
+  })
+}
+
+// The first `codex` on PATH that passes `accept` and does not look like the
+// shim (a script naming the adapter).
+function pathCodex(accept) {
   for (const dir of (env.PATH || '').split(delimiter).filter(Boolean)) {
     const candidate = join(dir, 'codex')
+    if (!accept(candidate)) continue
     try {
-      if (!statSync(candidate).isFile()) continue
       const head = fileHead(candidate)
       if (head.includes('CLAUDE_CODEX_ADAPTER') || head.includes('claude-codex')) continue
-      return candidate
-    } catch {}
+    } catch {
+      continue
+    }
+    return candidate
   }
   return null
+}
+
+function isExecutable(path) {
+  try {
+    accessSync(path, constants.X_OK)
+    return statSync(path).isFile()
+  } catch {
+    return false
+  }
 }
 
 // The first bytes only: the real codex is a large binary.
