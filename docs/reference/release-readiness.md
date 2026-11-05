@@ -27,7 +27,7 @@ replace the TypeScript runtime, transport, store, or provider execution path.
 | `npm test` | CI | Compiled Node test suite, including protocol, runtime, config, store, and projection behavior. |
 | `cargo test --workspace` | CI | Rust workspace tests for the experimental protocol crate. |
 | `npm run check:rust-protocol-fixtures` | CI | Drift between pinned Codex app-server behavior and checked Rust protocol fixtures. |
-| `npm run docs:build` | Release/docs PRs | VitePress documentation build and link rendering. |
+| `npm run docs:build` | CI | VitePress documentation build; fails on links to pages that do not exist. |
 | `npm run smoke:real` | Opt-in | Real Claude turn using host-owned Anthropic, Bedrock, or Vertex credentials. |
 | `npm run acceptance:local-remote` | Opt-in | Local shim, daemon, proxy, and real Claude file-edit flow. |
 | `npm run acceptance:gui-ssh-localhost` | Opt-in | Closest automated check to Codex App GUI Remote over SSH localhost. |

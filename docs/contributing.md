@@ -69,4 +69,6 @@ npm run docs:preview   # serve the built site
 ```
 
 It deploys to GitHub Pages automatically on push to `main` via
-`.github/workflows/deploy-docs.yml`.
+`.github/workflows/deploy-docs.yml`. CI also runs `npm run docs:build` on
+every pull request, and the build fails on a link to a page that does not
+exist.

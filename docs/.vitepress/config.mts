@@ -9,7 +9,6 @@ export default defineConfig({
   base: '/claude-codex/',
   lastUpdated: true,
   cleanUrls: true,
-  ignoreDeadLinks: true,
   head: [['meta', { name: 'theme-color', content: '#d97757' }]],
   themeConfig: {
     nav: [
