@@ -233,6 +233,13 @@ versioning or publishing metadata.
   explicit `--listen unix://PATH` or `proxy --sock PATH` still wins. Both
   commands read it, so set it where both run. The daemon makes the socket's
   folder private to the user, so give the socket a folder of its own.
+- `app-server proxy` takes `--sock=PATH` as well as `--sock PATH`; a `--sock`
+  with no path is an error instead of quietly using the default socket. A
+  bad `--listen` (`tcp://...`, `ws://host:abc`, or `--listen` with no value)
+  now fails with one line before the state database opens, instead of a
+  stack trace after it, or a silent `stdio://`. The unix daemon no longer
+  refuses to start over a pid file that is empty, holds `0`, or names a
+  process that is not listening on the socket.
 - With `CLAUDE_CODEX_SDK_LAUNCH_GATE=1`, the native runtime starts Claude
   Code processes one at a time: a new session waits until the previous
   launch has sent its first SDK message, has ended, or has held the slot for
