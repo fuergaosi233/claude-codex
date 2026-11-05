@@ -841,6 +841,7 @@ export class CodexClaudeAppServer {
     } finally {
       // The App plugin servers go with the adapter.
       stopAppPluginServers()
+      this.stopProcessesAndWatchers()
       // A store that can no longer be written must not keep the Claude
       // processes running.
       try {
@@ -849,6 +850,26 @@ export class CodexClaudeAppServer {
         this.store.close()
       }
     }
+  }
+
+  // The processes started by command/exec, process/spawn and
+  // thread/shellCommand, and the fs/watch watchers, go with the server. Without
+  // this they outlive a stopped daemon: a terminal or a streamed command has no
+  // timeout of its own.
+  private stopProcessesAndWatchers(): void {
+    for (const processes of [this.commandProcesses, this.processHandles]) {
+      for (const child of processes.values()) {
+        // As process/kill: a PTY bridge is asked to kill its shell first.
+        if ((child as any).__isPtyBridge && child.stdin?.writable) {
+          child.stdin.on('error', () => {})
+          child.stdin.write(`${JSON.stringify({ action: 'kill' })}\n`)
+        }
+        child.kill('SIGTERM')
+      }
+      processes.clear()
+    }
+    for (const watcher of this.fsWatchers.values()) watcher.close()
+    this.fsWatchers.clear()
   }
 
   // Background agents keep running (and Claude may still answer them) after
