@@ -56,6 +56,15 @@ test('an unknown thread is an invalid request, whatever the method', async () =>
       ['thread/attachment/list', { threadId }],
       ['thread/section/move', { threadId, sectionId: null }],
       ['thread/fork', { threadId }],
+      ['thread/turns/list', { threadId }],
+      ['thread/turns/items/list', { threadId, turnId: 'x' }],
+      ['thread/items/list', { threadId }],
+      ['thread/timeline/list', { threadId }],
+      ['thread/name/set', { threadId, name: 'renamed' }],
+      ['thread/archive', { threadId }],
+      ['thread/unarchive', { threadId }],
+      ['thread/goal/get', { threadId }],
+      ['turn/interrupt', { threadId }],
     ] as const)
       await refused(app, method, params, /^unknown thread: nope$/)
   })

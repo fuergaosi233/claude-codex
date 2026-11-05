@@ -2168,7 +2168,7 @@ export class CodexClaudeAppServer {
   // The App pages a long thread from its newest turn, and loads a search
   // match by reading both ways from the match's turn.
   private threadTurnsList(params: Record<string, unknown>): unknown {
-    const threadId = stringOr(params.threadId, '')
+    const threadId = this.knownThreadId(params)
     const itemsView = turnItemsView(params.itemsView)
     const page = pageTurns(this.store.historyTurns(threadId), {
       cursor: params.cursor,
@@ -2179,7 +2179,7 @@ export class CodexClaudeAppServer {
   }
 
   private threadItemsList(params: Record<string, unknown>): unknown {
-    return pageItems(this.store.historyTurns(stringOr(params.threadId, '')), {
+    return pageItems(this.store.historyTurns(this.knownThreadId(params)), {
       turnId: stringOr(params.turnId, '') || null,
       cursor: params.cursor,
       limit: pageLimit(params.limit),
@@ -2188,7 +2188,7 @@ export class CodexClaudeAppServer {
   }
 
   private threadTimelineList(params: Record<string, unknown>): unknown {
-    return pageTimeline(this.store.historyTurns(stringOr(params.threadId, '')), {
+    return pageTimeline(this.store.historyTurns(this.knownThreadId(params)), {
       cursor: params.cursor,
       limit: pageLimit(params.limit),
     })
@@ -2294,6 +2294,7 @@ export class CodexClaudeAppServer {
   private threadTurnItemsList(params: Record<string, unknown>): unknown {
     const turnId = stringOr(params.turnId, '')
     const threadId = stringOr(params.threadId, '')
+    if (threadId && !this.store.getThread(threadId)) throw unknownThread(threadId)
     // A fork's inherited turns keep their ids, so the thread names which copy.
     const turn = threadId ? this.store.historyTurn(threadId, turnId) : this.store.getTurn(turnId)
     return {
@@ -2304,7 +2305,7 @@ export class CodexClaudeAppServer {
   }
 
   private threadNameSet(params: Record<string, unknown>): unknown {
-    const threadId = stringOr(params.threadId, '')
+    const threadId = this.knownThreadId(params)
     const name = params.name == null ? null : String(params.name)
     this.store.updateThreadName(threadId, name)
     this.notifyThread(threadId, {
@@ -2315,7 +2316,7 @@ export class CodexClaudeAppServer {
   }
 
   private threadArchive(params: Record<string, unknown>, archived: boolean): unknown {
-    const threadId = stringOr(params.threadId, '')
+    const threadId = this.knownThreadId(params)
     this.store.setArchived(threadId, archived)
     this.notifyThread(threadId, {
       method: archived ? 'thread/archived' : 'thread/unarchived',
@@ -2448,7 +2449,7 @@ export class CodexClaudeAppServer {
   }
 
   private threadGoalGet(params: Record<string, unknown>): unknown {
-    return { goal: this.store.getGoal(stringOr(params.threadId, '')) }
+    return { goal: this.store.getGoal(this.knownThreadId(params)) }
   }
 
   private threadGoalClear(peer: RpcPeer, params: Record<string, unknown>): unknown {
@@ -2461,6 +2462,14 @@ export class CodexClaudeAppServer {
     if (cleared)
       this.notifyThread(threadId, { method: 'thread/goal/cleared', params: { threadId } })
     return { cleared }
+  }
+
+  // The request's threadId, refused the way Codex refuses a thread it does
+  // not have, before a handler writes, notifies or answers an empty page.
+  private knownThreadId(params: Record<string, unknown>): string {
+    const threadId = stringOr(params.threadId, '')
+    if (!this.store.getThread(threadId)) throw unknownThread(threadId)
+    return threadId
   }
 
   private goalThread(threadId: string): ThreadRecord {
@@ -8046,6 +8055,8 @@ export class CodexClaudeAppServer {
   private async turnInterrupt(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
     const threadId = stringOr(params.threadId, '')
     const requestedTurnId = stringOr(params.turnId, '')
+    // Subagent threads are stored too, so this check covers them.
+    if (!this.store.getThread(threadId)) throw unknownThread(threadId)
     this.subscribe(threadId, peer)
     // A background child has no runtime turn of its own; stop its task.
     const background = this.backgroundSubagents.get(threadId)
