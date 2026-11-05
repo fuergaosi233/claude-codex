@@ -25,6 +25,9 @@ export interface HttpAgentRuntimeOptions {
 interface ActiveRun {
   abort: AbortController
   baseUrl: string
+  // Set once the turn's own prompt is on the bridge. A steer before that would
+  // land ahead of the prompt, possibly on a different bridge than the turn's.
+  promptPosted: boolean
 }
 
 interface AgentMessage {
@@ -72,7 +75,7 @@ export class HttpAgentRuntime implements ClaudeRuntime {
     handlers: RuntimeHandlers,
   ): Promise<void> {
     const abort = new AbortController()
-    this.active.set(context.threadId, { abort, baseUrl: this.options.baseUrl })
+    this.active.set(context.threadId, { abort, baseUrl: this.options.baseUrl, promptPosted: false })
     const tracker = new MessageDeltaTracker(this.options.kind)
     const startedAt = Date.now()
     let sseTask: Promise<void> | null = null
@@ -125,6 +128,7 @@ export class HttpAgentRuntime implements ClaudeRuntime {
           'user',
           abort.signal,
         )
+        if (active) active.promptPosted = true
       } catch (error) {
         if (this.options.kind === 'agentapi') {
           const latestMessages = await this.fetchMessages(baseUrl, abort.signal).catch(() => null)
@@ -173,16 +177,22 @@ export class HttpAgentRuntime implements ClaudeRuntime {
     }
   }
 
+  // false until the thread's turn has posted its own prompt, so the server
+  // retries instead of the steer reaching the bridge first (or reaching no turn).
   async steer(
-    _threadId: string,
+    threadId: string,
     prompt: string,
     options: RuntimeSteerOptions = {},
-  ): Promise<undefined> {
+  ): Promise<false | undefined> {
+    const active = this.active.get(threadId)
+    if (!active?.promptPosted) return false
     await this.postMessage(
-      this.active.get(_threadId)?.baseUrl ?? this.options.baseUrl,
+      active.baseUrl,
       flatPrompt(prompt, options.promptContext),
       'user',
+      active.abort.signal,
     )
+    return undefined
   }
 
   async interrupt(threadId: string): Promise<void> {

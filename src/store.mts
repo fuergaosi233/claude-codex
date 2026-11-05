@@ -20,7 +20,7 @@ import type {
   TurnRecord,
   TurnStatus,
 } from './types.mjs'
-import { adapterHome, jsonClone, newId, nowSeconds } from './util.mjs'
+import { adapterHome, debugLog, jsonClone, newId, nowSeconds } from './util.mjs'
 
 const require = createRequire(import.meta.url)
 
@@ -34,6 +34,13 @@ type DatabaseSync = any
 // file at the wrong moment (a backup, a sqlite3 shell, a status script) fails
 // whichever turn happens to write then. Python's sqlite3 uses the same 5s.
 const DEFAULT_BUSY_TIMEOUT_MS = 5_000
+
+// How long streamed item updates (see streamItem) stay in memory before they
+// are written. The file is in rollback-journal mode with synchronous=FULL, so
+// every commit is an fsync; a turn streams thousands of deltas.
+const STREAM_FLUSH_MS = 50
+// When a timed write fails (the file is busy), how long until it is tried again.
+const STREAM_RETRY_MS = 250
 
 function busyTimeoutMs(): number {
   const raw = process.env.CLAUDE_CODEX_STATE_DB_TIMEOUT_MS?.trim()
@@ -107,12 +114,22 @@ function parseGitInfo(json: unknown): GitInfo | null {
 }
 
 export class SessionStore {
-  private db: DatabaseSync
+  private conn: DatabaseSync
+  // Turns streamItem changed that are not written yet, by id.
+  private pendingTurns = new Map<string, TurnRecord>()
+  private flushTimer: ReturnType<typeof setTimeout> | null = null
 
   constructor(path = join(adapterHome(), 'state.sqlite')) {
     mkdirSync(adapterHome(), { recursive: true, mode: 0o700 })
-    this.db = openDatabase(path)
+    this.conn = openDatabase(path)
     this.migrate()
+  }
+
+  // Every statement goes through here, so whatever reads, writes or opens a
+  // transaction first writes the turns streamItem left in memory.
+  private get db(): DatabaseSync {
+    if (this.pendingTurns.size > 0) this.flushPendingTurns()
+    return this.conn
   }
 
   private migrate(): void {
@@ -1180,8 +1197,13 @@ export class SessionStore {
   }
 
   upsertTurn(turn: TurnRecord): void {
+    this.flushPendingTurns()
+    this.writeTurn(turn)
+  }
+
+  private writeTurn(turn: TurnRecord): void {
     const owner = currentProcessOwner()
-    this.db
+    this.conn
       .prepare(`
         INSERT INTO turns (id, thread_id, status, started_at, completed_at, duration_ms, items_json, diff, error_json, root_turn_id, owner_pid, owner_started)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1213,13 +1235,21 @@ export class SessionStore {
       )
   }
 
+  // A turn streamItem holds in memory is read from there, so the status checks
+  // the server runs before each streamed delta do not write it early. Only this
+  // process changes a turn it owns, and its other writes flush first, so the
+  // copy is never behind the file.
   getTurn(id: string): TurnRecord | null {
+    const pending = this.pendingTurns.get(id)
+    if (pending) return jsonClone(pending)
     const row = this.db.prepare('SELECT * FROM turns WHERE id = ?').get(id)
     return row ? this.rowToTurn(row) : null
   }
 
   // A turn's status, without decoding its items.
   turnStatus(id: string): TurnRecord['status'] | null {
+    const pending = this.pendingTurns.get(id)
+    if (pending) return pending.status
     const row = this.db.prepare('SELECT status FROM turns WHERE id = ?').get(id) as
       | { status?: unknown }
       | undefined
@@ -1677,6 +1707,56 @@ export class SessionStore {
     return turn
   }
 
+  // updateItem for a streamed delta: the update lands in an in-memory copy of
+  // the turn, written once STREAM_FLUSH_MS later or before the store's next
+  // other use, whichever comes first. False when there is no such turn.
+  streamItem(turnId: string, itemId: string, updater: (item: ThreadItem) => ThreadItem): boolean {
+    let turn = this.pendingTurns.get(turnId)
+    if (!turn) {
+      const stored = this.getTurn(turnId)
+      if (!stored) return false
+      turn = stored
+      this.pendingTurns.set(turnId, turn)
+    }
+    turn.items = turn.items.map((item) => (item.id === itemId ? updater(jsonClone(item)) : item))
+    this.flushTimer ??= setTimeout(() => this.flushOnTimer(), STREAM_FLUSH_MS)
+    return true
+  }
+
+  private flushOnTimer(): void {
+    this.flushTimer = null
+    try {
+      this.flushPendingTurns()
+    } catch (error) {
+      // The turns stay pending and the timer tries again; a store write or
+      // close before then retries too and throws to its caller.
+      debugLog('store.stream_flush_failed', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+      if (this.pendingTurns.size > 0) {
+        this.flushTimer ??= setTimeout(() => this.flushOnTimer(), STREAM_RETRY_MS)
+      }
+    }
+  }
+
+  private flushPendingTurns(): void {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer)
+      this.flushTimer = null
+    }
+    if (this.pendingTurns.size === 0) return
+    const turns = [...this.pendingTurns.values()]
+    this.pendingTurns.clear()
+    for (const [index, turn] of turns.entries()) {
+      try {
+        this.writeTurn(turn)
+      } catch (error) {
+        for (const unwritten of turns.slice(index)) this.pendingTurns.set(unwritten.id, unwritten)
+        throw error
+      }
+    }
+  }
+
   updateItemAndMoveToEnd(
     turnId: string,
     itemId: string,
@@ -2025,7 +2105,11 @@ export class SessionStore {
   }
 
   close(): void {
-    this.db.close()
+    try {
+      this.flushPendingTurns()
+    } finally {
+      this.conn.close()
+    }
   }
 
   private rowToThread(row: any): ThreadRecord {

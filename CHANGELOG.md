@@ -38,6 +38,17 @@ versioning or publishing metadata.
 
 ### Failures you can see and act on
 
+- A turn in a GPT chat (the `codex-proxy` route) now hands its prompt to
+  `codex exec` on stdin instead of as the last argument. A message that
+  starts with `-` or `--` no longer fails as an unknown `codex` flag, and a
+  prompt over 128 KiB (a pasted log, a large injected context) no longer fails
+  with `spawn E2BIG` on Linux.
+- A message sent to steer a running turn in an `agent-http` or `agentapi`
+  chat no longer jumps ahead of the turn's own prompt. A steer that arrived
+  while the turn was still starting was posted before the prompt, possibly to
+  the unmanaged base URL instead of the turn's bridge, and was reported as
+  delivered. It now waits until the prompt is posted and goes to the turn's
+  bridge. A steer for a chat with no running turn is no longer posted.
 - A turn that fails after the computer slept for a minute or more since
   Claude last made progress in it says so in its error: roughly how long the
   computer slept, that this broke Claude's connection to the model, and that a
@@ -592,6 +603,14 @@ versioning or publishing metadata.
 
 ### Trustworthy history and settings
 
+- Streaming no longer stalls the adapter on every text, reasoning or command
+  output delta. Each delta used to read the whole turn, write it back and
+  fsync the state database before the delta reached the App, a few
+  milliseconds each on a long turn. The store now keeps a streaming turn in
+  memory and writes it about every 50 ms, and before any other write or read
+  of the state. Reads of that turn, such as the status check before each
+  delta, come from the copy in memory, so history, completion, a restart and
+  other processes still see every delta.
 - A forked chat shows the turns it was forked with on every read, as a Codex
   fork does: `thread/resume`, `thread/read`, `thread/turns/list`,
   `thread/items/list`, `thread/turns/items/list`, `thread/timeline/list` and

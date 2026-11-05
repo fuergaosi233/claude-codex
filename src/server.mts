@@ -3939,7 +3939,7 @@ export class CodexClaudeAppServer {
         onEvent: async (event) => {
           if (event.type === 'text_delta' && event.delta && active()) {
             collected += event.delta
-            this.store.updateItem(turnId, agentItemId, (item) =>
+            this.store.streamItem(turnId, agentItemId, (item) =>
               item.type === 'agentMessage' ? { ...item, text: item.text + event.delta } : item,
             )
             this.notify(peer, {
@@ -5622,7 +5622,7 @@ export class CodexClaudeAppServer {
             completeReasoningItem()
             hasTextOutput = true
             const itemId = ensureAgentItem()
-            this.store.updateItem(turn.id, itemId, (item) => {
+            this.store.streamItem(turn.id, itemId, (item) => {
               if (item.type === 'agentMessage') return { ...item, text: item.text + event.delta }
               return item
             })
@@ -5636,7 +5636,7 @@ export class CodexClaudeAppServer {
             if (event.delta.length === 0) return
             completeAgentItem('commentary')
             const itemId = ensureReasoningItem()
-            this.store.updateItem(turn.id, itemId, (item) => {
+            this.store.streamItem(turn.id, itemId, (item) => {
               if (item.type !== 'reasoning') return item
               return reasoningVisible
                 ? { ...item, summary: [(item.summary[0] ?? '') + event.delta] }
@@ -5732,7 +5732,7 @@ export class CodexClaudeAppServer {
             // Output that comes after the result is not the item's any more.
             if (!itemId || !openToolItems.has(itemId)) return
             commandOutputSeen.add(itemId)
-            this.store.updateItem(turn.id, itemId, (item) => {
+            this.store.streamItem(turn.id, itemId, (item) => {
               if (item.type === 'commandExecution') {
                 return {
                   ...item,
@@ -7056,7 +7056,7 @@ export class CodexClaudeAppServer {
     const at = this.commandItems.get(event.toolUseId)
     if (!at || at.threadId !== threadId || !event.delta) return
     let found = false
-    this.store.updateItem(at.turnId, at.itemId, (item) => {
+    this.store.streamItem(at.turnId, at.itemId, (item) => {
       if (item.type !== 'commandExecution') return item
       found = true
       return { ...item, aggregatedOutput: appendCommandOutput(item.aggregatedOutput, event.delta) }

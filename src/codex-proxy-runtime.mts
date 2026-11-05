@@ -96,7 +96,11 @@ export class CodexProxyRuntime implements ClaudeRuntime {
           for (const dir of context.addDirs) args.push('--add-dir', dir)
         }
       }
-      args.push(flatPrompt(context.prompt, context.promptContext))
+      // PROMPT `-` makes codex read the prompt from stdin. As an argv entry a
+      // prompt starting with '-' parses as a flag, and one over 128 KiB fails
+      // the spawn with E2BIG on Linux (MAX_ARG_STRLEN).
+      args.push('-')
+      const prompt = flatPrompt(context.prompt, context.promptContext)
 
       debugLog('codex-proxy.spawn', {
         binary,
@@ -106,9 +110,15 @@ export class CodexProxyRuntime implements ClaudeRuntime {
       })
 
       const proc = spawn(binary, args, {
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: ['pipe', 'pipe', 'pipe'],
         env: { ...process.env },
       })
+      // codex may exit before it reads the whole prompt (bad flag, auth
+      // failure); the exit handler reports the turn, so only log EPIPE here.
+      proc.stdin.on('error', (err) => {
+        debugLog('codex-proxy.stdinError', { turnId: context.turnId, err: String(err) })
+      })
+      proc.stdin.end(prompt)
 
       const pending: PendingTurn = {
         context,
