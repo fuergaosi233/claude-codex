@@ -124,7 +124,9 @@ thread or turn and a bad cursor, and a failure inside the adapter with
 `-32000`. The project store's errors (a project not found, a name, roots or
 metadata it refuses) stay `-32000`, with the texts the App matches.
 Regenerate the reference schema under `generated/` with
-`npm run generate:schema` (needs a matching `codex` on PATH).
+`npm run generate:schema` (needs a matching `codex` on PATH; behind the
+`codex` shim, set `CODEX_REAL` to it, as the shim hands schema generation to
+the real codex).
 
 Because the adapter reports the same version as a real `codex`, it appends a
 distinguishing suffix: `codex --version` prints `codex-cli 0.163.0-alpha.10.2

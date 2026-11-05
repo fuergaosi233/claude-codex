@@ -29,7 +29,8 @@ resolved secrets, or private infrastructure URLs.
 
 Codex App keeps using its native SSH flow: it probes `codex --version`, starts
 `codex app-server --listen unix://`, then connects via `codex app-server proxy`.
-The shim routes only those app-server calls to the adapter.
+The shim routes only those app-server calls to the adapter; `codex app-server
+generate-ts` and `generate-json-schema` go to `CODEX_REAL`.
 
 ::: tip Custom Anthropic endpoints
 If your organization uses a supported custom Anthropic endpoint, configure

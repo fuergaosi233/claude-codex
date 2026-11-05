@@ -9,7 +9,8 @@ plain `.mjs` / shell.
 - `codex-shim` — the `PATH` shim Codex App invokes. Routes `codex app-server`
   into the adapter (`CLAUDE_CODEX_ADAPTER`), answering the plain
   `--print-startup-config` and `daemon version` probes itself without starting
-  node; forwards everything else to the real Codex CLI (`CODEX_REAL`). Keep it
+  node; hands `app-server generate-ts` / `generate-json-schema` to the real
+  Codex CLI; forwards everything else to the real Codex CLI (`CODEX_REAL`). Keep it
   dependency-free and POSIX-sh portable.
 - `claude-codex-mode` — host helper to switch runtime backends, restart bridges,
   and read status/logs. Writes `~/.claude-codex/runtime.env`.
