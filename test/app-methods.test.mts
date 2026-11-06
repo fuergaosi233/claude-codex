@@ -322,6 +322,35 @@ test('thread/list pages through threads created in the same second', async () =>
   })
 })
 
+test('thread/loaded/list pages through the loaded threads by its cursor', async () => {
+  await withServer(async (server) => {
+    const threads = [
+      await server.startThread(),
+      await server.startThread(),
+      await server.startThread(),
+    ]
+    const first = await server.request('thread/loaded/list', { limit: 2 })
+    const second = await server.request('thread/loaded/list', {
+      limit: 2,
+      cursor: first.nextCursor,
+    })
+    assert.equal(second.nextCursor, null)
+    assert.deepEqual([...first.data, ...second.data].toSorted(), threads.toSorted())
+
+    // A limit under 1 still makes progress, and a bad cursor is refused.
+    const one = await server.request('thread/loaded/list', { limit: 0 })
+    assert.equal(one.data.length, 1)
+    assert.equal(one.nextCursor, '1')
+    await assert.rejects(
+      server.request('thread/loaded/list', { cursor: 'x' }),
+      /invalid loaded thread cursor/,
+    )
+    const all = await server.request('thread/loaded/list')
+    assert.deepEqual(all.data.toSorted(), threads.toSorted())
+    assert.equal(all.nextCursor, null)
+  })
+})
+
 test('a chat nothing was sent to stays out of the thread list and search', async () => {
   await withServer(async (server) => {
     const used = await server.startThread()
