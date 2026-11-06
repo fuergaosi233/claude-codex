@@ -15,7 +15,8 @@ const gitInfoCache = new Map<string, { at: number; info: Promise<GitInfo | null>
 
 // The Codex GitInfo of a workspace: HEAD's sha, its branch (null when
 // detached) and the origin remote without credentials; null outside a
-// repository. `fresh` skips the cache, for when the branch may have moved.
+// repository, and rejects when git times out. `fresh` skips the cache, for
+// when the branch may have moved.
 export function gitInfoFor(
   cwd: string,
   options: { fresh?: boolean } = {},
@@ -30,6 +31,10 @@ export function gitInfoFor(
   }
   const info = readGitInfo(cwd)
   gitInfoCache.set(cwd, { at: now, info })
+  // A failed lookup is not cached, so the next one runs git again.
+  info.catch(() => {
+    if (gitInfoCache.get(cwd)?.info === info) gitInfoCache.delete(cwd)
+  })
   return info
 }
 
@@ -52,7 +57,11 @@ async function git(cwd: string, args: string[]): Promise<string | null> {
       maxBuffer: 64 * 1024,
     })
     return stdout.trim() || null
-  } catch {
+  } catch (error) {
+    // A git killed at the timeout says nothing about the repository: fail the
+    // lookup rather than read it as a detached HEAD or a missing origin.
+    const { killed, signal } = error as { killed?: boolean; signal?: string | null }
+    if (killed || signal) throw error
     // Outside a repository, on an unborn branch or without an origin.
     return null
   }

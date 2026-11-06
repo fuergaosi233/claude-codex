@@ -1393,10 +1393,12 @@ test('threads carry the git info of their workspace without listing running git'
   // A git on PATH that logs each run, to show which requests run git.
   const tools = await mkdtemp(join(tmpdir(), 'claude-codex-git-runs-'))
   const log = join(tools, 'runs.log')
+  const slow = join(tools, 'slow')
   const realGit = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim()
   await writeFile(
     join(tools, 'git'),
-    `#!/bin/sh\necho "$*" >> '${log}'\nexec '${realGit}' "$@"\n`,
+    // While `slow` exists, symbolic-ref answers after the 1s git timeout.
+    `#!/bin/sh\necho "$*" >> '${log}'\n[ "$1" = symbolic-ref ] && [ -e '${slow}' ] && sleep 1.5\nexec '${realGit}' "$@"\n`,
     {
       mode: 0o755,
     },
@@ -1494,6 +1496,13 @@ test('threads carry the git info of their workspace without listing running git'
       const plain = await server.startThread()
       const resumed = await server.request('thread/resume', { threadId: plain, cwd: repo })
       assert.deepEqual(resumed.thread.gitInfo, later)
+      // A lookup there that times out drops the git info of the one it left.
+      const other = join(server.home, 'other')
+      await mkdir(other)
+      await writeFile(slow, '')
+      const timedOut = await server.request('thread/resume', { threadId: plain, cwd: other })
+      assert.equal(timedOut.thread.gitInfo, null)
+      await rm(slow)
       const back = await server.request('thread/resume', { threadId: plain, cwd: server.home })
       assert.equal(back.thread.gitInfo, null)
     }, env)

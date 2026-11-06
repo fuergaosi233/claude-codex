@@ -10102,6 +10102,8 @@ export class CodexClaudeAppServer {
         threadId,
         error: error instanceof Error ? error.message : String(error),
       })
+      // What is stored describes the workspace the thread left.
+      if (options.replace && !this.stopped) this.store.setThreadGitInfo(threadId, null)
     }
   }
 
