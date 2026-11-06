@@ -589,6 +589,11 @@ versioning or publishing metadata.
   A thread that names no reviewer runs as before, except that a call Claude
   Code says only the user may answer now asks in every mode, Full access
   included, and "Allow for this session" covers only that call.
+- `thread/loaded/list` reads its `cursor`. With a `limit` smaller than the
+  number of loaded threads it used to return the first page every time, so a
+  client that followed `nextCursor` never got past it. A limit under 1 now
+  counts as 1, and a bad cursor is an invalid request; without a limit every
+  loaded thread is still returned at once.
 
 ### Trustworthy history and settings
 

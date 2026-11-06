@@ -2365,10 +2365,12 @@ export class CodexClaudeAppServer {
 
   private threadLoadedList(params: Record<string, unknown>): unknown {
     const loaded = Array.from(this.subscribersByThread.keys())
-    const limit = numberOr(params.limit, loaded.length || 50)
+    const offset = offsetCursor(params.cursor, 'loaded thread')
+    // Without a limit the page runs to the end.
+    const end = offset + (pageLimit(params.limit) ?? loaded.length)
     return {
-      data: loaded.slice(0, limit),
-      nextCursor: loaded.length > limit ? String(limit) : null,
+      data: loaded.slice(offset, end),
+      nextCursor: end < loaded.length ? String(end) : null,
     }
   }
 
