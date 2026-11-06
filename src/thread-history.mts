@@ -218,10 +218,11 @@ export function visibleMessageText(item: ThreadItem): string | null {
   return null
 }
 
-// Case-insensitive literal search; null for a blank term.
+// Case-insensitive literal search; null for a blank term. `-` is literal
+// outside a class and `\-` is a syntax error under the `u` flag.
 export function searchPattern(term: string): RegExp | null {
   if (!term.trim()) return null
-  return new RegExp(term.replace(/[.*+?^${}()|[\]\\/-]/g, '\\$&'), 'giu')
+  return new RegExp(term.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&'), 'giu')
 }
 
 const SNIPPET_BEFORE = 40

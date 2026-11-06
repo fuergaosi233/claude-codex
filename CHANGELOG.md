@@ -253,6 +253,8 @@ versioning or publishing metadata.
 - Fixed `thread/turns/list` paging and ordering, and `thread/list` /
   `thread/search` pages that skipped threads updated in the same second as the
   last one shown.
+- `thread/search` and `thread/searchOccurrences` find terms with a hyphen
+  (`claude-codex`, `2026-11-06`) instead of failing with `Invalid escape`.
 - Input sent while a turn is still starting waits up to 10 s for it instead
   of failing with `no active turn to steer`, a turn whose runtime run has
   returned is ended instead of holding the thread until Stop, and a turn the
