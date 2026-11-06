@@ -704,6 +704,12 @@ versioning or publishing metadata.
 
 ### Provider and multi-agent boundaries
 
+- Follow-up turns of a Codex (`gpt-*`) chat on the `codex-proxy` route run
+  in the thread's folder with its sandbox mode and extra writable roots
+  again. `codex exec resume` was run without `-C`, `-s` and `--add-dir`, so
+  from the second turn on Codex worked in the adapter's own folder, dropped
+  the extra roots and, in `read-only` and `workspace-write` chats, used the
+  sandbox of the user's Codex config.
 - `/workflows` runs turn workflows on with the CLI's `CLAUDE_CODE_WORKFLOWS`
   switch instead of `--settings`, which pinned launchers reject, and respect a
   user's `enableWorkflows: false`.
