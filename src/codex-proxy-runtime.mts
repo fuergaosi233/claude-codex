@@ -305,11 +305,16 @@ export class CodexProxyRuntime implements ClaudeRuntime {
         if (pending.resolved) return
         const usage = asRecord(event.usage)
         if (Object.keys(usage).length > 0) {
+          // Codex counts cached tokens inside input_tokens; Claude's usage,
+          // which the server reads, keeps cache reads out of input.
+          const num = (value: unknown): number =>
+            typeof value === 'number' && Number.isFinite(value) ? value : 0
+          const cached = num(usage.cached_input_tokens)
           await handlers.onEvent({
             type: 'usage',
             usage: {
-              input_tokens: usage.input_tokens ?? 0,
-              cache_read_input_tokens: usage.cached_input_tokens ?? 0,
+              input_tokens: Math.max(0, num(usage.input_tokens) - cached),
+              cache_read_input_tokens: cached,
               output_tokens: usage.output_tokens ?? 0,
               reasoning_output_tokens: usage.reasoning_output_tokens ?? 0,
             },

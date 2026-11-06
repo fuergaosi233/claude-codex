@@ -22,6 +22,7 @@ import { dirname, join } from 'node:path'
 import test from 'node:test'
 import * as z from 'zod'
 import { ClaudePTranscriptRuntime } from '../src/claude-p-runtime.mjs'
+import { CodexProxyRuntime } from '../src/codex-proxy-runtime.mjs'
 import {
   HttpAgentRuntime,
   hasAgentapiTrustPrompt,
@@ -34,7 +35,7 @@ import {
 } from '../src/native-runtime.mjs'
 import { TurnInput } from '../src/native-turn-input.mjs'
 import { resolveRuntimeConfig } from '../src/runtime-config.mjs'
-import { buildSystemPromptAddendum } from '../src/server-helpers.mjs'
+import { buildSystemPromptAddendum, tokenBreakdownFromClaudeUsage } from '../src/server-helpers.mjs'
 import { sessionChangesHint } from '../src/session-changes.mjs'
 import type { DynamicToolServer, RuntimeTurnContext } from '../src/types.mjs'
 import { parseWorkflowCommand, workflowRuntimePrompt } from '../src/workflow-command.mjs'
@@ -3576,6 +3577,50 @@ test('claude-p runtime retries a process timeout once', async () => {
     ])
     assert.equal(await readFile(countFile, 'utf8'), '2')
   } finally {
+    await rm(tmp, { recursive: true, force: true })
+  }
+})
+
+test('codex-proxy runtime counts cached input tokens once', async () => {
+  const tmp = await mkdtemp(join(tmpdir(), 'claude-codex-codex-proxy-usage-test-'))
+  const codex = join(tmp, 'codex')
+  // `codex exec --json` usage: input_tokens already includes cached_input_tokens.
+  const usage = {
+    input_tokens: 10_000,
+    cached_input_tokens: 8_000,
+    output_tokens: 100,
+    reasoning_output_tokens: 40,
+  }
+  await writeFile(
+    codex,
+    [
+      '#!/usr/bin/env node',
+      `console.log(${JSON.stringify(JSON.stringify({ type: 'thread.started', thread_id: 'sess-1' }))});`,
+      `console.log(${JSON.stringify(JSON.stringify({ type: 'turn.completed', usage }))});`,
+    ].join('\n'),
+  )
+  await chmod(codex, 0o755)
+  const previous = process.env.CODEX_REAL
+  process.env.CODEX_REAL = codex
+  let reported: Record<string, unknown> | null = null
+  try {
+    await new CodexProxyRuntime().runTurn(nativeTurnContext({ cwd: tmp }), {
+      onEvent: async (event) => {
+        if (event.type === 'usage') reported = event.usage
+      },
+      onPermissionRequest: async () => ({ decision: 'accept' }),
+    })
+    assert.ok(reported)
+    assert.deepEqual(tokenBreakdownFromClaudeUsage(reported), {
+      inputTokens: 2_000,
+      cachedInputTokens: 8_000,
+      outputTokens: 100,
+      reasoningOutputTokens: 40,
+      totalTokens: 10_100,
+    })
+  } finally {
+    if (previous == null) delete process.env.CODEX_REAL
+    else process.env.CODEX_REAL = previous
     await rm(tmp, { recursive: true, force: true })
   }
 })

@@ -1264,7 +1264,8 @@ export function parseExitCodeFromResult(content: unknown): number | null {
 
 // Maps the raw Anthropic usage block carried on the Claude Agent SDK
 // ResultMessage onto the Codex `TokenUsageBreakdown` shape. Cache-creation
-// tokens count as input; Claude does not separate reasoning output tokens.
+// tokens count as input. Claude does not separate reasoning output tokens;
+// runtimes that do (codex-proxy) send reasoning_output_tokens.
 export function tokenBreakdownFromClaudeUsage(usage: Record<string, unknown>): TokenUsageBreakdown {
   const num = (value: unknown): number =>
     typeof value === 'number' && Number.isFinite(value) ? value : 0
@@ -1276,7 +1277,7 @@ export function tokenBreakdownFromClaudeUsage(usage: Record<string, unknown>): T
     inputTokens,
     cachedInputTokens: cacheRead,
     outputTokens,
-    reasoningOutputTokens: 0,
+    reasoningOutputTokens: num(usage.reasoning_output_tokens),
     totalTokens: inputTokens + cacheRead + outputTokens,
   }
 }
