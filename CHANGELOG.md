@@ -97,6 +97,10 @@ versioning or publishing metadata.
   compaction for failed and fell back to that summary, which cost a second
   model call. A run that goes wrong after Claude compacted the session no
   longer undoes that either.
+- `review/start` and `thread/compact/start` sent while a turn runs fail as an
+  invalid request, like a rewind or queued start, instead of starting a
+  second Claude run on the thread. The running turn used to lose everything
+  it streamed after that and still end `completed`.
 - Requests the user can correct fail with JSON-RPC `-32600` (invalid request),
   as Codex answers an unknown thread or turn and a bad cursor, instead of
   `-32000`, with the same messages: an unknown thread, turn, section, queued
