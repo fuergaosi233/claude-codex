@@ -454,8 +454,10 @@ versioning or publishing metadata.
   looked up after `thread/start`, when a thread without it resumes and when a
   turn ends, and stored, so `thread/list` and `thread/read` run no git.
   `thread/metadata/update` patches it as Codex does, which the App uses after
-  creating a branch, and `getConversationSummary` returns it. Threads also
-  carry their `model` and `reasoningEffort`.
+  creating a branch, and `getConversationSummary` returns it. A git run that
+  times out keeps the stored `gitInfo` and is not cached, instead of reading
+  as a detached HEAD for 30 seconds. Threads also carry their `model` and
+  `reasoningEffort`.
 - The context gauge moves while a turn runs, as it does for Codex: each API
   call of the main loop sends `thread/tokenUsage/updated` as it streams, with
   that call as `last` and on top of the settled total, once a result has

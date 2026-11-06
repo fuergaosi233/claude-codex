@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -108,6 +108,40 @@ test('gitInfoFor reads HEAD, its branch and origin, and caches per directory', a
     assert.equal(await gitInfoFor(root), null)
     assert.equal(await gitInfoFor(join(root, 'missing')), null)
   } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a git call that times out fails the lookup instead of reading as a detached HEAD', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'claude-codex-git-info-'))
+  const path = process.env.PATH
+  try {
+    const repo = join(root, 'repo')
+    execFileSync('git', ['init', '-q', repo])
+    git(repo, 'symbolic-ref', 'HEAD', 'refs/heads/feature/x')
+    git(repo, 'commit', '-q', '--allow-empty', '-m', 'first')
+    // A git that answers symbolic-ref after the 1s timeout while `slow` exists.
+    const real = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim()
+    const slow = join(root, 'slow')
+    await mkdir(join(root, 'bin'))
+    await writeFile(
+      join(root, 'bin', 'git'),
+      `#!/bin/sh\n[ "$1" = symbolic-ref ] && [ -e '${slow}' ] && sleep 1.5\nexec '${real}' "$@"\n`,
+      { mode: 0o755 },
+    )
+    process.env.PATH = `${join(root, 'bin')}:${path}`
+
+    await writeFile(slow, '')
+    const failed = gitInfoFor(repo, { fresh: true })
+    await assert.rejects(failed)
+    // The failure is not cached: the next lookup runs git again.
+    await rm(slow)
+    const next = gitInfoFor(repo)
+    assert.notEqual(next, failed)
+    // Its own result depends on how loaded the machine is.
+    await next.catch(() => null)
+  } finally {
+    process.env.PATH = path
     await rm(root, { recursive: true, force: true })
   }
 })
