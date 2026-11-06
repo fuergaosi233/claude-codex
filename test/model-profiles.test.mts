@@ -78,6 +78,11 @@ const TWO_PROFILES = {
   ],
 }
 
+// A load error clips the profiles file path to its last 80 characters, and
+// a temp directory can be long enough (macOS) for that to apply.
+const loadErrorPath = (path: string): string =>
+  path.length > 80 ? `…${path.slice(path.length - 79)}` : path
+
 test('model profiles expose models and build isolated child environments', async () => {
   const root = await mkdtemp(join(tmpdir(), 'claude-codex-model-profiles-'))
   const envFile = join(root, 'provider.env')
@@ -353,7 +358,7 @@ test('profiles that fail to load say where and why in one short line, quoting no
     )
 
     const fromFile = { CLAUDE_CODEX_MODEL_PROFILES_FILE: configFile }
-    const fileSource = `cannot load Claude model profiles from ${configFile} (CLAUDE_CODEX_MODEL_PROFILES_FILE): `
+    const fileSource = `cannot load Claude model profiles from ${loadErrorPath(configFile)} (CLAUDE_CODEX_MODEL_PROFILES_FILE): `
     await writeFile(
       configFile,
       '{\n  "models": [\n    { "id": "main-model",\n      "env": { "API_KEY": sk-file-credential } }\n  ]\n}\n',
@@ -370,7 +375,7 @@ test('profiles that fail to load say where and why in one short line, quoting no
     )
     assert.equal(
       failure({ CLAUDE_CODEX_MODEL_PROFILES_FILE: join(root, 'missing.json') }),
-      `cannot load Claude model profiles from ${join(root, 'missing.json')} (CLAUDE_CODEX_MODEL_PROFILES_FILE): the file does not exist`,
+      `cannot load Claude model profiles from ${loadErrorPath(join(root, 'missing.json'))} (CLAUDE_CODEX_MODEL_PROFILES_FILE): the file does not exist`,
     )
     // A long path keeps its end, where the file name is.
     const deep = join(root, 'a'.repeat(100), 'b'.repeat(100))
@@ -646,7 +651,7 @@ test('a model change refuses profiles that fail to load as an invalid request, q
       '{"models": [{"id": "main-model", "env": {"API_KEY": sk-pasted-credential}}]}',
       { mode: 0o600 },
     )
-    const reason = `cannot load Claude model profiles from ${harness.configFile} (CLAUDE_CODEX_MODEL_PROFILES_FILE): invalid Claude model profiles JSON: Unexpected token 's'`
+    const reason = `cannot load Claude model profiles from ${loadErrorPath(harness.configFile)} (CLAUDE_CODEX_MODEL_PROFILES_FILE): invalid Claude model profiles JSON: Unexpected token 's'`
     // The model menu, a running turn's settings, and a turn on another model.
     // App rule: model-menu-settings
     const refusals = [
