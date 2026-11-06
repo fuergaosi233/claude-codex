@@ -157,6 +157,60 @@ test('an approval left by an interrupted turn is not shown to a later follower',
   })
 })
 
+test('an approval or question Claude Code withdraws closes without stopping the turn', {
+  timeout: 20_000,
+}, async () => {
+  // Claude Code cancels the pending can_use_tool, as when the subagent that
+  // asked is stopped: the runtime aborts the request's signal.
+  let withdraw = new AbortController()
+  const runtime = new MockRuntime()
+  const runTurn = runtime.runTurn.bind(runtime)
+  runtime.runTurn = (context, handlers) =>
+    runTurn(context, {
+      ...handlers,
+      onPermissionRequest: (event) => handlers.onPermissionRequest(event, withdraw.signal),
+      onUserInputRequest: (event) =>
+        handlers.onUserInputRequest?.(event, withdraw.signal) ?? Promise.resolve({ answers: {} }),
+    })
+  await withServer(async (connect, debugLog) => {
+    const app = connect('app')
+    const threadId = await startThread(app)
+    const requests: string[] = []
+    for (const [prompt, method] of [
+      ['please run approval bash', 'item/commandExecution/requestApproval'],
+      ['ask user question check', 'item/tool/requestUserInput'],
+    ] as const) {
+      withdraw = new AbortController()
+      await app.request('turn/start', { threadId, input: textInput(prompt) })
+      const request = (await app.until((message) => message.method === method)).at(-1)
+      requests.push(request.id)
+      withdraw.abort()
+      const seen = await app.until((message) => message.method === 'turn/completed')
+      assert.ok(
+        seen.some(
+          (message) =>
+            message.method === 'serverRequest/resolved' && message.params.requestId === request.id,
+        ),
+        `${method} is taken down`,
+      )
+      assert.equal(seen.at(-1).params.turn.status, 'completed', prompt)
+    }
+
+    // A click on a withdrawn card does nothing; Cancel does not stop a turn.
+    const before = app.received.length
+    for (const id of requests) await app.respond(id, { decision: 'cancel' })
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 50))
+    assert.deepEqual(
+      ignoredResponses(debugLog),
+      requests.map((id) => ['app', id, 'notPending']),
+    )
+    assert.deepEqual(
+      app.received.slice(before).map((message) => message.method),
+      [],
+    )
+  }, runtime)
+})
+
 test('a client that closes a thread and opens it again gets its pending approval again', {
   timeout: 20_000,
 }, async () => {
@@ -385,6 +439,7 @@ async function withDaemon(body: (connect: () => Promise<Client>) => Promise<void
 // debug log.
 async function withServer(
   body: (connect: (id: string) => Client, debugLog: string) => Promise<void>,
+  runtime: MockRuntime = new MockRuntime(),
 ): Promise<void> {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const debugLog = join(home, 'debug.jsonl')
@@ -403,10 +458,7 @@ async function withServer(
     }
   }
   setEnv(Object.entries(env))
-  const server = new CodexClaudeAppServer(
-    new SessionStore(join(home, 'state.sqlite')),
-    new MockRuntime(),
-  )
+  const server = new CodexClaudeAppServer(new SessionStore(join(home, 'state.sqlite')), runtime)
   try {
     await body((id) => {
       const peer: RpcPeer = {

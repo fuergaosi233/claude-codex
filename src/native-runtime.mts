@@ -1160,12 +1160,15 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
           if (typeof pending.handlers.onUserInputRequest !== 'function') {
             return { behavior: 'deny', message: 'user input not available in this runtime' }
           }
-          const answers = await pending.handlers.onUserInputRequest({
-            type: 'user_input_request',
-            requestId,
-            toolUseId,
-            questions,
-          })
+          const answers = await settleOnAbort(
+            pending.handlers.onUserInputRequest(
+              { type: 'user_input_request', requestId, toolUseId, questions },
+              options.signal,
+            ),
+            options.signal,
+          )
+          // Claude Code withdrew the question; the call does not run.
+          if (!answers) return { behavior: 'deny', message: 'cancelled by Claude Code' }
           const formatted = formatAskUserQuestionAnswers(input, questions, answers)
           return { behavior: 'deny', message: formatted }
         } catch (err) {
@@ -1190,23 +1193,27 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       // still want THIS tool to be approved by the user (otherwise nested
       // tools would silently bypass approval). The server-side already
       // routes everything through onPermissionRequest; nothing to change here.
-      const decision = await new Promise<PermissionDecision>((resolve) => {
+      const decision = await new Promise<PermissionDecision | null>((resolve) => {
         this.permissions.set(requestId, { resolve })
-        void Promise.resolve(
-          pending.handlers.onPermissionRequest({
-            type: 'permission_request',
-            requestId,
-            toolUseId,
-            toolName,
-            input,
-            reason: options.decisionReason?.trim() || null,
-            title: options.title?.trim() || null,
-            blockedPath: options.blockedPath || null,
-            mcpServer: options.mcpServer?.name || null,
-            ...(options.suppressAlwaysAllowRule ? { suppressSessionApproval: true } : {}),
-            ...(userOnly ? { requiresUser: true } : {}),
-            ...(suggestions.length > 0 ? { suggestions } : {}),
-          }),
+        void settleOnAbort(
+          pending.handlers.onPermissionRequest(
+            {
+              type: 'permission_request',
+              requestId,
+              toolUseId,
+              toolName,
+              input,
+              reason: options.decisionReason?.trim() || null,
+              title: options.title?.trim() || null,
+              blockedPath: options.blockedPath || null,
+              mcpServer: options.mcpServer?.name || null,
+              ...(options.suppressAlwaysAllowRule ? { suppressSessionApproval: true } : {}),
+              ...(userOnly ? { requiresUser: true } : {}),
+              ...(suggestions.length > 0 ? { suggestions } : {}),
+            },
+            options.signal,
+          ),
+          options.signal,
         ).then((d) => {
           // The handler may resolve synchronously via the App's permission
           // response. Surface that here.
@@ -1214,6 +1221,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
           resolve(d)
         })
       })
+      // Claude Code withdrew the request; the call does not run.
+      if (!decision) return { behavior: 'deny', message: 'cancelled by Claude Code' }
 
       if (decision.decision === 'accept' || decision.decision === 'acceptForSession') {
         // Claude Code applies the permission changes the user chose with the
@@ -4234,6 +4243,20 @@ function dynamicToolNames(context: RuntimeTurnContext): Set<string> {
 function toolSignal(extra: unknown): AbortSignal | undefined {
   const signal = (extra as { signal?: unknown } | null)?.signal
   return signal instanceof AbortSignal ? signal : undefined
+}
+
+// The App's answer to a can_use_tool request, or null as soon as `signal`
+// aborts: Claude Code withdrew the request (control_cancel_request) and waits
+// on it no more.
+function settleOnAbort<T>(answer: Promise<T>, signal: AbortSignal): Promise<T | null> {
+  if (signal.aborted) return Promise.resolve(null)
+  return new Promise((resolve, reject) => {
+    const onAbort = () => resolve(null)
+    signal.addEventListener('abort', onAbort, { once: true })
+    Promise.resolve(answer)
+      .then(resolve, reject)
+      .finally(() => signal.removeEventListener('abort', onAbort))
+  })
 }
 
 function leaderToolServer(sdk: ClaudeSdk, z: Zod, leader: LeaderToolHandlers) {
