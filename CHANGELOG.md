@@ -128,6 +128,10 @@ versioning or publishing metadata.
 - The goal tools (`codex_goal`) and leader tools (`codex_leader`) load with the
   session instead of behind Claude Code's tool search, so Claude knows they are
   there in a session with many tools.
+- The `agent-http` backend reads every SSE event in a chunk that holds several.
+  It used to merge each event after the first into the one before it, so an
+  agent error showed as a generic `agent error` (a warning as an error) and
+  streamed text waited for the next poll.
 
 ### App-server and protocol compatibility
 
