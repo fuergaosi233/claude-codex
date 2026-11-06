@@ -3672,6 +3672,95 @@ test('HTTP agent runtime keeps recoverable SSE fallback out of the conversation'
   assert.deepEqual(notices, [])
 })
 
+test('HTTP agent runtime parses every SSE event that arrives in one chunk', async () => {
+  let eventsSent = false
+  let pollsAfterEvents = 0
+  const server = http.createServer((req, res) => {
+    if (req.method === 'GET' && req.url === '/messages') {
+      res.setHeader('content-type', 'application/json')
+      res.end(JSON.stringify({ messages: [] }))
+      return
+    }
+    if (req.method === 'GET' && req.url === '/status') {
+      if (eventsSent) pollsAfterEvents += 1
+      res.setHeader('content-type', 'application/json')
+      res.end(JSON.stringify({ status: pollsAfterEvents > 3 ? 'stable' : 'running' }))
+      return
+    }
+    if (req.method === 'GET' && req.url === '/events') {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      // One write, three events: each blank line must end its own event.
+      res.write(
+        'event: agent_error\ndata: {"level":"warning","message":"A"}\n\n' +
+          'event: agent_error\ndata: {"level":"error","message":"B"}\n\n' +
+          'event: agent_error\ndata: {"level":"error","message":"C"}\n\n',
+      )
+      eventsSent = true
+      return
+    }
+    if (req.method === 'POST' && req.url === '/message') {
+      req.resume()
+      res.setHeader('content-type', 'application/json')
+      res.end(JSON.stringify({ ok: true }))
+      return
+    }
+    res.statusCode = 404
+    res.end()
+  })
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  const address = server.address()
+  assert.ok(address && typeof address === 'object')
+
+  const runtime = new HttpAgentRuntime({
+    kind: 'agent-http',
+    baseUrl: `http://127.0.0.1:${address.port}`,
+    useSse: true,
+    pollIntervalMs: 20,
+    timeoutMs: 2_000,
+    sendInterruptRaw: false,
+    manageBridge: false,
+    modeCommand: 'claude-codex-mode',
+  })
+  const notices: string[] = []
+  try {
+    await runtime.runTurn(
+      {
+        threadId: 'thread',
+        turnId: 'turn',
+        prompt: 'hello',
+        cwd: process.cwd(),
+        runtimeType: null,
+        model: null,
+        effort: null,
+        claudeSessionId: null,
+        forkSession: false,
+        mcpServers: null,
+        allowedTools: null,
+        addDirs: [],
+        enableFileCheckpointing: false,
+        outputFormat: null,
+        approvalPolicy: null,
+        sandboxMode: null,
+        systemPromptAddendum: null,
+        planMode: false,
+        imageInputs: [],
+      },
+      {
+        onEvent: (event) => {
+          if (event.type === 'notice') notices.push(`${event.level}:${event.message}`)
+        },
+        onPermissionRequest: async () => ({ decision: 'accept' }),
+      },
+    )
+  } finally {
+    server.closeAllConnections()
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  }
+
+  assert.deepEqual(notices, ['warning:A', 'error:B', 'error:C'])
+})
+
 test('agentapi runtime polls running terminal output before final status-only screen', async () => {
   let status: 'running' | 'stable' = 'stable'
   let messages: Array<{ id: number; role: 'agent'; content: string; time: string }> = []

@@ -413,6 +413,7 @@ class SseParser {
   private buffer = ''
   private eventName = 'message'
   private dataLines: string[] = []
+  private queue: Promise<void> = Promise.resolve()
   private readonly onEvent: (eventName: string, data: string) => Promise<void>
 
   constructor(onEvent: (eventName: string, data: string) => Promise<void>) {
@@ -425,14 +426,18 @@ class SseParser {
     while ((lineEnd = this.buffer.indexOf('\n')) >= 0) {
       const raw = this.buffer.slice(0, lineEnd)
       this.buffer = this.buffer.slice(lineEnd + 1)
-      void this.handleLine(raw.replace(/\r$/, '')).catch(() => {})
+      this.handleLine(raw.replace(/\r$/, ''))
     }
   }
 
-  private async handleLine(line: string): Promise<void> {
+  private handleLine(line: string): void {
     if (line === '') {
+      // Reset the event state now, so the rest of the chunk can't append to it,
+      // and dispatch in order.
       if (this.dataLines.length > 0) {
-        await this.onEvent(this.eventName, this.dataLines.join('\n'))
+        const eventName = this.eventName
+        const data = this.dataLines.join('\n')
+        this.queue = this.queue.then(() => this.onEvent(eventName, data)).catch(() => {})
       }
       this.eventName = 'message'
       this.dataLines = []
