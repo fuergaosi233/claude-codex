@@ -9,7 +9,7 @@ import {
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import { existsSync } from 'node:fs'
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import http from 'node:http'
 import net from 'node:net'
 import { tmpdir } from 'node:os'
@@ -20,7 +20,7 @@ import test from 'node:test'
 import WebSocket from 'ws'
 import type { ProviderLoopConfigProjectionResult } from '../src/provider-loop-config.mjs'
 import { QUIET_TURN_HEARTBEAT } from '../src/quiet-turns.mjs'
-import { fileChangeFromTool } from '../src/server-helpers.mjs'
+import { fileChangeFromTool, gitDiff } from '../src/server-helpers.mjs'
 import { SessionStore } from '../src/store.mjs'
 
 const adapter = resolve('dist/src/adapter.mjs')
@@ -10548,6 +10548,45 @@ test('gitDiffToRemote includes untracked files for Codex diff review', async () 
     assert.match(response.result.diff, /\+new content/)
   } finally {
     proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('gitDiff shows untracked symlinks as links and keeps other new files', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const repo = join(home, 'repo')
+  await mkdir(repo)
+  execFileSync('git', ['init'], { cwd: repo, stdio: 'ignore' })
+  await writeFile(join(repo, 'README.md'), 'hello\n')
+  execFileSync('git', ['add', 'README.md'], { cwd: repo })
+  execFileSync(
+    'git',
+    ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-m', 'init'],
+    { cwd: repo, stdio: 'ignore' },
+  )
+  await writeFile(join(home, 'secret.env'), 'TOKEN=outside-secret\n')
+  await mkdir(join(home, 'shared'))
+  await writeFile(join(repo, 'new.txt'), 'new content\n')
+  await symlink('../secret.env', join(repo, 'link'))
+  await symlink('../shared', join(repo, 'shared'))
+  await symlink('../missing', join(repo, 'dangling'))
+  try {
+    const diff = await gitDiff(repo)
+    assert.doesNotMatch(diff, /outside-secret/)
+    assert.match(
+      diff,
+      /diff --git a\/link b\/link\nnew file mode 120000\n[\s\S]*?\+\.\.\/secret\.env\n/,
+    )
+    assert.match(
+      diff,
+      /diff --git a\/shared b\/shared\nnew file mode 120000\n[\s\S]*?\+\.\.\/shared\n/,
+    )
+    assert.match(diff, /diff --git a\/dangling b\/dangling\nnew file mode 120000\n/)
+    assert.match(
+      diff,
+      /diff --git a\/new\.txt b\/new\.txt\nnew file mode 100644\n[\s\S]*?\+new content/,
+    )
+  } finally {
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })

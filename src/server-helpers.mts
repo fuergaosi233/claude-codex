@@ -1503,9 +1503,11 @@ export async function gitDiff(cwd: string): Promise<string> {
   return [trackedDiff, untrackedDiff].filter(Boolean).join('\n')
 }
 
+const UNTRACKED_DIFF_MAX_BYTES = 1024 * 1024
+
 export async function gitUntrackedDiff(cwd: string): Promise<string> {
+  let paths: string[]
   try {
-    const { readFile } = await import('node:fs/promises')
     const { stdout } = await execFileAsync(
       'git',
       ['ls-files', '--others', '--exclude-standard', '-z'],
@@ -1515,14 +1517,7 @@ export async function gitUntrackedDiff(cwd: string): Promise<string> {
         maxBuffer: 1024 * 1024,
       },
     )
-    const paths = stdout.split('\0').filter(Boolean).slice(0, 50)
-    const diffs: string[] = []
-    for (const path of paths) {
-      const bytes = await readFile(`${cwd}/${path}`)
-      if (bytes.includes(0)) continue
-      diffs.push(addedFileDiff(path, bytes.toString('utf8')))
-    }
-    return diffs.join('\n')
+    paths = stdout.split('\0').filter(Boolean).slice(0, 50)
   } catch (error) {
     debugLog('git.untrackedDiff.failed', {
       cwd,
@@ -1531,13 +1526,39 @@ export async function gitUntrackedDiff(cwd: string): Promise<string> {
     })
     return ''
   }
+  const { lstat, readFile, readlink } = await import('node:fs/promises')
+  const diffs: string[] = []
+  for (const path of paths) {
+    // Like git, show a link as its target path and never read through it, so a
+    // link to a directory, a missing file, a device or a file outside the
+    // workspace neither leaks nor breaks the diff. One bad path drops only itself.
+    try {
+      const full = `${cwd}/${path}`
+      const stats = await lstat(full)
+      if (stats.isSymbolicLink()) {
+        diffs.push(addedFileDiff(path, await readlink(full), '120000'))
+        continue
+      }
+      if (!stats.isFile() || stats.size > UNTRACKED_DIFF_MAX_BYTES) continue
+      const bytes = await readFile(full)
+      if (bytes.includes(0)) continue
+      diffs.push(addedFileDiff(path, bytes.toString('utf8')))
+    } catch (error) {
+      debugLog('git.untrackedDiff.fileFailed', {
+        cwd,
+        path,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
+  return diffs.join('\n')
 }
 
-export function addedFileDiff(path: string, text: string): string {
+export function addedFileDiff(path: string, text: string, mode = '100644'): string {
   const lines = text.length === 0 ? [] : text.replace(/\n$/, '').split('\n')
   return [
     `diff --git a/${path} b/${path}`,
-    'new file mode 100644',
+    `new file mode ${mode}`,
     'index 0000000..0000000',
     '--- /dev/null',
     `+++ b/${path}`,
