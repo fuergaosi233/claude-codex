@@ -68,6 +68,7 @@ const PROFILE_ENV = [
   'CLAUDE_CONFIG_DIRS',
   'CLAUDE_ROUTER_DIR',
   'ANTHROPIC_API_KEY',
+  'CLAUDE_CODEX_REAP_ORPHANED_CLI',
 ]
 
 const TWO_PROFILES = {
@@ -160,7 +161,7 @@ test('model profiles expose models and build isolated child environments', async
     assert.equal(resolveClaudeModelProcess('main-model', { HOME: root }), null)
     assert.equal(modelProfileFingerprint('main-model', { HOME: root }), null)
   } finally {
-    await rm(root, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
   }
 })
 
@@ -270,7 +271,7 @@ test('profile fingerprints reject configuration drift without hashing secret val
       /model process profile main-model changed since this chat started, so this chat cannot continue; start a new chat/,
     )
   } finally {
-    await rm(root, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
   }
 })
 
@@ -299,7 +300,7 @@ test('model profiles reject literal inline secrets', async () => {
       )
     }
   } finally {
-    await rm(root, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
   }
 })
 
@@ -320,7 +321,7 @@ test('model profile config must be owner-controlled and cannot be a symbolic lin
       /must not be a symbolic link/,
     )
   } finally {
-    await rm(root, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
   }
 })
 
@@ -403,7 +404,7 @@ test('profiles that fail to load say where and why in one short line, quoting no
     assert.equal(clipped.length, 300)
     assert.match(clipped, /must reference a parent environment variable: PROVIDER_TOKEN_X+…$/)
   } finally {
-    await rm(root, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
   }
 })
 
@@ -439,7 +440,7 @@ test('model profile env files must be private regular files', async () => {
     )
     assert.throws(() => resolveClaudeModelProcess('main-model', env), /symbolic link/)
   } finally {
-    await rm(root, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
   }
 })
 
@@ -955,7 +956,7 @@ test('configured model profiles drive the model picker and native SDK process op
     )
   } finally {
     restore()
-    await rm(root, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
   }
 })
 
@@ -1047,7 +1048,7 @@ test('a profile reads what its env file sets, and token budgets are no secrets',
       /secret-like environment key must reference a parent environment variable: PROXY_AUTH_TOKENS/,
     )
   } finally {
-    await rm(root, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
   }
 })
 
@@ -1160,6 +1161,10 @@ test('the native runtime starts each profile turn in its own process', async () 
   )
   const restore = saveEnv(PROFILE_ENV)
   process.env.HOME = root
+  // The fake session reports init, which would otherwise record CLI children
+  // under HOME after the turn ends and race the cleanup below.
+  process.env.CLAUDE_CODEX_HOME = join(root, 'adapter')
+  process.env.CLAUDE_CODEX_REAP_ORPHANED_CLI = '0'
   process.env.CLAUDE_CODEX_MODEL_PROFILES_FILE = configFile
   process.env.ANTHROPIC_API_KEY = 'adapter-key'
   // Ignored for a profile turn, which runs the profile's executable.
@@ -1213,7 +1218,7 @@ test('the native runtime starts each profile turn in its own process', async () 
   } finally {
     await runtime.stop()
     restore()
-    await rm(root, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
   }
 })
 
@@ -1243,7 +1248,7 @@ test('profile sessions resume only from the profile config dir', async () => {
     assert.equal(sdkResumeSessionId('default-session', cwd), 'default-session')
   } finally {
     restore()
-    await rm(root, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
   }
 })
 
@@ -1341,7 +1346,7 @@ async function profileServer(
   const close = async () => {
     await server.stop()
     restore()
-    await rm(root, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
   }
   return {
     root,
