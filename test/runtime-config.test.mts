@@ -2575,6 +2575,48 @@ test('native SDK approvals carry why Claude asks and how the user answered', asy
   assert.equal(requests[2].suppressSessionApproval, true)
 })
 
+test('native SDK approvals and questions end when Claude Code withdraws them', async () => {
+  const runtime = new NativeClaudeRuntime()
+  const signals: unknown[] = []
+  const context = { threadId: 'thread', turnId: 'turn' }
+  const current = {
+    context,
+    resolved: false,
+    // The App never answers the card.
+    handlers: {
+      onPermissionRequest: (_event: unknown, signal: unknown) => {
+        signals.push(signal)
+        return new Promise(() => {})
+      },
+      onUserInputRequest: (_event: unknown, signal: unknown) => {
+        signals.push(signal)
+        return new Promise(() => {})
+      },
+    },
+  }
+  const makeCanUseTool = Reflect.get(runtime, 'makeCanUseTool')
+  const canUseTool = makeCanUseTool.call(runtime, () => ({ current, lastContext: context }))
+  const questions = [{ question: 'Which?', header: 'Pick', options: [{ label: 'A' }] }]
+
+  // Claude Code cancels the pending can_use_tool: the SDK aborts its signal.
+  for (const [toolName, input] of [
+    ['Bash', { command: 'rm -rf build' }],
+    ['AskUserQuestion', { questions }],
+  ] as const) {
+    const cancel = new AbortController()
+    const decision = canUseTool(toolName, input, { toolUseID: toolName, signal: cancel.signal })
+    await new Promise((resolve) => setImmediate(resolve))
+    cancel.abort()
+    const settled = await Promise.race([
+      decision,
+      new Promise((resolve) => setTimeout(() => resolve('pending'), 200)),
+    ])
+    assert.equal((settled as { behavior?: string }).behavior, 'deny', toolName)
+    assert.equal(signals.at(-1), cancel.signal, toolName)
+  }
+  assert.equal(Reflect.get(runtime, 'permissions').size, 0)
+})
+
 test('native SDK approvals pass on Claude suggestions and apply the changes the user chose', async () => {
   const runtime = new NativeClaudeRuntime()
   const requests: any[] = []

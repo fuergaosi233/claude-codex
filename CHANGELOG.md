@@ -559,6 +559,11 @@ versioning or publishing metadata.
   Cancel also stops the turn, and a call Claude refuses without asking (a
   deny rule, the auto-mode classifier) ends declined with a warning naming
   the reason.
+- An approval or question Claude Code withdraws in the middle of a turn
+  (`control_cancel_request`, as when the subagent that asked is stopped)
+  closes its card with `serverRequest/resolved`: the call ends declined, the
+  question ends unanswered, the subagent watchdog runs again, and a late
+  click, Cancel included, no longer stops the turn.
 - The App's "remember" choices save the permission rules Claude Code offers
   with a request: a shell command for which Claude offers exactly one rule
   gets "Allow similar commands" (`proposedExecpolicyAmendment` with the
