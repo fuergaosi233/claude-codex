@@ -454,9 +454,13 @@ async function fileReport(
   const status = before === null ? 'A' : now === null ? 'D' : 'M'
   if (before?.includes('\0') || now?.includes('\0'))
     return { name, status, summary: '(binary)', diff: '' }
-  const ops = editScript(diffLines(before ?? ''), diffLines(now ?? ''))
-  const added = ops.filter(([tag]) => tag === '+').length
-  const removed = ops.filter(([tag]) => tag === '-').length
+  const script = editScript(diffLines(before ?? ''), diffLines(now ?? ''))
+  let added = 0
+  let removed = 0
+  for (const [tag] of script.ops) {
+    if (tag === '+') added += 1
+    else if (tag === '-') removed += 1
+  }
   const [oldName, newName] = isAbsolute(name) ? [name, name] : [`a/${name}`, `b/${name}`]
   return {
     name,
@@ -466,7 +470,7 @@ async function fileReport(
       `diff --git ${oldName} ${newName}`,
       `--- ${before === null ? '/dev/null' : oldName}`,
       `+++ ${now === null ? '/dev/null' : newName}`,
-      ...hunks(ops),
+      ...hunks(script),
     ].join('\n'),
   }
 }
@@ -563,9 +567,19 @@ function diffLines(text: string): string[] {
   return lines
 }
 
-// The line edits from `a` to `b`: Myers' algorithm on what lies between
-// their common start and end.
-function editScript(a: readonly string[], b: readonly string[]): Op[] {
+// The edits of a file's window: the ops themselves and the line both texts
+// are at where it begins. A window starts inside the texts' common start, so
+// that one line numbers the old and the new side alike.
+interface EditScript {
+  ops: Op[]
+  start: number
+}
+
+// The line edits from `a` to `b`: Myers' algorithm on what lies between their
+// common start and end, with CONTEXT_LINES of each around it. The lines
+// further out are unchanged and too far from a change to reach a hunk, so a
+// file of any size costs only what its changed part needs.
+function editScript(a: readonly string[], b: readonly string[]): EditScript {
   let start = 0
   while (start < a.length && start < b.length && a[start] === b[start]) start += 1
   let endA = a.length
@@ -574,12 +588,13 @@ function editScript(a: readonly string[], b: readonly string[]): Op[] {
     endA -= 1
     endB -= 1
   }
-  const same = (lines: readonly string[]): Op[] => lines.map((line) => [' ', line])
-  return [
-    ...same(a.slice(0, start)),
-    ...shortestEdit(a.slice(start, endA), b.slice(start, endB)),
-    ...same(a.slice(endA)),
-  ]
+  const lead = Math.min(CONTEXT_LINES, start)
+  const trail = Math.min(CONTEXT_LINES, a.length - endA)
+  const ops: Op[] = []
+  for (let line = start - lead; line < start; line += 1) ops.push([' ', a[line] ?? ''])
+  for (const op of shortestEdit(a.slice(start, endA), b.slice(start, endB))) ops.push(op)
+  for (let line = endA; line < endA + trail; line += 1) ops.push([' ', a[line] ?? ''])
+  return { ops, start: start - lead }
 }
 
 function shortestEdit(a: readonly string[], b: readonly string[]): Op[] {
@@ -659,18 +674,17 @@ function backtrack(trace: readonly Int32Array[], a: readonly string[], b: readon
 
 // The edits as unified diff hunks, CONTEXT_LINES of unchanged lines around
 // each change.
-function hunks(ops: readonly Op[]): string[] {
-  // Old and new lines before each op.
-  const at: Array<[number, number]> = []
-  let oldLine = 0
-  let newLine = 0
-  for (const [tag] of ops) {
-    at.push([oldLine, newLine])
-    if (tag !== '+') oldLine += 1
-    if (tag !== '-') newLine += 1
-  }
-  const changed = ops.flatMap(([tag], index) => (tag === ' ' ? [] : [index]))
+function hunks(script: EditScript): string[] {
+  const ops = script.ops
+  const changed: number[] = []
+  for (let index = 0; index < ops.length; index += 1)
+    if (ops[index]?.[0] !== ' ') changed.push(index)
   const out: string[] = []
+  // How far the ops have been walked, and the old and new line the walk is
+  // at. Hunks come in order and never overlap, so one walk numbers them all.
+  let cursor = 0
+  let oldLine = script.start
+  let newLine = script.start
   for (let index = 0; index < changed.length; ) {
     const first = changed[index] ?? 0
     let last = first
@@ -680,12 +694,33 @@ function hunks(ops: readonly Op[]): string[] {
     index += 1
     const from = Math.max(0, first - CONTEXT_LINES)
     const to = Math.min(ops.length, last + CONTEXT_LINES + 1)
-    const slice = ops.slice(from, to)
-    const [oldStart, newStart] = at[from] ?? [0, 0]
-    const oldCount = slice.filter(([tag]) => tag !== '+').length
-    const newCount = slice.filter(([tag]) => tag !== '-').length
-    out.push(`@@ -${hunkRange(oldStart, oldCount)} +${hunkRange(newStart, newCount)} @@`)
-    for (const [tag, line] of slice) out.push(`${tag}${line}`)
+    while (cursor < from) {
+      const tag = ops[cursor]?.[0]
+      if (tag !== '+') oldLine += 1
+      if (tag !== '-') newLine += 1
+      cursor += 1
+    }
+    const oldStart = oldLine
+    const newStart = newLine
+    // The header counts the hunk's lines, so it is written once they are.
+    const header = out.length
+    out.push('')
+    let oldCount = 0
+    let newCount = 0
+    while (cursor < to) {
+      const [tag, line] = ops[cursor] ?? [' ', '']
+      if (tag !== '+') {
+        oldLine += 1
+        oldCount += 1
+      }
+      if (tag !== '-') {
+        newLine += 1
+        newCount += 1
+      }
+      out.push(`${tag}${line}`)
+      cursor += 1
+    }
+    out[header] = `@@ -${hunkRange(oldStart, oldCount)} +${hunkRange(newStart, newCount)} @@`
   }
   return out
 }

@@ -739,6 +739,79 @@ function applyHunks(before: readonly string[], diff: string): string[] {
   return [...out, ...before.slice(next)]
 }
 
+// A diff holds only the hunks around the changes, wherever in the file they
+// are: the lines further out are unchanged and too far from a change to reach
+// one, and each hunk still counts from the file's own start.
+test('a big file diffs to the hunks around its changes, numbered from its start', async () => {
+  await withDirs(async (dirs) => {
+    const { cwd, project } = dirs
+    const numbered = (count: number, changed: readonly number[]) =>
+      lines(
+        Array.from({ length: count }, (_, index) =>
+          changed.includes(index + 1) ? `line ${index + 1} changed` : `line ${index + 1}`,
+        ),
+      )
+    // Far apart in a long file, and on its very first and last lines, where
+    // the context around a change runs out.
+    await put(join(cwd, 'long.txt'), numbered(400, [200, 350]))
+    await put(join(cwd, 'edges.txt'), numbered(10, [1, 10]))
+    await put(
+      join(project, 'S1.jsonl'),
+      lines(
+        write('w1', join(cwd, 'long.txt'), numbered(400, [200, 350]), 1, numbered(400, [])),
+        write('w2', join(cwd, 'edges.txt'), numbered(10, [1, 10]), 2, numbered(10, [])),
+      ),
+    )
+    assert.equal(
+      await changesOf(dirs, { S1: null }),
+      [
+        lead(),
+        '',
+        'M edges.txt (+2 -2)',
+        'M long.txt (+2 -2)',
+        '',
+        'diff --git a/edges.txt b/edges.txt',
+        '--- a/edges.txt',
+        '+++ b/edges.txt',
+        '@@ -1,4 +1,4 @@',
+        '-line 1',
+        '+line 1 changed',
+        ' line 2',
+        ' line 3',
+        ' line 4',
+        '@@ -7,4 +7,4 @@',
+        ' line 7',
+        ' line 8',
+        ' line 9',
+        '-line 10',
+        '+line 10 changed',
+        '',
+        'diff --git a/long.txt b/long.txt',
+        '--- a/long.txt',
+        '+++ b/long.txt',
+        '@@ -197,7 +197,7 @@',
+        ' line 197',
+        ' line 198',
+        ' line 199',
+        '-line 200',
+        '+line 200 changed',
+        ' line 201',
+        ' line 202',
+        ' line 203',
+        '@@ -347,7 +347,7 @@',
+        ' line 347',
+        ' line 348',
+        ' line 349',
+        '-line 350',
+        '+line 350 changed',
+        ' line 351',
+        ' line 352',
+        ' line 353',
+      ].join('\n'),
+    )
+  })
+})
+
 test('outside git Claude is told where the chat changes are', async () => {
   await withDirs(async ({ cwd }) => {
     // Unless the test's own dir is in a git work tree.
