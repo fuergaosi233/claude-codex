@@ -249,6 +249,28 @@ test('findOccurrences searches visible messages literally, ignoring case', () =>
   assert.deepEqual(findOccurrences(turns, '   '), [])
 })
 
+test('search terms with a hyphen match it literally', () => {
+  const turns = [turn('t1', [user('u1', 'fix Claude-Codex on 2026-11-06')])]
+  assert.deepEqual(
+    findOccurrences(turns, 'claude-codex').map(({ snippet, snippetMatchRange: range }) =>
+      snippet.slice(range.start, range.end),
+    ),
+    ['Claude-Codex'],
+  )
+  assert.equal(
+    threadSnippet(['repo claude-codex'], () => [], 'CLAUDE-CODEX'),
+    'repo claude-codex',
+  )
+  assert.equal(
+    threadSnippet([null], () => turns, '2026-11-06'),
+    'fix Claude-Codex on 2026-11-06',
+  )
+  assert.equal(
+    threadSnippet([null], () => turns, '2026-11-07'),
+    null,
+  )
+})
+
 test('threadSnippet tries the name and preview before reading messages', () => {
   let read = 0
   const turns = (): TurnRecord[] => {
