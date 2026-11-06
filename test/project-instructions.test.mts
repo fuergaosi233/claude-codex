@@ -8,6 +8,7 @@ import { projectInstructions } from '../src/project-instructions.mjs'
 import { CodexClaudeAppServer } from '../src/server.mjs'
 import { SessionStore } from '../src/store.mjs'
 import type { ClaudeRuntime, RpcPeer, RuntimeTurnContext } from '../src/types.mjs'
+import { tempRootOutsideGit } from './support/temp-root.mjs'
 
 async function write(path: string, text: string): Promise<void> {
   await mkdir(dirname(path), { recursive: true })
@@ -67,8 +68,9 @@ test('AGENTS.md is read the way Codex reads it', async () => {
   }
 })
 
-test('project AGENTS.md files share a 32 KiB budget; without .git only the folder itself counts', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'project-instructions-budget-'))
+test('project AGENTS.md files share a 32 KiB budget; without .git only the folder itself counts', async (t) => {
+  const root = await tempRootOutsideGit(t, 'project-instructions-budget-')
+  if (!root) return
   const repo = join(root, 'repo')
   const cwd = join(repo, 'sub')
   const plain = join(root, 'plain', 'child')
@@ -96,7 +98,7 @@ test('project AGENTS.md files share a 32 KiB budget; without .git only the folde
       },
     )
   } finally {
-    await rm(root, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true, maxRetries: 5 })
   }
 })
 

@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import test from 'node:test'
 import { NativeClaudeRuntime } from '../src/native-runtime.mjs'
 import type {
@@ -7,6 +10,14 @@ import type {
   RuntimeHandlers,
   RuntimeTurnContext,
 } from '../src/types.mjs'
+
+// The runtime records its Claude CLI children (cli-children/<pid>.json) and
+// writes debug.jsonl under the adapter home. Point that home at a temp dir so
+// this suite never writes into the developer's ~/.codex, where a real
+// adapter's startup reaper would read the stray records.
+const adapterHome = mkdtempSync(join(tmpdir(), 'native-runtime-launch-gate-adapter-home-'))
+process.env.CLAUDE_CODEX_HOME = adapterHome
+test.after(() => rmSync(adapterHome, { recursive: true, force: true, maxRetries: 5 }))
 
 const context: RuntimeTurnContext = {
   threadId: 'thread',

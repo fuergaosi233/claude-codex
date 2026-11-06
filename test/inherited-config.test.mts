@@ -51,6 +51,7 @@ import { CodexClaudeAppServer } from '../src/server.mjs'
 import { SessionStore } from '../src/store.mjs'
 import { parseToml } from '../src/toml.mjs'
 import type { ClaudeRuntime, RpcPeer, RuntimeTurnContext } from '../src/types.mjs'
+import { tempRootOutsideGit } from './support/temp-root.mjs'
 
 async function write(path: string, text: string): Promise<void> {
   await mkdir(dirname(path), { recursive: true })
@@ -542,8 +543,9 @@ test('Claude Code MCP servers come from the global config and approved .mcp.json
   }
 })
 
-test('Claude Code trust covers the project itself, never a folder above it', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'inherited-claude-trust-'))
+test('Claude Code trust covers the project itself, never a folder above it', async (t) => {
+  const root = await tempRootOutsideGit(t, 'inherited-claude-trust-')
+  if (!root) return
   const configDir = join(root, 'claude-config')
   const parent = join(root, 'parent')
   const repo = join(parent, 'repo')
@@ -611,7 +613,7 @@ test('Claude Code trust covers the project itself, never a folder above it', asy
     assert.equal((await read(worktree)).trusted, true)
     assert.equal((await read(nested)).trusted, false)
   } finally {
-    await rm(root, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true, maxRetries: 5 })
   }
 })
 
