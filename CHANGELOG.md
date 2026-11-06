@@ -701,6 +701,11 @@ versioning or publishing metadata.
   injected items followed the command into its arguments. A message with no
   context still goes as typed. Codex chats on the `codex-proxy` route get the
   same flat text and have no Claude Code commands.
+- Codex chats on the `codex-proxy` route count cached input tokens once.
+  Codex reports them inside `input_tokens`, so `thread/tokenUsage/updated`
+  counted them twice, close to doubling the totals, and goal budgets were
+  charged for cache reads they exclude. Their reasoning output tokens are
+  reported too.
 
 ### Provider and multi-agent boundaries
 
