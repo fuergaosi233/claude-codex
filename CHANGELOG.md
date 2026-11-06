@@ -589,6 +589,14 @@ versioning or publishing metadata.
   A thread that names no reviewer runs as before, except that a call Claude
   Code says only the user may answer now asks in every mode, Full access
   included, and "Allow for this session" covers only that call.
+- The turn diff (`turn/diff/updated`, the stored turn diff and
+  `gitDiffToRemote`) shows an untracked symlink as git does, mode `120000`
+  with its target path, and never reads through it, so a link to a file
+  outside the workspace no longer puts that file's contents in the diff, and
+  a link to `/dev/zero` no longer hangs the turn. A link to a directory or a
+  missing target, or any other path that cannot be read, drops only itself
+  instead of every untracked file; anything but a regular file or a link,
+  and files over 1 MiB, are left out.
 
 ### Trustworthy history and settings
 
