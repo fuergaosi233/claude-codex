@@ -637,6 +637,10 @@ export class CodexClaudeAppServer {
   private subscribersByThread = new Map<string, Map<string, RpcPeer>>()
   private peerFeatures = new WeakMap<RpcPeer, PeerFeatures>()
   private activeTurnByThread = new Map<string, string>()
+  // The turn/start of each thread still deciding whether to join the running
+  // turn or start one. The next waits for it, so that two arriving at once
+  // never both find the thread idle.
+  private turnStartsByThread = new Map<string, Promise<void>>()
   // Turns whose runtime run has not returned yet. A running turn outside this
   // set has nothing left that would ever end it.
   private runtimeRuns = new Set<string>()
@@ -4012,12 +4016,28 @@ export class CodexClaudeAppServer {
       const running = runningTurnId ? this.store.getTurn(runningTurnId) : null
       if (running?.status === 'inProgress') return { turn: this.toLifecycleTurn(running) }
     } else if (!hiddenPrompt && params.outputSchema == null) {
-      const joined = await this.joinRunningTurn(
-        peer,
-        threadId,
-        params,
-        workflowCommand?.type === 'list',
-      )
+      const ahead = this.turnStartsByThread.get(threadId)
+      let release = (): void => {}
+      const decided = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      this.turnStartsByThread.set(threadId, decided)
+      let joined: TurnRecord | null
+      try {
+        await ahead
+        joined = await this.joinRunningTurn(
+          peer,
+          threadId,
+          params,
+          workflowCommand?.type === 'list',
+        )
+      } finally {
+        if (this.turnStartsByThread.get(threadId) === decided)
+          this.turnStartsByThread.delete(threadId)
+        // The next one resumes only after this one has claimed the thread:
+        // nothing below awaits before activeTurnByThread.set.
+        release()
+      }
       if (joined) return { turn: this.toLifecycleTurn(joined) }
     }
     // A structured summary or title turn runs its model, mapped to the
@@ -4127,6 +4147,9 @@ export class CodexClaudeAppServer {
       purpose: params.outputSchema == null ? 'normal' : 'summary',
     })
     this.activeTurnByThread.set(threadId, turnId)
+    // Its run launches on the next tick. Input that joins it before then
+    // waits for the run instead of finding the turn lost.
+    this.runtimeRuns.add(turnId)
     if (hiddenPrompt) this.goalTurns.add(turnId)
     else if (params.outputSchema == null) this.goalIdleStreaks.delete(threadId)
     this.syncGoalClock(threadId, this.store.getGoal(threadId))
@@ -4157,6 +4180,7 @@ export class CodexClaudeAppServer {
         })
       }
       if (params.outputSchema == null && workflowCommand?.type === 'list') {
+        this.runtimeRuns.delete(turnId)
         this.completeWorkflowListTurn(peer, thread, turn)
         return
       }

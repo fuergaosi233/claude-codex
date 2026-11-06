@@ -191,7 +191,10 @@ versioning or publishing metadata.
 - Goals, steer and the message queue follow the Codex App: `thread/goal/*`
   with continuation turns, token and time budgets and goal tools for Claude;
   steer errors in Codex's wording; `thread/queue/*`; and a `turn/start` that
-  races a running turn joins it instead of orphaning it.
+  races a running turn joins it instead of orphaning it. Two `turn/start`
+  requests for an idle thread that arrive together (a fast double send, or
+  two clients) now also make one turn, the second joining the first, instead
+  of two parallel runs that dropped an answer.
 - The context gauge follows the main loop's latest API call, like Codex's
   `last_token_usage`, and tokens spent by subagents and workflows count toward
   the thread total without moving the gauge or goal progress.

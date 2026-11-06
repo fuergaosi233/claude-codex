@@ -9737,6 +9737,72 @@ test('turn/start during a running turn joins that turn instead of orphaning it',
   }
 })
 
+test('two turn/start requests in one read join one turn', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  try {
+    const threadId = await startMockThread(reader, proc)
+    // One chunk: the transport dispatches both before either has finished.
+    proc.stdin.write(
+      json({
+        id: 2,
+        method: 'turn/start',
+        params: { threadId, input: textInput('hold this turn until released') },
+      }) +
+        json({
+          id: 3,
+          method: 'turn/start',
+          params: {
+            threadId,
+            clientUserMessageId: 'client-pipelined-1',
+            input: textInput('pipelined input'),
+          },
+        }),
+    )
+    const replies = new Map<number, any>()
+    const seen: any[] = []
+    await awaitMessage(
+      reader,
+      (message) => {
+        if (message.id === 2 || message.id === 3) replies.set(message.id, message)
+        return replies.size === 2
+      },
+      seen,
+    )
+    const turnId = replies.get(2).result.turn.id
+    assert.equal(replies.get(3).result.turn.id, turnId)
+    proc.stdin.write(
+      json({
+        id: 4,
+        method: 'turn/steer',
+        params: { threadId, expectedTurnId: turnId, input: textInput('release') },
+      }),
+    )
+    const completed = await awaitMessage(
+      reader,
+      (message) => message.method === 'turn/completed',
+      seen,
+    )
+    assert.equal(completed.params.turn.id, turnId)
+    seen.push(...(await readQuiet(reader, 200)))
+    assert.deepEqual(
+      seen
+        .filter((message) => message.method === 'turn/started' && message.params.turn.id !== turnId)
+        .map((message) => message.params.turn.id),
+      [],
+      'no second turn starts',
+    )
+    const joined = seen.find((message) =>
+      isUserMessageItem(message, 'item/started', 'client-pipelined-1'),
+    )
+    assert.equal(joined?.params.turnId, turnId)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('input for a turn whose session is still coming up waits for it instead of failing', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawnMockAdapter(home)
