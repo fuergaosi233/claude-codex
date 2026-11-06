@@ -69,33 +69,23 @@ export class CodexProxyRuntime implements ClaudeRuntime {
       //                                deadlock the JSONL stream.
       //   -m <model>                   the model the user picked in the App
       //   -C <cwd>                     anchor the workspace
-      //   resume <sessionId>           multi-turn continuity
+      //   --add-dir <dir>              extra writable roots
+      //   resume <sessionId>           multi-turn continuity; goes after the
+      //                                exec flags, since `codex exec resume`
+      //                                takes no -C, -s or --add-dir of its own
       const resumeId = context.claudeSessionId
-      const args: string[] = ['exec']
-      if (resumeId) {
-        args.push('resume', resumeId, '--json', '--skip-git-repo-check')
-        if (context.sandboxMode === 'danger-full-access' || !context.sandboxMode) {
-          args.push('--dangerously-bypass-approvals-and-sandbox')
-        }
-        if (context.model) args.push('-m', context.model)
+      const args: string[] = ['exec', '--json', '--skip-git-repo-check']
+      if (context.sandboxMode === 'read-only' || context.sandboxMode === 'workspace-write') {
+        args.push('-s', context.sandboxMode)
       } else {
-        args.push('--json', '--skip-git-repo-check')
-        if (context.sandboxMode === 'danger-full-access') {
-          args.push('--dangerously-bypass-approvals-and-sandbox')
-        } else if (
-          context.sandboxMode === 'read-only' ||
-          context.sandboxMode === 'workspace-write'
-        ) {
-          args.push('-s', context.sandboxMode)
-        } else {
-          args.push('--dangerously-bypass-approvals-and-sandbox')
-        }
-        if (context.model) args.push('-m', context.model)
-        if (context.cwd) args.push('-C', context.cwd)
-        if (context.addDirs && context.addDirs.length > 0) {
-          for (const dir of context.addDirs) args.push('--add-dir', dir)
-        }
+        args.push('--dangerously-bypass-approvals-and-sandbox')
       }
+      if (context.model) args.push('-m', context.model)
+      if (context.cwd) args.push('-C', context.cwd)
+      if (context.addDirs && context.addDirs.length > 0) {
+        for (const dir of context.addDirs) args.push('--add-dir', dir)
+      }
+      if (resumeId) args.push('resume', resumeId)
       args.push(flatPrompt(context.prompt, context.promptContext))
 
       debugLog('codex-proxy.spawn', {
