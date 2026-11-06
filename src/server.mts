@@ -3509,6 +3509,11 @@ export class CodexClaudeAppServer {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
     if (!thread) throw unknownThread(threadId)
+    // Like Codex, a review or a compaction never runs beside another turn: it
+    // would take over the thread's active turn and the running one would lose
+    // everything it streams after that.
+    if (this.activeTurnByThread.has(threadId))
+      throw invalidRequest(`cannot start a review while thread ${threadId} has an active turn`)
     this.checkModelProfileBinding(thread)
     this.subscribe(threadId, peer)
     const turnId = newId()
@@ -3587,6 +3592,8 @@ export class CodexClaudeAppServer {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
     if (!thread) throw unknownThread(threadId)
+    if (this.activeTurnByThread.has(threadId))
+      throw invalidRequest(`cannot compact thread ${threadId} while a turn is running`)
     this.checkModelProfileBinding(thread)
     this.subscribe(threadId, peer)
     const turnId = newId()

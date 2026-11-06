@@ -261,6 +261,40 @@ test('a running turn refuses what it cannot change as invalid requests', async (
   )
 })
 
+test('a review or a compaction is refused while a turn runs, and the turn keeps its answer', async () => {
+  const { runtime, release } = holdingRuntime()
+  let runs = 0
+  const runTurn = runtime.runTurn
+  runtime.runTurn = (context, handlers) => {
+    runs++
+    return runTurn(context, handlers)
+  }
+  await withInProcessApp(runtime, async (app) => {
+    const threadId = await app.startThread()
+    const turnId = await app.startTurn(threadId, 'hold on')
+    await app.waitFor(() => app.notified('turn/started')[0])
+
+    await refused(
+      app,
+      'review/start',
+      { threadId, target: { type: 'uncommittedChanges' } },
+      /cannot start a review while thread .* has an active turn/,
+    )
+    await refused(
+      app,
+      'thread/compact/start',
+      { threadId },
+      /cannot compact thread .* while a turn is running/,
+    )
+    release()
+    await app.turnCompleted(turnId)
+    assert.equal(runs, 1)
+    const turn = app.store.getTurn(turnId)
+    assert.equal(turn?.status, 'completed')
+    assert.ok(turn?.items.some((item) => item.type === 'agentMessage'))
+  })
+})
+
 // App rule: model-menu-settings
 test('the model menu gets the reason a chat cannot take a model, as an invalid request', async () => {
   await withInProcessApp(
