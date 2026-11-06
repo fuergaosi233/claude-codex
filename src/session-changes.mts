@@ -455,8 +455,12 @@ async function fileReport(
   if (before?.includes('\0') || now?.includes('\0'))
     return { name, status, summary: '(binary)', diff: '' }
   const script = editScript(diffLines(before ?? ''), diffLines(now ?? ''))
-  const added = script.ops.filter(([tag]) => tag === '+').length
-  const removed = script.ops.filter(([tag]) => tag === '-').length
+  let added = 0
+  let removed = 0
+  for (const [tag] of script.ops) {
+    if (tag === '+') added += 1
+    else if (tag === '-') removed += 1
+  }
   const [oldName, newName] = isAbsolute(name) ? [name, name] : [`a/${name}`, `b/${name}`]
   return {
     name,
