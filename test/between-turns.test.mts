@@ -279,3 +279,57 @@ test('a rejected turn start releases the claim for waiting requests', async () =
     },
   )
 })
+
+for (const [method, message] of [
+  ['review/start', 'cannot start review'],
+  ['thread/compact/start', 'cannot compact'],
+] as const) {
+  test(`${method} refuses a pipelined turn start and preserves its answer`, async () => {
+    let release!: () => void
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let runs = 0
+    const runtime = scriptedRuntime(async (_context, handlers) => {
+      runs++
+      await held
+      await handlers.onEvent({ type: 'text_delta', delta: 'Original answer.' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'Original answer.' })
+    })
+    await withInProcessApp(runtime, async (app) => {
+      const threadId = await app.startThread()
+      let turnId: string
+      try {
+        const [started, rejected] = await Promise.all([
+          app.call('turn/start', {
+            threadId,
+            input: [{ type: 'text', text: 'first input', text_elements: [] }],
+          }),
+          app.call(method, { threadId, target: { type: 'uncommittedChanges' } }),
+        ])
+        assert.equal(started.error, undefined)
+        turnId = started.result.turn.id
+        assert.equal(rejected.error?.code, -32600)
+        assert.ok(rejected.error?.message.includes(message))
+        // The same entrypoint must remain blocked after startup claims are released.
+        const active = await app.call(method, { threadId, target: { type: 'uncommittedChanges' } })
+        assert.equal(active.error?.code, -32600)
+      } finally {
+        release()
+      }
+      assert.equal((await app.turnCompleted(turnId)).status, 'completed')
+      assert.equal(runs, 1)
+      const { thread } = await app.request('thread/read', { threadId, includeTurns: true })
+      assert.equal(thread.turns.length, 1)
+      const items = thread.turns[0].items
+      assert.equal(
+        items.find((item: any) => item.type === 'userMessage')?.content[0].text,
+        'first input',
+      )
+      assert.equal(
+        items.find((item: any) => item.type === 'agentMessage')?.text,
+        'Original answer.',
+      )
+    })
+  })
+}

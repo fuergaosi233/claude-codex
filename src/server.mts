@@ -3510,6 +3510,11 @@ export class CodexClaudeAppServer {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
     if (!thread) throw unknownThread(threadId)
+    const runningTurnId = this.activeTurnByThread.get(threadId)
+    const activeTurn = runningTurnId ? this.store.getTurn(runningTurnId) : null
+    if (this.startingTurnByThread.has(threadId) || activeTurn?.status === 'inProgress') {
+      throw invalidRequest(`cannot start review while a turn is running on thread ${threadId}`)
+    }
     this.checkModelProfileBinding(thread)
     this.subscribe(threadId, peer)
     const turnId = newId()
@@ -3588,6 +3593,11 @@ export class CodexClaudeAppServer {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
     if (!thread) throw unknownThread(threadId)
+    const runningTurnId = this.activeTurnByThread.get(threadId)
+    const activeTurn = runningTurnId ? this.store.getTurn(runningTurnId) : null
+    if (this.startingTurnByThread.has(threadId) || activeTurn?.status === 'inProgress') {
+      throw invalidRequest(`cannot compact thread ${threadId} while a turn is running`)
+    }
     this.checkModelProfileBinding(thread)
     this.subscribe(threadId, peer)
     const turnId = newId()
