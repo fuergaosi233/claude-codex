@@ -110,6 +110,7 @@ export async function listMcpServerStatuses(
   const names = serverNames(snapshot.sdkValue)
   const plugins = pluginServers(names, scope)
   const key = JSON.stringify([
+    scope.cwd ?? null,
     snapshot.sdkValue ?? null,
     plugins.map((server) => [server.pluginId, server.name, server.cwd]),
   ])
@@ -119,7 +120,7 @@ export async function listMcpServerStatuses(
       key,
       at: Number.POSITIVE_INFINITY,
       data: Promise.all([
-        ...names.map((name) => enumerateServerStatus(name, snapshot.sdkValue)),
+        ...names.map((name) => enumerateServerStatus(name, snapshot.sdkValue, scope.cwd)),
         ...plugins.map((server) => pluginServerStatus(server)),
       ]),
     }
@@ -243,13 +244,14 @@ async function pluginServerStatus(server: AppPluginServer): Promise<Record<strin
 async function enumerateServerStatus(
   name: string,
   servers: unknown,
+  cwd?: string | null,
 ): Promise<Record<string, unknown>> {
   const status = listStatusEntry(name)
   let connection: McpConnection
   try {
     const config = configFrom(servers, name)
     status.httpOrigin = httpOrigin(config)
-    connection = await connectMcp(name, config)
+    connection = await connectMcp(name, config, cwd)
   } catch (error) {
     if (!(error instanceof OutOfReach)) status.toolsError = errorText(error)
     return status
@@ -427,7 +429,7 @@ async function runMcpRequest(
   params: unknown,
   scope: McpConfigScope,
 ): Promise<unknown> {
-  const connection = await connectMcp(serverName, getServerConfig(serverName, scope))
+  const connection = await connectMcp(serverName, getServerConfig(serverName, scope), scope.cwd)
   try {
     return await connection.request(method, params)
   } finally {
@@ -469,6 +471,7 @@ function mcpTimeoutMs(): number {
 async function connectMcp(
   serverName: string,
   config: Record<string, unknown>,
+  cwd?: string | null,
 ): Promise<McpConnection> {
   if (config.type === 'http') return connectHttp(config)
   if (config.type && config.type !== 'stdio') {
@@ -476,16 +479,18 @@ async function connectMcp(
       `direct MCP requests only support stdio and http servers; ${serverName} is ${config.type}`,
     )
   }
-  return connectStdio(serverName, config)
+  return connectStdio(serverName, config, cwd)
 }
 
 async function connectStdio(
   serverName: string,
   config: Record<string, unknown>,
+  cwd?: string | null,
 ): Promise<McpConnection> {
   const command = stringOr(config.command, '')
   if (!command) throw new Error(`MCP server ${serverName} has no command`)
   const child = spawn(command, Array.isArray(config.args) ? config.args.map(String) : [], {
+    cwd: typeof cwd === 'string' && existsSync(cwd) ? cwd : undefined,
     env: { ...process.env, ...stringRecord(config.env) },
     stdio: ['pipe', 'pipe', 'pipe'],
   })

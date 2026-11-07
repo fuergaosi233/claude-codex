@@ -9,7 +9,7 @@ import {
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import { existsSync } from 'node:fs'
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import http from 'node:http'
 import net from 'node:net'
 import { tmpdir } from 'node:os'
@@ -13627,6 +13627,69 @@ test('thread sections paginate without losing entries at page boundaries', async
   } finally {
     proc.kill()
     await once(proc, 'exit')
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('direct MCP requests use thread cwd and separate status caches by project', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-mcp-cwd-'))
+  const fixture = await readFile(resolve('test/fixtures/mcp-stdio-server.mjs'), 'utf8')
+  const projects = [join(home, 'project-a'), join(home, 'project-b')]
+  for (const [index, project] of projects.entries()) {
+    await mkdir(project)
+    await writeFile(
+      join(project, 'server.mjs'),
+      fixture.replace("name: 'echo'", `name: 'echo${index}'`),
+    )
+  }
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    cwd: home,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      CODEX_HOME: home,
+      CLAUDE_CODEX_MOCK: '1',
+      CLAUDE_CODEX_MCP_SERVERS: JSON.stringify({
+        fixture: { type: 'stdio', command: process.execPath, args: ['server.mjs'] },
+      }),
+      NODE_NO_WARNINGS: '1',
+    },
+  })
+  const reader = new JsonLineReader(proc)
+  let id = 1
+  const request = async (method: string, params: Record<string, unknown>) => {
+    const requestId = id++
+    proc.stdin.write(json({ id: requestId, method, params }))
+    const response = await reader.nextResponse(requestId)
+    assert.equal(response.error, undefined)
+    return response.result
+  }
+  try {
+    for (const [index, project] of projects.entries()) {
+      const started = await request('thread/start', { cwd: project })
+      const threadId = started.thread.id
+      const status = await request('mcpServerStatus/list', { threadId })
+      const server = status.data.find((entry: any) => entry.name === 'fixture')
+      assert.ok(
+        server.tools[`echo${index}`],
+        'status must come from this project, not cached from another',
+      )
+      const tool = await request('mcpServer/tool/call', {
+        threadId,
+        server: 'fixture',
+        tool: 'process',
+        arguments: {},
+      })
+      assert.equal(tool.structuredContent.cwd, await realpath(project))
+      const resource = await request('mcpServer/resource/read', {
+        threadId,
+        server: 'fixture',
+        uri: 'fixture://resource',
+      })
+      assert.equal(resource.contents[0].text, 'resource-ok')
+    }
+  } finally {
+    proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
