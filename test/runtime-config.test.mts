@@ -2520,6 +2520,88 @@ test('native SDK permission allow result carries original input for SDK validati
   assert.equal(requests.length, 1)
 })
 
+for (const toolName of ['Bash', 'AskUserQuestion']) {
+  const input =
+    toolName === 'Bash'
+      ? { command: 'printf ok' }
+      : {
+          questions: [
+            {
+              question: 'Which option?',
+              header: 'Option',
+              options: [{ label: 'One', description: 'First option' }],
+            },
+          ],
+        }
+
+  test(`native SDK ${toolName} does not ask for an already cancelled call`, async () => {
+    const runtime = new NativeClaudeRuntime()
+    const context = { threadId: 'thread', turnId: 'turn' }
+    const unexpected = async () => assert.fail('cancelled call must not ask the user')
+    const current = {
+      context,
+      resolved: false,
+      handlers: { onPermissionRequest: unexpected, onUserInputRequest: unexpected },
+    }
+    const canUseTool = Reflect.get(runtime, 'makeCanUseTool').call(runtime, () => ({
+      current,
+      lastContext: context,
+    }))
+    const controller = new AbortController()
+    controller.abort()
+    assert.deepEqual(
+      await canUseTool(toolName, input, { toolUseID: 'cancelled', signal: controller.signal }),
+      { behavior: 'deny', message: 'cancelled' },
+    )
+    assert.equal(Reflect.get(runtime, 'permissions').size, 0)
+  })
+
+  test(`native SDK ${toolName} cancellation settles without waiting for a late answer`, {
+    timeout: 2_000,
+  }, async () => {
+    const runtime = new NativeClaudeRuntime()
+    const context = { threadId: 'thread', turnId: 'turn' }
+    const controller = new AbortController()
+    let receivedSignal: AbortSignal | undefined
+    let answer!: (value: unknown) => void
+    let entered!: () => void
+    const asking = new Promise<void>((resolve) => {
+      entered = resolve
+    })
+    const handler = (_event: unknown, signal?: AbortSignal) => {
+      receivedSignal = signal
+      entered()
+      // Deliberately ignore abort: the SDK call must still settle immediately.
+      return new Promise<unknown>((resolve) => {
+        answer = resolve
+      })
+    }
+    const current = {
+      context,
+      resolved: false,
+      handlers: { onPermissionRequest: handler, onUserInputRequest: handler },
+    }
+    const canUseTool = Reflect.get(runtime, 'makeCanUseTool').call(runtime, () => ({
+      current,
+      lastContext: context,
+    }))
+    const result = canUseTool(toolName, input, {
+      toolUseID: 'cancelled',
+      signal: controller.signal,
+    })
+    await asking
+    assert.equal(receivedSignal, controller.signal)
+    assert.equal(Reflect.get(runtime, 'permissions').size, toolName === 'Bash' ? 1 : 0)
+    controller.abort()
+    assert.deepEqual(await result, { behavior: 'deny', message: 'cancelled' })
+    assert.equal(Reflect.get(runtime, 'permissions').size, 0)
+    answer(toolName === 'Bash' ? { decision: 'cancel' } : { answers: {} })
+    await Promise.resolve()
+    assert.deepEqual(await result, { behavior: 'deny', message: 'cancelled' })
+    assert.equal(Reflect.get(runtime, 'permissions').size, 0)
+  })
+}
+
 test('native SDK approvals carry why Claude asks and how the user answered', async () => {
   const runtime = new NativeClaudeRuntime()
   const requests: any[] = []
