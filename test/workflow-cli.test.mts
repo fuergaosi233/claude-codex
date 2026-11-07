@@ -1,10 +1,93 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, writeFile } from 'node:fs/promises'
+import { spawnSync } from 'node:child_process'
+import { cp, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import test from 'node:test'
+import { fileURLToPath } from 'node:url'
 import { runWorkflowCli, type WorkflowCliIo } from '../src/workflow-cli.mjs'
 import type { WorkflowState, WorkflowTask } from '../src/workflow-state.mjs'
+
+const cliUrl = new URL('../src/workflow-cli.mjs', import.meta.url)
+
+for (const entryKind of ['direct', 'space', 'directory symlink', 'file symlink'] as const) {
+  test(`workflow CLI executes commands through a ${entryKind} path`, async (t) => {
+    const dir = await realpath(await mkdtemp(join(tmpdir(), 'claude-codex-workflow-entry-')))
+    t.after(() => rm(dir, { recursive: true, force: true }))
+    const originalEntry = fileURLToPath(cliUrl)
+    let entry = originalEntry
+    if (entryKind === 'space') {
+      const copiedDir = join(dir, 'with space # é')
+      await cp(dirname(originalEntry), copiedDir, { recursive: true })
+      entry = join(copiedDir, 'workflow-cli.mjs')
+    } else if (entryKind === 'directory symlink') {
+      const linkedDir = join(dir, 'linked-src')
+      await symlink(dirname(originalEntry), linkedDir, 'dir')
+      entry = join(linkedDir, 'workflow-cli.mjs')
+    } else if (entryKind === 'file symlink') {
+      entry = join(dir, 'linked-cli.mjs')
+      await symlink(originalEntry, entry, 'file')
+    }
+    const statePath = join(dir, 'state.json')
+    const result = spawnSync(
+      process.execPath,
+      [
+        entry,
+        'enqueue',
+        '--id',
+        'entry-task',
+        '--prompt',
+        'Check CLI entry.',
+        '--state',
+        statePath,
+      ],
+      { encoding: 'utf8', timeout: 10000 },
+    )
+
+    assert.equal(result.error, undefined)
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(result.stderr, '')
+    assert.match(result.stdout, /"status": "enqueued"/)
+    assert.equal(jsonOf<EnqueueOutput>(result.stdout).task.id, 'entry-task')
+    const state = jsonOf<WorkflowState>(await readFile(statePath, 'utf8'))
+    assert.equal(state.tasks[0]?.id, 'entry-task')
+    assert.equal(state.tasks[0]?.status, 'queued')
+
+    const help = spawnSync(process.execPath, [entry, '--help'], {
+      encoding: 'utf8',
+      timeout: 10000,
+    })
+    assert.equal(help.status, 0, help.stderr)
+    assert.match(help.stdout, /Usage:/)
+
+    const unknown = spawnSync(process.execPath, [entry, 'bogus', '--state', statePath], {
+      encoding: 'utf8',
+      timeout: 10000,
+    })
+    assert.equal(unknown.status, 1, unknown.stderr)
+    assert.match(unknown.stderr, /unknown workflow command: bogus/)
+  })
+}
+
+test('workflow CLI stays inert when imported from a script or eval', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'claude-codex-workflow-import-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const source = `await import(${JSON.stringify(cliUrl.href)}); console.log('imported')`
+  const wrapper = join(dir, 'importer.mjs')
+  await writeFile(wrapper, source)
+
+  for (const args of [
+    [wrapper],
+    ['--input-type=module', '--eval', source],
+    ['--input-type=module', '--eval', source, join(dir, 'missing-entry.mjs')],
+  ]) {
+    const result = spawnSync(process.execPath, args, { encoding: 'utf8', timeout: 10000 })
+    assert.equal(result.error, undefined)
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(result.stderr, '')
+    assert.equal(result.stdout, 'imported\n')
+  }
+})
 
 test('workflow CLI enqueues and schedules a task through the state file', async () => {
   const statePath = await tempStatePath()
