@@ -13,12 +13,13 @@ if (process.env.MCP_FIXTURE_EXIT) {
 const rl = readline.createInterface({ input: process.stdin })
 // The tool call waiting for the client to answer the server's ping.
 let pingCall = null
+let pingId = 'server-ping'
 rl.on('line', (line) => {
   if (!line.trim()) return
   const request = JSON.parse(line)
-  if (request.id === 'server-ping' && !request.method) {
+  if (request.id === pingId && !request.method) {
     respond(pingCall, {
-      content: [{ type: 'text', text: `pong:${JSON.stringify(request.result)}` }],
+      content: [{ type: 'text', text: `pong:${JSON.stringify(request.error ?? request.result)}` }],
     })
     return
   }
@@ -85,8 +86,10 @@ rl.on('line', (line) => {
   if (request.method === 'tools/call' && request.params.name === 'ping') {
     // Asks the client for a ping before it answers.
     pingCall = request.id
+    pingId =
+      typeof request.params.arguments?.id === 'number' ? request.params.arguments.id : 'server-ping'
     process.stdout.write(
-      `${JSON.stringify({ jsonrpc: '2.0', id: 'server-ping', method: 'ping' })}\n`,
+      `${JSON.stringify({ jsonrpc: '2.0', id: pingId, method: request.params.arguments?.method ?? 'ping' })}\n`,
     )
     return
   }
