@@ -9425,26 +9425,50 @@ export class CodexClaudeAppServer {
     roots: string[],
   ): Promise<Array<Record<string, unknown>>> {
     const query = rawQuery.toLowerCase()
-    const files: Array<Record<string, unknown>> = []
+    const files: Array<{
+      root: string
+      path: string
+      match_type: string
+      file_name: string
+      score: number
+      indices: null
+    }> = []
     for (const root of roots) {
       const paths = await listFiles(root)
       for (const path of paths) {
         const fileName = path.split('/').at(-1) ?? path
         const haystack = path.toLowerCase()
         if (query && !haystack.includes(query)) continue
+        const name = fileName.toLowerCase()
+        const stem = name.replace(/\.[^.]+$/, '')
+        const score = !query
+          ? 1
+          : name === query || stem === query
+            ? 1000
+            : name.startsWith(query)
+              ? 800
+              : name.includes(query)
+                ? 500 - name.indexOf(query)
+                : 100 - haystack.indexOf(query)
         files.push({
           root,
           path,
           match_type: 'file',
           file_name: fileName,
-          score: query ? Math.max(1, 100 - haystack.indexOf(query)) : 1,
+          score,
           indices: null,
         })
-        if (files.length >= 100) break
       }
-      if (files.length >= 100) break
     }
     return files
+      .sort(
+        (a, b) =>
+          b.score - a.score ||
+          a.path.length - b.path.length ||
+          a.path.localeCompare(b.path) ||
+          a.root.localeCompare(b.root),
+      )
+      .slice(0, 100)
   }
 
   private fuzzySessionStart(params: Record<string, unknown>): unknown {
