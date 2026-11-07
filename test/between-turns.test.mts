@@ -3,6 +3,7 @@ import test from 'node:test'
 import * as z from 'zod'
 import { NativeClaudeRuntime } from '../src/native-runtime.mjs'
 import type { RuntimeBackgroundListener, RuntimeTurnContext } from '../src/types.mjs'
+import { scriptedRuntime, withInProcessApp } from './fixtures/in-process-app.mjs'
 
 function turnContext(overrides: Partial<RuntimeTurnContext> = {}): RuntimeTurnContext {
   return {
@@ -171,4 +172,110 @@ test('the goal and leader tools load up front, never behind tool search', () => 
   })
   assert.equal(options.mcpServers.codex_goal.alwaysLoad, true)
   assert.equal(options.mcpServers.codex_leader.alwaysLoad, true)
+})
+
+test('pipelined turn starts join one runtime run and preserve both inputs and the answer', async () => {
+  let release!: () => void
+  const held = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  let running = false
+  let runs = 0
+  const steered: string[] = []
+  const runtime = scriptedRuntime(
+    async (_context, handlers) => {
+      runs++
+      running = true
+      await held
+      await handlers.onEvent({ type: 'text_delta', delta: 'Both inputs answered.' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'Both inputs answered.' })
+    },
+    {
+      steer: async (_threadId, prompt, options) => {
+        if (!running) return false
+        steered.push(prompt)
+        options?.onAccepted?.()
+        return true
+      },
+    },
+  )
+  await withInProcessApp(runtime, async (app) => {
+    const threadId = await app.startThread()
+    let first: string
+    try {
+      const turns = await Promise.all([
+        app.startTurn(threadId, 'first input'),
+        app.startTurn(threadId, 'second input'),
+      ])
+      assert.ok(turns[0])
+      first = turns[0]
+      assert.equal(turns[1], first)
+      assert.equal(runs, 1)
+      assert.equal(steered.length, 1)
+    } finally {
+      release()
+    }
+    assert.equal((await app.turnCompleted(first)).status, 'completed')
+    const { thread } = await app.request('thread/read', { threadId, includeTurns: true })
+    assert.equal(thread.turns.length, 1)
+    const items = thread.turns[0].items
+    assert.deepEqual(
+      items
+        .filter((item: any) => item.type === 'userMessage')
+        .map((item: any) => item.content[0].text),
+      ['first input', 'second input'],
+    )
+    assert.equal(
+      items.find((item: any) => item.type === 'agentMessage')?.text,
+      'Both inputs answered.',
+    )
+    assert.equal(Reflect.get(app.server, 'startingTurnByThread').size, 0)
+  })
+})
+
+test('cleanup of an old turn leaves a newer active turn steerable', async () => {
+  let release!: () => void
+  const held = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const runtime = scriptedRuntime(
+    async (_context, handlers) => {
+      await held
+      await handlers.onEvent({ type: 'completed', success: true, result: 'done' })
+    },
+    { steer: async () => undefined },
+  )
+  await withInProcessApp(runtime, async (app) => {
+    const threadId = await app.startThread()
+    const turnId = await app.startTurn(threadId, 'new turn')
+    try {
+      Reflect.get(app.server, 'clearActiveTurn').call(app.server, threadId, 'older-turn')
+      Reflect.get(app.server, 'setThreadStatus').call(app.server, null, threadId, { type: 'idle' })
+      assert.equal(Reflect.get(app.server, 'activeTurnByThread').get(threadId), turnId)
+      assert.equal(app.store.getThread(threadId)?.status.type, 'active')
+      const result = await app.request('turn/steer', {
+        threadId,
+        expectedTurnId: turnId,
+        input: [{ type: 'text', text: 'still steerable' }],
+      })
+      assert.equal(result.turnId, turnId)
+    } finally {
+      release()
+    }
+    await app.turnCompleted(turnId)
+  })
+})
+
+test('a rejected turn start releases the claim for waiting requests', async () => {
+  await withInProcessApp(
+    scriptedRuntime(async () => {}),
+    async (app) => {
+      const replies = await Promise.all([
+        app.call('turn/start', { threadId: 'missing' }),
+        app.call('turn/start', { threadId: 'missing' }),
+      ])
+      for (const reply of replies) assert.match(reply.error?.message ?? '', /unknown thread/)
+      assert.equal(Reflect.get(app.server, 'startingTurnByThread').size, 0)
+    },
+  )
 })
