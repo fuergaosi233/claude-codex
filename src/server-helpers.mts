@@ -1629,12 +1629,21 @@ export function userInputAnswersAsContent(
   const out: Array<{ type: 'inputText'; text: string }> = []
   for (const q of questions) {
     const slot = answers.answers[q.id]
-    const picked = slot?.answers?.filter((s) => s && s !== 'Other') ?? []
-    const notes = slot?.notes ?? null
-    const body =
-      notes && (picked.length === 0 || picked.includes('Other'))
-        ? notes
-        : picked.join(', ') || '(no answer)'
+    const entries = slot?.answers ?? []
+    const picked = entries.filter((s) => s && !s.startsWith('user_note: '))
+    const notes =
+      entries
+        .filter((s) => s.startsWith('user_note: '))
+        .map((s) => s.slice('user_note: '.length))
+        .join('\n') ||
+      slot?.notes ||
+      null
+    const custom =
+      notes &&
+      (picked.length === 0 || picked.includes('Other') || picked.includes('None of the above'))
+    const body = custom
+      ? [...picked.filter((s) => s !== 'Other' && s !== 'None of the above'), notes].join(', ')
+      : picked.join(', ') || '(no answer)'
     out.push({ type: 'inputText', text: `${q.header}: ${body}` })
   }
   return out

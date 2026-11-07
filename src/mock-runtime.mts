@@ -1778,7 +1778,7 @@ export class MockRuntime implements ClaudeRuntime {
             id: 'q0',
             header: 'Auth',
             question: 'Which auth method do you want?',
-            isOther: false,
+            isOther: true,
             isSecret: false,
             options: [
               { label: 'OAuth', description: 'Use OAuth' },
