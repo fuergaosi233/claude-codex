@@ -1836,3 +1836,83 @@ test('the mock runtime shows its subagent items check, unless they are off', asy
     )
   }
 })
+
+test('parent and subagent Bash items preserve failure exit codes and ignore status text on success', async () => {
+  const cases = [
+    { content: 'nosuchcmd: command not found\nExit code 127', isError: true, code: 127 },
+    { content: [{ type: 'text', text: 'missing file\nExit code: 2' }], isError: true, code: 2 },
+    { content: 'failed without an exit trailer', isError: true, code: 1 },
+    { content: 'quoted log\nexit status: 101', isError: false, code: 0 },
+  ]
+  const script: Script = async (context, handlers, tools) => {
+    for (const [index, entry] of cases.entries()) {
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId: `parent-${index}`,
+        toolName: 'Bash',
+        input: { command: `command-${index}` },
+      })
+      await handlers.onEvent({
+        type: 'tool_result',
+        toolUseId: `parent-${index}`,
+        content: entry.content,
+        isError: entry.isError,
+      })
+    }
+    await startAgent(context, handlers, tools, 'agent-exits', 'task-exits', 'check command exits')
+    for (const [index, entry] of cases.entries()) {
+      await handlers.onEvent(
+        out(
+          'agent-exits',
+          {
+            type: 'tool_use',
+            toolUseId: `child-${index}`,
+            toolName: 'Bash',
+            input: { command: `command-${index}` },
+          },
+          'task-exits',
+        ),
+      )
+      await handlers.onEvent(
+        out(
+          'agent-exits',
+          {
+            type: 'tool_result',
+            toolUseId: `child-${index}`,
+            content: entry.content,
+            isError: entry.isError,
+          },
+          'task-exits',
+        ),
+      )
+    }
+    await handlers.onEvent({ type: 'tool_result', toolUseId: 'agent-exits', content: 'done' })
+    await handlers.onEvent({ type: 'completed', success: true, result: 'done' })
+  }
+  await withServer(script, async ({ startThread, runTurn, request }) => {
+    const parent = await startThread()
+    const live = await runTurn(parent, 'check command exit codes')
+    const child = spawnedChild(live, 'check command exits')
+    const commands = (items: any[]) =>
+      items
+        .filter((item) => item.type === 'commandExecution')
+        .map((item) => [item.command, item.status, item.exitCode])
+    const expected = cases.map((entry, index) => [
+      `command-${index}`,
+      entry.isError ? 'failed' : 'completed',
+      entry.code,
+    ])
+    for (const id of [parent, child]) {
+      assert.deepEqual(
+        commands(completedIn(live, id)),
+        expected,
+        id === parent ? 'parent live' : 'child live',
+      )
+      assert.deepEqual(
+        commands(await threadItems(request, id)),
+        expected,
+        id === parent ? 'parent stored' : 'child stored',
+      )
+    }
+  })
+})

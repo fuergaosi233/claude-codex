@@ -411,7 +411,7 @@ export class SubagentItems {
       : resultText
         ? appendCommandOutput(null, resultText)
         : ''
-    const exitCode = parseExitCodeFromResult(content) ?? (isError ? 1 : 0)
+    const exitCode = isError ? (parseExitCodeFromResult(content) ?? 1) : 0
     const item = this.updateItem(state, tool.itemId, (current) => {
       if (current.type === 'commandExecution')
         return {
