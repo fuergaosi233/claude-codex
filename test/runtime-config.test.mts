@@ -3880,3 +3880,26 @@ test('native SDK sends desktop presentation guidance on fresh and resumed turns'
     assert.match(options.systemPrompt.append, /Answer in Chinese\./)
   }
 })
+
+test('native SDK runtime forwards file checkpointing only when enabled', () => {
+  const runtime = new NativeClaudeRuntime()
+  const buildOptions = Reflect.get(runtime, 'buildOptions')
+  for (const enabled of [true, false, undefined]) {
+    const context = nativeTurnContext({ enableFileCheckpointing: enabled === true })
+    if (enabled === undefined) Reflect.deleteProperty(context, 'enableFileCheckpointing')
+    const options = buildOptions.call(runtime, {}, context, new AbortController(), () => null)
+    if (enabled) assert.equal(options.enableFileCheckpointing, true)
+    else assert.equal(Object.hasOwn(options, 'enableFileCheckpointing'), false)
+  }
+})
+
+test('file checkpointing changes the session signature when toggled', () => {
+  const disabled = sessionSignature(nativeTurnContext({ enableFileCheckpointing: false }))
+  const unset = nativeTurnContext()
+  Reflect.deleteProperty(unset, 'enableFileCheckpointing')
+  const omitted = sessionSignature(unset)
+  const enabled = sessionSignature(nativeTurnContext({ enableFileCheckpointing: true }))
+  assert.equal(disabled, omitted)
+  assert.notEqual(enabled, disabled)
+  assert.notEqual(enabled, omitted)
+})
