@@ -46,7 +46,14 @@ function openDatabase(path: string): DatabaseSync {
   const sqlite = require('node:sqlite') as {
     DatabaseSync: new (filename: string, options?: { timeout?: number }) => DatabaseSync
   }
-  return new sqlite.DatabaseSync(path, { timeout: busyTimeoutMs() })
+  const db = new sqlite.DatabaseSync(path, { timeout: busyTimeoutMs() })
+  // SQLite's LIKE ignores case for ASCII letters only, so thread search
+  // lowercases both sides with this. ς is σ at the end of a word, and the
+  // term and the text can disagree on where a word ends.
+  db.function('cc_fold', { deterministic: true }, (text: unknown) =>
+    text == null ? null : String(text).toLowerCase().replaceAll('ς', 'σ'),
+  )
+  return db
 }
 
 // The terminal form of a turn. completeTurn writes it; a caller whose write
@@ -539,10 +546,12 @@ export class SessionStore {
       const text = likePattern(options.searchTerm)
       const json = likePattern(JSON.stringify(options.searchTerm).slice(1, -1))
       where.push(
-        `(t.name LIKE ? ESCAPE '\\' OR t.preview LIKE ? ESCAPE '\\' OR EXISTS (
-           SELECT 1 FROM turns u WHERE u.thread_id = t.id AND u.items_json LIKE ? ESCAPE '\\')
+        `(cc_fold(t.name) LIKE cc_fold(?) ESCAPE '\\'
+           OR cc_fold(t.preview) LIKE cc_fold(?) ESCAPE '\\'
+           OR EXISTS (SELECT 1 FROM turns u
+             WHERE u.thread_id = t.id AND cc_fold(u.items_json) LIKE cc_fold(?) ESCAPE '\\')
            OR EXISTS (SELECT 1 FROM thread_inherited_turns h
-             WHERE h.thread_id = t.id AND h.items_json LIKE ? ESCAPE '\\'))`,
+             WHERE h.thread_id = t.id AND cc_fold(h.items_json) LIKE cc_fold(?) ESCAPE '\\'))`,
       )
       args.push(text, text, json, json)
     }
