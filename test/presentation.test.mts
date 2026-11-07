@@ -15,6 +15,7 @@ import { SessionStore } from '../src/store.mjs'
 import type {
   ClaudeRuntime,
   RpcPeer,
+  RuntimeBackgroundListener,
   RuntimeEvent,
   RuntimeFailure,
   RuntimeHandlers,
@@ -27,6 +28,7 @@ type CapturedMessage = { method?: string; id?: unknown; params?: any; result?: a
 async function present(
   run: (handlers: RuntimeHandlers, turn: { interrupt: () => Promise<void> }) => Promise<void>,
   params: Record<string, unknown> = {},
+  afterComplete?: (listener: RuntimeBackgroundListener, threadId: string) => Promise<void>,
 ) {
   const directory = await mkdtemp(join(tmpdir(), 'claude-presentation-'))
   const previousHome = process.env.CLAUDE_CODEX_HOME
@@ -37,7 +39,11 @@ async function present(
   const completed = new Promise<void>((resolve) => {
     finish = resolve
   })
+  let backgroundListener: RuntimeBackgroundListener | undefined
   const runtime: ClaudeRuntime = {
+    setBackgroundListener: (listener) => {
+      backgroundListener = listener
+    },
     runTurn: async (context, handlers) =>
       run(handlers, {
         interrupt: () =>
@@ -90,6 +96,10 @@ async function present(
         timeout = setTimeout(() => reject(new Error('Presentation turn timed out')), 5_000)
       }),
     ])
+    if (afterComplete) {
+      assert.ok(backgroundListener)
+      await afterComplete(backgroundListener, threadId)
+    }
     const turns = store.listTurns(threadId)
     const turn = turns.at(-1)
     assert.ok(turn)
@@ -830,3 +840,79 @@ test('subagent results keep only the report, in both CLI trailer formats', () =>
     usage: { totalTokens: 18437, toolUses: 1, durationMs: 97082 },
   })
 })
+
+for (const sandbox of ['danger-full-access', 'workspace-write']) {
+  test(`permission-first Bash preserves timing and background output (${sandbox})`, async () => {
+    const input = { command: 'npm run dev', run_in_background: true }
+    const { messages, turn, replay } = await present(
+      async (handlers) => {
+        const decision = await handlers.onPermissionRequest({
+          type: 'permission_request',
+          requestId: 'background-permission',
+          toolUseId: 'background-shell',
+          toolName: 'Bash',
+          input,
+        })
+        assert.equal(decision.decision, 'accept')
+        await handlers.onEvent({
+          type: 'tool_use',
+          toolUseId: 'background-shell',
+          toolName: 'Bash',
+          input,
+        })
+        await handlers.onEvent({
+          type: 'tool_result',
+          toolUseId: 'background-shell',
+          content: 'Started background server.',
+        })
+      },
+      { sandbox },
+      async (listener, threadId) => {
+        await listener.onTaskEvent(threadId, {
+          type: 'task_output',
+          taskId: 'dev-server',
+          toolUseId: 'background-shell',
+          delta: '\nServer ready after turn completion.\n',
+        })
+      },
+    )
+    const started = messages.filter(
+      (message) =>
+        message.method === 'item/started' && message.params.item.type === 'commandExecution',
+    )
+    assert.equal(started.length, 1, 'the later tool_use must reuse the permission-created item')
+    assert.ok(started[0])
+    const itemId = started[0].params.item.id
+    const completed = messages.find(
+      (message) => message.method === 'item/completed' && message.params.item.id === itemId,
+    )?.params.item
+    assert.ok(completed)
+    assert.equal(typeof completed.durationMs, 'number')
+    assert.ok(completed.durationMs >= 0)
+    const approval = messages.find(
+      (message) => message.method === 'item/commandExecution/requestApproval',
+    )
+    assert.equal(Boolean(approval), sandbox === 'workspace-write')
+    const deltaIndex = messages.findIndex(
+      (message) =>
+        message.method === 'item/commandExecution/outputDelta' &&
+        message.params.delta === '\nServer ready after turn completion.\n',
+    )
+    assert.ok(deltaIndex > messages.findIndex((message) => message.method === 'turn/completed'))
+    const delta = messages[deltaIndex]
+    assert.ok(delta)
+    assert.equal(delta.params.itemId, itemId)
+    assert.equal(delta.params.turnId, turn.id)
+    const stored = turn.items.find((item) => item.id === itemId)
+    assert.ok(stored?.type === 'commandExecution')
+    assert.equal(stored.durationMs, completed.durationMs)
+    assert.equal(
+      stored.aggregatedOutput,
+      'Started background server.\nServer ready after turn completion.\n',
+    )
+    assert.deepEqual(
+      replay.items.find((item: ThreadItem) => item.id === itemId),
+      stored,
+    )
+  })
+}

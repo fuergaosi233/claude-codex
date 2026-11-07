@@ -6054,8 +6054,11 @@ export class CodexClaudeAppServer {
             )
             itemId = item.id
             itemIds.set(event.toolUseId, item.id)
+            itemStartedAtMs.set(item.id, nowMillis())
             openToolItems.add(item.id)
             if (isExploreTool(event.toolName)) exploreItemIds.add(item.id)
+            else if (item.type === 'commandExecution')
+              this.rememberCommandItem(event.toolUseId, thread.id, turn.id, item.id)
             this.store.appendItem(turn.id, item)
             this.notify(peer, {
               method: 'item/started',
