@@ -1,6 +1,7 @@
 import { type ChildProcess, execFile, spawn } from 'node:child_process'
 import { type FSWatcher, readFileSync, watch, writeFileSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
+import { createInterface } from 'node:readline'
 import { promisify } from 'node:util'
 import type { ConfigEdit } from './app-settings.mjs'
 import type { AppSkill } from './claude-capabilities.mjs'
@@ -1547,29 +1548,77 @@ export function addedFileDiff(path: string, text: string): string {
   ].join('\n')
 }
 
-export async function listFiles(root: string): Promise<string[]> {
-  try {
-    const { stdout } = await execFileAsync('rg', ['--files'], {
-      cwd: root,
-      timeout: 10_000,
-      maxBuffer: 5 * 1024 * 1024,
+// Stream the walk: large repositories can exceed execFile's output buffer.
+function streamFiles(
+  root: string,
+  command: string,
+  args: string[],
+  maxFiles: number,
+): Promise<string[]> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { cwd: root, stdio: ['ignore', 'pipe', 'ignore'] })
+    const files: string[] = []
+    let capped = false
+    let timedOut = false
+    const lines = createInterface({ input: child.stdout, crlfDelay: Infinity })
+    const timer = setTimeout(() => {
+      timedOut = true
+      child.kill('SIGKILL')
+    }, 10_000)
+    lines.on('line', (line) => {
+      if (capped || !line) return
+      files.push(line.replace(/^\.\//, ''))
+      if (files.length >= maxFiles) {
+        capped = true
+        lines.close()
+        child.kill('SIGKILL')
+      }
     })
-    return stdout.split('\n').filter(Boolean)
+    child.once('error', (error) => {
+      clearTimeout(timer)
+      lines.close()
+      reject(error)
+    })
+    child.once('close', (code) => {
+      clearTimeout(timer)
+      lines.close()
+      if (timedOut) reject(new Error(`${command} file listing timed out`))
+      else if (capped || code === 0) resolve(files)
+      else reject(new Error(`${command} file listing exited with code ${code}`))
+    })
+  })
+}
+
+export async function listFiles(root: string, maxFiles = 250_000): Promise<string[]> {
+  if (maxFiles <= 0) return []
+  try {
+    return await streamFiles(root, 'rg', ['--files'], maxFiles)
   } catch (rgError) {
     debugLog('listFiles.rgFailed', {
       root,
       error: rgError instanceof Error ? rgError.message : String(rgError),
     })
     try {
-      const { stdout } = await execFileAsync('find', ['.', '-type', 'f'], {
-        cwd: root,
-        timeout: 10_000,
-        maxBuffer: 5 * 1024 * 1024,
-      })
-      return stdout
-        .split('\n')
-        .filter(Boolean)
-        .map((path) => path.replace(/^\.\//, ''))
+      return await streamFiles(
+        root,
+        'find',
+        [
+          '.',
+          '(',
+          '-name',
+          '.git',
+          '-o',
+          '-name',
+          'node_modules',
+          ')',
+          '-prune',
+          '-o',
+          '-type',
+          'f',
+          '-print',
+        ],
+        maxFiles,
+      )
     } catch (findError) {
       debugLog('listFiles.findFailed', {
         root,
