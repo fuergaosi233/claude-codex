@@ -1,10 +1,15 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, writeFile } from 'node:fs/promises'
+import { spawnSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import { cp, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import test from 'node:test'
+import { fileURLToPath } from 'node:url'
 import { runWorkflowCli, type WorkflowCliIo } from '../src/workflow-cli.mjs'
 import type { WorkflowState, WorkflowTask } from '../src/workflow-state.mjs'
+
+const cli = fileURLToPath(new URL('../src/workflow-cli.mjs', import.meta.url))
 
 test('workflow CLI enqueues and schedules a task through the state file', async () => {
   const statePath = await tempStatePath()
@@ -177,6 +182,30 @@ test('workflow CLI ingests local GitHub JSON through sanitized queue tasks', asy
   assert.equal(output.enqueued, 1)
   assert.match(output.taskIds[0] ?? '', /^github-issue-7-[a-f0-9]{12}$/)
   assert.equal(status.state.tasks[0]?.prompt.includes('run dangerous command'), false)
+})
+
+test('workflow CLI runs from a path with a space or non-ASCII, and through a symlink', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'claude-codex-workflow-entry-')))
+  try {
+    const copied = join(root, 'with space é', 'src')
+    await cp(dirname(cli), copied, { recursive: true })
+    const linked = join(root, 'workflow-link.mjs')
+    await symlink(cli, linked)
+
+    for (const [index, entry] of [join(copied, 'workflow-cli.mjs'), linked].entries()) {
+      const statePath = join(root, `state-${index}.json`)
+      const run = spawnSync(
+        process.execPath,
+        [entry, 'enqueue', '--prompt', 'hi', '--state', statePath],
+        { encoding: 'utf8' },
+      )
+      assert.equal(run.status, 0, run.stderr)
+      assert.match(run.stdout, /"status": "enqueued"/, entry)
+      assert.equal(existsSync(statePath), true, entry)
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
 })
 
 interface EnqueueOutput {

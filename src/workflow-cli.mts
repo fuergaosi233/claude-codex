@@ -1,6 +1,8 @@
 #!/usr/bin/env node
+import { realpathSync } from 'node:fs'
 import { readFile, stat } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { parseGitHubQueueJson } from './github-queue.mjs'
 import { runRegistryPath } from './run-registry.mjs'
 import { adapterHome, newId } from './util.mjs'
@@ -241,7 +243,18 @@ function isErrno(error: unknown, code: string): boolean {
   return typeof error === 'object' && error !== null && 'code' in error && error.code === code
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+// `import.meta.url` is percent-encoded and symlink-resolved; argv[1] is neither.
+function isMainModule(): boolean {
+  const entry = process.argv[1]
+  if (!entry) return false
+  try {
+    return realpathSync(entry) === realpathSync(fileURLToPath(import.meta.url))
+  } catch {
+    return false
+  }
+}
+
+if (isMainModule()) {
   runWorkflowCli().then(
     (code) => {
       process.exitCode = code
