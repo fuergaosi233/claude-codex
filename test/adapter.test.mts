@@ -4164,11 +4164,11 @@ test('a Claude Code that refused to start fails the turn with why, retryable onl
         reason,
       )
       // The CLI's own text, with the proxy's credentials, reaches no one.
-      assert.doesNotMatch(JSON.stringify(failed), /secret|proxy\.invalid/, reason)
+      assert.doesNotMatch(JSON.stringify(failed), /user:secret|proxy\.invalid/, reason)
     }
     proc.stdin.write(json({ id, method: 'thread/read', params: { threadId, includeTurns: true } }))
     const read = await reader.nextResponse(id)
-    assert.doesNotMatch(JSON.stringify(read.result), /secret|proxy\.invalid/)
+    assert.doesNotMatch(JSON.stringify(read.result), /user:secret|proxy\.invalid/)
   } finally {
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })

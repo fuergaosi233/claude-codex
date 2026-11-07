@@ -69,6 +69,7 @@ const PROVIDER_ENV_KEYS = new Set([
   'CLAUDE_CODE_EFFORT_LEVEL',
   'CLAUDE_CONFIG_DIR',
 ])
+const EXPLICIT_SECRET_ENV_KEYS = new Set(['ANTHROPIC_CUSTOM_HEADERS'])
 const SECRET_ENV_KEY = /(TOKEN|KEY|SECRET|PASSWORD|AUTH)/i
 // Token budgets such as CLAUDE_CODE_MAX_OUTPUT_TOKENS are counts, not secrets.
 const TOKEN_COUNT = /TOKENS(?=_|$)/gi
@@ -416,7 +417,7 @@ function interpolateForFingerprint(value: string, env: Environment, label: strin
 }
 
 function secretLikeEnvKey(key: string): boolean {
-  return SECRET_ENV_KEY.test(key.replace(TOKEN_COUNT, ''))
+  return EXPLICIT_SECRET_ENV_KEYS.has(key) || SECRET_ENV_KEY.test(key.replace(TOKEN_COUNT, ''))
 }
 
 function modelProfilesSource(env: Environment): { text: string; directory: string } | null {
