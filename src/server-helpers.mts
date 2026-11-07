@@ -1433,19 +1433,20 @@ export function fileChangeFromTool(
   ]
 }
 
+function splitDiffLines(text: string): string[] {
+  if (!text) return []
+  const lines = text.split('\n')
+  if (lines[lines.length - 1] === '') lines.pop()
+  return lines
+}
+
 export function simpleDiff(path: string, oldText: string, newText: string): string {
   return [
     `--- a/${path}`,
     `+++ b/${path}`,
     '@@',
-    ...oldText
-      .split('\n')
-      .filter(Boolean)
-      .map((line) => `-${line}`),
-    ...newText
-      .split('\n')
-      .filter(Boolean)
-      .map((line) => `+${line}`),
+    ...splitDiffLines(oldText).map((line) => `-${line}`),
+    ...splitDiffLines(newText).map((line) => `+${line}`),
     '',
   ].join('\n')
 }
