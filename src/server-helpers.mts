@@ -1481,6 +1481,63 @@ export async function isGitWorkTree(cwd: string): Promise<boolean> {
   return inside
 }
 
+const DIFF_FILE_BYTES = 256 * 1024
+const DIFF_INLINE_BYTES = 2 * 1024 * 1024
+
+function omittedFileDiff(path: string, reason: string, added = false): string {
+  return [
+    `diff --git a/${path} b/${path}`,
+    ...(added ? ['new file mode 100644', 'index 0000000..0000000'] : []),
+    added ? '--- /dev/null' : `--- a/${path}`,
+    `+++ b/${path}`,
+    '@@ -0,0 +1 @@',
+    `+[omitted: ${reason}]`,
+    '',
+  ].join('\n')
+}
+
+// A large patch must not erase smaller changes. Keep a header for every path
+// even after the content budget is spent. Disable renames for unambiguous -z records.
+async function trackedDiffFallback(cwd: string): Promise<string> {
+  const { stdout } = await execFileAsync(
+    'git',
+    ['diff', '--no-ext-diff', '--no-renames', '--numstat', '-z', '--'],
+    {
+      cwd,
+      timeout: 10_000,
+      maxBuffer: 5 * 1024 * 1024,
+    },
+  )
+  const diffs: string[] = []
+  let remaining = DIFF_INLINE_BYTES
+  for (const record of stdout.split('\0').filter(Boolean)) {
+    const firstTab = record.indexOf('\t')
+    const secondTab = record.indexOf('\t', firstTab + 1)
+    if (secondTab < 0) continue
+    const path = record.slice(secondTab + 1)
+    let diff = omittedFileDiff(path, 'diff size limit')
+    if (remaining > 0) {
+      try {
+        const { stdout: patch } = await execFileAsync(
+          'git',
+          ['--literal-pathspecs', 'diff', '--no-ext-diff', '--no-renames', '--', path],
+          {
+            cwd,
+            timeout: 10_000,
+            maxBuffer: Math.min(DIFF_FILE_BYTES, remaining),
+          },
+        )
+        diff = patch
+        remaining -= Buffer.byteLength(patch)
+      } catch {
+        // Oversized or unreadable files still appear in the file list.
+      }
+    }
+    diffs.push(diff)
+  }
+  return diffs.join('\n')
+}
+
 export async function gitDiff(cwd: string): Promise<string> {
   if (!(await isGitWorkTree(cwd))) return ''
   let trackedDiff = ''
@@ -1497,7 +1554,13 @@ export async function gitDiff(cwd: string): Promise<string> {
       reason: isNotAGitRepo(error) ? 'notAGitRepository' : 'error',
       error: error instanceof Error ? error.message : String(error),
     })
-    return ''
+    if ((error as NodeJS.ErrnoException)?.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') {
+      try {
+        trackedDiff = await trackedDiffFallback(cwd)
+      } catch (fallbackError) {
+        debugLog('git.diff.fallbackFailed', { cwd, error: String(fallbackError) })
+      }
+    }
   }
   const untrackedDiff = await gitUntrackedDiff(cwd)
   return [trackedDiff, untrackedDiff].filter(Boolean).join('\n')
@@ -1505,22 +1568,51 @@ export async function gitDiff(cwd: string): Promise<string> {
 
 export async function gitUntrackedDiff(cwd: string): Promise<string> {
   try {
-    const { readFile } = await import('node:fs/promises')
+    const { lstat, open } = await import('node:fs/promises')
     const { stdout } = await execFileAsync(
       'git',
       ['ls-files', '--others', '--exclude-standard', '-z'],
-      {
-        cwd,
-        timeout: 10_000,
-        maxBuffer: 1024 * 1024,
-      },
+      { cwd, timeout: 10_000, maxBuffer: 5 * 1024 * 1024 },
     )
-    const paths = stdout.split('\0').filter(Boolean).slice(0, 50)
+    const paths = stdout.split('\0').filter(Boolean)
     const diffs: string[] = []
+    let remaining = DIFF_INLINE_BYTES
     for (const path of paths) {
-      const bytes = await readFile(`${cwd}/${path}`)
-      if (bytes.includes(0)) continue
-      diffs.push(addedFileDiff(path, bytes.toString('utf8')))
+      try {
+        const info = await lstat(join(cwd, path))
+        let diff = omittedFileDiff(path, `${info.size} bytes`, true)
+        if (
+          info.isFile() &&
+          info.size <= DIFF_FILE_BYTES &&
+          info.size <= remaining &&
+          remaining > 0
+        ) {
+          // Bound the read too, in case a log grows between stat and open.
+          const file = await open(join(cwd, path), 'r')
+          const bytes = Buffer.alloc(DIFF_FILE_BYTES + 1)
+          let length = 0
+          try {
+            while (length < bytes.length) {
+              const { bytesRead } = await file.read(bytes, length, bytes.length - length, null)
+              if (!bytesRead) break
+              length += bytesRead
+            }
+          } finally {
+            await file.close()
+          }
+          const content = bytes.subarray(0, length)
+          if (length <= DIFF_FILE_BYTES && !content.includes(0)) {
+            const patch = addedFileDiff(path, content.toString('utf8'))
+            if (Buffer.byteLength(patch) <= remaining) {
+              diff = patch
+              remaining -= Buffer.byteLength(patch)
+            }
+          }
+        }
+        diffs.push(diff)
+      } catch {
+        diffs.push(omittedFileDiff(path, 'file unavailable', true))
+      }
     }
     return diffs.join('\n')
   } catch (error) {
