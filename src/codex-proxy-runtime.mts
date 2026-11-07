@@ -241,7 +241,13 @@ export class CodexProxyRuntime implements ClaudeRuntime {
             type: 'tool_use',
             toolUseId: String(item.id ?? `codex-${Date.now()}`),
             toolName: 'Edit',
-            input: { file_path: stringOr(item.path) ?? '', changes: item.changes ?? [] },
+            input: {
+              file_path:
+                stringOr(item.path) ??
+                stringOr(asRecord(Array.isArray(item.changes) ? item.changes[0] : null).path) ??
+                '',
+              changes: item.changes ?? [],
+            },
           })
         } else if (itemType === 'mcp_tool_call') {
           await handlers.onEvent({
@@ -286,17 +292,39 @@ export class CodexProxyRuntime implements ClaudeRuntime {
           itemType === 'file_change' ||
           itemType === 'mcp_tool_call'
         ) {
-          // Tool result side — synthesize a tool_result so the server's
-          // matching tool item closes properly.
+          let content =
+            stringOr(item.aggregated_output) ?? stringOr(item.summary) ?? stringOr(item.result)
+          let isError =
+            item.status === 'failed' ||
+            item.status === 'declined' ||
+            Boolean(item.error ?? item.is_error)
+          if (itemType === 'command_execution') {
+            const exitCode = typeof item.exit_code === 'number' ? item.exit_code : null
+            isError ||= exitCode !== null && exitCode !== 0
+            // Preserve the authoritative exit status for the server's Bash result parser.
+            if (
+              exitCode !== null &&
+              !/(?:^|\n)(?:Exit code|exit status):?\s*-?\d+\s*$/i.test(content ?? '')
+            ) {
+              content = `${content ? `${content}\n` : ''}Exit code: ${exitCode}`
+            }
+          } else if (itemType === 'mcp_tool_call') {
+            const result = asRecord(item.result)
+            const message = stringOr(asRecord(item.error).message)
+            content =
+              message ??
+              (Array.isArray(result.content)
+                ? result.content
+                    .map((part) => stringOr(asRecord(part).text))
+                    .filter((text) => text !== null)
+                    .join('\n')
+                : content)
+          }
           await handlers.onEvent({
             type: 'tool_result',
             toolUseId: itemId,
-            content:
-              stringOr(item.aggregated_output) ??
-              stringOr(item.summary) ??
-              stringOr(item.result) ??
-              null,
-            isError: Boolean(item.error ?? item.is_error),
+            content,
+            isError,
           })
         }
         break
