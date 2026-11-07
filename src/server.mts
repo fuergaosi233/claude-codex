@@ -65,6 +65,7 @@ import {
   asInvalidRequest,
   hostMethod,
   INVALID_REQUEST,
+  invalidParams,
   invalidRequest,
   invalidRequestIfThrows,
   methodNotFound,
@@ -671,6 +672,7 @@ export class CodexClaudeAppServer {
   // non-edit tool call, or an MCP tool (see approvalSessionKey).
   private sessionApprovals = new Map<string, Set<string>>()
   private commandProcesses = new Map<string, ChildProcess>()
+  private userShellStops = new Map<string, () => void>()
   private processHandles = new Map<string, ChildProcess>()
   private fsWatchers = new Map<string, FSWatcher>()
   // Goal state lives in the store. These track the hidden continuation turns
@@ -823,6 +825,8 @@ export class CodexClaudeAppServer {
   async stop(): Promise<void> {
     if (this.stopped) return
     this.stopped = true
+    for (const stop of this.userShellStops.values()) stop()
+    this.userShellStops.clear()
     this.stopCommandsListener()
     this.sleepMonitor.stop?.()
     this.idleSleep.stop()
@@ -854,7 +858,7 @@ export class CodexClaudeAppServer {
   // Background agents keep running (and Claude may still answer them) after
   // every turn has settled; the daemon must not idle-exit underneath them.
   hasActiveTurns(): boolean {
-    if (this.activeTurnByThread.size > 0) return true
+    if (this.activeTurnByThread.size > 0 || this.userShellStops.size > 0) return true
     for (const entry of this.backgroundSubagents.values()) if (entry.running) return true
     return this.runtime.hasBackgroundWork?.() === true
   }
@@ -3278,42 +3282,140 @@ export class CodexClaudeAppServer {
   private threadShellCommand(peer: RpcPeer, params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.threadId, '')
     const thread = this.store.getThread(threadId)
+    if (!thread) throw unknownThread(threadId)
+    const timeoutMs = params.timeoutMs === undefined ? 3_600_000 : params.timeoutMs
+    if (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs) || timeoutMs < 0) {
+      throw invalidParams('timeoutMs must be non-negative')
+    }
     const command = stringOr(params.command, '')
     if (!command) return {}
-    const shell = process.env.SHELL || '/bin/sh'
-    const cwd = thread?.cwd ?? process.cwd()
+    this.subscribe(threadId, peer)
+    const activeTurnId = this.activeTurnByThread.get(threadId)
+    const standalone = !activeTurnId
+    const turnId = activeTurnId ?? newId()
+    const startedAt = nowMillis()
+    if (standalone) {
+      const turn: TurnRecord = {
+        id: turnId,
+        threadId,
+        status: 'inProgress',
+        startedAt: nowSeconds(),
+        completedAt: null,
+        durationMs: null,
+        items: [],
+        diff: '',
+        error: null,
+      }
+      this.store.upsertTurn(turn)
+      this.notify(peer, {
+        method: 'turn/started',
+        params: { threadId, turn: this.toLifecycleTurn(turn) },
+      })
+    }
     const processId = newId()
-    debugLog('thread.shellCommand.start', { threadId, processId, cwd, command })
-    const child = spawn(shell, ['-lc', command], { cwd, env: process.env, stdio: 'pipe' })
+    const item: Extract<ThreadItem, { type: 'commandExecution' }> = {
+      type: 'commandExecution',
+      id: newId(),
+      command,
+      cwd: thread.cwd,
+      processId,
+      source: 'userShell',
+      status: 'inProgress',
+      commandActions: [{ type: 'unknown', command }],
+      aggregatedOutput: null,
+      exitCode: null,
+      durationMs: null,
+    }
+    this.store.appendItem(turnId, item)
+    this.notify(peer, {
+      method: 'item/started',
+      params: { threadId, turnId, item, startedAtMs: startedAt },
+    })
+    const child = spawn(process.env.SHELL || '/bin/sh', ['-lc', command], {
+      cwd: thread.cwd,
+      env: process.env,
+      stdio: 'pipe',
+      detached: process.platform !== 'win32',
+    })
     this.commandProcesses.set(processId, child)
-    child.stdout?.on('data', (chunk) =>
+    let aggregatedOutput = ''
+    let finished = false
+    let timedOut = false
+    const output = (delta: string) => {
+      if (finished || this.stopped) return
+      aggregatedOutput += delta
       this.notify(peer, {
-        method: 'command/exec/outputDelta',
-        params: {
-          processId,
-          stream: 'stdout',
-          deltaBase64: Buffer.from(chunk).toString('base64'),
-          capReached: false,
-        },
-      }),
-    )
-    child.stderr?.on('data', (chunk) =>
-      this.notify(peer, {
-        method: 'command/exec/outputDelta',
-        params: {
-          processId,
-          stream: 'stderr',
-          deltaBase64: Buffer.from(chunk).toString('base64'),
-          capReached: false,
-        },
-      }),
-    )
-    child.once('error', (error) =>
-      debugLog('thread.shellCommand.error', { threadId, processId, error: error.message }),
-    )
-    child.once('close', (code, signal) => {
-      debugLog('thread.shellCommand.close', { threadId, processId, code, signal })
+        method: 'item/commandExecution/outputDelta',
+        params: { threadId, turnId, itemId: item.id, delta },
+      })
+    }
+    child.stdout?.setEncoding('utf8')
+    child.stderr?.setEncoding('utf8')
+    child.stdout?.on('data', output)
+    child.stderr?.on('data', output)
+    const kill = () => {
+      // Kill descendants as well, so they cannot hold the output pipes open.
+      try {
+        if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, 'SIGKILL')
+        else child.kill('SIGKILL')
+      } catch {
+        child.kill('SIGKILL')
+      }
+    }
+    const deadline = startedAt + timeoutMs
+    let timer: NodeJS.Timeout
+    const checkTimeout = () => {
+      const remaining = deadline - nowMillis()
+      if (remaining > 0) timer = setTimeout(checkTimeout, Math.min(remaining, 2_147_483_647))
+      else {
+        timedOut = true
+        kill()
+      }
+    }
+    timer = setTimeout(checkTimeout, Math.min(timeoutMs, 2_147_483_647))
+    this.userShellStops.set(processId, () => {
+      clearTimeout(timer)
+      kill()
+      if (standalone) {
+        try {
+          this.store.completeTurn(turnId, 'interrupted')
+        } catch (error) {
+          debugLog('thread.shellCommand.stopFailed', { threadId, turnId, error: String(error) })
+        }
+      }
+    })
+    child.once('error', (error) => output(error.message))
+    child.once('close', (code) => {
+      if (finished) return
+      finished = true
+      clearTimeout(timer)
       this.commandProcesses.delete(processId)
+      this.userShellStops.delete(processId)
+      if (this.stopped) return
+      const exitCode = timedOut ? -1 : (code ?? 1)
+      const durationMs = Math.max(0, nowMillis() - startedAt)
+      const completedItem: ThreadItem = {
+        ...item,
+        status: exitCode === 0 ? 'completed' : 'failed',
+        aggregatedOutput,
+        exitCode,
+        durationMs,
+      }
+      if (!this.store.getTurn(turnId)) return
+      this.store.updateItem(turnId, item.id, () => completedItem)
+      this.notify(peer, {
+        method: 'item/completed',
+        params: { threadId, turnId, item: completedItem },
+      })
+      if (standalone) {
+        const turn = this.store.completeTurn(turnId, 'completed', null, durationMs)
+        if (turn)
+          this.notify(peer, {
+            method: 'turn/completed',
+            params: { threadId, turn: this.toLifecycleTurn(turn) },
+          })
+      }
+      this.checkIdle()
     })
     return {}
   }
@@ -9695,7 +9797,9 @@ export class CodexClaudeAppServer {
     return {
       id: turn.id,
       rootTurnId: turn.rootTurnId ?? turn.id,
-      items: turn.items,
+      items: turn.items.filter(
+        (item) => !(item.type === 'commandExecution' && item.source === 'userShell'),
+      ),
       itemsView: 'full',
       status: turn.status,
       error: turn.error,

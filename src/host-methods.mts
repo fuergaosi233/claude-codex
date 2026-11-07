@@ -15,6 +15,7 @@ import { stringOr } from './server-helpers.mjs'
 export const SERVER_ERROR = -32000
 export const INVALID_REQUEST = -32600
 export const METHOD_NOT_FOUND = -32601
+export const INVALID_PARAMS = -32602
 
 // A JSON-RPC error whose code or `data` the App reads.
 export class RpcError extends Error {
@@ -35,6 +36,10 @@ export class RpcError extends Error {
 // inside the server stays a SERVER_ERROR.
 export function invalidRequest(message: string, data?: unknown): RpcError {
   return new RpcError(message, data, INVALID_REQUEST)
+}
+
+export function invalidParams(message: string, data?: unknown): RpcError {
+  return new RpcError(message, data, INVALID_PARAMS)
 }
 
 // A refusal the user can put right, thrown as a plain error by code that
