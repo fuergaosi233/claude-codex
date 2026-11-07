@@ -113,23 +113,28 @@ rewrite_env_value() {
   local value="$2"
   python3 - "$ENV_FILE" "$key" "$value" <<'PY'
 import pathlib
+import shlex
 import sys
 
 path = pathlib.Path(sys.argv[1])
 key = sys.argv[2]
 value = sys.argv[3]
+# Entries are matched line by line, so a value must stay on one line.
+if value.splitlines() not in ([], [value]):
+    sys.exit(f"{key} cannot contain a line break: {value!r}")
+entry = f"export {key}={shlex.quote(value)}"
 lines = path.read_text().splitlines() if path.exists() else []
 out = []
 seen = False
 prefixes = (f"export {key}=", f"{key}=")
 for line in lines:
     if line.startswith(prefixes):
-        out.append(f'export {key}="{value}"')
+        out.append(entry)
         seen = True
     else:
         out.append(line)
 if not seen:
-    out.append(f'export {key}="{value}"')
+    out.append(entry)
 path.parent.mkdir(parents=True, exist_ok=True)
 path.write_text("\n".join(out) + "\n")
 PY
