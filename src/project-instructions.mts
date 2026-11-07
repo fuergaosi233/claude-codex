@@ -384,13 +384,21 @@ export function withoutFrontmatter(text: string): string {
   return next < 0 ? '' : text.slice(next + 1)
 }
 
+// Each folder once by its real path, so a link back up the tree ends the walk.
 export function markdownFiles(dir: string): string[] {
   const files: string[] = []
-  for (const entry of listDir(dir)) {
-    const path = join(dir, entry)
-    if (isDirectory(path)) files.push(...markdownFiles(path))
-    else if (entry.endsWith('.md')) files.push(path)
+  const seen = new Set<string>()
+  const walk = (dir: string): void => {
+    const key = realPath(dir)
+    if (seen.has(key)) return
+    seen.add(key)
+    for (const entry of listDir(dir)) {
+      const path = join(dir, entry)
+      if (isDirectory(path)) walk(path)
+      else if (entry.endsWith('.md')) files.push(path)
+    }
   }
+  walk(dir)
   return files
 }
 

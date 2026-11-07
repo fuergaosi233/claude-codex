@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { spawnSync } from 'node:child_process'
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import test from 'node:test'
@@ -230,6 +231,58 @@ test('a bridged Claude Code folder brings CLAUDE.md files, rules, imports and sk
         ['lint', 'repo'],
       ],
     )
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('links looping back under .claude/rules and .claude/agents are walked once', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'project-instructions-loop-'))
+  const claudeHome = join(root, 'claude-home')
+  const repo = join(root, 'repo')
+  const rules = join(repo, '.claude', 'rules')
+  const agents = join(repo, '.claude', 'agents')
+  try {
+    await mkdir(join(repo, '.git'), { recursive: true })
+    await write(join(rules, 'r.md'), 'Loop rule.')
+    await symlink('.', join(rules, 'a'))
+    await symlink('.', join(rules, 'b'))
+    // A link to a folder outside the loop is still read.
+    await write(join(root, 'shared', 'shared.md'), 'Shared rule.')
+    await symlink(join(root, 'shared'), join(rules, 'shared'))
+    await write(join(agents, 'reviewer.md'), '---\nname: reviewer\ndescription: Reviews\n---\nR.\n')
+    await symlink('.', join(agents, 'a'))
+    await symlink('..', join(agents, 'loop'))
+    await write(
+      join(root, 'team', 'writer.md'),
+      '---\nname: writer\ndescription: Writes\n---\nW.\n',
+    )
+    await symlink(join(root, 'team'), join(agents, 'team'))
+
+    const dist = (name: string) => JSON.stringify(new URL(`../src/${name}`, import.meta.url).href)
+    // In a child, so a walk that never ends fails the test instead of the run.
+    const script = `
+      const { projectInstructions } = await import(${dist('project-instructions.mjs')})
+      const { claudeAgents } = await import(${dist('claude-agents.mjs')})
+      const sources = projectInstructions(${JSON.stringify(repo)}).sources
+      const agents = claudeAgents(${JSON.stringify(repo)}, ${JSON.stringify(claudeHome)})
+      process.stdout.write(JSON.stringify({ sources, agents: agents.map((agent) => agent.source) }))
+    `
+    const ran = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+      encoding: 'utf8',
+      timeout: 10_000,
+      env: {
+        ...process.env,
+        HOME: join(root, 'home'),
+        CODEX_HOME: join(root, 'empty-home'),
+        CLAUDE_CODEX_CLAUDE_CONFIG_DIR: claudeHome,
+      },
+    })
+    assert.equal(ran.status, 0, ran.error ? String(ran.error) : ran.stderr)
+    assert.deepEqual(JSON.parse(ran.stdout), {
+      sources: [join(rules, 'r.md'), join(rules, 'shared', 'shared.md')],
+      agents: [join(agents, 'reviewer.md'), join(agents, 'team', 'writer.md')],
+    })
   } finally {
     await rm(root, { recursive: true, force: true })
   }
