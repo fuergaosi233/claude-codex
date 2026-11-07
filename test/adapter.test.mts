@@ -10169,11 +10169,10 @@ test('AskUserQuestion is bridged to Codex item/tool/requestUserInput', async () 
     assert.equal(Array.isArray(askRequest.params.questions), true)
     assert.equal(askRequest.params.questions[0].header, 'Auth')
     assert.equal(askRequest.params.questions[0].question, 'Which auth method do you want?')
-    // The bridge auto-appends an "Other" option so the App's free-text
-    // affordance lights up even when Claude didn't model one explicitly.
+    assert.equal(askRequest.params.questions[0].isOther, true)
     assert.equal(
       askRequest.params.questions[0].options.some((o: any) => o.label === 'Other'),
-      true,
+      false,
     )
 
     // Answer as the App would.

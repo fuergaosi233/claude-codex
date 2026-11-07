@@ -4701,12 +4701,11 @@ export function parseAskUserQuestions(input: Record<string, unknown>): UserInput
     }))
     // Claude's harness implicitly offers an "Other" free-text choice; surface
     // it as a Codex isOther option so the App renders the free-text affordance.
-    options.push({ label: 'Other', description: 'Provide a custom answer' })
     out.push({
       id: `q${i}`,
       header: header.slice(0, 12),
       question,
-      isOther: false,
+      isOther: true,
       isSecret: false,
       options,
     })
@@ -4734,17 +4733,19 @@ export function formatAskUserQuestionAnswers(
       answersByQuestion[questionText] = ''
       continue
     }
-    const picked = Array.isArray(slot.answers) ? slot.answers.filter((s) => s !== 'Other') : []
-    const notes = typeof slot.notes === 'string' ? slot.notes : null
-    // Other-only: notes is the user's free-text reply.
-    if (picked.length === 0 && notes) {
-      answersByQuestion[questionText] = notes
-    } else if (notes && picked.includes('Other')) {
-      answersByQuestion[questionText] = notes
-    } else {
-      // Multi-select Claude format = comma-separated labels.
-      answersByQuestion[questionText] = picked.join(', ')
-    }
+    const entries = Array.isArray(slot.answers) ? slot.answers : []
+    const picked = entries.filter((s) => !s.startsWith('user_note: '))
+    const notes =
+      entries
+        .filter((s) => s.startsWith('user_note: '))
+        .map((s) => s.slice('user_note: '.length))
+        .join('\n') || (typeof slot.notes === 'string' ? slot.notes : null)
+    const custom =
+      notes &&
+      (picked.length === 0 || picked.includes('Other') || picked.includes('None of the above'))
+    answersByQuestion[questionText] = custom
+      ? [...picked.filter((s) => s !== 'Other' && s !== 'None of the above'), notes].join(', ')
+      : picked.join(', ')
     if (notes) annotations[questionText] = { notes }
   }
   const payload = {

@@ -7913,6 +7913,7 @@ export class CodexClaudeAppServer {
     // is available, even when the upstream caller (Claude tool input, mock
     // runtime, etc.) didn't model it explicitly.
     const normalized = questions.map((q) => {
+      if (q.isOther) return q
       const options = q.options ?? []
       const hasOther = options.some((o) => o.label === 'Other')
       return hasOther
