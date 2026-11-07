@@ -13630,3 +13630,47 @@ test('thread sections paginate without losing entries at page boundaries', async
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
 })
+
+test('TTY process/spawn drains output and reports child exit status without process/kill', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-pty-exit-'))
+  const proc = spawnMockAdapter(home)
+  const reader = new JsonLineReader(proc)
+  try {
+    const cases = [
+      { command: ['sh', '-c', 'printf bye; exit 3'], code: 3, output: 'bye' },
+      { command: ['sh', '-c', 'kill -TERM $$'], code: 143, output: '' },
+      { command: ['/definitely/missing/claude-codex-pty-test'], code: 127, output: '' },
+    ]
+    for (const [index, scenario] of cases.entries()) {
+      const processHandle = `tty-exit-${index}`
+      proc.stdin.write(
+        json({
+          id: index + 1,
+          method: 'process/spawn',
+          params: {
+            processHandle,
+            command: scenario.command,
+            tty: true,
+            streamStdoutStderr: false,
+          },
+        }),
+      )
+      await reader.nextResponse(index + 1)
+      const messages = await readUntil(
+        reader,
+        (message) =>
+          message.method === 'process/exited' && message.params.processHandle === processHandle,
+      )
+      const exited = messages.at(-1)?.params
+      assert.equal(exited.exitCode, scenario.code)
+      const output = messages
+        .filter((message) => message.method === 'process/outputDelta')
+        .map((message) => Buffer.from(message.params.deltaBase64, 'base64').toString('utf8'))
+        .join('')
+      assert.equal(output, scenario.output)
+    }
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})

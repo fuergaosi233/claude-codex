@@ -6,7 +6,38 @@ def set_winsize(fd, rows, cols):
     except Exception:
         pass
 
+# The reader and stdin cleanup can both observe exit; retain the one reaped status.
+_child_status = {}
+_reap_lock = threading.Lock()
+
+def reap_status(pid, wait=True):
+    while True:
+        with _reap_lock:
+            if pid in _child_status:
+                return _child_status[pid]
+            try:
+                reaped, status = os.waitpid(pid, os.WNOHANG)
+                if reaped:
+                    if os.WIFEXITED(status):
+                        code = os.WEXITSTATUS(status)
+                    elif os.WIFSIGNALED(status):
+                        code = 128 + os.WTERMSIG(status)
+                    else:
+                        code = 1
+                    _child_status[pid] = code
+                    return code
+            except ChildProcessError:
+                return 0
+            except Exception:
+                return 1
+        if not wait:
+            return None
+        time.sleep(0.01)
+
 def cleanup_child(pid):
+    code = reap_status(pid, wait=False)
+    if code is not None:
+        return code
     try:
         os.killpg(pid, signal.SIGTERM)
     except Exception:
@@ -15,12 +46,9 @@ def cleanup_child(pid):
         except Exception:
             pass
     for _ in range(10):
-        try:
-            res, _ = os.waitpid(pid, os.WNOHANG)
-            if res != 0:
-                return
-        except Exception:
-            return
+        code = reap_status(pid, wait=False)
+        if code is not None:
+            return code
         time.sleep(0.02)
     try:
         os.killpg(pid, signal.SIGKILL)
@@ -29,6 +57,7 @@ def cleanup_child(pid):
             os.kill(pid, signal.SIGKILL)
         except Exception:
             pass
+    return reap_status(pid)
 
 def main():
     if len(sys.argv) < 2:
@@ -60,6 +89,12 @@ def main():
                 sys.stdout.flush()
         except Exception:
             pass
+        code = reap_status(pid)
+        try:
+            os.close(master)
+        except Exception:
+            pass
+        os._exit(code)
 
     t = threading.Thread(target=pty_reader, daemon=True)
     t.start()
@@ -80,7 +115,6 @@ def main():
                     rows = int(cmd_obj.get("rows", 24))
                     set_winsize(master, rows, cols)
                 elif action == "kill":
-                    cleanup_child(pid)
                     break
             except Exception:
                 pass
@@ -89,7 +123,9 @@ def main():
         pass
 
     finally:
-        cleanup_child(pid)
+        code = cleanup_child(pid)
+        t.join()
+        sys.exit(code)
 
 if __name__ == "__main__":
     main()
