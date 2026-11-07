@@ -1447,3 +1447,72 @@ function saveEnv(keys: string[]): () => void {
     }
   }
 }
+
+test('profile env files strip comments while preserving quoted content and URL fragments', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'claude-codex-env-comments-'))
+  const envFile = join(root, 'provider.env')
+  const env = {
+    HOME: root,
+    CLAUDE_CODEX_MODEL_PROFILES: JSON.stringify([{ id: 'main-model', envFile }]),
+  }
+  const expected = {
+    ANTHROPIC_BASE_URL: 'https://gw.example',
+    CLAUDE_CODE_MAX_OUTPUT_TOKENS: '32000',
+    ANTHROPIC_MODEL: 'claude-x',
+    LINK: 'http://host/#frag',
+    EMPTY: '',
+    HASH: '#literal',
+    QUOTED: ' inside # value ',
+    ADJACENT: 'value',
+  }
+  try {
+    await writeFile(
+      envFile,
+      [
+        '# full-line comment',
+        'export ANTHROPIC_BASE_URL=https://gw.example # corp gateway',
+        'CLAUDE_CODE_MAX_OUTPUT_TOKENS="32000" # cap',
+        "ANTHROPIC_MODEL='claude-x' # model",
+        'LINK=http://host/#frag',
+        'EMPTY= \t# comment',
+        'HASH=#literal',
+        'QUOTED=" inside # value " # comment',
+        "ADJACENT='value'# comment",
+        '',
+      ].join('\n'),
+      { mode: 0o600 },
+    )
+    const resolved = resolveClaudeModelProcess('main-model', env)
+    assert.ok(resolved)
+    for (const [key, value] of Object.entries(expected)) assert.equal(resolved.env[key], value, key)
+    const fingerprint = modelProfileFingerprint('main-model', env)
+    await writeFile(
+      envFile,
+      Object.entries(expected)
+        .map(([key, value]) => `${key}='${value}'`)
+        .join('\n'),
+    )
+    assert.equal(modelProfileFingerprint('main-model', env), fingerprint)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('profile env files reject unterminated quotes and text after closing quotes', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'claude-codex-env-invalid-'))
+  const envFile = join(root, 'provider.env')
+  const env = {
+    HOME: root,
+    CLAUDE_CODEX_MODEL_PROFILES: JSON.stringify([{ id: 'main-model', envFile }]),
+  }
+  try {
+    for (const value of ['"unterminated', "'unterminated", '"value"suffix', "'value' trailing"]) {
+      await writeFile(envFile, `# first line\nLINK=${value}\n`, { mode: 0o600 })
+      assert.throws(() => resolveClaudeModelProcess('main-model', env), {
+        message: `invalid env assignment at ${envFile}:2`,
+      })
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})

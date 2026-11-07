@@ -532,13 +532,16 @@ function parseEnvAssignments(text: string, path: string): Record<string, string>
     if (separator <= 0) throw new Error(`invalid env assignment at ${path}:${index + 1}`)
     const key = declaration.slice(0, separator).trim()
     if (!ENV_KEY.test(key)) throw new Error(`invalid env key at ${path}:${index + 1}`)
-    let value = declaration.slice(separator + 1).trim()
-    if (
-      value.length >= 2 &&
-      ((value.startsWith("'") && value.endsWith("'")) ||
-        (value.startsWith('"') && value.endsWith('"')))
-    ) {
-      value = value.slice(1, -1)
+    const rawValue = declaration.slice(separator + 1)
+    let value = rawValue.trim()
+    if (value.startsWith("'") || value.startsWith('"')) {
+      const closing = value.indexOf(value.charAt(0), 1)
+      if (closing === -1 || !/^\s*(?:#.*)?$/.test(value.slice(closing + 1)))
+        throw new Error(`invalid env assignment at ${path}:${index + 1}`)
+      value = value.slice(1, closing)
+    } else {
+      const comment = rawValue.search(/\s#/)
+      value = (comment === -1 ? rawValue : rawValue.slice(0, comment)).trim()
     }
     values[key] = value
   }
