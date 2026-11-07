@@ -5760,7 +5760,7 @@ export class CodexClaudeAppServer {
               const started = itemStartedAtMs.get(itemId)
               return started == null ? null : Math.max(0, nowMillis() - started)
             })()
-            const parsedExitCode = parseExitCodeFromResult(event.content) ?? (event.isError ? 1 : 0)
+            const parsedExitCode = event.isError ? (parseExitCodeFromResult(event.content) ?? 1) : 0
             const output = exploreItemIds.has(itemId) ? capOutput(resultText) : resultText
             const updated = this.store.updateItem(turn.id, itemId, (item) => {
               if (item.type === 'commandExecution') {

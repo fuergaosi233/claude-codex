@@ -1256,7 +1256,7 @@ export function parseExitCodeFromResult(content: unknown): number | null {
             .join('')
         : ''
   if (!text) return null
-  const match = text.match(/(?:Exit code|exit status|exit code):\s*(-?\d+)/i)
+  const match = text.match(/(?:^|\n)(?:Exit code|exit status):?\s*(-?\d+)\s*$/i)
   if (!match) return null
   const code = Number(match[1])
   return Number.isFinite(code) ? code : null
