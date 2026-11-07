@@ -1000,6 +1000,7 @@ export interface RuntimeHandlers {
   onEvent(event: RuntimeEvent): Promise<void> | void
   onPermissionRequest(
     event: Extract<RuntimeEvent, { type: 'permission_request' }>,
+    signal?: AbortSignal,
   ): Promise<PermissionDecision>
   // Routed when Claude invokes AskUserQuestion. The server bridges this to
   // Codex's native `item/tool/requestUserInput` reverse RPC so the App can
@@ -1009,6 +1010,7 @@ export interface RuntimeHandlers {
   // empty answer to the model.
   onUserInputRequest?(
     event: Extract<RuntimeEvent, { type: 'user_input_request' }>,
+    signal?: AbortSignal,
   ): Promise<UserInputAnswers>
   // Routed when an MCP server elicits input. The server bridges it to
   // Codex's `mcpServer/elicitation/request`; `signal` aborts when Claude

@@ -6032,7 +6032,7 @@ export class CodexClaudeAppServer {
             throw new Error(event.message)
           }
         },
-        onPermissionRequest: async (event) => {
+        onPermissionRequest: async (event, signal) => {
           if (!turnIsActive()) return { decision: 'cancel' }
           completeMessage()
           // The request can overtake the finished call; the approval must
@@ -6081,6 +6081,7 @@ export class CodexClaudeAppServer {
               itemId,
               event,
               imageReadFallbacks.get(itemId),
+              signal,
             ),
           )
           if (!turnIsActive()) return { decision: 'cancel' }
@@ -6095,7 +6096,7 @@ export class CodexClaudeAppServer {
           }
           return decision
         },
-        onUserInputRequest: async (event) => {
+        onUserInputRequest: async (event, signal) => {
           if (!turnIsActive()) return { answers: {} }
           completeMessage()
           // Render AskUserQuestion as Codex's native dynamicToolCall item +
@@ -6125,7 +6126,7 @@ export class CodexClaudeAppServer {
             activeFlags: ['waitingOnUserInput'],
           })
           const answers = await watchdog.whilePaused(
-            this.requestUserInput(peer, thread.id, turn.id, item.id, event.questions),
+            this.requestUserInput(peer, thread.id, turn.id, item.id, event.questions, signal),
           )
           if (!turnIsActive()) return { answers: {} }
           const contentItems = userInputAnswersAsContent(event.questions, answers)
@@ -7692,6 +7693,7 @@ export class CodexClaudeAppServer {
     // The command an item that is not one asks about, such as the Read
     // behind an image the App shows.
     commandFallback?: ThreadItem,
+    signal?: AbortSignal,
   ): Promise<PermissionDecision> {
     // Defensive: if Codex App selected approvalPolicy=never (or "Full access"
     // sandbox), auto-accept without bouncing the request to the user. The
@@ -7720,7 +7722,7 @@ export class CodexClaudeAppServer {
       const tool = event.toolName.startsWith(named)
         ? event.toolName.slice(named.length)
         : (mcpTool[2] ?? '')
-      return this.requestMcpToolApproval(peer, threadId, turnId, event, server, tool)
+      return this.requestMcpToolApproval(peer, threadId, turnId, event, server, tool, signal)
     }
     const sessionKey = approvalSessionKey(event.toolName, event.input)
     if (!userOnly && this.sessionApprovals.get(threadId)?.has(sessionKey))
@@ -7809,7 +7811,10 @@ export class CodexClaudeAppServer {
 
     let response: unknown
     try {
-      response = await this.sendServerRequest(peer, method, requestId, params)
+      response = await this.sendServerRequest(peer, method, requestId, params, signal)
+    } catch (error) {
+      if (signal?.aborted) return { decision: 'decline' }
+      throw error
     } finally {
       this.notify(peer, { method: 'serverRequest/resolved', params: { threadId, requestId } })
       this.setThreadStatus(peer, threadId, { type: 'active', activeFlags: [] })
@@ -7846,6 +7851,7 @@ export class CodexClaudeAppServer {
     event: Extract<RuntimeEvent, { type: 'permission_request' }>,
     server: string,
     tool: string,
+    signal?: AbortSignal,
   ): Promise<PermissionDecision> {
     const sessionKey = approvalSessionKey(event.toolName, event.input)
     // App rule: auto-review
@@ -7880,6 +7886,7 @@ export class CodexClaudeAppServer {
           },
         },
         'waitingOnApproval',
+        signal,
       )
     } catch {
       // The App could not answer: refuse this call and let Claude go on.
@@ -7907,6 +7914,7 @@ export class CodexClaudeAppServer {
     turnId: string,
     itemId: string,
     questions: UserInputQuestion[],
+    signal?: AbortSignal,
   ): Promise<UserInputAnswers> {
     const requestId = newId()
     // Always guarantee an "Other" affordance so the App's free-text fallback
@@ -7925,7 +7933,16 @@ export class CodexClaudeAppServer {
     const params = { threadId, turnId, itemId, questions: normalized }
     let response: unknown
     try {
-      response = await this.sendServerRequest(peer, 'item/tool/requestUserInput', requestId, params)
+      response = await this.sendServerRequest(
+        peer,
+        'item/tool/requestUserInput',
+        requestId,
+        params,
+        signal,
+      )
+    } catch (error) {
+      if (signal?.aborted) return { answers: {} }
+      throw error
     } finally {
       this.notify(peer, { method: 'serverRequest/resolved', params: { threadId, requestId } })
     }

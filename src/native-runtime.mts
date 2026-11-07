@@ -1097,6 +1097,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
     > => {
       if (GOAL_TOOL_NAMES.has(toolName) || toolName === SESSION_CHANGES_TOOL)
         return { behavior: 'allow' }
+      if (options.signal.aborted) return { behavior: 'deny', message: 'cancelled' }
       const toolUseId = options.toolUseID || `tool-${newId()}`
       // Claude Code says the user has to answer this ask themselves (the card
       // is the tool's own interface, or its disclosure only shows locally): no
@@ -1160,15 +1161,22 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
           if (typeof pending.handlers.onUserInputRequest !== 'function') {
             return { behavior: 'deny', message: 'user input not available in this runtime' }
           }
-          const answers = await pending.handlers.onUserInputRequest({
-            type: 'user_input_request',
-            requestId,
-            toolUseId,
-            questions,
-          })
+          const answers = await untilToolCancelled(options.signal, () =>
+            pending.handlers.onUserInputRequest!(
+              {
+                type: 'user_input_request',
+                requestId,
+                toolUseId,
+                questions,
+              },
+              options.signal,
+            ),
+          )
+          if (options.signal.aborted) return { behavior: 'deny', message: 'cancelled' }
           const formatted = formatAskUserQuestionAnswers(input, questions, answers)
           return { behavior: 'deny', message: formatted }
         } catch (err) {
+          if (options.signal.aborted) return { behavior: 'deny', message: 'cancelled' }
           const msg = err instanceof Error ? err.message : String(err)
           return { behavior: 'deny', message: `AskUserQuestion failed: ${msg}` }
         }
@@ -1190,30 +1198,46 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       // still want THIS tool to be approved by the user (otherwise nested
       // tools would silently bypass approval). The server-side already
       // routes everything through onPermissionRequest; nothing to change here.
-      const decision = await new Promise<PermissionDecision>((resolve) => {
-        this.permissions.set(requestId, { resolve })
-        void Promise.resolve(
-          pending.handlers.onPermissionRequest({
-            type: 'permission_request',
-            requestId,
-            toolUseId,
-            toolName,
-            input,
-            reason: options.decisionReason?.trim() || null,
-            title: options.title?.trim() || null,
-            blockedPath: options.blockedPath || null,
-            mcpServer: options.mcpServer?.name || null,
-            ...(options.suppressAlwaysAllowRule ? { suppressSessionApproval: true } : {}),
-            ...(userOnly ? { requiresUser: true } : {}),
-            ...(suggestions.length > 0 ? { suggestions } : {}),
-          }),
-        ).then((d) => {
-          // The handler may resolve synchronously via the App's permission
-          // response. Surface that here.
-          this.permissions.delete(requestId)
-          resolve(d)
-        })
-      })
+      let decision: PermissionDecision
+      try {
+        decision = await untilToolCancelled(
+          options.signal,
+          () =>
+            new Promise<PermissionDecision>((resolve, reject) => {
+              this.permissions.set(requestId, { resolve })
+              void Promise.resolve(
+                pending.handlers.onPermissionRequest(
+                  {
+                    type: 'permission_request',
+                    requestId,
+                    toolUseId,
+                    toolName,
+                    input,
+                    reason: options.decisionReason?.trim() || null,
+                    title: options.title?.trim() || null,
+                    blockedPath: options.blockedPath || null,
+                    mcpServer: options.mcpServer?.name || null,
+                    ...(options.suppressAlwaysAllowRule ? { suppressSessionApproval: true } : {}),
+                    ...(userOnly ? { requiresUser: true } : {}),
+                    ...(suggestions.length > 0 ? { suggestions } : {}),
+                  },
+                  options.signal,
+                ),
+              ).then((d) => {
+                // The handler may resolve synchronously via the App's permission
+                // response. Surface that here.
+                this.permissions.delete(requestId)
+                resolve(d)
+              }, reject)
+            }),
+        )
+      } catch (error) {
+        if (options.signal.aborted) return { behavior: 'deny', message: 'cancelled' }
+        throw error
+      } finally {
+        this.permissions.delete(requestId)
+      }
+      if (options.signal.aborted) return { behavior: 'deny', message: 'cancelled' }
 
       if (decision.decision === 'accept' || decision.decision === 'acceptForSession') {
         // Claude Code applies the permission changes the user chose with the
@@ -4753,4 +4777,26 @@ export function formatAskUserQuestionAnswers(
     ...(Object.keys(annotations).length > 0 ? { annotations } : {}),
   }
   return JSON.stringify(payload)
+}
+
+// Settle even when a consumer ignores cancellation, without retaining a signal listener.
+function untilToolCancelled<T>(signal: AbortSignal, run: () => Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => {
+      signal.removeEventListener('abort', abort)
+      reject(new Error('cancelled'))
+    }
+    if (signal.aborted) {
+      abort()
+      return
+    }
+    signal.addEventListener('abort', abort, { once: true })
+    void Promise.resolve()
+      .then(() => {
+        if (signal.aborted) throw new Error('cancelled')
+        return run()
+      })
+      .then(resolve, reject)
+      .finally(() => signal.removeEventListener('abort', abort))
+  })
 }
