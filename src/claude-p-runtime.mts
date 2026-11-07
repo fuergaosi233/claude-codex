@@ -169,6 +169,7 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
         timedOut = true
         terminateProcessTree(child, 'SIGTERM')
         killTimer = setTimeout(() => {
+          // Resnapshot descendants: more may have spawned since SIGTERM.
           if (child.exitCode === null && child.signalCode === null)
             terminateProcessTree(child, 'SIGKILL')
         }, 1500).unref()
