@@ -28,7 +28,11 @@ export function gitInfoFor(
       if (now - entry.at >= GIT_INFO_TTL_MS) gitInfoCache.delete(key)
     if (gitInfoCache.size >= MAX_CACHED_DIRECTORIES) gitInfoCache.clear()
   }
-  const info = readGitInfo(cwd)
+  const info = readGitInfo(cwd).catch((error) => {
+    // A superseded lookup must not evict a newer fresh lookup.
+    if (gitInfoCache.get(cwd)?.info === info) gitInfoCache.delete(cwd)
+    throw error
+  })
   gitInfoCache.set(cwd, { at: now, info })
   return info
 }
@@ -52,7 +56,9 @@ async function git(cwd: string, args: string[]): Promise<string | null> {
       maxBuffer: 64 * 1024,
     })
     return stdout.trim() || null
-  } catch {
+  } catch (error) {
+    const err = error as { killed?: boolean; signal?: string | null; code?: string | number | null }
+    if (err?.killed || err?.signal || err?.code === 'ENOENT') throw error
     // Outside a repository, on an unborn branch or without an origin.
     return null
   }
