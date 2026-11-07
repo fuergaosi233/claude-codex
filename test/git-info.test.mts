@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -106,8 +106,52 @@ test('gitInfoFor reads HEAD, its branch and origin, and caches per directory', a
     assert.deepEqual(await gitInfoFor(repo, { fresh: true }), { ...expected, branch: null })
 
     assert.equal(await gitInfoFor(root), null)
-    assert.equal(await gitInfoFor(join(root, 'missing')), null)
+    await assert.rejects(gitInfoFor(join(root, 'missing')), { code: 'ENOENT' })
   } finally {
     await rm(root, { recursive: true, force: true })
   }
 })
+
+for (const failure of ['timeout', 'signal', 'spawn']) {
+  test(`gitInfoFor rejects ${failure} and retries without a cached partial result`, async () => {
+    const root = await mkdtemp(join(tmpdir(), 'claude-codex-git-failure-'))
+    const previousPath = process.env.PATH
+    const executable = join(root, 'git')
+    const healthy = `#!/bin/sh
+case "$1" in
+  rev-parse) echo abc123 ;;
+  symbolic-ref) echo feature/recovered ;;
+  remote) echo https://example.com/repo.git ;;
+esac
+`
+    try {
+      process.env.PATH = root
+      if (failure !== 'spawn') {
+        const action = failure === 'timeout' ? 'exec /bin/sleep 5' : 'kill -KILL $$'
+        await writeFile(
+          executable,
+          healthy.replace('symbolic-ref) echo feature/recovered', () => `symbolic-ref) ${action}`),
+          { mode: 0o755 },
+        )
+      }
+      await assert.rejects(gitInfoFor(root), (error: unknown) => {
+        const err = error as { killed?: boolean; signal?: string; code?: string }
+        if (failure === 'spawn') assert.equal(err.code, 'ENOENT')
+        else if (failure === 'timeout') assert.equal(err.killed, true)
+        else assert.equal(err.signal, 'SIGKILL')
+        return true
+      })
+      await writeFile(executable, healthy, { mode: 0o755 })
+      // No fresh option: failure must have evicted the rejected promise.
+      assert.deepEqual(await gitInfoFor(root), {
+        sha: 'abc123',
+        branch: 'feature/recovered',
+        originUrl: 'https://example.com/repo.git',
+      })
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH
+      else process.env.PATH = previousPath
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+}
