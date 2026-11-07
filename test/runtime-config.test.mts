@@ -3400,12 +3400,14 @@ test('claude-p runtime timeout terminates spawned process tree', async () => {
     command,
     extraArgs: [],
     // Long enough for a loaded machine to start the fake and its grandchild.
-    timeoutMs: 3_000,
+    timeoutMs: 8_000,
     skipPermissions: false,
     resume: false,
   })
+  let childPid: number | undefined
+  let timedOut: Promise<void> | undefined
   try {
-    await assert.rejects(
+    timedOut = assert.rejects(
       runtime.runTurn(
         {
           threadId: 'thread-timeout',
@@ -3436,10 +3438,35 @@ test('claude-p runtime timeout terminates spawned process tree', async () => {
       /timed out/,
     )
 
-    const childPid = Number(await readFile(childPidFile, 'utf8'))
-    await new Promise((resolve) => setTimeout(resolve, 600))
+    void timedOut.catch(() => {})
+    const readyDeadline = Date.now() + 6_000
+    while (Date.now() < readyDeadline) {
+      try {
+        const pid = Number(await readFile(childPidFile, 'utf8'))
+        if (Number.isInteger(pid) && pid > 0) {
+          childPid = pid
+          break
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    assert.ok(childPid, 'the fake must publish its child PID before the turn times out')
+    await timedOut
+    const exitDeadline = Date.now() + 3_000
+    while (processIsAlive(childPid) && Date.now() < exitDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
     assert.equal(processIsAlive(childPid), false)
   } finally {
+    await timedOut?.catch(() => {})
+    // Do not leave the detached fixture running if readiness or termination fails.
+    if (childPid && processIsAlive(childPid)) {
+      try {
+        process.kill(childPid, 'SIGKILL')
+      } catch {}
+    }
     await rm(tmp, { recursive: true, force: true })
   }
 })
