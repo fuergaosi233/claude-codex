@@ -7,6 +7,7 @@ import { delimiter, join, resolve } from 'node:path'
 import test from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { isDeepStrictEqual } from 'node:util'
+import { searchPattern } from '../src/thread-history.mjs'
 
 // The App methods end to end: each test drives its own mock app-server over
 // stdio, the way the App does.
@@ -1882,5 +1883,47 @@ test('thread/delete removes a thread with its subagents, even mid-turn', async (
     await delay(300)
     await assert.rejects(server.request('thread/read', { threadId: busy }), /unknown thread/)
     assert.deepEqual(ids(await server.request('thread/list')), [fork.id])
+  })
+})
+
+test('literal search patterns accept hyphens, slashes and regex metacharacters', () => {
+  for (const term of [
+    'claude-codex',
+    '2026-11-06',
+    '--force',
+    'path/to-file',
+    'a.*+[b](c)?^$|{d}\\e',
+  ]) {
+    const pattern = searchPattern(term)
+    assert.ok(pattern)
+    const match = pattern.exec(`prefix ${term.toUpperCase()} suffix`)
+    assert.equal(match?.[0], term.toUpperCase())
+  }
+  assert.equal(searchPattern('  '), null)
+})
+
+test('thread searches match hyphenated terms literally in both RPCs', async () => {
+  await withServer(async (server) => {
+    const threadId = await server.startThread()
+    const turnId = await server.runTurn(threadId, 'CLAUDE-CODEX 2026-11-06 --force path/to-file')
+    const other = await server.startThread()
+    await server.runTurn(other, 'unrelated content')
+    for (const term of ['claude-codex', '2026-11-06', '--force', 'path/to-file']) {
+      const threads = await server.request('thread/search', { searchTerm: term })
+      assert.deepEqual(
+        threads.data.map((entry: any) => entry.thread.id),
+        [threadId],
+      )
+      const occurrences = await server.request('thread/searchOccurrences', {
+        threadId,
+        searchTerm: term,
+      })
+      assert.equal(occurrences.data.length, 2)
+      for (const entry of occurrences.data) {
+        assert.equal(entry.turnCursor, turnId)
+        const { start, end } = entry.snippetMatchRange
+        assert.equal(entry.snippet.slice(start, end).toLowerCase(), term)
+      }
+    }
   })
 })

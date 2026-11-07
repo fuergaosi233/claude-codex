@@ -221,7 +221,7 @@ export function visibleMessageText(item: ThreadItem): string | null {
 // Case-insensitive literal search; null for a blank term.
 export function searchPattern(term: string): RegExp | null {
   if (!term.trim()) return null
-  return new RegExp(term.replace(/[.*+?^${}()|[\]\\/-]/g, '\\$&'), 'giu')
+  return new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'giu')
 }
 
 const SNIPPET_BEFORE = 40
