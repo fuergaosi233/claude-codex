@@ -7,6 +7,7 @@ import { delimiter, join, resolve } from 'node:path'
 import test from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { isDeepStrictEqual } from 'node:util'
+import { scriptedRuntime, withInProcessApp } from './fixtures/in-process-app.mjs'
 
 // The App methods end to end: each test drives its own mock app-server over
 // stdio, the way the App does.
@@ -1882,5 +1883,52 @@ test('thread/delete removes a thread with its subagents, even mid-turn', async (
     await delay(300)
     await assert.rejects(server.request('thread/read', { threadId: busy }), /unknown thread/)
     assert.deepEqual(ids(await server.request('thread/list')), [fork.id])
+  })
+})
+
+test('review and compaction reject a running turn without losing its output', async () => {
+  let release!: () => void
+  const released = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  let started!: () => void
+  const ready = new Promise<void>((resolve) => {
+    started = resolve
+  })
+  let runs = 0
+  const runtime = scriptedRuntime(async (_context, handlers) => {
+    runs++
+    await handlers.onEvent({ type: 'text_delta', delta: 'Before. ' })
+    started()
+    await released
+    await handlers.onEvent({ type: 'text_delta', delta: 'After.' })
+    await handlers.onEvent({ type: 'completed', success: true, result: 'Before. After.' })
+  })
+  await withInProcessApp(runtime, async (app) => {
+    const threadId = await app.startThread()
+    const turnId = await app.startTurn(threadId, 'hold the original turn')
+    await ready
+    try {
+      assert.equal(app.store.getTurn(turnId)?.status, 'inProgress')
+      for (const [method, message] of [
+        ['review/start', 'cannot start review'],
+        ['thread/compact/start', 'cannot compact'],
+      ] as const) {
+        const reply = await app.call(method, { threadId, target: { type: 'uncommittedChanges' } })
+        assert.equal(reply.error?.code, -32600)
+        assert.ok(reply.error?.message.includes(message))
+      }
+    } finally {
+      release()
+    }
+    assert.equal((await app.turnCompleted(turnId)).status, 'completed')
+    assert.equal(runs, 1)
+    const { thread } = await app.request('thread/read', { threadId, includeTurns: true })
+    assert.equal(thread.turns.length, 1)
+    assert.equal(thread.turns[0].id, turnId)
+    assert.equal(
+      thread.turns[0].items.find((item: any) => item.type === 'agentMessage')?.text,
+      'Before. After.',
+    )
   })
 })
