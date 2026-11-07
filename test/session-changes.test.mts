@@ -826,3 +826,35 @@ test("the adapter gives Claude the changes of the thread's history", async () =>
     )
   })
 })
+
+for (const originalFile of ['one\ntwo\nthree\n', 'one\r\ntwo\r\nthree\r\n', undefined]) {
+  test(`CRLF disk files diff one line with ${originalFile === undefined ? 'reconstructed' : originalFile.includes('\r') ? 'CRLF' : 'LF'} baselines`, async () => {
+    await withDirs(async (dirs) => {
+      const file = join(dirs.cwd, 'windows.bat')
+      await put(file, 'one\r\nTWO\r\nthree\r\n')
+      await put(
+        join(dirs.project, 'S1.jsonl'),
+        lines(edit('t1', file, ['two\nthree', 'TWO\nthree'], 1, originalFile)),
+      )
+      const report = await changesOf(dirs, { S1: null })
+      assert.match(report, /\(\+1 -1\)/)
+      assert.match(report, /\n-two\n\+TWO\n/)
+      assert.doesNotMatch(report, /\r/)
+    })
+  })
+}
+
+test('CRLF files edited back to their original contents report no changes', async () => {
+  await withDirs(async (dirs) => {
+    const file = join(dirs.cwd, 'windows.bat')
+    await put(file, 'one\r\ntwo\r\nthree\r\n')
+    await put(
+      join(dirs.project, 'S1.jsonl'),
+      lines(
+        edit('t1', file, ['two', 'TWO'], 1, 'one\ntwo\nthree\n'),
+        edit('t2', file, ['TWO', 'two'], 2, 'one\nTWO\nthree\n'),
+      ),
+    )
+    assert.equal(await changesOf(dirs, { S1: null }), `${lead()}\n\nNone.`)
+  })
+})
