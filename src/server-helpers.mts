@@ -325,6 +325,48 @@ export function summarizeRpcParams(method: string, params: unknown): unknown {
       inputTypes: Array.isArray(rec.input) ? rec.input.map((item) => asRecord(item).type) : [],
     }
   }
+  if (method === 'turn/steer') {
+    return {
+      threadId: rec.threadId,
+      inputTypes: Array.isArray(rec.input) ? rec.input.map((item) => asRecord(item).type) : [],
+    }
+  }
+  if (method === 'turn/diff/updated') {
+    return {
+      threadId: rec.threadId,
+      diffBytes: typeof rec.diff === 'string' ? Buffer.byteLength(rec.diff, 'utf8') : 0,
+    }
+  }
+  if (method === 'process/writeStdin' || method === 'command/exec/write') {
+    return {
+      processHandle: rec.processHandle,
+      processId: rec.processId,
+      deltaBytes:
+        typeof rec.deltaBase64 === 'string'
+          ? Buffer.from(rec.deltaBase64, 'base64').byteLength
+          : typeof rec.delta === 'string'
+            ? Buffer.byteLength(rec.delta, 'utf8')
+            : 0,
+      closeStdin: rec.closeStdin,
+    }
+  }
+  if (method === 'fs/writeFile') {
+    return {
+      path: rec.path,
+      bytes:
+        typeof rec.dataBase64 === 'string'
+          ? Buffer.from(rec.dataBase64, 'base64').byteLength
+          : typeof rec.data === 'string'
+            ? Buffer.byteLength(rec.data, 'utf8')
+            : 0,
+    }
+  }
+  if (method === 'thread/inject_items') {
+    return {
+      threadId: rec.threadId,
+      itemCount: Array.isArray(rec.items) ? rec.items.length : 0,
+    }
+  }
   if (method === 'process/spawn' || method === 'command/exec') {
     return {
       processHandle: rec.processHandle,
@@ -352,7 +394,7 @@ export function summarizeRpcParams(method: string, params: unknown): unknown {
       capReached: rec.capReached,
     }
   }
-  if (method === 'item/agentMessage/delta') {
+  if (method.endsWith('/delta') || method.endsWith('Delta')) {
     return {
       threadId: rec.threadId,
       turnId: rec.turnId,
