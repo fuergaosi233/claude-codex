@@ -305,11 +305,15 @@ export class CodexProxyRuntime implements ClaudeRuntime {
         if (pending.resolved) return
         const usage = asRecord(event.usage)
         if (Object.keys(usage).length > 0) {
+          // Codex input includes cached tokens; the shared Claude usage shape does not.
+          const rawInput = typeof usage.input_tokens === 'number' ? usage.input_tokens : 0
+          const rawCached =
+            typeof usage.cached_input_tokens === 'number' ? usage.cached_input_tokens : 0
           await handlers.onEvent({
             type: 'usage',
             usage: {
-              input_tokens: usage.input_tokens ?? 0,
-              cache_read_input_tokens: usage.cached_input_tokens ?? 0,
+              input_tokens: Math.max(0, rawInput - rawCached),
+              cache_read_input_tokens: rawCached,
               output_tokens: usage.output_tokens ?? 0,
               reasoning_output_tokens: usage.reasoning_output_tokens ?? 0,
             },
