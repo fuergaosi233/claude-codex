@@ -158,7 +158,7 @@ The file holds either an object with a `models` array (and optionally
 environment; a missing variable is an error. `executable` and `envFile` may
 also start with `~/`, and a relative path is taken from the profiles file's
 folder (the adapter's working folder for inline profiles). A key in `env` that looks like a secret (its name contains `TOKEN`,
-`KEY`, `SECRET`, `PASSWORD` or `AUTH`) must be a single `${VAR}` reference, so
+`KEY`, `SECRET`, `PASSWORD` or `AUTH`, or is `ANTHROPIC_CUSTOM_HEADERS`) must be a single `${VAR}` reference, so
 the file itself never holds a credential. A token budget such as
 `CLAUDE_CODE_MAX_OUTPUT_TOKENS` (`TOKENS` at the end of a word) is no secret.
 `${VAR}` in the env file also reads the file's earlier lines, and in `env`

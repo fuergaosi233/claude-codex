@@ -1447,3 +1447,59 @@ function saveEnv(keys: string[]): () => void {
     }
   }
 }
+
+test('custom header credential rotation in env files keeps profile fingerprints and chats', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'claude-codex-header-rotation-'))
+  const envFile = join(root, 'provider.env')
+  const env = {
+    HOME: root,
+    CLAUDE_CODEX_MODEL_PROFILES: JSON.stringify([{ id: 'main-model', envFile }]),
+  }
+  try {
+    await writeFile(envFile, 'ANTHROPIC_CUSTOM_HEADERS=x-api-key: old\n', { mode: 0o600 })
+    const pinned = modelProfileFingerprint('main-model', env)
+    assert.ok(pinned)
+    await writeFile(envFile, 'ANTHROPIC_CUSTOM_HEADERS=x-api-key: new\n')
+    assert.equal(modelProfileFingerprint('main-model', env), pinned)
+    assert.equal(
+      resolveClaudeModelProcess('main-model', env, pinned)?.env.ANTHROPIC_CUSTOM_HEADERS,
+      'x-api-key: new',
+    )
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('custom headers in profile env reject literal credentials', () => {
+  assert.throws(
+    () =>
+      loadClaudeModelProfiles({
+        CLAUDE_CODEX_MODEL_PROFILES: JSON.stringify([
+          {
+            id: 'main-model',
+            env: { ANTHROPIC_CUSTOM_HEADERS: 'x-api-key: literal' },
+          },
+        ]),
+      }),
+    /secret-like environment key must reference a parent environment variable: ANTHROPIC_CUSTOM_HEADERS/,
+  )
+})
+
+test('custom headers resolve parent references without pinning credential values', () => {
+  const env = {
+    HEADER_VAR: 'Authorization: Bearer old',
+    CLAUDE_CODEX_MODEL_PROFILES: JSON.stringify([
+      {
+        id: 'main-model',
+        inheritEnv: ['*'],
+        env: { ANTHROPIC_CUSTOM_HEADERS: '${HEADER_VAR}' },
+      },
+    ]),
+  }
+  const pinned = modelProfileFingerprint('main-model', env)
+  assert.ok(pinned)
+  const rotated = { ...env, HEADER_VAR: 'Authorization: Bearer new' }
+  assert.equal(modelProfileFingerprint('main-model', rotated), pinned)
+  const resolved = resolveClaudeModelProcess('main-model', rotated, pinned)
+  assert.equal(resolved?.env.ANTHROPIC_CUSTOM_HEADERS, 'Authorization: Bearer new')
+})
