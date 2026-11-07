@@ -1502,6 +1502,33 @@ test('threads carry the git info of their workspace without listing running git'
   }
 })
 
+test('getConversationSummary refuses a thread it does not know and dates one it does', async () => {
+  await withServer(async (server) => {
+    // The newest thread, whose summary an unknown id must not get.
+    const threadId = await server.startThread()
+    const refused = (params: Record<string, unknown>, id: string) =>
+      assert.rejects(server.request('getConversationSummary', params), (error: unknown) => {
+        assert.ok(error instanceof RpcError)
+        assert.equal(error.code, -32600)
+        assert.equal(error.message, `unknown thread: ${id}`)
+        return true
+      })
+    await refused({ conversationId: 'nope' }, 'nope')
+    // Threads here have no rollout file, so no rollout path names one.
+    await refused({ rolloutPath: '/nope/rollout.jsonl' }, '/nope/rollout.jsonl')
+
+    // The thread's own times, which are whole seconds, not the request's.
+    await delay(1100)
+    await server.request('thread/name/set', { threadId, name: 'renamed later' })
+    const { thread } = await server.request('thread/read', { threadId })
+    assert.ok(thread.updatedAt > thread.createdAt)
+    const { summary } = await server.request('getConversationSummary', { conversationId: threadId })
+    assert.equal(summary.conversationId, threadId)
+    assert.equal(summary.timestamp, new Date(thread.createdAt * 1000).toISOString())
+    assert.equal(summary.updatedAt, new Date(thread.updatedAt * 1000).toISOString())
+  })
+})
+
 test('notifications a client opts out of are not sent, nor the diff after each tool run', async () => {
   // A git on PATH that logs each run, to count the diffs the server takes.
   const tools = await mkdtemp(join(tmpdir(), 'claude-codex-git-runs-'))

@@ -9379,20 +9379,21 @@ export class CodexClaudeAppServer {
 
   private getConversationSummary(params: Record<string, unknown>): unknown {
     const threadId = stringOr(params.conversationId, '')
-    const thread = this.store.getThread(threadId) ?? this.store.listThreads({ limit: 1 }).at(0)
-    const now = new Date().toISOString()
+    const thread = this.store.getThread(threadId)
+    // Threads here have no rollout file, so a rolloutPath names none of them.
+    if (!thread) throw unknownThread(threadId || stringOr(params.rolloutPath, ''))
     return {
       summary: {
-        conversationId: thread?.id ?? threadId,
+        conversationId: thread.id,
         path: '',
-        preview: thread?.preview ?? '',
-        timestamp: now,
-        updatedAt: now,
-        modelProvider: thread?.modelProvider ?? 'claude-code',
-        cwd: thread?.cwd ?? process.cwd(),
+        preview: thread.preview,
+        timestamp: new Date(thread.createdAt * 1000).toISOString(),
+        updatedAt: new Date(thread.updatedAt * 1000).toISOString(),
+        modelProvider: thread.modelProvider,
+        cwd: thread.cwd,
         cliVersion: codexCliVersion(),
-        source: normalizeSessionSource(thread?.source),
-        gitInfo: thread?.gitInfo
+        source: normalizeSessionSource(thread.source),
+        gitInfo: thread.gitInfo
           ? {
               sha: thread.gitInfo.sha,
               branch: thread.gitInfo.branch,
