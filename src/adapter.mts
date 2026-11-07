@@ -14,6 +14,7 @@ import {
   parseProxySockArg,
   prepareWebSocketAuth,
   type RunningTransport,
+  removeStaleSocket,
   runProxy,
   startStdioTransport,
   startWebSocketTransport,
@@ -310,9 +311,7 @@ function ensureSingleUnixDaemon(listen: string): string {
       process.exit(0)
     }
   }
-  try {
-    if (existsSync(socketPath)) unlinkSync(socketPath)
-  } catch {}
+  checkOptions(() => removeStaleSocket(socketPath))
   writeFileSync(pidFile, `${process.pid}\n`, { mode: 0o600 })
   try {
     chmodSync(dirname(socketPath), 0o700)

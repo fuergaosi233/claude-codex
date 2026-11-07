@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, rmSync } from 'node:fs'
+import { lstatSync, rmSync } from 'node:fs'
 import http from 'node:http'
 import net from 'node:net'
 import readline from 'node:readline'
@@ -152,7 +152,7 @@ export async function startWebSocketTransport(
     server.once('listening', resolve)
     if (parsed.kind === 'unix') {
       ensureParent(parsed.path)
-      if (existsSync(parsed.path)) rmSync(parsed.path, { force: true })
+      removeStaleSocket(parsed.path)
       server.listen(parsed.path)
     } else {
       server.listen(parsed.port, unbracketHost(parsed.host))
@@ -199,6 +199,15 @@ export async function startWebSocketTransport(
       if (socketPath && fileId(socketPath) === ownSocket) rmSync(socketPath, { force: true })
     },
   }
+}
+
+// Clears the way for a listener at the path: a socket there is one an earlier
+// daemon left behind, anything else is the user's and is never removed.
+export function removeStaleSocket(path: string): void {
+  const stat = lstatSync(path, { throwIfNoEntry: false })
+  if (!stat) return
+  if (!stat.isSocket()) throw new Error(`refusing to replace non-socket file at ${path}`)
+  rmSync(path, { force: true })
 }
 
 // A file's device and inode, or null when nothing is at the path.
