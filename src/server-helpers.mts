@@ -1,5 +1,5 @@
 import { type ChildProcess, execFile, spawn } from 'node:child_process'
-import { type FSWatcher, readFileSync, watch, writeFileSync } from 'node:fs'
+import { constants, type FSWatcher, readFileSync, watch, writeFileSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import { promisify } from 'node:util'
 import type { ConfigEdit } from './app-settings.mjs'
@@ -1505,7 +1505,7 @@ export async function gitDiff(cwd: string): Promise<string> {
 
 export async function gitUntrackedDiff(cwd: string): Promise<string> {
   try {
-    const { readFile } = await import('node:fs/promises')
+    const { lstat, open, readlink } = await import('node:fs/promises')
     const { stdout } = await execFileAsync(
       'git',
       ['ls-files', '--others', '--exclude-standard', '-z'],
@@ -1518,9 +1518,30 @@ export async function gitUntrackedDiff(cwd: string): Promise<string> {
     const paths = stdout.split('\0').filter(Boolean).slice(0, 50)
     const diffs: string[] = []
     for (const path of paths) {
-      const bytes = await readFile(`${cwd}/${path}`)
-      if (bytes.includes(0)) continue
-      diffs.push(addedFileDiff(path, bytes.toString('utf8')))
+      try {
+        const fullPath = join(cwd, path)
+        const stats = await lstat(fullPath)
+        if (stats.isSymbolicLink()) {
+          diffs.push(addedFileDiff(path, await readlink(fullPath), '120000'))
+        } else if (stats.isFile()) {
+          // Refuse a link swapped in after lstat, and never block on a FIFO.
+          const file = await open(
+            fullPath,
+            constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+          )
+          try {
+            if (!(await file.stat()).isFile()) continue
+            const bytes = await file.readFile()
+            if (bytes.includes(0)) continue
+            diffs.push(addedFileDiff(path, bytes.toString('utf8')))
+          } finally {
+            await file.close()
+          }
+        }
+      } catch (error) {
+        // A disappearing or unreadable path must not hide the other new files.
+        debugLog('git.untrackedDiff.fileFailed', { cwd, path, error: String(error) })
+      }
     }
     return diffs.join('\n')
   } catch (error) {
@@ -1533,11 +1554,11 @@ export async function gitUntrackedDiff(cwd: string): Promise<string> {
   }
 }
 
-export function addedFileDiff(path: string, text: string): string {
+export function addedFileDiff(path: string, text: string, mode = '100644'): string {
   const lines = text.length === 0 ? [] : text.replace(/\n$/, '').split('\n')
   return [
     `diff --git a/${path} b/${path}`,
-    'new file mode 100644',
+    `new file mode ${mode}`,
     'index 0000000..0000000',
     '--- /dev/null',
     `+++ b/${path}`,
