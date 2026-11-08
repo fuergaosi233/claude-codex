@@ -12,13 +12,15 @@ proxy` flow — but `codex app-server` is handled by this adapter instead of the
 real Codex runtime, so agent turns run on Claude Code.
 
 <p align="center">
-  <img src="docs/public/images/inline-visualization.png" width="720"
-    alt="A Claude reply in the Codex App with an inline visualization: tiles for total signups, the peak month and quarter-over-quarter growth, a bar chart of six months of signups with the peak month highlighted and a dashed monthly average, a chart of month-over-month change, and a short summary of the trend">
+  <img src="docs/public/images/inline-visualization.webp" width="720"
+    alt="Animation of the inline visualization from a Claude reply: tiles for total signups, the peak month and quarter-over-quarter growth, a bar chart of six months of signups with June highlighted as the peak and a dashed monthly average, a chart of month-over-month change, and a short summary. The pointer rests on June: a tooltip shows 204 signups and +27.5% month over month, and June stands out in both charts. Then it moves to May, 160 signups and -6.4%. Recreated with the same synthetic data">
 </p>
 
 <p align="center"><sub>Claude, asked in a Codex App chat to chart six months of signups,
 answers with an <a href="#inline-visualizations">inline visualization</a> that the
-App renders inside the reply. The request was in Chinese, so are the labels.</sub></p>
+App renders inside the reply. The request was in Chinese, so are the labels. The
+animation recreates that chart as HTML with the same synthetic data; pointing at a
+month shows its numbers.</sub></p>
 
 📖 **Documentation: <https://fuergaosi233.github.io/claude-codex/>**
 
