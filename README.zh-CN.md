@@ -53,7 +53,7 @@ export ANTHROPIC_API_KEY="<your-anthropic-api-key>" # or authenticate with `clau
 
 ## 视频介绍
 
-https://github.com/user-attachments/assets/2237be25-7341-48ca-b959-a1fdf5ce3930
+https://github.com/user-attachments/assets/fbfc3ed0-323f-4ca3-a5af-b9f8c5c1bc28
 
 [下载高清版和字幕](https://github.com/nwverse/claude-codex/releases/tag/promo-v1)
 

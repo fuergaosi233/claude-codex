@@ -58,7 +58,7 @@ Full walkthrough → **[Getting started](https://fuergaosi233.github.io/claude-c
 
 ## Video tour
 
-https://github.com/user-attachments/assets/bbaba5a0-2be4-4efd-a000-f4f187c15177
+https://github.com/user-attachments/assets/b9aea33d-53f1-401b-9ed1-89f2b36d9c97
 
 [Download the HD version and subtitles](https://github.com/nwverse/claude-codex/releases/tag/promo-v1)
 
