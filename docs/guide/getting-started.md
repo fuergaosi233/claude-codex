@@ -14,9 +14,11 @@ Codex App  ──SSH──▶  login shell  ──▶  codex (shim, earlier in P
                        everything else  ──────▶ real Codex CLI (CODEX_REAL)
 ```
 
-The shim is the only integration point: it intercepts `codex app-server` and
-forwards everything else to the real Codex CLI, so it coexists with normal
-command-line Codex usage.
+The SSH shim intercepts every first-argument `codex app-server` call that
+reaches it and forwards other commands to the real Codex CLI. On a workstation
+shared with Orca or native Codex app-server clients, use the
+[isolated launcher](/guide/deployment#alongside-orca-and-native-codex) and connect
+only the chosen CLI with `--remote`.
 
 ## Prerequisites
 
@@ -41,8 +43,8 @@ The only runtime dependency for Claude itself is
 
 ## Next steps
 
-1. **[Deployment](/guide/deployment)** — install the shim on the remote host and
-   bootstrap a fresh machine without sudo.
+1. **[Deployment](/guide/deployment)** — launch alongside Orca/native Codex, or
+   install the SSH shim on a dedicated remote host.
 2. **[Using the Codex App](/guide/gui)** — connect the GUI and run a turn.
 3. **[Configuration](/guide/configuration)** — models, effort, MCP, tools,
    worktrees.
@@ -56,7 +58,24 @@ Set `CLAUDE_CODEX_MOCK=1` to exercise the protocol without Claude credentials:
 CLAUDE_CODEX_MOCK=1 node dist/src/adapter.mjs app-server --listen ws://127.0.0.1:8788
 ```
 
-## Transports / modes
+## CLI entry points
+
+```bash
+# Explicit coexistence entry point; no shim or global configuration changes.
+node dist/src/isolated-launch.mjs --state-dir "$PWD/.claude-codex/local" --port 8790
+# In another terminal in the same checkout, connect a native Codex CLI:
+CLAUDE_CODEX_REMOTE_TOKEN="$(cat "$PWD/.claude-codex/local/adapter/ws-token")" \
+  codex --remote ws://127.0.0.1:8790 --remote-auth-token-env CLAUDE_CODEX_REMOTE_TOKEN
+```
+
+When installed, the package exposes `claude-codex-isolated` for the launcher and
+`claude-codex-adapter` for the existing app-server entry point. The isolated
+launcher accepts `--state-dir PATH` (required), `--port PORT` (default `0`, a
+free loopback port), and `--ws-auth`, `--ws-token-file`, `--ws-token-sha256`,
+`--ws-allowed-origins`. `--help` lists the options. It uses capability-token auth
+by default and stops its own adapter child when you press Ctrl-C. See
+[Deployment](/guide/deployment#foreground-lifecycle) for state, conflicts and
+crash recovery. The direct app-server entry point retains its existing modes:
 
 ```bash
 node dist/src/adapter.mjs app-server --listen unix://
