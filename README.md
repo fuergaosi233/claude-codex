@@ -1,5 +1,7 @@
 # Claude Codex Adapter
 
+[简体中文](README.zh-CN.md)
+
 [![CI](https://github.com/fuergaosi233/claude-codex/actions/workflows/ci.yml/badge.svg)](https://github.com/fuergaosi233/claude-codex/actions/workflows/ci.yml)
 [![Docs](https://github.com/fuergaosi233/claude-codex/actions/workflows/deploy-docs.yml/badge.svg)](https://fuergaosi233.github.io/claude-codex/)
 [![Node](https://img.shields.io/badge/node-%3E%3D24-brightgreen)](https://nodejs.org)
@@ -10,6 +12,10 @@ Production TypeScript adapter that lets the **Codex desktop app** talk to
 Codex App still runs its normal SSH version probe, bootstrap, and `app-server
 proxy` flow — but `codex app-server` is handled by this adapter instead of the
 real Codex runtime, so agent turns run on Claude Code.
+
+[![Claude Codex promo: Codex desktop chats powered by Claude Code](docs/assets/promo-preview-en.webp)](#video-tour)
+
+[Watch the video tour (with sound)](#video-tour)
 
 <p align="center">
   <img src="docs/public/images/inline-visualization.png" width="720"
@@ -49,6 +55,12 @@ Provide credentials only through your local shell or secret manager. Do not
 commit API keys, OAuth/session data, `.env` files, or acceptance-test logs.
 
 Full walkthrough → **[Getting started](https://fuergaosi233.github.io/claude-codex/guide/getting-started)**.
+
+## Video tour
+
+https://github.com/user-attachments/assets/bbaba5a0-2be4-4efd-a000-f4f187c15177
+
+[Download the HD version and subtitles](https://github.com/nwverse/claude-codex/releases/tag/promo-v1)
 
 ## How it works
 
