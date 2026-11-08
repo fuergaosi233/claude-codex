@@ -14,7 +14,8 @@
   },
   "type": "module",
   "bin": {
-    "claude-codex-adapter": "dist/src/adapter.mjs"
+    "claude-codex-adapter": "dist/src/adapter.mjs",
+    "claude-codex-isolated": "dist/src/isolated-launch.mjs"
   },
   "files": [
     "dist/",

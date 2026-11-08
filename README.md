@@ -31,11 +31,46 @@ npm run dev          # tsx src/adapter.mts — run sources directly, no build
 npm run doctor       # environment self-check
 ```
 
-> **Requires Node.js 24+** for stable `node:sqlite`. Set `CLAUDE_CODEX_NODE` to
-> pin a node binary if your default is older.
+> **Requires Node.js 24+** for stable `node:sqlite`. Use a Node 24+ binary for
+> the commands below; `CLAUDE_CODEX_NODE` pins the binary used by the SSH shim.
 
-Then install the `codex` shim on the remote host and add a Remote connection in
-the Codex App:
+### Alongside Orca and native Codex
+
+Start an isolated foreground adapter from this checkout, using your usual
+Claude Code login or credentials supplied through your shell:
+
+```bash
+node dist/src/isolated-launch.mjs --state-dir "$PWD/.claude-codex/local" --port 8790
+```
+
+In another terminal, connect only the chosen native Codex CLI:
+
+```bash
+CLAUDE_CODEX_REMOTE_TOKEN="$(cat "$PWD/.claude-codex/local/adapter/ws-token")" \
+  codex --remote ws://127.0.0.1:8790 --remote-auth-token-env CLAUDE_CODEX_REMOTE_TOKEN
+```
+
+The package bin is `claude-codex-isolated` (the equivalent of the first command
+when installed). It keeps its Codex home, adapter database, logs and generated
+token under the specified directory. Omit `--port` to choose a free loopback
+port; use the address printed at startup in `--remote`. Give parallel instances
+different state directories. An occupied port or reserved directory fails
+without replacing a listener. Stop the foreground launcher with **Ctrl-C** or
+send **SIGTERM to its printed launcher PID**; it stops only its adapter child.
+The state persists for the next launch.
+
+This route leaves the native `codex` executable, PATH, shell settings and Orca
+configuration as they are. Ordinary `codex app-server`, CLI commands and Orca
+chats keep their native route. It requires a native Codex CLI with `--remote`
+and `--remote-auth-token-env` support; an already installed global shim still
+intercepts app-server calls, so clients needing native Codex must resolve the
+real executable. See [Deployment](https://fuergaosi233.github.io/claude-codex/guide/deployment#alongside-orca-and-native-codex)
+for lifecycle, crash recovery and environment details.
+
+### Codex App over SSH
+
+On a dedicated remote host, install the `codex` shim and add a Remote connection
+in the Codex App:
 
 ```bash
 mkdir -p ~/bin
@@ -44,6 +79,13 @@ export PATH="$HOME/bin:$PATH"
 export CLAUDE_CODEX_ADAPTER="$PWD/dist/src/adapter.mjs"
 export ANTHROPIC_API_KEY="<your-anthropic-api-key>" # or authenticate with `claude /login`
 ```
+
+The shim redirects **every** first-argument `codex app-server` invocation that
+reaches it, including Orca structured chats. `CODEX_REAL` forwards other commands;
+it does not exempt app-server calls in adapter mode. Use the isolated route
+above on a shared workstation. The legacy `claude-codex-mode` switch/restart
+helper matches host-wide app-server processes; keep it out of the isolated
+workflow and use the foreground launcher's own lifecycle instead.
 
 Provide credentials only through your local shell or secret manager. Do not
 commit API keys, OAuth/session data, `.env` files, or acceptance-test logs.
