@@ -24,6 +24,12 @@ Claude 用<a href="#内联可视化">内联可视化</a>作答，由 App 直接�
 
 📖 **文档：<https://fuergaosi233.github.io/claude-codex/>**
 
+## 视频介绍
+
+https://github.com/user-attachments/assets/fbfc3ed0-323f-4ca3-a5af-b9f8c5c1bc28
+
+[下载高清版和字幕](https://github.com/nwverse/claude-codex/releases/tag/promo-v1)
+
 ## 快速开始
 
 ```bash
@@ -50,12 +56,6 @@ export ANTHROPIC_API_KEY="<your-anthropic-api-key>" # or authenticate with `clau
 `.env` 文件或验收测试日志。
 
 完整步骤见 **[入门指南](https://fuergaosi233.github.io/claude-codex/guide/getting-started)**。
-
-## 视频介绍
-
-https://github.com/user-attachments/assets/fbfc3ed0-323f-4ca3-a5af-b9f8c5c1bc28
-
-[下载高清版和字幕](https://github.com/nwverse/claude-codex/releases/tag/promo-v1)
 
 ## 工作原理
 

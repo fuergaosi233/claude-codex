@@ -28,6 +28,12 @@ App renders inside the reply. The request was in Chinese, so are the labels.</su
 
 📖 **Documentation: <https://fuergaosi233.github.io/claude-codex/>**
 
+## Video tour
+
+https://github.com/user-attachments/assets/b9aea33d-53f1-401b-9ed1-89f2b36d9c97
+
+[Download the HD version and subtitles](https://github.com/nwverse/claude-codex/releases/tag/promo-v1)
+
 ## Quick start
 
 ```bash
@@ -55,12 +61,6 @@ Provide credentials only through your local shell or secret manager. Do not
 commit API keys, OAuth/session data, `.env` files, or acceptance-test logs.
 
 Full walkthrough → **[Getting started](https://fuergaosi233.github.io/claude-codex/guide/getting-started)**.
-
-## Video tour
-
-https://github.com/user-attachments/assets/b9aea33d-53f1-401b-9ed1-89f2b36d9c97
-
-[Download the HD version and subtitles](https://github.com/nwverse/claude-codex/releases/tag/promo-v1)
 
 ## How it works
 
