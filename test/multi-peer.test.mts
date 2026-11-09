@@ -122,6 +122,54 @@ test('a pending approval reaches a peer that opens the thread later', {
   })
 })
 
+test('a turn/start racing thread/delete does not bring the thread back', {
+  timeout: 20_000,
+}, async () => {
+  await withServer(async (connect) => {
+    const a = connect('a')
+    const b = connect('b')
+    const threadId = await startThread(a)
+    await b.request('thread/resume', { threadId })
+    await a.request('turn/start', { threadId, input: textInput('please run approval bash') })
+    await b.until((message) => message.method === 'item/commandExecution/requestApproval')
+
+    // The delete interrupts the running turn first; the turn/start arrives meanwhile.
+    const [deleted, started] = await Promise.allSettled([
+      a.request('thread/delete', { threadId }),
+      b.request('turn/start', { threadId, input: textInput('hi') }),
+    ])
+    assert.equal(deleted.status, 'fulfilled')
+    assert.equal(started.status, 'rejected')
+    assert.match(String(started.reason), /unknown thread/)
+    await b.until((message) => message.method === 'thread/deleted')
+
+    const listed = await b.request('thread/list', {})
+    assert.equal(
+      listed.result.data.some((thread: any) => thread.id === threadId),
+      false,
+      'the deleted thread stays deleted',
+    )
+  })
+})
+
+test('a turn/start keeps a rename that lands while it starts', { timeout: 20_000 }, async () => {
+  await withServer(async (connect) => {
+    const a = connect('a')
+    const b = connect('b')
+    const threadId = await startThread(a)
+    await b.request('thread/resume', { threadId })
+
+    await Promise.all([
+      a.request('turn/start', { threadId, input: textInput('hello') }),
+      b.request('thread/name/set', { threadId, name: 'Renamed' }),
+    ])
+    await a.until((message) => message.method === 'turn/completed')
+
+    const read = await b.request('thread/read', { threadId })
+    assert.equal(read.result.thread.name, 'Renamed')
+  })
+})
+
 test('an approval left by an interrupted turn is not shown to a later follower', {
   timeout: 20_000,
 }, async () => {
