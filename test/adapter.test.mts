@@ -3609,6 +3609,89 @@ test('remote utility methods use v2 response shapes', async () => {
   }
 })
 
+test('command/exec stops the whole process group on timeout or terminate and drains briefly', {
+  skip: process.platform === 'win32',
+}, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  const leftRunning: number[] = []
+  const alive = (pid: number): boolean => {
+    try {
+      process.kill(pid, 0)
+      return true
+    } catch {
+      return false
+    }
+  }
+  let id = 0
+  const exec = async (params: Record<string, unknown>) => {
+    const requestId = ++id
+    const started = Date.now()
+    proc.stdin.write(json({ id: requestId, method: 'command/exec', params }))
+    const { result } = await reader.nextResponse(requestId)
+    return { result, elapsed: Date.now() - started }
+  }
+  // The shell prints the pid of the sleep it put in the background.
+  const sleeper = (rest: string) => ['sh', '-c', `sleep 30 & echo $!; ${rest}`]
+  const sleepPid = (stdout: string): number => {
+    const pid = Number(stdout.trim().split('\n')[0])
+    assert.ok(Number.isInteger(pid) && pid > 0, `no background pid in ${JSON.stringify(stdout)}`)
+    leftRunning.push(pid)
+    return pid
+  }
+  const gone = async (pid: number) => {
+    for (let waited = 0; alive(pid) && waited < 3_000; waited += 50) await delay(50)
+    assert.equal(alive(pid), false, `process ${pid} still running`)
+  }
+  try {
+    const timedOut = await exec({ command: sleeper('wait'), timeoutMs: 300 })
+    assert.equal(timedOut.result.exitCode, 124)
+    assert.ok(timedOut.elapsed < 5_000, `answered after ${timedOut.elapsed} ms`)
+    await gone(sleepPid(timedOut.result.stdout))
+
+    // SIGTERM is ignored by the shell and the sleep it runs: SIGKILL follows.
+    const stubborn = await exec({
+      command: ['sh', '-c', 'trap "" TERM; sleep 30 & echo $!; wait'],
+      timeoutMs: 300,
+    })
+    assert.equal(stubborn.result.exitCode, 124)
+    assert.ok(stubborn.elapsed < 5_000, `answered after ${stubborn.elapsed} ms`)
+    await gone(sleepPid(stubborn.result.stdout))
+
+    // A command that exits is answered after a bounded drain, not when the
+    // process it left in the background exits.
+    const background = await exec({ command: sleeper('echo started') })
+    assert.equal(background.result.exitCode, 0)
+    assert.match(background.result.stdout, /started\n$/)
+    assert.ok(background.elapsed < 5_000, `answered after ${background.elapsed} ms`)
+    assert.equal(alive(sleepPid(background.result.stdout)), true)
+
+    const requestId = ++id
+    proc.stdin.write(
+      json({
+        id: requestId,
+        method: 'command/exec',
+        params: { processId: 'stop-me', command: sleeper('wait'), disableTimeout: true },
+      }),
+    )
+    await delay(300)
+    proc.stdin.write(
+      json({ id: ++id, method: 'command/exec/terminate', params: { processId: 'stop-me' } }),
+    )
+    const { result: terminated } = await reader.nextResponse(requestId)
+    assert.notEqual(terminated.exitCode, 0)
+    await gone(sleepPid(terminated.stdout))
+  } finally {
+    for (const pid of leftRunning) if (pid > 0 && alive(pid)) process.kill(pid, 'SIGKILL')
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('process/spawn supports shell strings, errors, and debug logs terminal lifecycle', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const debugLog = join(home, 'adapter-debug.jsonl')

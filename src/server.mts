@@ -517,6 +517,38 @@ function goalBudget(value: unknown): number | null {
   return value
 }
 
+// command/exec answers a timed-out command with Codex's EXEC_TIMEOUT_EXIT_CODE,
+// and waits this long for its pipes after it exits (Codex's IO_DRAIN_TIMEOUT_MS).
+const COMMAND_EXEC_TIMEOUT_EXIT_CODE = 124
+const COMMAND_EXEC_IO_DRAIN_MS = 2_000
+// How long a stopped command has to exit on SIGTERM before it gets SIGKILL.
+const COMMAND_EXEC_KILL_GRACE_MS = 1_000
+
+// Signals a child's process group when it leads one (spawned detached),
+// else the child alone.
+function signalProcessGroup(child: ChildProcess, signal: NodeJS.Signals): void {
+  if (child.pid && process.platform !== 'win32') {
+    try {
+      process.kill(-child.pid, signal)
+      return
+    } catch {
+      // Not a group leader, or the group is gone: fall back to the child.
+    }
+  }
+  try {
+    child.kill(signal)
+  } catch {
+    // Already gone.
+  }
+}
+
+// SIGTERM to the group, then SIGKILL to whatever ignores it.
+function stopProcessGroup(child: ChildProcess): void {
+  signalProcessGroup(child, 'SIGTERM')
+  const kill = setTimeout(() => signalProcessGroup(child, 'SIGKILL'), COMMAND_EXEC_KILL_GRACE_MS)
+  kill.unref()
+}
+
 function isUsageLimitError(error: unknown): boolean {
   const message = typeof asRecord(error).message === 'string' ? String(asRecord(error).message) : ''
   return /usage limit|rate limit|quota|\b429\b/i.test(message)
@@ -8835,6 +8867,8 @@ export class CodexClaudeAppServer {
       cwd,
       env: commandEnv(params.env),
       stdio: 'pipe',
+      // Its own process group, so a timeout or terminate ends what it started too.
+      detached: process.platform !== 'win32',
     })
     this.commandProcesses.set(processId, child)
 
@@ -8889,11 +8923,16 @@ export class CodexClaudeAppServer {
 
     const timeoutMs = params.disableTimeout === true ? null : numberOr(params.timeoutMs, 60_000)
     let timeout: NodeJS.Timeout | null = null
+    let timedOut = false
     if (timeoutMs != null && timeoutMs > 0) {
-      timeout = setTimeout(() => child.kill('SIGTERM'), timeoutMs)
+      timeout = setTimeout(() => {
+        timedOut = true
+        stopProcessGroup(child)
+      }, timeoutMs)
     }
 
     return new Promise((resolve, reject) => {
+      let settled = false
       child.once('error', (error) => {
         debugLog('command.exec.error', {
           processId,
@@ -8902,17 +8941,40 @@ export class CodexClaudeAppServer {
         })
         if (timeout) clearTimeout(timeout)
         this.commandProcesses.delete(processId)
+        if (settled) return
+        settled = true
         reject(error)
       })
-      child.once('close', (code, signal) => {
-        debugLog('command.exec.close', { processId, code, signal, stdoutBytes, stderrBytes })
+      // Answered when the command's own process exits. Processes it left in
+      // the background may hold its pipes open: they get a bounded drain, not
+      // the request's lifetime.
+      child.once('exit', (code, signal) => {
         if (timeout) clearTimeout(timeout)
         this.commandProcesses.delete(processId)
-        resolve({
-          exitCode: code ?? 1,
-          stdout: streamOutput ? '' : Buffer.concat(stdout).toString('utf8'),
-          stderr: streamOutput ? '' : Buffer.concat(stderr).toString('utf8'),
-        })
+        // A child forked as the group was signalled can have missed it.
+        if (timedOut) signalProcessGroup(child, 'SIGKILL')
+        const finish = () => {
+          clearTimeout(drain)
+          if (settled) return
+          settled = true
+          child.stdout?.destroy()
+          child.stderr?.destroy()
+          debugLog('command.exec.close', {
+            processId,
+            code,
+            signal,
+            timedOut,
+            stdoutBytes,
+            stderrBytes,
+          })
+          resolve({
+            exitCode: timedOut ? COMMAND_EXEC_TIMEOUT_EXIT_CODE : (code ?? 1),
+            stdout: streamOutput ? '' : Buffer.concat(stdout).toString('utf8'),
+            stderr: streamOutput ? '' : Buffer.concat(stderr).toString('utf8'),
+          })
+        }
+        const drain = setTimeout(finish, COMMAND_EXEC_IO_DRAIN_MS)
+        child.once('close', finish)
       })
     })
   }
@@ -8934,7 +8996,7 @@ export class CodexClaudeAppServer {
     const processId = stringOr(params.processId, '')
     const child = this.commandProcesses.get(processId)
     if (!child) throw invalidRequest(`unknown command process: ${processId}`)
-    child.kill('SIGTERM')
+    stopProcessGroup(child)
     return {}
   }
 

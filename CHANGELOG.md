@@ -131,6 +131,10 @@ versioning or publishing metadata.
 
 ### App-server and protocol compatibility
 
+- A `command/exec` that hits `timeoutMs` now stops its whole process group
+  (SIGTERM, then SIGKILL after 1 s) and reports `exitCode` 124. The reply comes
+  when the command exits plus at most a 2 s output drain, so a backgrounded
+  child no longer holds it. `command/exec/terminate` stops the group too.
 - Opt-in Memories: with `CLAUDE_CODEX_MEMORIES=1`, the App's Memories
   settings (Settings > Personalization) and `/memories` decide whether Claude
   threads run with Claude Code's auto-memory, and while Memories is off in the
