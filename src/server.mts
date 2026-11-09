@@ -8855,19 +8855,22 @@ export class CodexClaudeAppServer {
     }
 
     // Streamed output is capped per stream as Codex caps it: the chunk is cut
-    // at the cap, the delta that reaches it says capReached, and later data on
-    // that stream is read and dropped so the child never blocks on a full pipe.
+    // at the cap, the delta that reaches it (empty when the cap is 0) says
+    // capReached and is sent once, and later data on that stream is read and
+    // dropped so the child never blocks on a full pipe.
+    const streamReached = { stdout: false, stderr: false }
     const stream = (name: 'stdout' | 'stderr', chunk: Buffer, currentBytes: number): number => {
-      if (currentBytes >= cap) return currentBytes
-      const allowed = Math.min(chunk.byteLength, cap - currentBytes)
+      if (streamReached[name]) return currentBytes
+      const allowed = Math.max(0, Math.min(chunk.byteLength, cap - currentBytes))
       const sent = currentBytes + allowed
+      streamReached[name] = sent >= cap
       this.notify(peer, {
         method: 'command/exec/outputDelta',
         params: {
           processId,
           stream: name,
           deltaBase64: chunk.subarray(0, allowed).toString('base64'),
-          capReached: sent >= cap,
+          capReached: streamReached[name],
         },
       })
       return sent
