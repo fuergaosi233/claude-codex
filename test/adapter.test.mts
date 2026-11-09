@@ -3639,6 +3639,7 @@ test('command/exec stops the whole process group on timeout or terminate and dra
   const sleeper = (rest: string) => ['sh', '-c', `sleep 30 & echo $!; ${rest}`]
   const sleepPid = (stdout: string): number => {
     const pid = Number(stdout.trim().split('\n')[0])
+    assert.ok(Number.isInteger(pid) && pid > 0, `no background pid in ${JSON.stringify(stdout)}`)
     leftRunning.push(pid)
     return pid
   }
@@ -3685,7 +3686,7 @@ test('command/exec stops the whole process group on timeout or terminate and dra
     assert.notEqual(terminated.exitCode, 0)
     await gone(sleepPid(terminated.stdout))
   } finally {
-    for (const pid of leftRunning) if (alive(pid)) process.kill(pid, 'SIGKILL')
+    for (const pid of leftRunning) if (pid > 0 && alive(pid)) process.kill(pid, 'SIGKILL')
     proc.kill()
     await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
   }
