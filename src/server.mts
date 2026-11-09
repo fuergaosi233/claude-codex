@@ -1873,7 +1873,7 @@ export class CodexClaudeAppServer {
 
   private threadList(params: Record<string, unknown>): unknown {
     const query = this.threadListQuery(params)
-    // thread/list's searchTerm filters by title only; thread/search reads messages too.
+    // thread/list's searchTerm filters by title (name or preview) only; thread/search reads messages too.
     const titleSearch =
       typeof params.searchTerm === 'string' && params.searchTerm.trim().length > 0
         ? params.searchTerm

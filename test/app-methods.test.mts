@@ -339,8 +339,8 @@ test('thread/list filters by title and leaves out excluded threads before the li
     assert.equal((await server.request('thread/list', { searchTerm: ' ' })).data.length, 3)
 
     // The page stays full: the exclusion applies before the limit.
-    const page = ids(await server.request('thread/list', { excludedThreadIds: [apples], limit: 2 }))
-    assert.deepEqual(page.toSorted(), [bananas, grapes].toSorted())
+    const page = ids(await server.request('thread/list', { excludedThreadIds: [grapes], limit: 2 }))
+    assert.deepEqual(page, [bananas, apples])
 
     const list = (excludedThreadIds: unknown) =>
       server.request('thread/list', { excludedThreadIds })

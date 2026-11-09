@@ -131,6 +131,10 @@ versioning or publishing metadata.
 
 ### App-server and protocol compatibility
 
+- `thread/list` now filters by `searchTerm` (thread name or preview) and
+  `excludedThreadIds`, and the exclusion applies before the page limit. A
+  malformed or oversized (more than 100) `excludedThreadIds` returns
+  `invalidRequest`, for `thread/search` too.
 - Opt-in Memories: with `CLAUDE_CODEX_MEMORIES=1`, the App's Memories
   settings (Settings > Personalization) and `/memories` decide whether Claude
   threads run with Claude Code's auto-memory, and while Memories is off in the
