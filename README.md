@@ -1,5 +1,7 @@
 # Claude Codex Adapter
 
+[简体中文](README.zh-CN.md)
+
 [![CI](https://github.com/fuergaosi233/claude-codex/actions/workflows/ci.yml/badge.svg)](https://github.com/fuergaosi233/claude-codex/actions/workflows/ci.yml)
 [![Docs](https://github.com/fuergaosi233/claude-codex/actions/workflows/deploy-docs.yml/badge.svg)](https://fuergaosi233.github.io/claude-codex/)
 [![Node](https://img.shields.io/badge/node-%3E%3D24-brightgreen)](https://nodejs.org)
@@ -11,6 +13,10 @@ Codex App still runs its normal SSH version probe, bootstrap, and `app-server
 proxy` flow — but `codex app-server` is handled by this adapter instead of the
 real Codex runtime, so agent turns run on Claude Code.
 
+[![Claude Codex promo: Codex desktop chats powered by Claude Code](docs/assets/promo-preview-en.webp)](#video-tour)
+
+[Watch the video tour (with sound)](#video-tour)
+
 <p align="center">
   <img src="docs/public/images/inline-visualization.png" width="720"
     alt="A Claude reply in the Codex App with an inline visualization: tiles for total signups, the peak month and quarter-over-quarter growth, a bar chart of six months of signups with the peak month highlighted and a dashed monthly average, a chart of month-over-month change, and a short summary of the trend">
@@ -21,6 +27,12 @@ answers with an <a href="#inline-visualizations">inline visualization</a> that t
 App renders inside the reply. The request was in Chinese, so are the labels.</sub></p>
 
 📖 **Documentation: <https://fuergaosi233.github.io/claude-codex/>**
+
+## Video tour
+
+https://github.com/user-attachments/assets/50523c51-29b3-41ea-b10f-e0fe41e91e1d
+
+[Download the HD version and subtitles](https://github.com/nwverse/claude-codex/releases/tag/promo-v1)
 
 ## Quick start
 
