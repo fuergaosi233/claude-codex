@@ -131,6 +131,11 @@ versioning or publishing metadata.
 
 ### App-server and protocol compatibility
 
+- `fs/watch` follows Codex: it keeps the path the client sent instead of its
+  realpath, watches a file (such as `.git/HEAD`) through its directory so the
+  watch survives git's lock-file rename and reports the file's own path, accepts
+  a file that does not exist yet, coalesces each watch's events over 200 ms,
+  and refuses a `watchId` already in use with `watchId already exists: <id>`.
 - Opt-in Memories: with `CLAUDE_CODEX_MEMORIES=1`, the App's Memories
   settings (Settings > Personalization) and `/memories` decide whether Claude
   threads run with Claude Code's auto-memory, and while Memories is off in the

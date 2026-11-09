@@ -1,7 +1,7 @@
 import { type ChildProcess, execFile, spawn } from 'node:child_process'
-import { existsSync, type FSWatcher, readFileSync, watch, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, isAbsolute, join } from 'node:path'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { rendersCompletedSubagentActivity, unverifiedAppWarning } from './app-compat.mjs'
@@ -49,6 +49,7 @@ import {
   dynamicToolsEnabled,
   parseDynamicTools,
 } from './dynamic-tools.mjs'
+import { type PathWatch, watchPath } from './fs-watch.mjs'
 import { gitInfoFor, patchGitInfo } from './git-info.mjs'
 import {
   continuePrompt,
@@ -672,7 +673,7 @@ export class CodexClaudeAppServer {
   private sessionApprovals = new Map<string, Set<string>>()
   private commandProcesses = new Map<string, ChildProcess>()
   private processHandles = new Map<string, ChildProcess>()
-  private fsWatchers = new Map<string, FSWatcher>()
+  private fsWatchers = new Map<string, PathWatch>()
   // Goal state lives in the store. These track the hidden continuation turns
   // the adapter starts, how many of them in a row made no progress, and when
   // goal time was last accrued for a thread's running turn.
@@ -8790,13 +8791,11 @@ export class CodexClaudeAppServer {
   }
 
   private async fsWatch(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
-    const { realpath } = await import('node:fs/promises')
     const watchId = stringOr(params.watchId, newId())
-    const path = await realpath(stringOr(params.path, process.cwd()))
-    this.fsWatchers.get(watchId)?.close()
-    const watcher = watch(path, { persistent: false }, (_eventType, filename) => {
-      const changedPath = filename ? `${path}/${String(filename)}` : path
-      this.notify(peer, { method: 'fs/changed', params: { watchId, changedPaths: [changedPath] } })
+    if (this.fsWatchers.has(watchId)) throw invalidRequest(`watchId already exists: ${watchId}`)
+    const path = resolve(stringOr(params.path, process.cwd()))
+    const watcher = watchPath(path, (changedPaths) => {
+      this.notify(peer, { method: 'fs/changed', params: { watchId, changedPaths } })
     })
     this.fsWatchers.set(watchId, watcher)
     return { path }
