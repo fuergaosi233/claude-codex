@@ -158,14 +158,19 @@ test('claude-p timeout SIGKILLs a detached descendant after the leader exits', a
   const grandchildPid = await waitForPidFile(paths.pidFile)
   t.after(() => killLeftover(grandchildPid))
   await waitForFile(paths.readyFile)
-  const startedAt = Date.now()
   assert.equal(
     await Promise.race([observed, sleep(8000).then(() => 'unsettled')]),
     'rejected: claude-p timed out after 3000ms',
   )
-  // Grace period is 1500 ms after SIGTERM (fired 3000 ms after the turn
-  // started, ~1400 ms after the descendant became ready); check past it.
-  await sleep(Math.max(0, startedAt + 3400 - Date.now()))
+  // The turn rejects when SIGTERM fires; the SIGKILL follows 1500 ms
+  // later. Poll until the descendant is gone (deadline: grace + margin)
+  // instead of sleeping a fixed offset from an unrelated timestamp: on a
+  // fast machine the ready file appears long before the timeout, so a
+  // fixed wait from there can check before the SIGKILL has fired.
+  const deadline = Date.now() + 4000
+  while (isAlive(grandchildPid) && Date.now() < deadline) {
+    await sleep(100)
+  }
   assert.equal(
     isAlive(grandchildPid),
     false,
