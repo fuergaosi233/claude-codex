@@ -135,7 +135,9 @@ versioning or publishing metadata.
   realpath, watches a file (such as `.git/HEAD`) through its directory so the
   watch survives git's lock-file rename and reports the file's own path, accepts
   a file that does not exist yet, coalesces each watch's events over 200 ms,
-  and refuses a `watchId` already in use with `watchId already exists: <id>`.
+  and refuses a `watchId` already in use on the same connection with
+  `watchId already exists: <id>`. Watch ids are per connection, and a closed
+  connection's watches are dropped.
 - Opt-in Memories: with `CLAUDE_CODEX_MEMORIES=1`, the App's Memories
   settings (Settings > Personalization) and `/memories` decide whether Claude
   threads run with Claude Code's auto-memory, and while Memories is off in the
