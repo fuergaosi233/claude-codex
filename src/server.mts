@@ -1,7 +1,7 @@
 import { type ChildProcess, execFile, spawn } from 'node:child_process'
-import { existsSync, type FSWatcher, readFileSync, watch, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, isAbsolute, join } from 'node:path'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { rendersCompletedSubagentActivity, unverifiedAppWarning } from './app-compat.mjs'
@@ -49,6 +49,7 @@ import {
   dynamicToolsEnabled,
   parseDynamicTools,
 } from './dynamic-tools.mjs'
+import { type PathWatch, watchPath } from './fs-watch.mjs'
 import { gitInfoFor, patchGitInfo } from './git-info.mjs'
 import {
   continuePrompt,
@@ -672,7 +673,8 @@ export class CodexClaudeAppServer {
   private sessionApprovals = new Map<string, Set<string>>()
   private commandProcesses = new Map<string, ChildProcess>()
   private processHandles = new Map<string, ChildProcess>()
-  private fsWatchers = new Map<string, FSWatcher>()
+  // A watch belongs to the connection that made it: ids are unique per connection.
+  private fsWatchers = new WeakMap<RpcPeer, Map<string, PathWatch>>()
   // Goal state lives in the store. These track the hidden continuation turns
   // the adapter starts, how many of them in a row made no progress, and when
   // goal time was last accrued for a thread's running turn.
@@ -818,6 +820,8 @@ export class CodexClaudeAppServer {
         this.subscribersByThread.delete(threadId)
     }
     for (const pending of this.pendingServerRequests.values()) pending.targets.delete(peer.id)
+    for (const watch of this.fsWatchers.get(peer)?.values() ?? []) watch.close()
+    this.fsWatchers.delete(peer)
   }
 
   async stop(): Promise<void> {
@@ -1300,7 +1304,7 @@ export class CodexClaudeAppServer {
       case 'fs/watch':
         return this.fsWatch(peer, asRecord(params))
       case 'fs/unwatch':
-        return this.fsUnwatch(asRecord(params))
+        return this.fsUnwatch(peer, asRecord(params))
       case 'command/exec':
         return this.commandExec(peer, asRecord(params))
       case 'command/exec/write':
@@ -8790,22 +8794,26 @@ export class CodexClaudeAppServer {
   }
 
   private async fsWatch(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
-    const { realpath } = await import('node:fs/promises')
     const watchId = stringOr(params.watchId, newId())
-    const path = await realpath(stringOr(params.path, process.cwd()))
-    this.fsWatchers.get(watchId)?.close()
-    const watcher = watch(path, { persistent: false }, (_eventType, filename) => {
-      const changedPath = filename ? `${path}/${String(filename)}` : path
-      this.notify(peer, { method: 'fs/changed', params: { watchId, changedPaths: [changedPath] } })
+    let watches = this.fsWatchers.get(peer)
+    if (watches?.has(watchId)) throw invalidRequest(`watchId already exists: ${watchId}`)
+    const path = resolve(stringOr(params.path, process.cwd()))
+    const watcher = watchPath(path, (changedPaths) => {
+      this.notify(peer, { method: 'fs/changed', params: { watchId, changedPaths } })
     })
-    this.fsWatchers.set(watchId, watcher)
+    if (!watches) {
+      watches = new Map()
+      this.fsWatchers.set(peer, watches)
+    }
+    watches.set(watchId, watcher)
     return { path }
   }
 
-  private fsUnwatch(params: Record<string, unknown>): unknown {
+  private fsUnwatch(peer: RpcPeer, params: Record<string, unknown>): unknown {
     const watchId = stringOr(params.watchId, '')
-    this.fsWatchers.get(watchId)?.close()
-    this.fsWatchers.delete(watchId)
+    const watches = this.fsWatchers.get(peer)
+    watches?.get(watchId)?.close()
+    watches?.delete(watchId)
     return {}
   }
 
