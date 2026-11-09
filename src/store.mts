@@ -477,6 +477,10 @@ export class SessionStore {
       // Keeps threads whose name, preview or stored items contain the text.
       // A prefilter: a match inside item JSON may be a key, not visible text.
       searchTerm?: string | undefined
+      // Keeps threads whose name or preview contains the text.
+      titleSearch?: string | undefined
+      // Leaves out these threads before the page limit applies.
+      excludedThreadIds?: string[]
       // Leaves out threads that have no turn and no preview yet.
       excludeEmpty?: boolean
       sortKey?: 'created_at' | 'updated_at' | 'recency_at' | 'section_position'
@@ -545,6 +549,15 @@ export class SessionStore {
              WHERE h.thread_id = t.id AND h.items_json LIKE ? ESCAPE '\\'))`,
       )
       args.push(text, text, json, json)
+    }
+    if (options.titleSearch) {
+      const text = likePattern(options.titleSearch)
+      where.push(`(t.name LIKE ? ESCAPE '\\' OR t.preview LIKE ? ESCAPE '\\')`)
+      args.push(text, text)
+    }
+    if (options.excludedThreadIds && options.excludedThreadIds.length > 0) {
+      where.push(`t.id NOT IN (${options.excludedThreadIds.map(() => '?').join(', ')})`)
+      args.push(...options.excludedThreadIds)
     }
     const parentThreadId = options.parentThreadId ?? null
     const ancestorThreadId = options.ancestorThreadId ?? null

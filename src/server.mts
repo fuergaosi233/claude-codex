@@ -517,6 +517,16 @@ function goalBudget(value: unknown): number | null {
   return value
 }
 
+// thread/list's excludedThreadIds: at most 100 ids. A longer or malformed
+// list is rejected, never truncated, so no excluded thread slips back in.
+function threadIdList(value: unknown): string[] {
+  if (value == null) return []
+  if (!Array.isArray(value) || !value.every((id) => typeof id === 'string'))
+    throw invalidRequest('excludedThreadIds must be an array of thread ids')
+  if (value.length > 100) throw invalidRequest('excludedThreadIds takes at most 100 thread ids')
+  return value
+}
+
 function isUsageLimitError(error: unknown): boolean {
   const message = typeof asRecord(error).message === 'string' ? String(asRecord(error).message) : ''
   return /usage limit|rate limit|quota|\b429\b/i.test(message)
@@ -1863,7 +1873,12 @@ export class CodexClaudeAppServer {
 
   private threadList(params: Record<string, unknown>): unknown {
     const query = this.threadListQuery(params)
-    const threads = this.store.listThreads(query.options)
+    // thread/list's searchTerm filters by title only; thread/search reads messages too.
+    const titleSearch =
+      typeof params.searchTerm === 'string' && params.searchTerm.trim().length > 0
+        ? params.searchTerm
+        : undefined
+    const threads = this.store.listThreads({ ...query.options, titleSearch })
     const last = threads.at(-1)
     return {
       data: threads.map((thread) => this.toThread(thread, [])),
@@ -1911,6 +1926,7 @@ export class CodexClaudeAppServer {
         : typeof params.projectId === 'string'
           ? params.projectId
           : undefined
+    const excludedThreadIds = threadIdList(params.excludedThreadIds)
     // The store pages at most 200 threads.
     const limit = pageLimit(params.limit, 200) ?? 50
     return {
@@ -1930,6 +1946,7 @@ export class CodexClaudeAppServer {
         parentThreadId,
         ancestorThreadId,
         sourceKinds,
+        excludedThreadIds,
         sortKey,
         sortDirection,
       },
