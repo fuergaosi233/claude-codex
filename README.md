@@ -30,7 +30,7 @@ App renders inside the reply. The request was in Chinese, so are the labels.</su
 
 ## Video tour
 
-https://github.com/user-attachments/assets/6c8425df-c7bc-4b31-9314-2304ce97f171
+https://github.com/user-attachments/assets/50523c51-29b3-41ea-b10f-e0fe41e91e1d
 
 [Download the HD version and subtitles](https://github.com/nwverse/claude-codex/releases/tag/promo-v1)
 
