@@ -26,7 +26,7 @@ Claude 用<a href="#内联可视化">内联可视化</a>作答，由 App 直接�
 
 ## 视频介绍
 
-https://github.com/user-attachments/assets/fbfc3ed0-323f-4ca3-a5af-b9f8c5c1bc28
+https://github.com/user-attachments/assets/da0a3a3a-5e16-4ba4-84c3-864e1f60a464
 
 [下载高清版和字幕](https://github.com/nwverse/claude-codex/releases/tag/promo-v1)
 
