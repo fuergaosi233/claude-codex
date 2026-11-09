@@ -638,8 +638,9 @@ export class CodexClaudeAppServer {
   private peerFeatures = new WeakMap<RpcPeer, PeerFeatures>()
   private activeTurnByThread = new Map<string, string>()
   // Threads a thread/delete is removing. It waits for their turns to end
-  // first; a turn/start in that gap is refused rather than starting a turn
-  // on a thread that is about to go.
+  // first; a turn/start in that gap, on one of them or on a subagent thread
+  // below one, is refused rather than starting a turn on a thread that is
+  // about to go.
   private deletingThreads = new Set<string>()
   // Turns whose runtime run has not returned yet. A running turn outside this
   // set has nothing left that would ever end it.
@@ -4192,9 +4193,16 @@ export class CodexClaudeAppServer {
   }
 
   private startableThread(threadId: string): ThreadRecord {
-    const thread = this.deletingThreads.has(threadId) ? null : this.store.getThread(threadId)
-    if (!thread) throw unknownThread(threadId)
+    const thread = this.store.getThread(threadId)
+    if (!thread || this.isBeingDeleted(threadId)) throw unknownThread(threadId)
     return thread
+  }
+
+  // store.deleteThread takes a thread's subagent threads with it.
+  private isBeingDeleted(threadId: string): boolean {
+    for (const id of this.deletingThreads)
+      if (id === threadId || this.isSubagentDescendant(threadId, id)) return true
+    return false
   }
 
   // Steers input into the thread's running turn. Returns null when there is

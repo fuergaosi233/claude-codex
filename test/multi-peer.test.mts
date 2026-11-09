@@ -152,6 +152,32 @@ test('a turn/start racing thread/delete does not bring the thread back', {
   })
 })
 
+test('a turn/start on a subagent thread of a chat being deleted is refused', {
+  timeout: 20_000,
+}, async () => {
+  await withServer(async (connect) => {
+    const a = connect('a')
+    const b = connect('b')
+    const threadId = await startThread(a)
+    // thread/delete takes a chat's subagent threads with it.
+    const fork = await b.request('thread/fork', { threadId, threadSource: 'subagent' })
+    const childId = fork.result.thread.id
+    await a.request('turn/start', { threadId, input: textInput('please run approval bash') })
+    await a.until((message) => message.method === 'item/commandExecution/requestApproval')
+
+    const [deleted, started] = await Promise.allSettled([
+      a.request('thread/delete', { threadId }),
+      b.request('turn/start', { threadId: childId, input: textInput('hi') }),
+    ])
+    assert.equal(deleted.status, 'fulfilled')
+    assert.equal(started.status, 'rejected')
+    assert.match(String(started.reason), /unknown thread/)
+    await b.until(
+      (message) => message.method === 'thread/deleted' && message.params.threadId === childId,
+    )
+  })
+})
+
 test('a turn/start keeps a rename that lands while it starts', { timeout: 20_000 }, async () => {
   await withServer(async (connect) => {
     const a = connect('a')
