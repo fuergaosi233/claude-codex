@@ -592,6 +592,12 @@ versioning or publishing metadata.
 
 ### Trustworthy history and settings
 
+- A deleted chat stays deleted and a rename sticks when a `turn/start`
+  arrives at the same time, for example from a second window on the same
+  chat. `turn/start` re-reads the thread after waiting on a running turn
+  instead of writing back the copy it read first, and a `turn/start` that
+  lands while `thread/delete` is ending the chat's turn fails with
+  `unknown thread` and starts nothing.
 - A forked chat shows the turns it was forked with on every read, as a Codex
   fork does: `thread/resume`, `thread/read`, `thread/turns/list`,
   `thread/items/list`, `thread/turns/items/list`, `thread/timeline/list` and

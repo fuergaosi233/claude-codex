@@ -637,6 +637,11 @@ export class CodexClaudeAppServer {
   private subscribersByThread = new Map<string, Map<string, RpcPeer>>()
   private peerFeatures = new WeakMap<RpcPeer, PeerFeatures>()
   private activeTurnByThread = new Map<string, string>()
+  // Threads a thread/delete is removing. It waits for their turns to end
+  // first; a turn/start in that gap, on one of them or on a subagent thread
+  // below one, is refused rather than starting a turn on a thread that is
+  // about to go.
+  private deletingThreads = new Set<string>()
   // Turns whose runtime run has not returned yet. A running turn outside this
   // set has nothing left that would ever end it.
   private runtimeRuns = new Set<string>()
@@ -3244,6 +3249,16 @@ export class CodexClaudeAppServer {
       if (params.missingRolloutRecovery === true) return {}
       throw new Error(`no rollout found for thread id ${threadId}`)
     }
+    this.deletingThreads.add(threadId)
+    try {
+      await this.removeThread(peer, threadId)
+    } finally {
+      this.deletingThreads.delete(threadId)
+    }
+    return {}
+  }
+
+  private async removeThread(peer: RpcPeer, threadId: string): Promise<void> {
     if (this.activeTurnByThread.has(threadId)) await this.turnInterrupt(peer, { threadId })
     // Background agents go with the thread that launched them (or that they
     // are, or that they hang off): their turns end before their threads do.
@@ -3272,7 +3287,6 @@ export class CodexClaudeAppServer {
       for (const target of targets.values())
         this.sendNotification(target, { method: 'thread/deleted', params: { threadId: id } })
     }
-    return {}
   }
 
   private threadShellCommand(peer: RpcPeer, params: Record<string, unknown>): unknown {
@@ -3969,8 +3983,7 @@ export class CodexClaudeAppServer {
 
   private async turnStart(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
     const threadId = stringOr(params.threadId, '')
-    const thread = this.store.getThread(threadId)
-    if (!thread) throw unknownThread(threadId)
+    let thread = this.startableThread(threadId)
     this.checkModelProfileBinding(thread)
     // Follow-up turns the adapter starts itself have no requesting peer.
     if (peer !== DETACHED_PEER) this.subscribe(threadId, peer)
@@ -4019,6 +4032,9 @@ export class CodexClaudeAppServer {
         workflowCommand?.type === 'list',
       )
       if (joined) return { turn: this.toLifecycleTurn(joined) }
+      // Other requests ran while the input waited: take the thread as they
+      // left it, so this turn's write keeps a rename and a delete holds.
+      thread = this.startableThread(threadId)
     }
     // A structured summary or title turn runs its model, mapped to the
     // summary model, for that turn alone; it never rebinds the thread's.
@@ -4174,6 +4190,19 @@ export class CodexClaudeAppServer {
       })
     })
     return { turn: publicTurn }
+  }
+
+  private startableThread(threadId: string): ThreadRecord {
+    const thread = this.store.getThread(threadId)
+    if (!thread || this.isBeingDeleted(threadId)) throw unknownThread(threadId)
+    return thread
+  }
+
+  // store.deleteThread takes a thread's subagent threads with it.
+  private isBeingDeleted(threadId: string): boolean {
+    for (const id of this.deletingThreads)
+      if (id === threadId || this.isSubagentDescendant(threadId, id)) return true
+    return false
   }
 
   // Steers input into the thread's running turn. Returns null when there is
