@@ -322,6 +322,36 @@ test('thread/list pages through threads created in the same second', async () =>
   })
 })
 
+test('thread/list filters by title and leaves out excluded threads before the limit', async () => {
+  await withServer(async (server) => {
+    const apples = await server.startThread()
+    await server.runTurn(apples, 'alpha apples')
+    const bananas = await server.startThread()
+    await server.runTurn(bananas, 'beta bananas')
+    const grapes = await server.startThread()
+    await server.runTurn(grapes, 'gamma grapes')
+
+    assert.deepEqual(ids(await server.request('thread/list', { searchTerm: 'BANANAS' })), [bananas])
+    await server.request('thread/name/set', { threadId: grapes, name: 'fruit salad' })
+    assert.deepEqual(ids(await server.request('thread/list', { searchTerm: 'salad' })), [grapes])
+    // The title filter does not read messages: thread/search does.
+    assert.deepEqual(ids(await server.request('thread/list', { searchTerm: 'agentMessage' })), [])
+    assert.equal((await server.request('thread/list', { searchTerm: ' ' })).data.length, 3)
+
+    // The page stays full: the exclusion applies before the limit.
+    const page = ids(await server.request('thread/list', { excludedThreadIds: [grapes], limit: 2 }))
+    assert.deepEqual(page, [bananas, apples])
+
+    const list = (excludedThreadIds: unknown) =>
+      server.request('thread/list', { excludedThreadIds })
+    await assert.rejects(list([apples, 7]), /excludedThreadIds must be an array/)
+    await assert.rejects(list(apples), /excludedThreadIds must be an array/)
+    const tooMany = Array.from({ length: 101 }, (_, index) => `missing-${index}`)
+    await assert.rejects(list(tooMany), /at most 100/)
+    assert.equal((await list(tooMany.slice(1))).data.length, 3)
+  })
+})
+
 test('a chat nothing was sent to stays out of the thread list and search', async () => {
   await withServer(async (server) => {
     const used = await server.startThread()
