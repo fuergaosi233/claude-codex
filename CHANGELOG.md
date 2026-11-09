@@ -131,6 +131,11 @@ versioning or publishing metadata.
 
 ### App-server and protocol compatibility
 
+- Streamed `command/exec` output (`streamStdoutStderr` or `tty`) now honors
+  `outputBytesCap`, including its 1,000,000-byte default, as Codex does: each
+  stream is cut at the cap, the delta that reaches it carries `capReached:
+  true`, and later data on that stream is dropped while the process keeps
+  running. `disableOutputCap` keeps streaming everything.
 - Opt-in Memories: with `CLAUDE_CODEX_MEMORIES=1`, the App's Memories
   settings (Settings > Personalization) and `/memories` decide whether Claude
   threads run with Claude Code's auto-memory, and while Memories is off in the

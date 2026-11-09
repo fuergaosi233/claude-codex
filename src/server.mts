@@ -8854,37 +8854,36 @@ export class CodexClaudeAppServer {
       return currentBytes + allowed
     }
 
+    // Streamed output is capped per stream as Codex caps it: the chunk is cut
+    // at the cap, the delta that reaches it says capReached, and later data on
+    // that stream is read and dropped so the child never blocks on a full pipe.
+    const stream = (name: 'stdout' | 'stderr', chunk: Buffer, currentBytes: number): number => {
+      if (currentBytes >= cap) return currentBytes
+      const allowed = Math.min(chunk.byteLength, cap - currentBytes)
+      const sent = currentBytes + allowed
+      this.notify(peer, {
+        method: 'command/exec/outputDelta',
+        params: {
+          processId,
+          stream: name,
+          deltaBase64: chunk.subarray(0, allowed).toString('base64'),
+          capReached: sent >= cap,
+        },
+      })
+      return sent
+    }
+
     child.stdout?.on('data', (chunk: Buffer | string) => {
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
-      if (streamOutput) {
-        this.notify(peer, {
-          method: 'command/exec/outputDelta',
-          params: {
-            processId,
-            stream: 'stdout',
-            deltaBase64: buffer.toString('base64'),
-            capReached: false,
-          },
-        })
-        return
-      }
-      stdoutBytes = capture(stdout, buffer, stdoutBytes)
+      stdoutBytes = streamOutput
+        ? stream('stdout', buffer, stdoutBytes)
+        : capture(stdout, buffer, stdoutBytes)
     })
     child.stderr?.on('data', (chunk: Buffer | string) => {
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
-      if (streamOutput) {
-        this.notify(peer, {
-          method: 'command/exec/outputDelta',
-          params: {
-            processId,
-            stream: 'stderr',
-            deltaBase64: buffer.toString('base64'),
-            capReached: false,
-          },
-        })
-        return
-      }
-      stderrBytes = capture(stderr, buffer, stderrBytes)
+      stderrBytes = streamOutput
+        ? stream('stderr', buffer, stderrBytes)
+        : capture(stderr, buffer, stderrBytes)
     })
 
     const timeoutMs = params.disableTimeout === true ? null : numberOr(params.timeoutMs, 60_000)
