@@ -8743,13 +8743,22 @@ export class CodexClaudeAppServer {
   }
 
   private async fsGetMetadata(params: Record<string, unknown>): Promise<unknown> {
-    const { stat } = await import('node:fs/promises')
+    const { lstat, stat } = await import('node:fs/promises')
     const path = stringOr(params.path, '')
-    const metadata = await stat(path)
+    const entry = await lstat(path)
+    const isSymlink = entry.isSymbolicLink()
+    let metadata = entry
+    if (isSymlink) {
+      try {
+        metadata = await stat(path)
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      }
+    }
     return {
       isDirectory: metadata.isDirectory(),
       isFile: metadata.isFile(),
-      isSymlink: metadata.isSymbolicLink(),
+      isSymlink,
       createdAtMs: metadata.birthtimeMs,
       modifiedAtMs: metadata.mtimeMs,
     }
