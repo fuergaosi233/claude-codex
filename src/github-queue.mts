@@ -41,11 +41,19 @@ function taskFromGitHubEntry(entry: unknown, now: Date): GitHubEntryTaskResult {
   const state = stringField(entry, 'state') ?? 'open'
   if (number === null) return { kind: 'skip', reason: 'missing numeric number' }
   if (title === null) return { kind: 'skip', reason: 'missing title' }
+  if (
+    state.toLowerCase() === 'merged' ||
+    stringField(entry, 'mergedAt') !== null ||
+    stringField(entry, 'merged_at') !== null
+  ) {
+    return { kind: 'skip', reason: 'merged item' }
+  }
   if (state.toLowerCase() === 'closed') return { kind: 'skip', reason: 'closed item' }
 
   const kind = githubKind(entry)
+  const taskUrl = kind === 'pull-request' ? (stringField(entry, 'html_url') ?? url) : url
   const safeTitle = compactText(title, 160)
-  const sourceUrl = url === null ? 'unknown' : compactText(url, 240)
+  const sourceUrl = taskUrl === null ? 'unknown' : compactText(taskUrl, 240)
   return {
     kind: 'task',
     task: {
@@ -74,6 +82,13 @@ function githubKind(entry: Record<string, unknown>): 'issue' | 'pull-request' {
     return 'pull-request'
   }
   if (isRecord(entry.pull_request) || isRecord(entry.pullRequest)) return 'pull-request'
+  if (typeof entry.headRefName === 'string' || typeof entry.isDraft === 'boolean') {
+    return 'pull-request'
+  }
+  const url = stringField(entry, 'html_url') ?? stringField(entry, 'url')
+  if (url !== null && URL.canParse(url) && /\/pull\/\d+(?:\/|$)/.test(new URL(url).pathname)) {
+    return 'pull-request'
+  }
   return 'issue'
 }
 
