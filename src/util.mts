@@ -12,6 +12,13 @@ import {
 } from 'node:fs'
 import { homedir, platform, tmpdir } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import {
+  agModelOptions,
+  catalogModel,
+  codexCatalogModels,
+  harnessDisplayName,
+  nativeCodexEnabled,
+} from './harness-models.mjs'
 import { loadClaudeModelProfiles, modelProfileFingerprint } from './model-profiles.mjs'
 import type { ImageInput, TurnToolOutput, UserInput } from './types.mjs'
 
@@ -838,7 +845,7 @@ export function codexProxyModelOptions(): Array<{
   // Suppressed in mock / opt-out flows. Mock runtime tests assume a clean
   // Claude-only model list; environments without a real Codex shouldn't see
   // unusable picker entries.
-  if (process.env.CLAUDE_CODEX_MOCK === '1') return []
+  if (process.env.CLAUDE_CODEX_MOCK === '1' && !nativeCodexEnabled()) return []
   if (process.env.CLAUDE_CODEX_DISABLE_CODEX_PROXY === '1') return []
   if (!resolveCodexBinary()) return []
   const now = Date.now()
@@ -867,17 +874,32 @@ export function codexProxyModelOptions(): Array<{
         } catch {}
       }
     }
+    // The native harness runs the real codex, whose catalog may be the one
+    // config.toml names.
+    if (ids.length === 0 && nativeCodexEnabled())
+      ids = codexCatalogModels()
+        .map((model) => model.slug)
+        .filter((slug) => isCodexOpenAiModel(slug) && slug !== 'codex-auto-review')
     if (ids.length === 0) {
       ids = ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini']
     }
   }
-  return ids.map((id) => ({
-    id,
-    sdkModel: id,
-    displayName: `Codex · ${id}`,
-    description: 'Real OpenAI Codex CLI (forwarded via `codex exec --json`).',
-    isDefault: false,
-  }))
+  const native = nativeCodexEnabled()
+  return [
+    ...ids.map((id) => {
+      const entry = native ? catalogModel(id) : null
+      return {
+        id,
+        sdkModel: id,
+        displayName: harnessDisplayName('codex', entry?.displayName ?? id),
+        description: native
+          ? `${entry?.description ?? id} Runs in Codex on your ChatGPT login.`
+          : 'Real OpenAI Codex CLI (forwarded via `codex exec --json`).',
+        isDefault: false,
+      }
+    }),
+    ...agModelOptions(),
+  ]
 }
 
 // Resolve the real codex CLI binary — explicit CODEX_REAL wins; otherwise

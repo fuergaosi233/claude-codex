@@ -25,6 +25,30 @@ mode saved there) takes Claude Code's WebSearch tool away on the SDK route and
 WebSearch there whatever the web search setting says, as Claude Code's own
 setting decides [memories](/guide/gui#memories) there.
 
+## Harnesses
+
+With `CLAUDE_CODEX_NATIVE_CODEX=on`, each chat picks one of three harnesses from
+the Codex App's model menu:
+
+| Menu label | Model ids | Runs on |
+| --- | --- | --- |
+| Claude Code · … | Claude (and gateway) ids, as before | Claude Code through the Agent SDK |
+| Codex · … | `gpt-*` | a real `codex app-server` on the `openai` provider (ChatGPT login) |
+| Codex+AsterGate · … | `codex-ag:<model>` | a real `codex app-server` on `CLAUDE_CODEX_CODEX_AG_PROVIDER` |
+
+Codex threads keep their sidebar record in the adapter and their conversation
+in Codex: every request about the conversation is forwarded to the child, and
+Codex's approvals, questions and notifications come back to the App as Codex
+sends them. The real codex runs a thread's turns on its own config's
+provider, so there is one child per provider, started on first use and stopped
+after `CLAUDE_CODEX_NATIVE_IDLE_MS` of nothing to do.
+
+A chat keeps its harness once it has a conversation: another model of the
+same harness is fine, another harness asks for a new chat. A new chat's thread
+exists before the user picks a model, so its first turn's model still picks the
+harness. The App's title and summary helper threads run on Claude Code, so
+they never spend the ChatGPT login.
+
 ## Switching routes
 
 Install the host helper next to the shim:

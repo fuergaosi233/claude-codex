@@ -28,6 +28,30 @@ check('shim version probe', () => {
     throw new Error(`unexpected version output: ${result.stdout}`)
 })
 
+// The native Codex harness runs Codex threads in a real `codex app-server`.
+const nativeCodex = ['on', '1', 'true'].includes(
+  (process.env.CLAUDE_CODEX_NATIVE_CODEX ?? '').trim().toLowerCase(),
+)
+if (nativeCodex)
+  check('real codex app-server answers (native Codex harness)', () => {
+    const codex = process.env.CODEX_REAL
+    if (!codex || !existsSync(codex)) throw new Error('set CODEX_REAL to the real codex binary')
+    // codex exits on stdin EOF before it answers, so a small child keeps the
+    // pipe open until the answer arrives.
+    const probe = `
+      const { spawn } = require('node:child_process')
+      const p = spawn(process.argv[1], ['app-server', '--listen', 'stdio://'])
+      p.stdout.on('data', (d) => { if (/"id":1,"result"/.test(String(d))) { console.log('ok'); p.kill(); process.exit(0) } })
+      p.stdin.write(JSON.stringify({ id: 1, method: 'initialize', params: { clientInfo: { name: 'claude-codex-doctor', version: '0' } } }) + '\\n')
+      setTimeout(() => { p.kill(); process.exit(1) }, 25000)
+    `
+    const result = spawnSync(process.execPath, ['-e', probe, codex], {
+      encoding: 'utf8',
+      timeout: 30_000,
+    })
+    if (!/ok/.test(result.stdout ?? '')) throw new Error(`no initialize answer from ${codex}`)
+  })
+
 if (runtimeType === 'agent-sdk-sidecar')
   check('@anthropic-ai/claude-agent-sdk installed', () => {
     // The native TS runtime imports the SDK dynamically; verify it resolves
