@@ -3130,12 +3130,12 @@ export class CodexClaudeAppServer {
     debugLog('thread.revert', { threadId, beforeTurnId, dropped })
     const kept = this.store.historyTurns(threadId)
     const last = kept.at(-1)
-    const lastItem = last?.items.at(-1)
+    const itemCount = kept.reduce((count, turn) => count + turn.items.length, 0)
     this.notify(peer, { method: 'thread/reverted', params: { threadId } })
     return {
       thread: this.toThread(this.store.getThread(threadId) ?? thread, []),
       turnsBackwardsCursor: last ? last.id : null,
-      itemsBackwardsCursor: lastItem ? lastItem.id : null,
+      itemsBackwardsCursor: itemCount > 0 ? String(itemCount - 1) : null,
     }
   }
 
