@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -99,6 +99,83 @@ test('workflow CLI reports missing required inputs without writing state', async
     () => runWorkflowCli(['enqueue', '--state', statePath], io),
     (error: unknown) => error instanceof Error && error.message === 'missing required --prompt',
   )
+})
+
+test('workflow enqueue rejects unreadable numeric options without changing an existing queue', async () => {
+  const statePath = await tempStatePath()
+  await runWorkflowCli(
+    ['enqueue', '--state', statePath, '--id', 'good', '--prompt', 'Keep this task.'],
+    captureIo(),
+  )
+  const before = await readFile(statePath)
+  for (const [flag, value] of [
+    ['priority', '1.5'],
+    ['max-attempts', '0'],
+    ['max-attempts', '-1'],
+    ['max-attempts', '2.5'],
+  ] as const) {
+    const io = captureIo()
+    await assert.rejects(
+      () =>
+        runWorkflowCli(
+          [
+            'enqueue',
+            '--state',
+            statePath,
+            '--id',
+            'bad',
+            '--prompt',
+            'Invalid.',
+            `--${flag}`,
+            value,
+          ],
+          io,
+        ),
+      /must be (a positive integer|an integer)/,
+    )
+    assert.deepEqual(await readFile(statePath), before)
+    assert.equal(io.stdoutText(), '')
+  }
+  assert.equal(await runWorkflowCli(['status', '--state', statePath], captureIo()), 0)
+})
+
+test('invalid enqueue creates no state and valid integer boundaries remain readable', async () => {
+  const statePath = await tempStatePath()
+  await assert.rejects(
+    () =>
+      runWorkflowCli(
+        ['enqueue', '--state', statePath, '--prompt', 'Invalid.', '--max-attempts', '0'],
+        captureIo(),
+      ),
+    /must be a positive integer/,
+  )
+  await assert.rejects(readFile(statePath), { code: 'ENOENT' })
+  for (const priority of ['0', '-3']) {
+    const io = captureIo()
+    assert.equal(
+      await runWorkflowCli(
+        [
+          'enqueue',
+          '--state',
+          statePath,
+          '--id',
+          priority,
+          '--prompt',
+          'Valid.',
+          '--priority',
+          priority,
+          '--max-attempts',
+          '1',
+        ],
+        io,
+      ),
+      0,
+    )
+    const task = jsonOf<EnqueueOutput>(io.stdoutText()).task
+    assert.equal(task.priority, Number(priority))
+    assert.equal(task.maxAttempts, 1)
+  }
+  assert.equal(await runWorkflowCli(['status', '--state', statePath], captureIo()), 0)
 })
 
 test('workflow CLI shows help before validating subcommand options', async () => {

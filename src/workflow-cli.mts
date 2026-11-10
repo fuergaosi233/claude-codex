@@ -126,14 +126,23 @@ export async function runWorkflowCli(
 }
 
 function taskFromArgs(args: ParsedArgs, now: Date): WorkflowTask {
+  const prompt = requiredOption(args, 'prompt')
+  const priority = numberOption(args, 'priority') ?? 0
+  const maxAttempts = numberOption(args, 'max-attempts') ?? 3
+  if (!Number.isInteger(priority)) {
+    throw new WorkflowCliInputError('--priority must be an integer')
+  }
+  if (!Number.isInteger(maxAttempts) || maxAttempts < 1) {
+    throw new WorkflowCliInputError('--max-attempts must be a positive integer')
+  }
   return {
     id: stringOption(args, 'id') ?? newId(),
     status: 'queued',
     updatedAt: now.toISOString(),
-    prompt: requiredOption(args, 'prompt'),
-    priority: numberOption(args, 'priority') ?? 0,
+    prompt,
+    priority,
     attempts: 0,
-    maxAttempts: numberOption(args, 'max-attempts') ?? 3,
+    maxAttempts,
     lease: null,
     blockedReason: null,
     lastError: null,
