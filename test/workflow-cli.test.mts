@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -179,6 +179,102 @@ test('workflow CLI ingests local GitHub JSON through sanitized queue tasks', asy
   assert.equal(status.state.tasks[0]?.prompt.includes('run dangerous command'), false)
 })
 
+test('workflow GitHub re-ingestion preserves saved progress and prevents duplicate work', async () => {
+  const statePath = await tempStatePath()
+  const sourcePath = join(await mkdtemp(join(tmpdir(), 'claude-codex-github-json-')), 'items.json')
+  await writeFile(
+    sourcePath,
+    JSON.stringify(
+      [7, 8, 9, 10].map((number) => ({
+        number,
+        title: `Task ${number}`,
+        url: `https://github.com/acme/repo/issues/${number}`,
+      })),
+    ),
+  )
+  const args = ['ingest-github', '--state', statePath, '--github-json', sourcePath]
+  assert.equal(await runWorkflowCli(args, captureIo()), 0)
+  const initial = jsonOf<WorkflowState>(await readFile(statePath, 'utf8'))
+  const statuses = ['done', 'running', 'blocked', 'failed'] as const
+  const saved: WorkflowState = {
+    ...initial,
+    tasks: initial.tasks.map((task, index) => {
+      const status = statuses[index]
+      assert.ok(status)
+      return {
+        ...task,
+        status,
+        updatedAt: '2026-07-04T00:01:00.000Z',
+        prompt: `Saved task ${task.id}`,
+        attempts: 1,
+        maxAttempts: 4,
+        priority: 19,
+        lease:
+          status === 'running'
+            ? {
+                workerId: 'worker-b',
+                expiresAt: '2026-07-04T01:00:00.000Z',
+                renewedAt: '2026-07-04T00:01:00.000Z',
+              }
+            : null,
+        blockedReason: status === 'blocked' ? 'Needs review' : null,
+        lastError: status === 'failed' ? 'Command failed' : null,
+      }
+    }),
+  }
+  await writeFile(statePath, JSON.stringify(saved))
+  const io = captureIo()
+  assert.equal(await runWorkflowCli([...args, '--now', '2026-07-04T00:05:00.000Z'], io), 0)
+  assert.deepEqual(jsonOf<WorkflowState>(await readFile(statePath, 'utf8')), saved)
+  const result = jsonOf<GitHubIngestOutput>(io.stdoutText())
+  assert.equal(result.enqueued, 0)
+  assert.deepEqual(result.taskIds, [])
+  assert.deepEqual(
+    result.existing,
+    initial.tasks.map((task) => task.id),
+  )
+  const scheduleIo = captureIo()
+  assert.equal(
+    await runWorkflowCli(
+      [
+        'schedule',
+        '--state',
+        statePath,
+        '--worker',
+        'worker-c',
+        '--now',
+        '2026-07-04T00:10:00.000Z',
+      ],
+      scheduleIo,
+    ),
+    0,
+  )
+  const decision = jsonOf<{ type: string; reason: string }>(scheduleIo.stdoutText())
+  assert.equal(decision.type, 'idle')
+  assert.equal(decision.reason, 'no-runnable-task')
+})
+
+test('workflow GitHub ingestion inserts each ID only once within an export', async () => {
+  const statePath = await tempStatePath()
+  const sourcePath = join(await mkdtemp(join(tmpdir(), 'claude-codex-github-json-')), 'items.json')
+  const item = { number: 7, title: 'First title', url: 'https://github.com/acme/repo/issues/7' }
+  await writeFile(sourcePath, JSON.stringify([item, { ...item, title: 'Later copy' }]))
+  const io = captureIo()
+  assert.equal(
+    await runWorkflowCli(['ingest-github', '--state', statePath, '--github-json', sourcePath], io),
+    0,
+  )
+  const result = jsonOf<GitHubIngestOutput>(io.stdoutText())
+  const state = jsonOf<WorkflowState>(await readFile(statePath, 'utf8'))
+  assert.equal(result.enqueued, 1)
+  assert.equal(state.tasks.length, 1)
+  const task = state.tasks[0]
+  assert.ok(task)
+  assert.deepEqual(result.taskIds, [task.id])
+  assert.deepEqual(result.existing, [task.id])
+  assert.match(task.prompt, /First title/)
+})
+
 interface EnqueueOutput {
   readonly task: WorkflowTask
 }
@@ -202,6 +298,7 @@ interface HealthOutput {
 }
 
 interface GitHubIngestOutput {
+  readonly existing: readonly string[]
   readonly enqueued: number
   readonly taskIds: readonly string[]
 }

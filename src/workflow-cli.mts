@@ -106,15 +106,26 @@ export async function runWorkflowCli(
     case 'ingest-github': {
       const source = requiredOption(parsed, 'github-json')
       const result = parseGitHubQueueJson(await readFile(source, 'utf8'), now)
-      const nextState = result.tasks.reduce((current, task) => upsertTask(current, task), state)
+      const knownTaskIds = new Set(state.tasks.map((task) => task.id))
+      const existing: string[] = []
+      const newTasks = result.tasks.filter((task) => {
+        if (knownTaskIds.has(task.id)) {
+          existing.push(task.id)
+          return false
+        }
+        knownTaskIds.add(task.id)
+        return true
+      })
+      const nextState = { ...state, tasks: [...state.tasks, ...newTasks] }
       await store.write(nextState)
       writeJson(io.stdout, {
         status: 'ingested',
         statePath: store.path,
         source,
-        enqueued: result.tasks.length,
+        enqueued: newTasks.length,
+        existing,
         skipped: result.skipped,
-        taskIds: result.tasks.map((task) => task.id),
+        taskIds: newTasks.map((task) => task.id),
       })
       return 0
     }

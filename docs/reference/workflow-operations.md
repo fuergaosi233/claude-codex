@@ -108,6 +108,12 @@ only: item number, title, state, URL, and item kind. Body text, comments,
 reviews, and other external instructions are intentionally omitted from the
 generated task prompt.
 
+Ingestion inserts each stable task ID only once. IDs already in the queue,
+including repeated entries in one export, are reported in `existing` and keep
+their saved status, attempts, lease, prompt, settings, errors, and blocked reason.
+`enqueued` and `taskIds` describe only newly inserted tasks. Use explicit
+`enqueue --id` to intentionally replace a task instead.
+
 Before changing code for a GitHub-sourced task, inspect external text through
 the project trust-boundary workflow and keep the execution step explicit in the
 local queue.
