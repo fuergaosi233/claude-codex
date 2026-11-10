@@ -1189,6 +1189,9 @@ export class CodexClaudeAppServer {
       case 'plugin/install':
         return this.pluginInstall(asRecord(params))
       case 'skills/config/write':
+        if (asRecord(params).enabled === false) {
+          throw invalidRequest('Disabling skills is not supported for Claude threads.')
+        }
         return { effectiveEnabled: asRecord(params).enabled === true }
       case 'plugin/share/list':
         return { data: [] }
