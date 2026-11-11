@@ -8056,6 +8056,8 @@ export class CodexClaudeAppServer {
     // Neither does a foreground child: it runs inside its parent's turn.
     if (await this.stopForegroundSubagent(peer, threadId)) return {}
     const activeTurnId = this.activeTurnByThread.get(threadId)
+    // A delayed interrupt for a completed turn must not interrupt a newer turn.
+    if (activeTurnId && requestedTurnId && requestedTurnId !== activeTurnId) return {}
     this.settleInterruptedTurn(peer, threadId, activeTurnId || requestedTurnId)
     // Persist the terminal state before asking the SDK to abort. A few SDK
     // versions deliver one or two buffered tool events during interrupt; the
