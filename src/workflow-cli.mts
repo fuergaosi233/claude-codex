@@ -41,50 +41,62 @@ export async function runWorkflowCli(
   switch (command) {
     case 'enqueue': {
       const task = taskFromArgs(parsed, now)
-      const nextState = upsertTask(state, task)
-      await store.write(nextState)
+      await store.transact(emptyState(), (current) => ({
+        state: upsertTask(current, task),
+        value: task,
+      }))
       writeJson(io.stdout, { status: 'enqueued', statePath: store.path, task })
       return 0
     }
     case 'schedule': {
-      const decision = scheduleNextWorkflowTask(state, {
-        now,
-        workerId: stringOption(parsed, 'worker') ?? `worker-${process.pid}`,
-        leaseTtlMs: numberOption(parsed, 'ttl-ms') ?? 30 * 60 * 1000,
+      const decision = await store.transact(emptyState(), (current) => {
+        const next = scheduleNextWorkflowTask(current, {
+          now,
+          workerId: stringOption(parsed, 'worker') ?? `worker-${process.pid}`,
+          leaseTtlMs: numberOption(parsed, 'ttl-ms') ?? 30 * 60 * 1000,
+        })
+        return { state: next.state, value: next }
       })
-      await store.write(decision.state)
       writeJson(io.stdout, { ...decision, statePath: store.path })
       return 0
     }
     case 'heartbeat': {
       const taskId = requiredOption(parsed, 'task')
-      const nextState = renewWorkflowLease(state, taskId, {
-        now,
-        workerId: requiredOption(parsed, 'worker'),
-        leaseTtlMs: numberOption(parsed, 'ttl-ms') ?? 30 * 60 * 1000,
-      })
-      await store.write(nextState)
+      await store.transact(emptyState(), (current) => ({
+        state: renewWorkflowLease(current, taskId, {
+          now,
+          workerId: requiredOption(parsed, 'worker'),
+          leaseTtlMs: numberOption(parsed, 'ttl-ms') ?? 30 * 60 * 1000,
+        }),
+        value: null,
+      }))
       writeJson(io.stdout, { status: 'heartbeat', statePath: store.path, taskId })
       return 0
     }
     case 'complete': {
       const taskId = requiredOption(parsed, 'task')
-      const nextState = completeWorkflowTask(state, taskId, now)
-      await store.write(nextState)
+      await store.transact(emptyState(), (current) => ({
+        state: completeWorkflowTask(current, taskId, now),
+        value: null,
+      }))
       writeJson(io.stdout, { status: 'completed', statePath: store.path, taskId })
       return 0
     }
     case 'fail': {
       const taskId = requiredOption(parsed, 'task')
-      const nextState = failWorkflowTask(state, taskId, requiredOption(parsed, 'error'), now)
-      await store.write(nextState)
+      await store.transact(emptyState(), (current) => ({
+        state: failWorkflowTask(current, taskId, requiredOption(parsed, 'error'), now),
+        value: null,
+      }))
       writeJson(io.stdout, { status: 'failed-or-requeued', statePath: store.path, taskId })
       return 0
     }
     case 'block': {
       const taskId = requiredOption(parsed, 'task')
-      const nextState = blockWorkflowTask(state, taskId, requiredOption(parsed, 'reason'), now)
-      await store.write(nextState)
+      await store.transact(emptyState(), (current) => ({
+        state: blockWorkflowTask(current, taskId, requiredOption(parsed, 'reason'), now),
+        value: null,
+      }))
       writeJson(io.stdout, { status: 'blocked', statePath: store.path, taskId })
       return 0
     }
@@ -106,8 +118,13 @@ export async function runWorkflowCli(
     case 'ingest-github': {
       const source = requiredOption(parsed, 'github-json')
       const result = parseGitHubQueueJson(await readFile(source, 'utf8'), now)
-      const nextState = result.tasks.reduce((current, task) => upsertTask(current, task), state)
-      await store.write(nextState)
+      await store.transact(emptyState(), (current) => ({
+        state: result.tasks.reduce(
+          (stateWithTasks, task) => upsertTask(stateWithTasks, task),
+          current,
+        ),
+        value: null,
+      }))
       writeJson(io.stdout, {
         status: 'ingested',
         statePath: store.path,

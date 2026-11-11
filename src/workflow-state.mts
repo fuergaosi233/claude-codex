@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto'
-import { mkdir, open, readFile, rename, rm } from 'node:fs/promises'
+import { link, mkdir, open, readFile, rename, rm, stat } from 'node:fs/promises'
+import { hostname } from 'node:os'
 import { basename, dirname, join } from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 
 export const WORKFLOW_STATE_VERSION = 1
 export const WORKFLOW_TASK_STATUSES = ['queued', 'running', 'blocked', 'done', 'failed'] as const
@@ -50,11 +52,39 @@ export class WorkflowStateSerializeError extends Error {
   }
 }
 
+export interface WorkflowStateLockRecord {
+  readonly pid: number
+  readonly hostname: string
+  readonly acquiredAt: string
+  readonly token: string
+}
+
+export interface WorkflowStateStoreOptions {
+  readonly lockTimeoutMs?: number
+  readonly lockStaleMs?: number
+}
+
+export class WorkflowStateLockTimeoutError extends Error {
+  override readonly name = 'WorkflowStateLockTimeoutError'
+
+  constructor(path: string, timeoutMs: number, holder: WorkflowStateLockRecord | null) {
+    super(
+      `workflow state lock acquisition timed out after ${timeoutMs}ms for ${path}; ` +
+        `holder pid ${holder?.pid ?? 'unknown'} on ${holder?.hostname ?? 'unknown host'} ` +
+        `since ${holder?.acquiredAt ?? 'unknown time'}`,
+    )
+  }
+}
+
 export class WorkflowStateStore {
   readonly path: string
+  private readonly lockTimeoutMs: number
+  private readonly lockStaleMs: number
 
-  constructor(path: string) {
+  constructor(path: string, options: WorkflowStateStoreOptions = {}) {
     this.path = path
+    this.lockTimeoutMs = options.lockTimeoutMs ?? 30_000
+    this.lockStaleMs = options.lockStaleMs ?? 5 * 60 * 1000
   }
 
   async read(): Promise<WorkflowState | null> {
@@ -66,9 +96,221 @@ export class WorkflowStateStore {
     }
   }
 
+  async transact<T>(
+    fallback: WorkflowState,
+    transition: (state: WorkflowState) => { state: WorkflowState; value: T },
+  ): Promise<T> {
+    const release = await acquireWorkflowStateLock(this.path, {
+      timeoutMs: this.lockTimeoutMs,
+      staleMs: this.lockStaleMs,
+    })
+    try {
+      const current = (await this.read()) ?? fallback
+      const next = transition(current)
+      await this.write(next.state)
+      return next.value
+    } finally {
+      await release()
+    }
+  }
+
   async write(state: WorkflowState): Promise<void> {
     await writeWorkflowStateFile(this.path, state)
   }
+}
+
+interface WorkflowStateLockSnapshot {
+  readonly record: WorkflowStateLockRecord | null
+  readonly mtimeMs: number
+}
+
+const localHostname = hostname()
+const lockRetryMs = 10
+
+async function acquireWorkflowStateLock(
+  path: string,
+  options: { readonly timeoutMs: number; readonly staleMs: number },
+): Promise<() => Promise<void>> {
+  const lockPath = `${path}.lock`
+  const startedAt = Date.now()
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 })
+
+  while (true) {
+    const acquired = await tryCreateWorkflowStateLock(lockPath)
+    if (acquired) {
+      return () => releaseWorkflowStateLock(lockPath, acquired.token)
+    }
+
+    const holder = await readWorkflowStateLock(lockPath)
+    const elapsedMs = Date.now() - startedAt
+    if (elapsedMs >= options.timeoutMs) {
+      throw new WorkflowStateLockTimeoutError(lockPath, options.timeoutMs, holder?.record ?? null)
+    }
+    if (!holder) {
+      await delay(Math.min(lockRetryMs, options.timeoutMs - elapsedMs))
+      continue
+    }
+
+    if (isWorkflowStateLockStale(holder, options.staleMs)) {
+      await quarantineStaleWorkflowStateLock(lockPath, holder)
+      // Let concurrent stale-lock observations finish their quarantine attempts before
+      // racing to install the next generation.
+      await delay(lockRetryMs)
+      continue
+    }
+    await delay(Math.min(lockRetryMs, options.timeoutMs - elapsedMs))
+  }
+}
+
+async function tryCreateWorkflowStateLock(
+  lockPath: string,
+): Promise<WorkflowStateLockRecord | null> {
+  const record: WorkflowStateLockRecord = {
+    pid: process.pid,
+    hostname: localHostname,
+    acquiredAt: new Date().toISOString(),
+    token: randomUUID(),
+  }
+  const tempPath = `${lockPath}.${process.pid}.${record.token}.tmp`
+  try {
+    const handle = await open(tempPath, 'wx', 0o600)
+    try {
+      await handle.writeFile(JSON.stringify(record), 'utf8')
+      await handle.sync()
+    } finally {
+      await handle.close()
+    }
+    // Hard-linking a complete record avoids exposing a partially written lock while
+    // retaining exclusive-create semantics across processes.
+    await link(tempPath, lockPath)
+    return record
+  } catch (error) {
+    if (hasErrorCode(error, 'EEXIST')) return null
+    throw error
+  } finally {
+    await rm(tempPath, { force: true })
+  }
+}
+
+async function readWorkflowStateLock(lockPath: string): Promise<WorkflowStateLockSnapshot | null> {
+  try {
+    const info = await stat(lockPath)
+    const text = await readFile(lockPath, 'utf8')
+    return { record: parseWorkflowStateLockRecord(text), mtimeMs: info.mtimeMs }
+  } catch (error) {
+    if (hasErrorCode(error, 'ENOENT')) return null
+    throw error
+  }
+}
+
+function parseWorkflowStateLockRecord(text: string): WorkflowStateLockRecord | null {
+  let value: unknown
+  try {
+    value = JSON.parse(text)
+  } catch {
+    return null
+  }
+  if (
+    !isRecord(value) ||
+    typeof value.pid !== 'number' ||
+    !Number.isInteger(value.pid) ||
+    value.pid <= 0 ||
+    typeof value.hostname !== 'string' ||
+    typeof value.acquiredAt !== 'string' ||
+    typeof value.token !== 'string'
+  ) {
+    return null
+  }
+  return {
+    pid: value.pid,
+    hostname: value.hostname,
+    acquiredAt: value.acquiredAt,
+    token: value.token,
+  }
+}
+
+function isWorkflowStateLockStale(snapshot: WorkflowStateLockSnapshot, staleMs: number): boolean {
+  const record = snapshot.record
+  if (record?.hostname === localHostname) {
+    try {
+      process.kill(record.pid, 0)
+    } catch (error) {
+      if (hasErrorCode(error, 'ESRCH')) return true
+    }
+  }
+  const acquiredAtMs = record ? Date.parse(record.acquiredAt) : snapshot.mtimeMs
+  return Number.isFinite(acquiredAtMs) && Date.now() - acquiredAtMs >= staleMs
+}
+
+async function quarantineStaleWorkflowStateLock(
+  lockPath: string,
+  expected: WorkflowStateLockSnapshot,
+): Promise<void> {
+  // Recheck before renaming so a waiter acting on an old observation does not
+  // normally move a live next-generation lock.
+  const current = await readWorkflowStateLock(lockPath)
+  if (!current || !sameWorkflowStateLock(current, expected)) return
+
+  const quarantinePath = `${lockPath}.${process.pid}.${randomUUID()}.stale`
+  try {
+    await rename(lockPath, quarantinePath)
+  } catch (error) {
+    if (hasErrorCode(error, 'ENOENT')) return
+    throw error
+  }
+
+  const quarantined = await readWorkflowStateLock(quarantinePath)
+  if (quarantined && sameWorkflowStateLock(quarantined, expected)) {
+    await rm(quarantinePath, { force: true })
+    return
+  }
+
+  // Another waiter installed a new generation between our check and rename.
+  // Put that generation back without overwriting any lock created since.
+  if (quarantined) await restoreQuarantinedWorkflowStateLock(quarantinePath, lockPath)
+}
+
+function sameWorkflowStateLock(
+  left: WorkflowStateLockSnapshot,
+  right: WorkflowStateLockSnapshot,
+): boolean {
+  if (left.record || right.record) return left.record?.token === right.record?.token
+  return left.mtimeMs === right.mtimeMs
+}
+
+async function restoreQuarantinedWorkflowStateLock(
+  quarantinePath: string,
+  lockPath: string,
+): Promise<void> {
+  try {
+    await link(quarantinePath, lockPath)
+  } catch (error) {
+    if (!hasErrorCode(error, 'EEXIST') && !hasErrorCode(error, 'ENOENT')) throw error
+  } finally {
+    await rm(quarantinePath, { force: true })
+  }
+}
+
+async function releaseWorkflowStateLock(lockPath: string, token: string): Promise<void> {
+  const current = await readWorkflowStateLock(lockPath)
+  if (current?.record?.token !== token) return
+
+  const releasePath = `${lockPath}.${process.pid}.${randomUUID()}.release`
+  try {
+    await rename(lockPath, releasePath)
+  } catch (error) {
+    if (hasErrorCode(error, 'ENOENT')) return
+    throw error
+  }
+
+  const released = await readWorkflowStateLock(releasePath)
+  if (released?.record?.token === token) {
+    await rm(releasePath, { force: true })
+    return
+  }
+  // A conservative stale takeover may have replaced our generation while a
+  // long transition was still finishing. Never delete its lock.
+  if (released) await restoreQuarantinedWorkflowStateLock(releasePath, lockPath)
 }
 
 export function parseWorkflowStateJson(text: string): WorkflowState {
