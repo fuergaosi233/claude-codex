@@ -238,6 +238,15 @@ test("adapters sharing a home preserve each other's config edits", async () => {
         assert.notEqual(changed.ino, stamp.ino)
         assert.equal(changed.mode & 0o777, 0o600)
         assert.equal((await a.request('config/read')).config.model, 'haiku')
+
+        // A file another program broke is repaired by the next save, as a
+        // save overwrote it before.
+        for (const broken of ['{"model": "opus",', '[]', '"text"']) {
+          await writeFile(file, broken)
+          await a.request('config/value/write', edit('web_search', 'disabled'))
+          assert.equal((await saved()).overrides.web_search, 'disabled')
+          assert.equal((await a.request('config/read')).config.web_search, 'disabled')
+        }
       } finally {
         await b.close()
       }

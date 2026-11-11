@@ -9222,7 +9222,6 @@ export class CodexClaudeAppServer {
   // or, when one fails, none: the App shows the error and its settings stay
   // as they were. See app-settings.mts for what each setting does.
   private configWriteResponse(params: Record<string, unknown>): unknown {
-    // 共享同一配置文件的适配器只修改当前请求的键，不能回写启动时的副本。
     this.loadPersistedConfig()
     const overrides = structuredClone(this.configOverrides)
     let model = this.configModel
@@ -10370,9 +10369,7 @@ export class CodexClaudeAppServer {
 
   private loadPersistedConfig(): void {
     try {
-      const parsed: Record<string, unknown> = existsSync(this.configPath)
-        ? JSON.parse(readFileSync(this.configPath, 'utf8'))
-        : {}
+      const parsed = this.savedConfig()
       this.configModel = defaultSelectableModelId()
       this.configReasoningEffort =
         normalizeCodexReasoningEffort(process.env.CLAUDE_CODEX_DEFAULT_EFFORT) ?? 'medium'
@@ -10419,13 +10416,19 @@ export class CodexClaudeAppServer {
     } catch {}
   }
 
-  private persistConfig(): void {
-    const saved = existsSync(this.configPath)
-      ? JSON.parse(readFileSync(this.configPath, 'utf8'))
-      : {}
-    if (saved === null || typeof saved !== 'object' || Array.isArray(saved)) {
-      throw new Error('Invalid persisted adapter config')
+  // What config.json holds, or {} when it is missing or not a JSON object: a
+  // save then repairs the file instead of failing for good.
+  private savedConfig(): Record<string, unknown> {
+    try {
+      const parsed = JSON.parse(readFileSync(this.configPath, 'utf8'))
+      return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
+    } catch {
+      return {}
     }
+  }
+
+  private persistConfig(): void {
+    const saved = this.savedConfig()
     const config = {
       ...saved,
       model: this.configModel,
