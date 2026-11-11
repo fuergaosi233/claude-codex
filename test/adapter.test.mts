@@ -10702,6 +10702,117 @@ test('turn interrupt completes requested in-progress turn after reconnect', asyn
   }
 })
 
+test('stale interrupt for a completed turn leaves the active turn running', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  try {
+    execFileSync(
+      process.execPath,
+      [
+        '--no-warnings',
+        '--input-type=module',
+        '-e',
+        `
+      import assert from 'node:assert/strict'
+      import { join } from 'node:path'
+      import { CodexClaudeAppServer } from './dist/src/server.mjs'
+      import { SessionStore } from './dist/src/store.mjs'
+
+      process.env.CLAUDE_CODEX_HOME = ${JSON.stringify(home)}
+      const store = new SessionStore(join(${JSON.stringify(home)}, 'state.sqlite'))
+      const running = new Map()
+      const interrupted = []
+      let runCount = 0
+      const server = new CodexClaudeAppServer(store, {
+        async runTurn(context) {
+          runCount += 1
+          if (runCount > 1) {
+            await new Promise((resolve) => running.set(context.turnId, resolve))
+          }
+        },
+        async steer() {},
+        async interrupt(id) {
+          interrupted.push(id)
+        },
+        async stop() {},
+      })
+      const messages = []
+      const peer = {
+        id: 'peer',
+        send(message) {
+          messages.push(message)
+        },
+        close() {},
+      }
+      let requestId = 0
+      const response = (id) => messages.find((message) => 'id' in message && message.id === id)
+      const waitFor = async (condition) => {
+        for (let attempt = 0; attempt < 100; attempt += 1) {
+          if (condition()) return
+          await new Promise((resolve) => setTimeout(resolve, 5))
+        }
+        throw new Error('timed out waiting for turn state')
+      }
+
+      await server.handle(peer, {
+        id: ++requestId,
+        method: 'thread/start',
+        params: { cwd: process.cwd(), persistExtendedHistory: false },
+      })
+      const threadId = response(requestId).result.thread.id
+      await server.handle(peer, {
+        id: ++requestId,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'complete turn A', text_elements: [] }],
+        },
+      })
+      const completedTurnId = response(requestId).result.turn.id
+      await waitFor(() => store.getTurn(completedTurnId)?.status === 'completed')
+
+      await server.handle(peer, {
+        id: ++requestId,
+        method: 'turn/start',
+        params: {
+          threadId,
+          input: [{ type: 'text', text: 'keep turn B running', text_elements: [] }],
+        },
+      })
+      const activeTurnId = response(requestId).result.turn.id
+      await waitFor(() => running.has(activeTurnId))
+
+      await server.handle(peer, {
+        id: ++requestId,
+        method: 'turn/interrupt',
+        params: { threadId, turnId: completedTurnId },
+      })
+
+      assert.deepEqual(response(requestId).result, {})
+      assert.equal(store.getTurn(completedTurnId)?.status, 'completed')
+      assert.equal(store.getTurn(activeTurnId)?.status, 'inProgress')
+      assert.deepEqual(interrupted, [])
+      assert.equal(
+        messages.some(
+          (message) =>
+            'method' in message &&
+            message.method === 'turn/completed' &&
+            message.params.turn.id === activeTurnId,
+        ),
+        false,
+      )
+
+      running.get(activeTurnId)?.()
+      await waitFor(() => store.getTurn(activeTurnId)?.status === 'completed')
+      await server.stop()
+    `,
+      ],
+      { cwd: resolve('.'), stdio: 'pipe' },
+    )
+  } finally {
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('runtime settlement cannot overwrite an interrupted turn', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   try {
