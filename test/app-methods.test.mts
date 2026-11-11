@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { type ChildProcessWithoutNullStreams, execFileSync, spawn } from 'node:child_process'
 import { once } from 'node:events'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { delimiter, join, resolve } from 'node:path'
 import test from 'node:test'
@@ -163,6 +163,97 @@ async function eventually(read: () => Promise<unknown>, expected: unknown): Prom
   }
   assert.deepEqual(actual, expected)
 }
+
+test("adapters sharing a home preserve each other's config edits", async () => {
+  await withServer(
+    async (a) => {
+      const b = new AppServer(a.home, { CLAUDE_CODEX_WEBSEARCH: undefined })
+      try {
+        const initialize = { clientInfo: { name: 'test', version: '1' }, capabilities: {} }
+        await a.request('initialize', initialize)
+        await b.request('initialize', initialize)
+        const file = join(a.home, 'claude-codex-adapter', 'config.json')
+        const saved = async () => JSON.parse(await readFile(file, 'utf8'))
+        const edit = (keyPath: string, value: unknown) => ({
+          keyPath,
+          value,
+          mergeStrategy: 'replace',
+        })
+        await a.request('config/batchWrite', {
+          edits: [
+            edit('approval_policy', 'never'),
+            edit('web_search', 'disabled'),
+            edit('model', 'opus'),
+          ],
+        })
+        await b.request('config/value/write', edit('model_reasoning_effort', 'high'))
+        assert.equal((await saved()).model, 'opus')
+        assert.equal((await saved()).model_reasoning_effort, 'high')
+        assert.deepEqual((await saved()).overrides, {
+          approval_policy: 'never',
+          web_search: 'disabled',
+        })
+        const read = (await a.request('config/read')).config
+        assert.equal(read.model_reasoning_effort, 'high')
+        assert.equal(read.approval_policy, 'never')
+        assert.equal(read.web_search, 'disabled')
+
+        const manifest = join(a.home, 'marketplace.json')
+        const root = join(a.home, 'plugins', 'visualize')
+        await writeFile(
+          manifest,
+          JSON.stringify({
+            name: 'test-market',
+            plugins: [{ name: 'visualize', source: './plugins/visualize' }],
+          }),
+        )
+        await b.request('plugin/install', { marketplacePath: manifest, pluginName: 'visualize' })
+        await a.request('config/value/write', edit('web_search', null))
+        const installed = await saved()
+        assert.deepEqual(installed.appPlugins, [{ name: 'visualize', root }])
+        assert.deepEqual(installed.installedAppPlugins, [{ id: 'visualize@test-market', root }])
+        assert.equal((await b.request('config/read')).config.web_search, 'live')
+        await a.request('config/value/write', edit('approval_policy', 'on-request'))
+        await b.request('plugin/uninstall', { pluginId: 'visualize@test-market' })
+        const removed = await saved()
+        assert.equal(removed.overrides.approval_policy, 'on-request')
+        assert.deepEqual(removed.appPlugins, [])
+        assert.deepEqual(removed.installedAppPlugins, [])
+        await a.request('config/value/write', edit('web_search', 'disabled'))
+        assert.deepEqual((await saved()).appPlugins, [])
+        assert.deepEqual((await saved()).installedAppPlugins, [])
+
+        await utimes(file, 1, 1)
+        const before = await readFile(file, 'utf8')
+        const stamp = await stat(file)
+        await b.request('config/batchWrite', {
+          edits: [edit('mcp_servers.node_repl', { command: 'node', args: ['repl.js'] })],
+        })
+        await b.request('config/value/write', edit('web_search', 'disabled'))
+        assert.equal(await readFile(file, 'utf8'), before)
+        assert.equal((await stat(file)).mtimeMs, stamp.mtimeMs)
+        assert.equal((await stat(file)).ino, stamp.ino)
+        await b.request('config/value/write', edit('model', 'haiku'))
+        const changed = await stat(file)
+        assert.notEqual(changed.ino, stamp.ino)
+        assert.equal(changed.mode & 0o777, 0o600)
+        assert.equal((await a.request('config/read')).config.model, 'haiku')
+
+        // A file another program broke is repaired by the next save, as a
+        // save overwrote it before.
+        for (const broken of ['{"model": "opus",', '[]', '"text"']) {
+          await writeFile(file, broken)
+          await a.request('config/value/write', edit('web_search', 'disabled'))
+          assert.equal((await saved()).overrides.web_search, 'disabled')
+          assert.equal((await a.request('config/read')).config.web_search, 'disabled')
+        }
+      } finally {
+        await b.close()
+      }
+    },
+    { CLAUDE_CODEX_WEBSEARCH: undefined },
+  )
+})
 
 test('thread history pages turns, items and the timeline', async () => {
   await withServer(async (server) => {

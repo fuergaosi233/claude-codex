@@ -1,9 +1,17 @@
 import { type ChildProcess, execFile, spawn } from 'node:child_process'
-import { existsSync, type FSWatcher, readFileSync, watch, writeFileSync } from 'node:fs'
+import {
+  existsSync,
+  type FSWatcher,
+  readFileSync,
+  renameSync,
+  rmSync,
+  watch,
+  writeFileSync,
+} from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { promisify } from 'node:util'
+import { isDeepStrictEqual, promisify } from 'node:util'
 import { rendersCompletedSubagentActivity, unverifiedAppWarning } from './app-compat.mjs'
 import { type InstalledAppPlugin, stopAppPluginServers } from './app-plugin-mcp.mjs'
 import {
@@ -8219,6 +8227,7 @@ export class CodexClaudeAppServer {
   }
 
   private configRead(params: Record<string, unknown>): unknown {
+    this.loadPersistedConfig()
     // Base config = our typed defaults; overrides (whatever the App's
     // settings sheet has written previously via config/value/write) are
     // layered on top so the user sees their last-saved values instead of
@@ -9213,6 +9222,7 @@ export class CodexClaudeAppServer {
   // or, when one fails, none: the App shows the error and its settings stay
   // as they were. See app-settings.mts for what each setting does.
   private configWriteResponse(params: Record<string, unknown>): unknown {
+    this.loadPersistedConfig()
     const overrides = structuredClone(this.configOverrides)
     let model = this.configModel
     let effort = this.configReasoningEffort
@@ -9301,6 +9311,7 @@ export class CodexClaudeAppServer {
   // started before the App gets to it list the same skills.
   // App rule: inline-visualizations
   private pluginInstall(params: Record<string, unknown>): unknown {
+    this.loadPersistedConfig()
     const plugin = claudeRunnableAppPlugin(params.marketplacePath, params.pluginName)
     const known = this.appPlugins.find((candidate) => candidate.name === plugin?.name)
     let changed = false
@@ -9326,6 +9337,7 @@ export class CodexClaudeAppServer {
   }
 
   private pluginUninstall(params: Record<string, unknown>): unknown {
+    this.loadPersistedConfig()
     // Plugin ids read `<name>@<marketplace>`.
     const id = stringOr(params.pluginId, '')
     const name = id.split('@')[0]
@@ -10357,7 +10369,13 @@ export class CodexClaudeAppServer {
 
   private loadPersistedConfig(): void {
     try {
-      const parsed = JSON.parse(readFileSync(this.configPath, 'utf8')) as Record<string, unknown>
+      const parsed = this.savedConfig()
+      this.configModel = defaultSelectableModelId()
+      this.configReasoningEffort =
+        normalizeCodexReasoningEffort(process.env.CLAUDE_CODEX_DEFAULT_EFFORT) ?? 'medium'
+      this.configOverrides = {}
+      this.appPlugins = []
+      this.installedAppPlugins = []
       let shouldRepair = false
       if (typeof parsed.model === 'string' && parsed.model.length > 0) {
         const normalized = normalizeSelectableModelId(parsed.model, this.configModel)
@@ -10398,24 +10416,35 @@ export class CodexClaudeAppServer {
     } catch {}
   }
 
+  // What config.json holds, or {} when it is missing or not a JSON object: a
+  // save then repairs the file instead of failing for good.
+  private savedConfig(): Record<string, unknown> {
+    try {
+      const parsed = JSON.parse(readFileSync(this.configPath, 'utf8'))
+      return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
+    } catch {
+      return {}
+    }
+  }
+
   private persistConfig(): void {
+    const saved = this.savedConfig()
+    const config = {
+      ...saved,
+      model: this.configModel,
+      model_reasoning_effort: this.configReasoningEffort,
+      overrides: this.configOverrides,
+      appPlugins: this.appPlugins,
+      installedAppPlugins: this.installedAppPlugins,
+    }
+    if (isDeepStrictEqual(config, saved)) return
+    const temp = `${this.configPath}.${newId()}.tmp`
     try {
       ensureParent(this.configPath)
-      writeFileSync(
-        this.configPath,
-        JSON.stringify(
-          {
-            model: this.configModel,
-            model_reasoning_effort: this.configReasoningEffort,
-            overrides: this.configOverrides,
-            appPlugins: this.appPlugins,
-            installedAppPlugins: this.installedAppPlugins,
-          },
-          null,
-          2,
-        ) + '\n',
-        { mode: 0o600 },
-      )
-    } catch {}
+      writeFileSync(temp, JSON.stringify(config, null, 2) + '\n', { mode: 0o600, flag: 'wx' })
+      renameSync(temp, this.configPath)
+    } finally {
+      rmSync(temp, { force: true })
+    }
   }
 }
