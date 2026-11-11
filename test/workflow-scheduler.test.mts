@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, readdir } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { spawn } from 'node:child_process'
+import { once } from 'node:events'
+import { readFileSync } from 'node:fs'
+import { mkdtemp, readdir, writeFile } from 'node:fs/promises'
+import { hostname, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import {
@@ -15,6 +18,8 @@ import {
 import {
   parseWorkflowStateJson,
   type WorkflowState,
+  type WorkflowStateLockRecord,
+  WorkflowStateLockTimeoutError,
   WorkflowStateParseError,
   WorkflowStateStore,
   type WorkflowTask,
@@ -63,6 +68,87 @@ test('workflow state store writes through an atomic JSON file', async () => {
 
   assert.deepEqual(await store.read(), nextState)
   assert.deepEqual(await readdir(join(dir, 'nested')), ['workflow-state.json'])
+})
+
+test('workflow state store takes over a dead local lock without losing concurrent updates', {
+  timeout: 5_000,
+}, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'claude-codex-workflow-state-'))
+  const statePath = join(dir, 'workflow-state.json')
+  const lockPath = `${statePath}.lock`
+  const deadProcess = spawn(process.execPath, ['-e', ''])
+  const [exitCode] = (await once(deadProcess, 'close')) as [number | null]
+  assert.equal(exitCode, 0)
+  const deadPid = deadProcess.pid
+  assert.ok(deadPid)
+  await writeFile(
+    lockPath,
+    JSON.stringify({
+      pid: deadPid,
+      hostname: hostname(),
+      acquiredAt: new Date().toISOString(),
+      token: 'dead-lock',
+    }),
+  )
+
+  const stores = [
+    new WorkflowStateStore(statePath, { lockTimeoutMs: 2_000, lockStaleMs: 60_000 }),
+    new WorkflowStateStore(statePath, { lockTimeoutMs: 2_000, lockStaleMs: 60_000 }),
+  ]
+  const observedLocks: WorkflowStateLockRecord[] = []
+  await Promise.all(
+    stores.map((store, index) =>
+      store.transact(sampleState(), (current) => {
+        observedLocks.push(JSON.parse(readFileSync(lockPath, 'utf8')) as WorkflowStateLockRecord)
+        return {
+          state: { ...current, tasks: [...current.tasks, task({ id: `after-${index}` })] },
+          value: index,
+        }
+      }),
+    ),
+  )
+
+  const state = await new WorkflowStateStore(statePath).read()
+  assert.deepEqual(state?.tasks.map((task) => task.id).sort(), ['after-0', 'after-1', 'scheduler'])
+  assert.equal(observedLocks.length, 2)
+  assert.equal(new Set(observedLocks.map((record) => record.token)).size, 2)
+  for (const record of observedLocks) {
+    assert.equal(record.pid, process.pid)
+    assert.equal(record.hostname, hostname())
+    assert.ok(Number.isFinite(Date.parse(record.acquiredAt)))
+  }
+  assert.deepEqual(await readdir(dir), ['workflow-state.json'])
+})
+
+test('workflow state store times out with live holder details instead of waiting forever', {
+  timeout: 2_000,
+}, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'claude-codex-workflow-state-'))
+  const statePath = join(dir, 'workflow-state.json')
+  const lockPath = `${statePath}.lock`
+  const holder: WorkflowStateLockRecord = {
+    pid: process.pid,
+    hostname: hostname(),
+    acquiredAt: new Date().toISOString(),
+    token: 'live-lock',
+  }
+  await writeFile(lockPath, JSON.stringify(holder))
+  const store = new WorkflowStateStore(statePath, {
+    lockTimeoutMs: 50,
+    lockStaleMs: 60_000,
+  })
+
+  await assert.rejects(
+    store.transact(sampleState(), (current) => ({ state: current, value: null })),
+    (error: unknown) => {
+      if (!(error instanceof WorkflowStateLockTimeoutError)) return false
+      assert.ok(error.message.includes(`holder pid ${process.pid}`))
+      assert.ok(error.message.includes(`since ${holder.acquiredAt}`))
+      return true
+    },
+  )
+  assert.deepEqual(JSON.parse(readFileSync(lockPath, 'utf8')), holder)
+  assert.equal(await store.read(), null)
 })
 
 test('workflow scheduler claims highest priority runnable task with a lease', () => {
