@@ -1179,6 +1179,54 @@ export class SessionStore {
       .run(archived ? 1 : 0, nowSeconds(), threadId)
   }
 
+  // Atomically claims the thread's one active foreground turn. A live owner
+  // in another adapter wins; a dead owner's turn is settled before this one
+  // replaces it. The write lock makes the check and insert one operation
+  // across every server sharing this database.
+  claimTurn(turn: TurnRecord): { claimed: true } | { claimed: false; activeTurn: TurnRecord } {
+    return this.transaction(() => {
+      const activeRows = this.db
+        .prepare(
+          `SELECT * FROM turns
+           WHERE thread_id = ? AND status = 'inProgress'
+           ORDER BY started_at DESC, rowid DESC`,
+        )
+        .all(turn.threadId) as Array<{
+        owner_pid: number | null
+        owner_started: string | null
+      }>
+      const self = currentProcessOwner()
+      const ownerAlive = (row: {
+        owner_pid: number | null
+        owner_started: string | null
+      }): boolean => {
+        if (self && row.owner_pid === self.pid && row.owner_started === self.started) {
+          return true
+        }
+        if (row.owner_pid == null || row.owner_started == null) {
+          // Without process start times (Windows), startup recovery has
+          // already settled legacy rows. An unowned row appearing now may be
+          // live, so never displace it on a guess.
+          return self == null
+        }
+        return otherProcessRunning({ pid: Number(row.owner_pid), started: row.owner_started })
+      }
+      const live = activeRows.find(ownerAlive)
+      if (live) return { claimed: false as const, activeTurn: this.rowToTurn(live) }
+
+      for (const row of activeRows) {
+        const stale = this.rowToTurn(row)
+        this.upsertTurn(
+          settledTurn(stale, 'interrupted', {
+            message: 'turn owner exited before completing turn',
+          }),
+        )
+      }
+      this.upsertTurn(turn)
+      return { claimed: true as const }
+    })
+  }
+
   upsertTurn(turn: TurnRecord): void {
     const owner = currentProcessOwner()
     this.db

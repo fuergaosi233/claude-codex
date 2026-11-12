@@ -4072,12 +4072,6 @@ export class CodexClaudeAppServer {
     // App rule: auto-review
     const reviewer = approvalsReviewerFromParams(params)
     if (reviewer) thread.approvalsReviewer = reviewer
-    this.store.upsertThread(thread)
-    if (!hiddenPrompt && !resumed && !thread.preview && prompt) {
-      thread.preview = prompt.slice(0, 200)
-      thread.updatedAt = nowSeconds()
-      this.store.upsertThread(thread)
-    }
     const userItem: ThreadItem | null = hiddenPrompt ? null : turnInputItem(params, input)
     const initialItems: ThreadItem[] = userItem ? [userItem] : []
     const imageItems: ThreadItem[] = []
@@ -4117,7 +4111,38 @@ export class CodexClaudeAppServer {
       error: null,
       rootTurnId: rootTurnId.trim() ? rootTurnId : null,
     }
-    this.store.upsertTurn(turn)
+    // Both sides of an in-process pipeline can pass the await above before
+    // either claims. SQLite settles which turn wins across processes; a local
+    // loser still joins as before, while a remote one is rejected without
+    // persisting a user item or launching another model run.
+    for (;;) {
+      const claim = this.store.claimTurn(turn)
+      if (claim.claimed) break
+      const ownedHere = this.activeTurnByThread.get(threadId) === claim.activeTurn.id
+      if (ownedHere && resumed) return { turn: this.toLifecycleTurn(claim.activeTurn) }
+      if (ownedHere && !hiddenPrompt && params.outputSchema == null) {
+        const joined = await this.joinRunningTurn(
+          peer,
+          threadId,
+          params,
+          workflowCommand?.type === 'list',
+        )
+        if (joined) return { turn: this.toLifecycleTurn(joined) }
+        // The local turn ended while this input waited to join it. Claim the
+        // next turn with the input instead of dropping it.
+        continue
+      }
+      if (ownedHere) throw invalidRequest(`thread ${threadId} already has an active turn`)
+      throw invalidRequest(
+        `thread ${threadId} has an active turn in another adapter process; retry after it completes`,
+      )
+    }
+    this.store.upsertThread(thread)
+    if (!hiddenPrompt && !resumed && !thread.preview && prompt) {
+      thread.preview = prompt.slice(0, 200)
+      thread.updatedAt = nowSeconds()
+      this.store.upsertThread(thread)
+    }
     recordRunEvent('turn.started', {
       threadId,
       turnId,
